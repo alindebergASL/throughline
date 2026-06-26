@@ -1,0 +1,23 @@
+{
+  "name": "@throughline/db",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Drizzle/PostgreSQL package placeholder; schemas and migrations start in later waves.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@throughline/core-types": "workspace:*",
+    "drizzle-orm": "^0.44.4"
+  },
+  "devDependencies": {
+    "drizzle-kit": "^0.31.4"
+  }
+}

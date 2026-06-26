@@ -1,0 +1,20 @@
+{
+  "name": "@throughline/domain-profiles",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Domain profile package placeholder; no generic Solution Pack runtime.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@throughline/core-types": "workspace:*",
+    "zod": "^4.0.14"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "@throughline/agent-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Governed agent runtime package placeholder; AgentRun/ChangeSet behavior is deferred.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@throughline/core-types": "workspace:*"
+  }
+}

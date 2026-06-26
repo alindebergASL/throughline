@@ -1,0 +1,16 @@
+{
+  "name": "@throughline/testing",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared test helpers placeholder for future security and fixture suites.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  }
+}
