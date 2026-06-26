@@ -1,0 +1,19 @@
+{
+  "name": "@throughline/content",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Content and SourceArtifact package placeholder; ingestion behavior is deferred.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@throughline/core-types": "workspace:*"
+  }
+}

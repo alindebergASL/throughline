@@ -1,0 +1,19 @@
+node_modules
+dist
+.next
+coverage
+pnpm-lock.yaml
+
+# Pre-existing canonical docs/specs/fixtures are source-of-truth artifacts.
+# Wave A1 formatting checks cover the implementation workspace and root configs.
+docs/**/*.md
+docs/ux/*.md
+backlog/**
+contracts/**
+profiles/**
+tests/fixtures/**
+CLAUDE.md
+AGENTS.md
+HERMES_RUNBOOK.md
+CHANGELOG.md
+VALIDATION.md

@@ -1,0 +1,16 @@
+{
+  "name": "@throughline/core-types",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Shared Phase 0/1 primitive TypeScript types; no product-specific imports.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  }
+}

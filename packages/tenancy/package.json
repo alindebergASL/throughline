@@ -1,0 +1,19 @@
+{
+  "name": "@throughline/tenancy",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Tenant, Workspace, and Space boundary package placeholder; tables/RLS are deferred.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@throughline/core-types": "workspace:*"
+  }
+}

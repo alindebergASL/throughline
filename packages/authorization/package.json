@@ -1,0 +1,19 @@
+{
+  "name": "@throughline/authorization",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Central can() authorization boundary placeholder; policy implementation is deferred.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "lint": "eslint .",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run --passWithNoTests"
+  },
+  "dependencies": {
+    "@throughline/core-types": "workspace:*"
+  }
+}
