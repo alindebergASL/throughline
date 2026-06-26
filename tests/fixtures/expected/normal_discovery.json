@@ -1,0 +1,20 @@
+{
+  "mustForeground": [
+    "Jonah agenda commitment due 2026-06-19",
+    "Priya recap commitment due 2026-06-19",
+    "Luis process map and samples due 2026-06-26",
+    "Erin security requirements with ambiguous week-of date",
+    "tentative July 22 workshop date",
+    "funding not approved",
+    "human review required"
+  ],
+  "mustNotAssertAsFact": [
+    "Leah Martin confirmed as owner",
+    "July 22 workshop confirmed",
+    "pilot budget approved"
+  ],
+  "expectedUseCases": [
+    "resident request triage and draft-response assistance",
+    "board packet summarization (lower priority, sensitive)"
+  ]
+}

@@ -1,0 +1,306 @@
+{
+  "id": "ai-solutions",
+  "version": "1.0.0",
+  "status": "published",
+  "minCoreVersion": "0.1.0",
+  "displayName": "AI Solutions",
+  "labels": {
+    "organization": "Organization",
+    "initiative": "AI Initiative",
+    "activity": "Engagement",
+    "readiness": "AI Readiness & Governance",
+    "useCase": "AI Use Case",
+    "pulse": "Team Pulse"
+  },
+  "initiativeTypes": [
+    {
+      "key": "governance",
+      "label": "AI Governance"
+    },
+    {
+      "key": "infrastructure",
+      "label": "AI Infrastructure"
+    },
+    {
+      "key": "security",
+      "label": "AI Security"
+    },
+    {
+      "key": "application",
+      "label": "AI Application / Use Case"
+    },
+    {
+      "key": "enablement",
+      "label": "AI Enablement"
+    }
+  ],
+  "stagePipeline": [
+    {
+      "key": "exploring",
+      "label": "Exploring",
+      "order": 10
+    },
+    {
+      "key": "qualified",
+      "label": "Qualified",
+      "order": 20
+    },
+    {
+      "key": "workshop",
+      "label": "Workshop",
+      "order": 30
+    },
+    {
+      "key": "assessment",
+      "label": "Assessment",
+      "order": 40
+    },
+    {
+      "key": "solution_proposed",
+      "label": "Solution Proposed",
+      "order": 50
+    },
+    {
+      "key": "validated",
+      "label": "Validated",
+      "order": 60
+    },
+    {
+      "key": "committed",
+      "label": "Committed",
+      "order": 70
+    },
+    {
+      "key": "paused",
+      "label": "Paused",
+      "order": 80
+    },
+    {
+      "key": "closed",
+      "label": "Closed",
+      "order": 90
+    }
+  ],
+  "evidenceRules": [
+    {
+      "stageKey": "qualified",
+      "requiredSignals": [
+        "business_problem_validated",
+        "customer_owner_identified"
+      ]
+    },
+    {
+      "stageKey": "workshop",
+      "requiredSignals": [
+        "workshop_objective_confirmed",
+        "attendees_identified"
+      ]
+    },
+    {
+      "stageKey": "assessment",
+      "requiredSignals": [
+        "assessment_scope_confirmed"
+      ]
+    },
+    {
+      "stageKey": "solution_proposed",
+      "requiredSignals": [
+        "use_case_validated",
+        "proposed_approach_presented"
+      ]
+    },
+    {
+      "stageKey": "validated",
+      "requiredSignals": [
+        "customer_validation_recorded",
+        "next_commitment_confirmed"
+      ]
+    }
+  ],
+  "readinessDimensions": [
+    {
+      "key": "executive_sponsorship",
+      "label": "Executive Sponsorship",
+      "valueType": "enum",
+      "options": [
+        "unknown",
+        "absent",
+        "emerging",
+        "established"
+      ]
+    },
+    {
+      "key": "governance_process",
+      "label": "Governance Process",
+      "valueType": "enum",
+      "options": [
+        "unknown",
+        "none",
+        "informal",
+        "documented",
+        "operational"
+      ]
+    },
+    {
+      "key": "ai_inventory",
+      "label": "AI Inventory",
+      "valueType": "enum",
+      "options": [
+        "unknown",
+        "none",
+        "partial",
+        "maintained"
+      ]
+    },
+    {
+      "key": "risk_classification",
+      "label": "Risk Classification",
+      "valueType": "enum",
+      "options": [
+        "unknown",
+        "none",
+        "informal",
+        "formal"
+      ]
+    },
+    {
+      "key": "data_readiness",
+      "label": "Data Readiness",
+      "valueType": "score",
+      "min": 0,
+      "max": 5
+    },
+    {
+      "key": "security_validation",
+      "label": "Security Validation",
+      "valueType": "enum",
+      "options": [
+        "unknown",
+        "none",
+        "planned",
+        "active"
+      ]
+    },
+    {
+      "key": "human_oversight",
+      "label": "Human Oversight",
+      "valueType": "enum",
+      "options": [
+        "unknown",
+        "undefined",
+        "defined",
+        "tested"
+      ]
+    },
+    {
+      "key": "monitoring",
+      "label": "Monitoring & Incident Response",
+      "valueType": "enum",
+      "options": [
+        "unknown",
+        "none",
+        "planned",
+        "operational"
+      ]
+    }
+  ],
+  "activityTemplates": [
+    {
+      "key": "discovery",
+      "label": "AI Discovery",
+      "defaultObjectives": [
+        "Validate business problem",
+        "Identify sponsor",
+        "Capture current state"
+      ]
+    },
+    {
+      "key": "ai_workshop",
+      "label": "AI Workshop",
+      "defaultObjectives": [
+        "Discover and prioritize use cases",
+        "Identify readiness gaps",
+        "Agree next step"
+      ]
+    },
+    {
+      "key": "assessment",
+      "label": "AI Assessment",
+      "defaultObjectives": [
+        "Document maturity",
+        "Capture evidence",
+        "Recommend plays"
+      ]
+    },
+    {
+      "key": "architecture_review",
+      "label": "Architecture Review",
+      "defaultObjectives": [
+        "Validate requirements",
+        "Review proposed design",
+        "Capture decisions"
+      ]
+    },
+    {
+      "key": "executive_briefing",
+      "label": "Executive Briefing",
+      "defaultObjectives": [
+        "Align outcomes",
+        "Confirm sponsorship",
+        "Secure commitment"
+      ]
+    }
+  ],
+  "playbookSeeds": [
+    {
+      "key": "governance_foundation",
+      "condition": {
+        "op": "in",
+        "field": "readiness.governance_process",
+        "values": [
+          "none",
+          "informal"
+        ]
+      },
+      "recommend": "AI Governance Workshop"
+    },
+    {
+      "key": "inventory_gap",
+      "condition": {
+        "op": "in",
+        "field": "readiness.ai_inventory",
+        "values": [
+          "none",
+          "partial"
+        ]
+      },
+      "recommend": "AI Inventory & Discovery Assessment"
+    },
+    {
+      "key": "security_gap",
+      "condition": {
+        "op": "in",
+        "field": "readiness.security_validation",
+        "values": [
+          "none",
+          "planned"
+        ]
+      },
+      "recommend": "AI Security Validation Workshop"
+    },
+    {
+      "key": "use_case_validation",
+      "condition": {
+        "op": "eq",
+        "field": "initiative.stage",
+        "value": "workshop"
+      },
+      "recommend": "Use Case Prioritization Session"
+    }
+  ],
+  "frameworks": [
+    "NIST AI RMF",
+    "ISO/IEC 42001",
+    "EU AI Act"
+  ]
+}

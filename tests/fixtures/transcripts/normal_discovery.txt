@@ -1,0 +1,41 @@
+THROUGHLINE SYNTHETIC FIXTURE — NORMAL AI DISCOVERY
+Organization: Northstar County Services (fictional)
+Date: June 18, 2026, 10:00 AM America/New_York
+Attendees: Maya Chen (County CIO), Luis Romero (Data Director), Erin Walsh (Security), Priya Shah (Throughline user), Jonah Reed (partner architect)
+
+Priya: The goal today is to validate the county's highest-value AI use cases and agree on a practical next step.
+Maya: Our biggest pain is the resident-service backlog. We have about 18,000 unresolved requests across email and web forms.
+Luis: The volume figure is from last month's operations report, and it fluctuates, so treat 18,000 as approximate.
+Maya: We want to reduce average response time from twelve business days to five.
+Erin: We cannot send regulated case data to a public model endpoint. Any pilot needs private processing and audit logs.
+Luis: Our data is mostly in ServiceNow, SharePoint, and a legacy case database.
+Maya: The first use case should be triage and draft-response assistance, not autonomous decisions.
+Erin: Human review is mandatory before anything is sent to a resident.
+Jonah: We can prepare a reference architecture using a private model endpoint and retrieval from approved repositories.
+Maya: Yes, please prepare that.
+Priya: Who owns the use case on the business side?
+Maya: I do for now, but operations director Leah Martin should become the day-to-day owner.
+Luis: Leah is out this week, so that ownership is not yet confirmed with her.
+Priya: Do you have an AI governance process?
+Maya: We have an informal technology review group, but no formal AI council.
+Erin: Security reviews AI projects under our existing third-party risk process.
+Luis: We do not have a complete AI inventory. We have a spreadsheet with six known pilots.
+Maya: The board asked for an AI policy draft by September.
+Priya: Would an AI governance workshop be useful before the pilot design?
+Maya: Yes. I would like a two-hour workshop in July.
+Erin: Avoid the week of July 13 because of the audit.
+Maya: July 22 in the afternoon could work, but I need to confirm.
+Jonah: I will send three agenda options by Friday, June 19.
+Priya: I will send the discovery recap and proposed workshop outcomes by tomorrow afternoon.
+Luis: I will provide the current process map and sample de-identified requests by June 26.
+Erin: I will provide the security requirements, but I cannot commit to June 26. Let's say the week of June 29.
+Maya: The pilot budget is not approved. We may be able to use innovation funds, but finance has not confirmed that.
+Priya: So funding is a risk, not a committed budget.
+Maya: Correct.
+Luis: Another possible use case is summarizing board packets, but it is lower priority.
+Erin: Board packets sometimes contain attorney-client material, so that one needs separate review.
+Maya: For success, I care about response time, backlog reduction, and no increase in complaint escalations.
+Priya: Can we agree the next decision is whether to run the governance workshop and then scope a limited triage pilot?
+Maya: Yes.
+Jonah: I will also document which repositories are in scope and which must be excluded.
+Priya: Great. I will keep the workshop date as tentative until Maya confirms.

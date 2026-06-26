@@ -1,0 +1,44 @@
+issue_id,epic,title,type,priority,depends_on,labels,acceptance_criteria
+TL-001,P0-1,Initialize pnpm/Turborepo monorepo,task,P0,,"repo,foundation",apps and packages compile; dependency boundaries enforced
+TL-002,P0-1,Create local infrastructure compose stack,task,P0,TL-001,"infra,local-dev","PostgreSQL+pgvector, S3-compatible store, and queue start with one command"
+TL-003,P0-1,Implement transactional outbox proof,story,P0,TL-001;TL-002,"outbox,worker",API commit writes test aggregate and outbox atomically; relay publishes; worker handles idempotently
+TL-004,P0-1,Propagate OpenTelemetry trace across API and worker,task,P0,TL-003,observability,"single trace links request, transaction, relay, and worker"
+TL-005,P0-2,Implement Tenant Workspace Space schema,story,P0,TL-002,"tenancy,db",migrations and repositories preserve tenant/workspace keys and recursive Space
+TL-006,P0-2,Implement User Membership Person principals,story,P0,TL-005,"identity,authorization",User/Membership separated from graph Person; invitations supported
+TL-007,P0-2,Implement ServicePrincipal and AgentPrincipal,task,P0,TL-006,"identity,agent",workers and agents use explicit non-human principals
+TL-008,P0-2,Implement SecurityContext reference and rehydration,story,P0,TL-006;TL-007,"security,async",queue carries signed reference; worker rehydrates and reauthorizes
+TL-009,P0-2,Implement central AuthorizationService.can,story,P0,TL-006,authorization,no module contains ad hoc role checks; explainable decisions supported
+TL-010,P0-2,Enable and test PostgreSQL RLS,story,P0,TL-005;TL-008,"security,rls",cross-tenant access denied under pooled connections and worker runs
+TL-011,P0-3,Implement Organization Initiative Activity Relationship,story,P0,TL-010,work-graph,manual account workflow is functional with no integrations
+TL-012,P0-3,Implement AI Solutions profile loader and validator,story,P0,TL-001,"profile,validation","profile validates typed condition AST, stable keys, stages, dimensions"
+TL-013,P0-3,Add core-cleanliness dependency test,task,P0,TL-001,"architecture,test","Core cannot import account operations, profile, or adapter modules"
+TL-014,P0-4,Implement ContentItem and immutable SourceArtifact,story,P0,TL-011,"content,truth",manual note/transcript stored with hash and immutable evidence record
+TL-015,P0-4,Implement SourceChunk normalization and hashes,story,P0,TL-014,"provenance,citations","stable chunk IDs, offsets, normalized text, and hashes produced deterministically"
+TL-016,P0-4,Implement mechanically verified source spans,story,P0,TL-015,"provenance,security","fabricated chunk, offset, or excerpt is rejected"
+TL-017,P0-4,Implement Claim and AcceptedFact ledger,story,P0,TL-016,truth-ledger,claim acceptance records authority and supporting evidence
+TL-018,P0-4,Implement conflicts supersession revocation,story,P0,TL-017,truth-ledger,old facts preserved; current state and conflicts resolvable
+TL-019,P0-4,Implement access-class propagation,story,P0,TL-017,"security,classification",claim/fact/view cannot be less restrictive than inputs
+TL-020,P0-4,Implement DerivedView revision hash and regeneration,story,P0,TL-018;TL-019,derived-view,fact or permission change forces a permission-correct regeneration
+TL-021,P0-5,Implement AgentRun durable state machine,story,P0,TL-003;TL-008,agent-runtime,"runs pause, retry, cancel, and resume without in-memory dependency"
+TL-022,P0-5,Implement versioned Skill registry,story,P0,TL-021,"agent-runtime,skills","skills declare schemas, context recipe, permissions, budgets, eval suite"
+TL-023,P0-5,Implement ContextPacket builder,story,P0,TL-020;TL-022,"agent-runtime,security",context is permission-filtered and trust-labeled before model access
+TL-024,P0-5,Enforce ingestion/action plane separation,story,P0,TL-023,"agent-runtime,security",extraction worker has no write-capable capability path
+TL-025,P0-5,Implement typed ChangeSet operation unions,story,P0,TL-022,"changeset,types","each operation has schema, evidence, impact floor, approval, pre/postconditions"
+TL-026,P0-5,Implement deterministic impact and approval policy,story,P0,TL-025;TL-009,"policy,approval","model cannot downgrade commitments, dates, stages, security, or external actions"
+TL-027,P0-5,Implement batch review state and escalation,story,P0,TL-025;TL-026,"review,workflow",reviewer finishes eligible batch while escalations route independently
+TL-028,P0-5,Implement Domain Command Bus,story,P0,TL-009;TL-025,"domain,commands",all human and agent writes use typed authorized commands
+TL-029,P0-5,Implement ExecutionReceipt verification and compensation,story,P0,TL-028,"execution,reliability","attempts, pending verification, atomic groups, and compensation recorded"
+TL-030,P0-7,Create deterministic manual ChangeSet fixture path,story,P0,TL-027;TL-028,"review,test",review UX and command semantics proven without an LLM
+TL-031,P0-7,Implement engagement extraction schema and verifier,story,P0,TL-016;TL-022;TL-024,"extraction,ai",only allowed entities/states; citations and dates verified server-side
+TL-032,P0-7,Build transcript-scale batch review UI,story,P0,TL-027;TL-030;TL-031,"ui,review","30–50 items grouped into attention, ready, and escalation buckets"
+TL-033,P0-7,Add normal discovery transcript evaluation,test,P0,TL-031;TL-032,"fixture,evaluation",expected claims and impact classes pass thresholds
+TL-034,P0-7,Add conflict-heavy workshop evaluation,test,P0,TL-031;TL-032,"fixture,evaluation","conflicts, ambiguous dates, and supersession are foregrounded"
+TL-035,P0-7,Add adversarial injection evaluation,test,P0,TL-024;TL-031;TL-032,"fixture,security",malicious instructions cannot create tool intent or hide consequential items
+TL-036,P0-6,Implement adapter registry and Capability Broker,story,P0,TL-009;TL-024,"mcp,integration",trusted capability manifests mediate all external tools
+TL-037,P0-6,Implement mock AccountIntelligenceProvider,story,P0,TL-036,"adapter,contract",mock returns provenance-bearing canonical contract
+TL-038,P0-6,Implement Account Research MCP adapter,story,P0,TL-036;TL-037,"mcp,adapter",read-only provider passes same contract and cannot create facts
+TL-039,P0-8,Implement exact Space-scoped hybrid retrieval,story,P0,TL-010;TL-019;TL-020,"search,security",retrieval only searches currently authorized Spaces
+TL-040,P0-8,Implement cited organization and initiative summaries,story,P0,TL-020;TL-039,"summary,derived-view",material assertion links to verified source and respects current permissions
+TL-041,P0-8,Implement asymmetric-access regression suite,test,P0,TL-039;TL-040,"security,search",restricted child Space has no influence on other user outputs or counts
+TL-042,P0-8,Implement Today and minimal Pulse,story,P0,TL-027;TL-040,"ui,pulse","reviews, commitments, changes, and unblock needs shown without activity scoring"
+TL-043,P0-8,Automate Phase 0 demo from clean environment,test,P0,TL-003;TL-010;TL-032;TL-038;TL-042,"demo,e2e",scripted proof passes end-to-end with adapter disabled and switched

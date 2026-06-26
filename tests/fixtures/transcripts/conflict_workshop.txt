@@ -1,0 +1,44 @@
+THROUGHLINE SYNTHETIC FIXTURE — CONFLICT-HEAVY AI WORKSHOP
+Organization: Meridian Health Cooperative (fictional)
+Date: June 20, 2026, 1:00 PM America/Chicago
+Attendees: Dr. Sofia Patel (Chief Clinical Officer), Ben Ortiz (CIO), Dana Kim (Privacy), Marcus Lee (Program Manager), Alex Grant (Throughline user)
+
+Alex: We are reviewing the clinical-documentation assistant initiative and what has changed since discovery.
+Marcus: The initiative is in pilot and starts July 1.
+Ben: That is not correct. We approved technical validation, not a clinical pilot. The earliest pilot would be August.
+Sofia: I told the clinical leads we were targeting late July, assuming privacy clears it.
+Dana: Privacy has not cleared it. We have not completed the data-protection assessment.
+Marcus: The vendor said the environment is HIPAA ready.
+Dana: Vendor readiness is not our approval. We still need the BAA amendment and retention terms.
+Ben: The current system of record says the stage is solution proposed. Keep it there until validation is complete.
+Alex: Who is the executive sponsor?
+Sofia: I am.
+Marcus: Ben has been acting as sponsor for the budget request.
+Ben: I am the technical sponsor. Sofia owns the clinical outcome.
+Alex: Then we should record separate executive and technical sponsorship rather than pick one.
+Sofia: Agreed.
+Dana: The use case may process psychotherapy notes.
+Sofia: No, psychotherapy notes are excluded.
+Marcus: The requirements document from May included them.
+Dana: That document is outdated. The June 12 steering decision excluded them.
+Alex: Please send the June 12 decision record.
+Dana: I will send it today.
+Ben: We need a limited dataset for validation by next Friday.
+Marcus: Next Friday means June 26, right?
+Ben: I meant July 3; I was looking at the wrong week.
+Dana: July 3 is a holiday for much of the team. July 6 is more realistic.
+Sofia: Let's not commit to a date until data engineering responds.
+Alex: I will capture the date as unresolved and create a question, not a commitment.
+Marcus: The vendor proposal is $240,000.
+Ben: That includes optional services. The base proposal is $185,000.
+Dana: Neither amount is approved.
+Sofia: Our success metric is a 20 percent reduction in after-hours documentation.
+Marcus: I have 30 percent in my notes.
+Sofia: Twenty percent is the approved target. Thirty was the stretch goal.
+Ben: We also require no measurable increase in coding errors.
+Dana: And zero use of excluded note types.
+Alex: The next formal gate is privacy and security validation, followed by a clinical-governance review.
+All: Agreed.
+Marcus: I can schedule the governance review for July 10.
+Dana: Do not schedule it yet. We need the assessment first.
+Alex: I will draft the proposed sequence, but no meeting will be scheduled without approval.

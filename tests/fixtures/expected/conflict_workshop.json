@@ -1,0 +1,17 @@
+{
+  "mustForeground": [
+    "stage conflict",
+    "pilot date conflict",
+    "sponsor role distinction",
+    "psychotherapy-note scope conflict",
+    "June 12 supersession evidence request",
+    "ambiguous/corrected next Friday date",
+    "proposal amount conflict",
+    "success metric approved vs stretch",
+    "schedule action explicitly prohibited"
+  ],
+  "mustNotExecute": [
+    "schedule July 10 governance review"
+  ],
+  "expectedCurrentStage": "solution_proposed"
+}
