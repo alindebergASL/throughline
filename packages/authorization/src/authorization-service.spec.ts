@@ -87,6 +87,30 @@ maybeDescribe("AuthorizationService database decisions", () => {
     expect(decision.reasonCode).toBe("space_not_found");
   });
 
+  it("denies tenant.read when the target tenant is outside the current context", async () => {
+    const decision = await service.can(createDevSecurityContext("tenant-a-owner"), "tenant.read", {
+      type: "tenant",
+      id: devFixtures.tenantB
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe("wrong_tenant");
+  });
+
+  it("denies workspace.manage_members when the target workspace is outside the current context", async () => {
+    const decision = await service.can(
+      createDevSecurityContext("tenant-a-owner"),
+      "workspace.manage_members",
+      {
+        type: "workspace",
+        id: devFixtures.workspaceB
+      }
+    );
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe("wrong_workspace");
+  });
+
   it("denies restricted child Space reads to same-workspace viewers without direct grants", async () => {
     const decision = await service.can(createDevSecurityContext("tenant-a-viewer"), "space.read", {
       type: "space",
@@ -97,19 +121,97 @@ maybeDescribe("AuthorizationService database decisions", () => {
     expect(decision.reasonCode).toBe("space_access_denied");
   });
 
+  it("does not let root grants inherit through a restricted ancestor", async () => {
+    await ownerPool.query(
+      `
+      INSERT INTO access.access_relationships
+        (tenant_id, workspace_id, subject_type, subject_id, relation, resource_type, resource_id, source)
+      VALUES ($1, $2, 'membership', $3, 'viewer', 'space', $4, 'direct')
+      `,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        devFixtures.rootSpaceA
+      ]
+    );
+
+    const decision = await service.can(createDevSecurityContext("tenant-a-viewer"), "space.read", {
+      type: "space",
+      id: devFixtures.restrictedChildSpaceA
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe("space_access_denied");
+  });
+
+  it("lets a grant at the restricted boundary inherit to an inheriting child", async () => {
+    await ownerPool.query(
+      `
+      INSERT INTO access.access_relationships
+        (tenant_id, workspace_id, subject_type, subject_id, relation, resource_type, resource_id, source)
+      VALUES ($1, $2, 'membership', $3, 'viewer', 'space', $4, 'direct')
+      `,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        devFixtures.restrictedSpaceA
+      ]
+    );
+
+    const decision = await service.can(createDevSecurityContext("tenant-a-viewer"), "space.read", {
+      type: "space",
+      id: devFixtures.restrictedChildSpaceA
+    });
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.reasonCode).toBe("inherited_space_grant");
+  });
+
+  it("lets a direct child grant read the child under a restricted ancestor", async () => {
+    await ownerPool.query(
+      `
+      INSERT INTO access.access_relationships
+        (tenant_id, workspace_id, subject_type, subject_id, relation, resource_type, resource_id, source)
+      VALUES ($1, $2, 'membership', $3, 'viewer', 'space', $4, 'direct')
+      `,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        devFixtures.restrictedChildSpaceA
+      ]
+    );
+
+    const decision = await service.can(createDevSecurityContext("tenant-a-viewer"), "space.read", {
+      type: "space",
+      id: devFixtures.restrictedChildSpaceA
+    });
+
+    expect(decision.allowed).toBe(true);
+    expect(decision.reasonCode).toBe("direct_space_grant");
+  });
+
   it("denies stale contexts after live membership suspension", async () => {
     const context = createDevSecurityContext("tenant-a-owner");
     await ownerPool.query("UPDATE identity.memberships SET status = 'suspended' WHERE id = $1", [
       devFixtures.membershipAOwner
     ]);
 
-    const decision = await service.can(context, "workspace.manage_members", {
-      type: "workspace",
-      id: devFixtures.workspaceA
-    });
+    try {
+      const decision = await service.can(context, "workspace.manage_members", {
+        type: "workspace",
+        id: devFixtures.workspaceA
+      });
 
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe("principal_not_active");
+      expect(decision.allowed).toBe(false);
+      expect(decision.reasonCode).toBe("principal_not_active");
+    } finally {
+      await ownerPool.query("UPDATE identity.memberships SET status = 'active' WHERE id = $1", [
+        devFixtures.membershipAOwner
+      ]);
+    }
   });
 
   it("does not let Person records authorize actions", async () => {

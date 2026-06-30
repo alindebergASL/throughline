@@ -57,6 +57,7 @@ Added Wave A2 primitives in `packages/core-types`:
   - agent principal
 - Added expiry validation.
 - Added deterministic local dev identities and fixtures for A2 tests.
+- Added deterministic restricted-child Space fixture for recursive inheritance tests.
 - Added guarded dev identity resolver that rejects public header-sourced authority fields.
 - Added SecurityContext tests.
 
@@ -101,7 +102,9 @@ Added Wave A2 primitives in `packages/core-types`:
   - space child creation/access management for owner/admin
 - Enforced default-deny for service and agent principals in A2.
 - Recomputed live authorization from the database, rather than trusting context hints.
-- Added tests for service/agent default-deny, cross-tenant denial, stale-context denial, restricted Space denial, and Person/principal confusion.
+- Added target-resource checks so `tenant.read` and `workspace.manage_members` cannot allow resources outside the current context.
+- Added restricted-ancestor inheritance semantics so inherited Space grants cannot pass through a restricted boundary.
+- Added tests for service/agent default-deny, cross-tenant denial, wrong tenant/workspace resource denial, stale-context denial, restricted Space denial, restricted-ancestor inheritance, and Person/principal confusion.
 
 ## Binding clarification enforcement
 
@@ -115,6 +118,8 @@ Added Wave A2 primitives in `packages/core-types`:
 | Do not broaden API/product surface | No A2 API/product endpoints or UI screens were added. Work stayed inside packages/db, packages/tenancy, packages/authorization, types, docs, and root tooling. |
 | No Teams in A2 | No teams table was added; `access.access_relationships.subject_type` CHECK excludes `team`; security test verifies team insertion is rejected. |
 | ServicePrincipal and AgentPrincipal default-deny | `AuthorizationService.can()` denies service/agent principals before DB authorization rules. Tests cover both. |
+| `can()` must not allow wrong target resources | `tenant.read` denies unless the resource is the current tenant; `workspace.manage_members` denies unless the resource is the current workspace. Tests cover tenant A owner targeting tenant B/workspace B. |
+| Restricted Space ancestors break inherited access | Space inheritance checks block inherited grants when any closer ancestor/target is `inheritance_mode = 'restricted'`. Tests cover root grant denial through a restricted ancestor plus boundary/direct grants. |
 | Local dev identity must not trust public authority headers | Dev resolver accepts deterministic aliases and explicitly rejects tenant/workspace/user/role/permission authority headers. |
 | `identity.users` self-read only | RLS policy only allows `id = ops.current_user_id()` for SELECT; test verifies tenant A sees only the current user. |
 | Active memberships require linked Person | SQL CHECK requires `status <> 'active' OR person_id IS NOT NULL`; authorization also requires live membership with `person_id IS NOT NULL`. |
@@ -171,8 +176,22 @@ Results:
 
 ```text
 @throughline/db security tests: PASS — 5/5 tests passed
-@throughline/authorization security tests: PASS — 7/7 tests passed
+@throughline/authorization security tests: PASS — 12/12 tests passed
 Root test:security: PASS — 5/5 Turbo tasks successful
+```
+
+### PR-readiness review fix pass
+
+After PR #2 readiness review, Hermes applied two required authorization fixes before merge:
+
+1. `AuthorizationService.can()` now validates the requested target resource for `tenant.read` and `workspace.manage_members` before returning allow decisions.
+2. Recursive Space inheritance now treats restricted ancestors as inheritance boundaries. Root grants do not pass through a restricted ancestor; direct grants at the restricted boundary or target can authorize the expected descendant reads.
+
+Additional focused verification before the final full run:
+
+```text
+@throughline/authorization test:security: PASS — 12/12 tests passed
+@throughline/db test:security: PASS — 5/5 tests passed
 ```
 
 ### Security/static review checks
@@ -215,7 +234,7 @@ PASS
 
 Claude found no blocking findings, no spec violations, no security issues, and no missing required tests. Non-blocking notes were:
 
-1. The stale-context authorization test mutates membership status without restoring it; currently safe because following tests do not depend on the owner remaining active.
+1. The stale-context authorization test mutates membership status without restoring it; this was addressed in the PR-readiness fix pass by restoring the membership in a `finally` block.
 2. `parseSecurityContext` is called twice per `can()` call; harmless but redundant.
 3. `ResourceRef.spaceId` is forward-looking and unused in A2; minor extra type surface.
 4. Invited memberships would deny generically rather than explain invite state; acceptable for A2.

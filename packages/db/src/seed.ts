@@ -108,7 +108,8 @@ export async function seedWaveA2DeterministicData(pool: PgPool): Promise<void> {
     VALUES
       ($1, $2, $3, NULL, 'workspace_root', 'Workspace A Root', 'root', 'workspace', 'inherit'),
       ($4, $2, $3, $1, 'knowledge', 'Tenant A Restricted', 'restricted', 'restricted', 'restricted'),
-      ($5, $6, $7, NULL, 'workspace_root', 'Workspace B Root', 'root', 'workspace', 'inherit')
+      ($5, $2, $3, $4, 'knowledge', 'Tenant A Restricted Child', 'restricted-child', 'restricted', 'inherit'),
+      ($6, $7, $8, NULL, 'workspace_root', 'Workspace B Root', 'root', 'workspace', 'inherit')
     ON CONFLICT (id) DO NOTHING
     `,
     [
@@ -116,6 +117,7 @@ export async function seedWaveA2DeterministicData(pool: PgPool): Promise<void> {
       devFixtures.tenantA,
       devFixtures.workspaceA,
       devFixtures.restrictedSpaceA,
+      devFixtures.restrictedChildSpaceA,
       devFixtures.rootSpaceB,
       devFixtures.tenantB,
       devFixtures.workspaceB

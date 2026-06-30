@@ -41,7 +41,11 @@ maybeDescribe("Wave A2 database RLS security", () => {
     );
 
     expect(visibleSpaces.rows.map((row: { id: string }) => row.id).sort()).toEqual(
-      [devFixtures.restrictedSpaceA, devFixtures.rootSpaceA].sort()
+      [
+        devFixtures.restrictedChildSpaceA,
+        devFixtures.restrictedSpaceA,
+        devFixtures.rootSpaceA
+      ].sort()
     );
     expect(visibleSpaces.rows).not.toContainEqual({ id: devFixtures.rootSpaceB });
   });

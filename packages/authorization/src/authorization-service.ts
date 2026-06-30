@@ -62,6 +62,14 @@ export class PostgresAuthorizationService implements AuthorizationService {
       }
 
       if (action === "tenant.read") {
+        if (resource.type !== "tenant" || resource.id !== context.tenantId) {
+          return deny(
+            context.policyVersion,
+            "wrong_tenant",
+            "Resource is outside the current tenant"
+          );
+        }
+
         return allow(
           context.policyVersion,
           "tenant_member",
@@ -103,6 +111,14 @@ export class PostgresAuthorizationService implements AuthorizationService {
       }
 
       if (action === "workspace.manage_members") {
+        if (resource.type !== "workspace" || resource.id !== context.workspaceId) {
+          return deny(
+            context.policyVersion,
+            "wrong_workspace",
+            "Resource is outside the current workspace"
+          );
+        }
+
         return ownerOrAdminDecision(
           context.policyVersion,
           membership.role,
@@ -228,6 +244,12 @@ async function canReadSpaceResource(
         FROM ancestors a
         JOIN access.access_relationships ar ON ar.resource_type = 'space' AND ar.resource_id = a.id
         WHERE a.depth > 0
+          AND NOT EXISTS (
+            SELECT 1
+            FROM ancestors boundary
+            WHERE boundary.depth < a.depth
+              AND boundary.inheritance_mode = 'restricted'
+          )
           AND ar.relation IN ('owner', 'manager', 'contributor', 'viewer')
           AND (
             (ar.subject_type = 'membership' AND ar.subject_id = $4)

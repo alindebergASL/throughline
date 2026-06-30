@@ -21,7 +21,14 @@ export type AutonomyTier = "automatic_reversible" | "propose_for_approval" | "ne
 export type ImpactClass = "routine" | "material" | "consequential" | "restricted";
 
 export interface ResourceRef {
-  type: EntityKind | "workspace" | "user" | "membership" | "service_principal" | "agent_principal";
+  type:
+    | EntityKind
+    | "tenant"
+    | "workspace"
+    | "user"
+    | "membership"
+    | "service_principal"
+    | "agent_principal";
   id: string;
   spaceId?: string;
 }
