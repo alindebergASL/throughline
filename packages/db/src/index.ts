@@ -1,7 +1,5 @@
-import type { SkeletonModule } from "@throughline/core-types";
-
-export const dbSkeleton: SkeletonModule = {
-  name: "@throughline/db",
-  wave: "A1",
-  status: "placeholder"
-};
+export * from "./client.js";
+export * from "./migrations.js";
+export * from "./schema.js";
+export * from "./seed.js";
+export * from "./transaction.js";

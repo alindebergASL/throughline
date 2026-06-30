@@ -11,13 +11,17 @@
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run --passWithNoTests",
+    "test:security": "vitest run src/security.spec.ts"
   },
   "dependencies": {
     "@throughline/core-types": "workspace:*",
-    "drizzle-orm": "^0.44.4"
+    "@throughline/tenancy": "workspace:*",
+    "drizzle-orm": "^0.44.4",
+    "pg": "^8.13.1"
   },
   "devDependencies": {
+    "@types/pg": "^8.11.10",
     "drizzle-kit": "^0.31.4"
   }
 }
