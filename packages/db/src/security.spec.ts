@@ -1,22 +1,25 @@
 import { createDevSecurityContext, devFixtures } from "@throughline/tenancy";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { applyMigrations } from "./migrations.js";
+import { applyMigrations, type MigrationRunResult } from "./migrations.js";
 import { seedWaveA2DeterministicData } from "./seed.js";
+import { provisionTestAppRole } from "./test-database.js";
 import { withTenantTransaction } from "./transaction.js";
 
-const ownerUrl = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-const appUrl =
-  process.env.TEST_APP_DATABASE_URL ??
-  ownerUrl?.replace("throughline:throughline_dev@", "throughline_app:throughline_app_dev@");
+const ownerUrl = process.env.TEST_DATABASE_URL;
+const appUrl = process.env.TEST_APP_DATABASE_URL;
 const maybeDescribe = ownerUrl && appUrl ? describe : describe.skip;
 
 maybeDescribe("Wave A2 database RLS security", () => {
   const ownerPool = new pg.Pool({ connectionString: ownerUrl });
   const appPool = new pg.Pool({ connectionString: appUrl });
+  let cleanMigrationRun: MigrationRunResult;
+  let repeatedMigrationRun: MigrationRunResult;
 
   beforeAll(async () => {
-    await applyMigrations(ownerPool, { reset: true });
+    cleanMigrationRun = await applyMigrations(ownerPool, { reset: true });
+    await provisionTestAppRole(ownerPool, appUrl!);
+    repeatedMigrationRun = await applyMigrations(ownerPool);
     await seedWaveA2DeterministicData(ownerPool);
   });
 
@@ -25,11 +28,58 @@ maybeDescribe("Wave A2 database RLS security", () => {
     await ownerPool.end();
   });
 
-  it("creates an app role without BYPASSRLS", async () => {
-    const result = await ownerPool.query<{ rolbypassrls: boolean }>(
-      "SELECT rolbypassrls FROM pg_roles WHERE rolname = 'throughline_app'"
+  it("applies migration 0001 cleanly once and treats a repeated apply as a no-op", async () => {
+    const migrationId = "0001_wave_a2_identity_access_rls.sql";
+    const journal = await ownerPool.query<{ count: string }>(
+      `
+      SELECT count(*)::text AS count
+      FROM throughline_migrations.journal
+      WHERE id = $1
+      `,
+      [migrationId]
     );
 
+    expect(cleanMigrationRun).toEqual({ applied: [migrationId], skipped: [] });
+    expect(repeatedMigrationRun).toEqual({ applied: [], skipped: [migrationId] });
+    expect(journal.rows[0]?.count).toBe("1");
+  });
+
+  it("fails closed if an applied migration filename has a different checksum", async () => {
+    const migrationId = "0001_wave_a2_identity_access_rls.sql";
+    const recorded = await ownerPool.query<{ checksum: string }>(
+      "SELECT checksum FROM throughline_migrations.journal WHERE id = $1",
+      [migrationId]
+    );
+    const originalChecksum = recorded.rows[0]?.checksum;
+    expect(originalChecksum).toBeDefined();
+
+    await ownerPool.query("UPDATE throughline_migrations.journal SET checksum = $1 WHERE id = $2", [
+      "0".repeat(64),
+      migrationId
+    ]);
+
+    try {
+      await expect(applyMigrations(ownerPool)).rejects.toThrow(
+        `Migration checksum mismatch for ${migrationId}`
+      );
+    } finally {
+      await ownerPool.query(
+        "UPDATE throughline_migrations.journal SET checksum = $1 WHERE id = $2",
+        [originalChecksum, migrationId]
+      );
+    }
+  });
+
+  it("connects through the app pool as throughline_app without BYPASSRLS", async () => {
+    const result = await appPool.query<{ current_user: string; rolbypassrls: boolean }>(
+      `
+      SELECT current_user, rolbypassrls
+      FROM pg_roles
+      WHERE rolname = current_user
+      `
+    );
+
+    expect(result.rows[0]?.current_user).toBe("throughline_app");
     expect(result.rows[0]?.rolbypassrls).toBe(false);
   });
 

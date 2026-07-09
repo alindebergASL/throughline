@@ -12,7 +12,7 @@
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run --passWithNoTests",
-    "test:security": "vitest run src/security.spec.ts"
+    "test:security": "node --import tsx ../../scripts/require-security-dsns.ts && vitest run src/security.spec.ts"
   },
   "dependencies": {
     "@throughline/core-types": "workspace:*",

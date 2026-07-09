@@ -26,14 +26,28 @@ export const securityContextSchema = z
     expiresAt: isoDateSchema
   })
   .superRefine((context, issue) => {
-    const hasUserPrincipal = Boolean(context.actorUserId && context.actorMembershipId);
+    const hasActorUserId = context.actorUserId !== undefined;
+    const hasActorMembershipId = context.actorMembershipId !== undefined;
+    const hasAnyUserPrincipalField = hasActorUserId || hasActorMembershipId;
+    const hasCompleteUserPrincipal = hasActorUserId && hasActorMembershipId;
+    const hasServicePrincipal = context.servicePrincipalId !== undefined;
+    const hasAgentPrincipal = context.agentPrincipalId !== undefined;
+
+    if (hasAnyUserPrincipalField && !hasCompleteUserPrincipal) {
+      issue.addIssue({
+        code: "custom",
+        message: "SecurityContext user principal requires both actorUserId and actorMembershipId",
+        path: [hasActorUserId ? "actorMembershipId" : "actorUserId"]
+      });
+    }
+
     const principalCount = [
-      hasUserPrincipal,
-      Boolean(context.servicePrincipalId),
-      Boolean(context.agentPrincipalId)
+      hasAnyUserPrincipalField,
+      hasServicePrincipal,
+      hasAgentPrincipal
     ].filter(Boolean).length;
 
-    if (principalCount !== 1) {
+    if (principalCount !== 1 || (hasAnyUserPrincipalField && !hasCompleteUserPrincipal)) {
       issue.addIssue({
         code: "custom",
         message: "SecurityContext must carry exactly one user, service, or agent principal",

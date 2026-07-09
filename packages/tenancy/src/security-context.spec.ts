@@ -12,6 +12,66 @@ describe("SecurityContext validation", () => {
     expect(() => parseSecurityContext(withoutPrincipal)).toThrow(/exactly one/);
   });
 
+  it.each([
+    ["actorUserId", "actorMembershipId"],
+    ["actorMembershipId", "actorUserId"]
+  ] as const)("rejects a user principal missing %s", (missingField, presentField) => {
+    const context = createDevSecurityContext("tenant-a-owner");
+    const partialPrincipal: Record<string, unknown> = { ...context };
+    delete partialPrincipal[missingField];
+
+    expect(partialPrincipal[presentField]).toBeDefined();
+    expect(() => parseSecurityContext(partialPrincipal)).toThrow(
+      /requires both actorUserId and actorMembershipId/
+    );
+  });
+
+  it.each([
+    ["user and service", { servicePrincipalId: "11111111-1111-4111-8111-111111111116" }],
+    ["user and agent", { agentPrincipalId: "11111111-1111-4111-8111-111111111117" }],
+    [
+      "service and agent",
+      {
+        servicePrincipalId: "11111111-1111-4111-8111-111111111116",
+        agentPrincipalId: "11111111-1111-4111-8111-111111111117"
+      }
+    ]
+  ])("rejects mixed %s principal variants", (_name, principalFields) => {
+    const userContext = createDevSecurityContext("tenant-a-owner");
+    const context =
+      "servicePrincipalId" in principalFields && "agentPrincipalId" in principalFields
+        ? {
+            ...userContext,
+            actorUserId: undefined,
+            actorMembershipId: undefined,
+            ...principalFields
+          }
+        : { ...userContext, ...principalFields };
+
+    expect(() => parseSecurityContext(context)).toThrow(/exactly one/);
+  });
+
+  it("rejects a partial user principal even when another variant is complete", () => {
+    const context = { ...createDevSecurityContext("tenant-a-service") } as Record<string, unknown>;
+    context.actorUserId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1";
+
+    expect(() => parseSecurityContext(context)).toThrow(
+      /requires both actorUserId and actorMembershipId/
+    );
+  });
+
+  it("preserves delegation metadata without treating it as another actor principal", () => {
+    const context = createDevSecurityContext("tenant-a-service");
+
+    expect(
+      parseSecurityContext({
+        ...context,
+        delegatedByUserId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+        delegatedByMembershipId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5"
+      })
+    ).toMatchObject({ servicePrincipalId: context.servicePrincipalId });
+  });
+
   it("rejects expired contexts", () => {
     const context = createDevSecurityContext("tenant-a-owner");
 

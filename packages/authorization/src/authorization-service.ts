@@ -35,15 +35,24 @@ export class PostgresAuthorizationService implements AuthorizationService {
       return deny(context.policyVersion, "context_expired", "SecurityContext has expired");
     }
 
-    if (context.servicePrincipalId || context.agentPrincipalId) {
-      return deny(
-        context.policyVersion,
-        "principal_default_denied",
-        "Service and agent principals have no A2 allow rules"
-      );
-    }
-
     return withTenantTransaction({ pool: this.pool, context }, async (tx) => {
+      const hasActivePolicyVersion = await loadActivePolicyVersion(tx, context);
+      if (!hasActivePolicyVersion) {
+        return deny(
+          context.policyVersion,
+          "policy_version_not_active",
+          "SecurityContext policy version is not active for the current tenant and workspace"
+        );
+      }
+
+      if (context.servicePrincipalId || context.agentPrincipalId) {
+        return deny(
+          context.policyVersion,
+          "principal_default_denied",
+          "Service and agent principals have no A2 allow rules"
+        );
+      }
+
       const membership = await loadActiveMembership(tx, context);
       if (!membership) {
         return deny(
@@ -155,6 +164,27 @@ export class PostgresAuthorizationService implements AuthorizationService {
       return deny(context.policyVersion, "unsupported_action", "Action is not implemented in A2");
     });
   }
+}
+
+async function loadActivePolicyVersion(
+  tx: TenantQueryExecutor,
+  context: SecurityContext
+): Promise<boolean> {
+  const result = await tx.query<{ id: string }>(
+    `
+    SELECT id
+    FROM identity.policy_versions
+    WHERE id = $1
+      AND tenant_id = $2
+      AND workspace_id = $3
+      AND status = 'active'
+    LIMIT 1
+    FOR SHARE
+    `,
+    [context.policyVersion, context.tenantId, context.workspaceId]
+  );
+
+  return result.rows.length === 1;
 }
 
 async function loadActiveMembership(

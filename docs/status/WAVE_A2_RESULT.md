@@ -11,20 +11,26 @@
 
 Wave A2 implements Throughline's tenancy, identity, authorization, and PostgreSQL RLS foundation only. It keeps scope inside the approved `Tenant → Workspace → recursive Space` model; separates authorization subjects (`User`, `Membership`, `ServicePrincipal`, `AgentPrincipal`) from graph-level `Person`; and uses PostgreSQL RLS plus application `AuthorizationService.can()` as a defense-in-depth boundary.
 
-The final implementation passed Hermes verification and Claude Code review. No Wave A3/product UI/agent runtime/truth-ledger/provider/MCP scope was added.
+The implementation at the original A2 result point passed Hermes verification and Claude Code
+review. PR #2 then received a focused merge-gate hardening pass on 2026-07-09; the historical
+verification and review evidence below predates that pass unless a section explicitly says
+otherwise. No Wave A3/product UI/agent runtime/truth-ledger/provider/MCP scope was added.
 
 ## What changed
 
 ### Root/tooling
 
 - Added root `test:security` script:
-  - `turbo test:security --filter=@throughline/db --filter=@throughline/authorization --concurrency=1`
+  - requires explicit `TEST_DATABASE_URL` and `TEST_APP_DATABASE_URL` before Turbo starts;
+  - runs DB and authorization security suites serially with no `DATABASE_URL` fallback.
 - Added Turbo environment passthrough for database test URLs:
   - `DATABASE_URL`
   - `TEST_DATABASE_URL`
   - `TEST_APP_DATABASE_URL`
 - Updated `pnpm-lock.yaml` after Wave A2 package dependency changes.
 - Updated `.env.example` with owner and app-role test database URLs.
+- Added GitHub Actions verification on Node.js 22 and PostgreSQL 16/pgvector, including frozen
+  install, format, lint, typecheck, ordinary tests, build, and serial `test:security`.
 
 ### Documentation
 
@@ -51,7 +57,8 @@ Added Wave A2 primitives in `packages/core-types`:
 ### Tenancy package
 
 - Added `SecurityContext` validation using Zod.
-- Enforced exactly one principal kind per context:
+- Enforced a strict principal XOR, including rejection of partial user principals even when a
+  service or agent principal is present:
   - user+membership
   - service principal
   - agent principal
@@ -83,10 +90,14 @@ Added Wave A2 primitives in `packages/core-types`:
   - `access.access_relationships`
 - Added RLS helper functions under `ops` for current tenant/workspace/user/membership/service/agent/policy context.
 - Enabled and forced RLS on all tenant/workspace-scoped A2 tables.
-- Created `throughline_app` role with `NOBYPASSRLS`.
+- Created/configured `throughline_app` with `NOBYPASSRLS` and no canonical migration login secret.
 - Granted app role access to schemas/tables/functions while relying on RLS policies for row isolation.
 - Added `withTenantTransaction()` wrapper that starts a transaction and sets context via transaction-local `set_config(..., true)` only.
-- Added migration and deterministic seed helpers for tests.
+- Replaced raw migration replay with a deterministic, advisory-locked migration journal that
+  records filename, SHA-256 checksum, and applied timestamp atomically with each migration;
+  repeated unchanged applies are no-ops and checksum drift fails closed.
+- Added deterministic seed helpers and test-only app-role login provisioning. Any test password is
+  derived only from `TEST_APP_DATABASE_URL` and is never logged.
 - Added database security tests covering app role, RLS isolation, self-read-only `identity.users`, `SET LOCAL` leakage, and `team` subject rejection.
 
 ### Authorization package
@@ -101,6 +112,8 @@ Added Wave A2 primitives in `packages/core-types`:
   - space read
   - space child creation/access management for owner/admin
 - Enforced default-deny for service and agent principals in A2.
+- Required the context policy version to exist live for the current tenant/workspace with
+  `status='active'` before any allow or service/agent default-deny decision.
 - Recomputed live authorization from the database, rather than trusting context hints.
 - Added target-resource checks so `tenant.read` and `workspace.manage_members` cannot allow resources outside the current context.
 - Added restricted-ancestor inheritance semantics so inherited Space grants cannot pass through a restricted boundary.
@@ -111,9 +124,9 @@ Added Wave A2 primitives in `packages/core-types`:
 | Binding clarification | Enforcement |
 | --- | --- |
 | SQL migrations define RLS/policies/roles | RLS, role creation, policies, grants, schemas, tables, and helper functions are in reviewed SQL migration `0001_wave_a2_identity_access_rls.sql`. Drizzle schema mirrors structure only. |
-| App role must not have `BYPASSRLS` | Migration creates `throughline_app` with `NOBYPASSRLS`; `packages/db/src/security.spec.ts` verifies `rolbypassrls = false`. |
+| App role must not have `BYPASSRLS` | Migration creates/configures `throughline_app` with `NOBYPASSRLS`; the app-pool test verifies both `current_user = 'throughline_app'` and `rolbypassrls = false`. |
 | Tenant-aware repository operations use `withTenantTransaction` and `SET LOCAL` inside transaction | `withTenantTransaction()` begins a transaction, calls transaction-local `set_config(..., true)`, then commits/rolls back and releases the client. Tests verify no context leaks after the transaction. |
-| Tests must not pass only via superuser/owner connections | RLS assertions use `appPool` with `TEST_APP_DATABASE_URL`; owner pool is used only for migrations/seeding/admin checks. |
+| Tests must not pass only via superuser/owner connections | RLS assertions use `appPool` with explicit `TEST_APP_DATABASE_URL`; owner pool is used only for migrations/seeding/admin checks and test-only role provisioning. |
 | Diagnostic request/trace IDs are metadata only | `requestId` and `traceId` are stored as transaction-local settings but no RLS policy or authorization query uses them as authority. |
 | Do not broaden API/product surface | No A2 API/product endpoints or UI screens were added. Work stayed inside packages/db, packages/tenancy, packages/authorization, types, docs, and root tooling. |
 | No Teams in A2 | No teams table was added; `access.access_relationships.subject_type` CHECK excludes `team`; security test verifies team insertion is rejected. |
@@ -126,6 +139,32 @@ Added Wave A2 primitives in `packages/core-types`:
 | No vector extension in A2 | Migration enables `pgcrypto` only; no vector extension or vector/search tables were added. |
 
 ## Verification commands and results
+
+The results in the original subsections below describe the pre-hardening A2 head. Current
+hardening-pass commands and results are recorded separately and must not be inferred from the
+earlier counts.
+
+### PR #2 merge-gate hardening verification (2026-07-09)
+
+Fresh commands completed on the hardening working tree:
+
+```text
+npm exec -- pnpm format:check: PASS — all files match Prettier style
+npm exec -- pnpm lint: PASS — 27/27 Turbo tasks successful
+npm exec -- pnpm typecheck: PASS — 27/27 Turbo tasks successful
+env -u TEST_DATABASE_URL -u TEST_APP_DATABASE_URL -u DATABASE_URL npm exec -- pnpm test:
+  PASS — 27/27 Turbo tasks successful; DB-backed suites skipped as designed
+npm exec -- pnpm build: PASS — 21/21 Turbo tasks successful
+npm exec -- pnpm test:security with explicit owner/app DSNs:
+  PASS — DB 7/7, authorization 14/14, Turbo 5/5
+```
+
+The fail-closed preflight was also exercised with no explicit security DSNs and with only
+`TEST_DATABASE_URL` present. Both commands exited 1 before Turbo, naming the missing explicit test
+DSN(s). With both explicit DSNs loaded, the authoritative PostgreSQL-backed suite ran without skips
+and proved migration repeatability/checksum enforcement, the effective `throughline_app` role,
+`NOBYPASSRLS`, RLS isolation, active-policy enforcement, pooled-context cleanup, and authorization
+denial behavior.
 
 ### Host/resource guardrail before verification
 
@@ -245,13 +284,20 @@ Claude concluded:
 Minimal required changes: None. The implementation is ready to merge.
 ```
 
+That conclusion applies to the pre-hardening diff and is not a review verdict for the 2026-07-09
+merge-gate changes.
+
 ## Known caveats
 
-- `pnpm test` without DB URLs skips DB-backed RLS/security tests by design. Use `pnpm test:security` with local DB URLs loaded for the authoritative RLS/app-role checks.
-- Fable was unavailable during review, so the review used default Claude Code instead of `claude-fable-5`.
-- Postgres was left running and healthy for local verification continuity.
-- The branch is not merged.
+- `pnpm test` without explicit security DSNs skips DB-backed RLS/security tests by design.
+  `pnpm test:security` is authoritative and fails immediately unless both `TEST_DATABASE_URL` and
+  `TEST_APP_DATABASE_URL` are explicitly set; it never falls back to `DATABASE_URL`.
+- In the original review, Fable was unavailable, so default Claude Code was used instead of
+  `claude-fable-5`. The merge-gate hardening requires a new independent exact-head review.
+- The branch is not merged or deployed.
 
-## Final status
+## Current status
 
-Wave A2 implementation is verified and review-passed. It is ready for PR review against `main`.
+Wave A2 remains limited to tenancy, identity, authorization, and RLS. The PR #2 merge-gate fixes
+are implemented and pass the fresh local static/build and PostgreSQL-backed security gates recorded
+above. PR #2 remains held pending a fresh independent exact-head review and GitHub Actions result.

@@ -5,43 +5,14 @@ import { PostgresAuthorizationService } from "./authorization-service.js";
 import {
   applyMigrations,
   createPgPool,
+  provisionTestAppRole,
   seedWaveA2DeterministicData,
   type PgPool
 } from "@throughline/db";
 
-const ownerUrl = process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL;
-const appUrl =
-  process.env.TEST_APP_DATABASE_URL ??
-  ownerUrl?.replace("throughline:throughline_dev@", "throughline_app:throughline_app_dev@");
+const ownerUrl = process.env.TEST_DATABASE_URL;
+const appUrl = process.env.TEST_APP_DATABASE_URL;
 const maybeDescribe = ownerUrl && appUrl ? describe : describe.skip;
-
-describe("AuthorizationService principal defaults", () => {
-  it("denies service principals by default without consulting live authority hints", async () => {
-    const service = new PostgresAuthorizationService({} as PgPool);
-    const decision = await service.can(
-      createDevSecurityContext("tenant-a-service"),
-      "workspace.read",
-      {
-        type: "workspace",
-        id: devFixtures.workspaceA
-      }
-    );
-
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe("principal_default_denied");
-  });
-
-  it("denies agent principals by default", async () => {
-    const service = new PostgresAuthorizationService({} as PgPool);
-    const decision = await service.can(createDevSecurityContext("tenant-a-agent"), "space.read", {
-      type: "space",
-      id: devFixtures.rootSpaceA
-    });
-
-    expect(decision.allowed).toBe(false);
-    expect(decision.reasonCode).toBe("principal_default_denied");
-  });
-});
 
 maybeDescribe("AuthorizationService database decisions", () => {
   let ownerPool: PgPool;
@@ -56,16 +27,85 @@ maybeDescribe("AuthorizationService database decisions", () => {
     }
 
     ownerPool = createPgPool(ownerUrl);
+    await applyMigrations(ownerPool, { reset: true });
+    await provisionTestAppRole(ownerPool, appUrl);
     appPool = createPgPool(appUrl);
     service = new PostgresAuthorizationService(appPool);
-
-    await applyMigrations(ownerPool, { reset: true });
     await seedWaveA2DeterministicData(ownerPool);
   });
 
   afterAll(async () => {
     await appPool?.end();
     await ownerPool?.end();
+  });
+
+  it("checks the live active policy before default-denying a service principal", async () => {
+    const decision = await service.can(
+      createDevSecurityContext("tenant-a-service"),
+      "workspace.read",
+      {
+        type: "workspace",
+        id: devFixtures.workspaceA
+      }
+    );
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe("principal_default_denied");
+  });
+
+  it("checks the live active policy before default-denying an agent principal", async () => {
+    const decision = await service.can(createDevSecurityContext("tenant-a-agent"), "space.read", {
+      type: "space",
+      id: devFixtures.rootSpaceA
+    });
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe("principal_default_denied");
+  });
+
+  it("fails closed when the context policy version does not exist", async () => {
+    const decision = await service.can(
+      {
+        ...createDevSecurityContext("tenant-a-service"),
+        policyVersion: "missing-v1"
+      },
+      "workspace.read",
+      {
+        type: "workspace",
+        id: devFixtures.workspaceA
+      }
+    );
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe("policy_version_not_active");
+  });
+
+  it("fails closed when the context policy version is retired", async () => {
+    await ownerPool.query(
+      `
+      INSERT INTO identity.policy_versions
+        (id, tenant_id, workspace_id, status, description)
+      VALUES ('retired-v1', $1, $2, 'retired', 'Retired policy regression fixture')
+      ON CONFLICT (tenant_id, workspace_id, id)
+      DO UPDATE SET status = 'retired'
+      `,
+      [devFixtures.tenantA, devFixtures.workspaceA]
+    );
+
+    const decision = await service.can(
+      {
+        ...createDevSecurityContext("tenant-a-owner"),
+        policyVersion: "retired-v1"
+      },
+      "workspace.read",
+      {
+        type: "workspace",
+        id: devFixtures.workspaceA
+      }
+    );
+
+    expect(decision.allowed).toBe(false);
+    expect(decision.reasonCode).toBe("policy_version_not_active");
   });
 
   it("allows an active owner to read a restricted Space in their workspace", async () => {

@@ -72,15 +72,42 @@ pnpm build
 pnpm test:security
 ```
 
+`pnpm test:security` is the authoritative PostgreSQL/RLS suite. It fails before Turbo starts unless
+both `TEST_DATABASE_URL` (the owner/migration connection) and `TEST_APP_DATABASE_URL` (the
+application connection) are explicitly present. It never falls back to `DATABASE_URL` and never
+derives one connection string from the other. For the local Compose database, load the explicit
+test values from `.env.example` before running it:
+
+```bash
+set -a
+. ./.env.example
+set +a
+pnpm test:security
+```
+
+Ordinary `pnpm test` remains usable without those variables and skips PostgreSQL-backed suites in
+that case. The dedicated security command never skips them. Security tests provision
+`throughline_app` login access from `TEST_APP_DATABASE_URL` through the owner connection, without
+logging the credential; the canonical schema migration contains no login secret. The tests also
+prove that the app pool's `current_user` is exactly `throughline_app` and that the role has
+`NOBYPASSRLS`.
+
 Run the focused Wave A1 smoke tests:
 
 ```bash
 pnpm test:smoke
 ```
 
-Note: the Wave A2 security tests require PostgreSQL and use the `throughline_app` role created by
-the reviewed SQL migration. Set `TEST_DATABASE_URL` for the migration/owner connection and
-`TEST_APP_DATABASE_URL` for the app-role connection when the defaults do not match local Docker.
+Wave A2 migrations are applied in deterministic filename order through a durable
+`throughline_migrations.journal`. Each filename, SHA-256 checksum, and applied timestamp is
+recorded atomically with its SQL. Reapplying an unchanged migration is a no-op; changing an applied
+migration's checksum fails closed. Test resets remove and recreate the application schemas and
+journal deterministically.
+
+GitHub Actions runs Node.js 22 with PostgreSQL 16/pgvector, a frozen install, formatting, lint,
+typechecking, ordinary tests, build, and the serial PostgreSQL-backed security suite. CI uses
+isolated PostgreSQL trust authentication and explicit passwordless test DSNs rather than a
+committed reusable credential.
 
 ## Dependency notes
 
