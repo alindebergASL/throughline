@@ -206,6 +206,87 @@ maybeDescribe("Wave A2 database RLS security", () => {
     }
   });
 
+  it("adopts a parent-equivalent schema when the owner search path includes the parent schemas", async () => {
+    const parentSchemaOwnerPool = new pg.Pool({
+      connectionString: ownerUrl,
+      max: 1,
+      options: "-c search_path=access,identity,public"
+    });
+
+    try {
+      const configuredConnection = await parentSchemaOwnerPool.query<{
+        effective_schemas: string[];
+        search_path: string;
+      }>(`
+        SELECT
+          current_schemas(false)::text[] AS effective_schemas,
+          current_setting('search_path') AS search_path
+      `);
+
+      expect(
+        configuredConnection.rows[0]?.search_path.split(",").map((schema) => schema.trim())
+      ).toEqual(["access", "identity", "public"]);
+      expect(configuredConnection.rows[0]?.effective_schemas).toEqual([
+        "access",
+        "identity",
+        "public"
+      ]);
+
+      await ownerPool.query("DROP SCHEMA throughline_migrations CASCADE");
+
+      const startingState = await parentSchemaOwnerPool.query<{
+        constraint_count: string;
+        journal_relation: string | null;
+        referenced_schema: string | null;
+      }>(`
+        SELECT
+          (
+            SELECT count(*)::text
+            FROM pg_constraint
+            WHERE conname = 'workspaces_default_space_fk'
+              AND conrelid = to_regclass('identity.workspaces')
+              AND contype = 'f'
+              AND condeferrable
+              AND condeferred
+          ) AS constraint_count,
+          (
+            SELECT target_namespace.nspname
+            FROM pg_constraint AS constraint_record
+            JOIN pg_class AS target_relation
+              ON target_relation.oid = constraint_record.confrelid
+            JOIN pg_namespace AS target_namespace
+              ON target_namespace.oid = target_relation.relnamespace
+            WHERE constraint_record.conname = 'workspaces_default_space_fk'
+              AND constraint_record.conrelid = to_regclass('identity.workspaces')
+          ) AS referenced_schema,
+          to_regclass('throughline_migrations.journal')::text AS journal_relation
+      `);
+
+      expect(startingState.rows[0]).toEqual({
+        constraint_count: "1",
+        journal_relation: null,
+        referenced_schema: "access"
+      });
+
+      const adopted = await applyMigrations(parentSchemaOwnerPool);
+      const repeated = await applyMigrations(parentSchemaOwnerPool);
+      const journal = await parentSchemaOwnerPool.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM throughline_migrations.journal WHERE id = $1",
+        [migrationId]
+      );
+
+      expect(adopted).toEqual({ applied: [migrationId], skipped: [] });
+      expect(repeated).toEqual({ applied: [], skipped: [migrationId] });
+      expect(journal.rows[0]?.count).toBe("1");
+    } finally {
+      try {
+        await applyMigrations(ownerPool);
+      } finally {
+        await parentSchemaOwnerPool.end();
+      }
+    }
+  });
+
   it("fails closed when the named adoption constraint has an unexpected definition", async () => {
     await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
       migrationId

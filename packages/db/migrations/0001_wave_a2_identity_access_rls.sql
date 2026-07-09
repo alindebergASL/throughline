@@ -181,11 +181,39 @@ BEGIN
       DEFERRABLE INITIALLY DEFERRED;
   ELSIF NOT EXISTS (
     SELECT 1
-    FROM pg_constraint
-    WHERE conname = 'workspaces_default_space_fk'
-      AND conrelid = to_regclass('identity.workspaces')
-      AND pg_get_constraintdef(oid) =
-        'FOREIGN KEY (tenant_id, id, default_space_id) REFERENCES access.spaces(tenant_id, workspace_id, id) DEFERRABLE INITIALLY DEFERRED'
+    FROM pg_constraint AS constraint_record
+    WHERE constraint_record.conname = 'workspaces_default_space_fk'
+      AND constraint_record.conrelid = to_regclass('identity.workspaces')
+      AND constraint_record.contype = 'f'
+      AND constraint_record.confrelid = to_regclass('access.spaces')
+      AND constraint_record.conkey = ARRAY(
+        SELECT attribute.attnum
+        FROM unnest(ARRAY['tenant_id', 'id', 'default_space_id']) WITH ORDINALITY
+          AS expected_column(name, position)
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = to_regclass('identity.workspaces')
+          AND attribute.attname = expected_column.name
+        WHERE attribute.attnum > 0
+          AND NOT attribute.attisdropped
+        ORDER BY expected_column.position
+      )
+      AND constraint_record.confkey = ARRAY(
+        SELECT attribute.attnum
+        FROM unnest(ARRAY['tenant_id', 'workspace_id', 'id']) WITH ORDINALITY
+          AS expected_column(name, position)
+        JOIN pg_attribute AS attribute
+          ON attribute.attrelid = to_regclass('access.spaces')
+          AND attribute.attname = expected_column.name
+        WHERE attribute.attnum > 0
+          AND NOT attribute.attisdropped
+        ORDER BY expected_column.position
+      )
+      AND constraint_record.confmatchtype = 's'
+      AND constraint_record.confupdtype = 'a'
+      AND constraint_record.confdeltype = 'a'
+      AND constraint_record.condeferrable
+      AND constraint_record.condeferred
+      AND constraint_record.convalidated
   ) THEN
     RAISE EXCEPTION 'Existing constraint workspaces_default_space_fk does not match the expected definition';
   END IF;
