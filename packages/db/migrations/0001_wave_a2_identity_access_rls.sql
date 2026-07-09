@@ -179,6 +179,15 @@ BEGIN
       ADD CONSTRAINT workspaces_default_space_fk
       FOREIGN KEY (tenant_id, id, default_space_id) REFERENCES access.spaces(tenant_id, workspace_id, id)
       DEFERRABLE INITIALLY DEFERRED;
+  ELSIF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'workspaces_default_space_fk'
+      AND conrelid = to_regclass('identity.workspaces')
+      AND pg_get_constraintdef(oid) =
+        'FOREIGN KEY (tenant_id, id, default_space_id) REFERENCES access.spaces(tenant_id, workspace_id, id) DEFERRABLE INITIALLY DEFERRED'
+  ) THEN
+    RAISE EXCEPTION 'Existing constraint workspaces_default_space_fk does not match the expected definition';
   END IF;
 END $$;
 

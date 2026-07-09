@@ -206,6 +206,37 @@ maybeDescribe("Wave A2 database RLS security", () => {
     }
   });
 
+  it("fails closed when the named adoption constraint has an unexpected definition", async () => {
+    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
+      migrationId
+    ]);
+    await ownerPool.query(
+      "ALTER TABLE identity.workspaces DROP CONSTRAINT workspaces_default_space_fk"
+    );
+    await ownerPool.query(`
+      ALTER TABLE identity.workspaces
+      ADD CONSTRAINT workspaces_default_space_fk
+      CHECK (default_space_id IS NULL)
+    `);
+
+    try {
+      await expect(applyMigrations(ownerPool)).rejects.toThrow(
+        "Existing constraint workspaces_default_space_fk does not match the expected definition"
+      );
+
+      const journal = await ownerPool.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM throughline_migrations.journal WHERE id = $1",
+        [migrationId]
+      );
+      expect(journal.rows[0]?.count).toBe("0");
+    } finally {
+      await ownerPool.query(
+        "ALTER TABLE identity.workspaces DROP CONSTRAINT IF EXISTS workspaces_default_space_fk"
+      );
+      await applyMigrations(ownerPool);
+    }
+  });
+
   it("rolls migration SQL back when the journal insert fails", async () => {
     await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
       migrationId
