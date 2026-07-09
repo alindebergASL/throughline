@@ -11,7 +11,7 @@ BEGIN
       NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
   ELSE
     ALTER ROLE throughline_app
-      NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS;
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD NULL;
   END IF;
 END $$;
 
@@ -167,10 +167,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS spaces_child_slug_unique
   ON access.spaces (workspace_id, parent_space_id, slug)
   WHERE parent_space_id IS NOT NULL;
 
-ALTER TABLE identity.workspaces
-  ADD CONSTRAINT workspaces_default_space_fk
-  FOREIGN KEY (tenant_id, id, default_space_id) REFERENCES access.spaces(tenant_id, workspace_id, id)
-  DEFERRABLE INITIALLY DEFERRED;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'workspaces_default_space_fk'
+      AND conrelid = to_regclass('identity.workspaces')
+  ) THEN
+    ALTER TABLE identity.workspaces
+      ADD CONSTRAINT workspaces_default_space_fk
+      FOREIGN KEY (tenant_id, id, default_space_id) REFERENCES access.spaces(tenant_id, workspace_id, id)
+      DEFERRABLE INITIALLY DEFERRED;
+  END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS access.access_relationships (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -8,6 +8,9 @@ describe("canonical Wave A2 migration", () => {
       "utf8"
     );
 
+    expect(sql).toContain(
+      "NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD NULL"
+    );
     expect(sql).toContain("NOBYPASSRLS");
     expect(sql).not.toMatch(/PASSWORD\s+'[^']+'/i);
   });

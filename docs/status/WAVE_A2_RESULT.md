@@ -140,11 +140,11 @@ Added Wave A2 primitives in `packages/core-types`:
 
 ## Verification commands and results
 
-The results in the original subsections below describe the pre-hardening A2 head. Current
-hardening-pass commands and results are recorded separately and must not be inferred from the
-earlier counts.
+The results in the original subsections below describe the pre-hardening A2 head. First- and
+second-hardening-pass commands and results are recorded separately and must not be inferred from
+the earlier counts.
 
-### PR #2 merge-gate hardening verification (2026-07-09)
+### First PR #2 merge-gate hardening verification (2026-07-09)
 
 Fresh commands completed on the hardening working tree:
 
@@ -165,6 +165,31 @@ DSN(s). With both explicit DSNs loaded, the authoritative PostgreSQL-backed suit
 and proved migration repeatability/checksum enforcement, the effective `throughline_app` role,
 `NOBYPASSRLS`, RLS isolation, active-policy enforcement, pooled-context cleanup, and authorization
 denial behavior.
+
+### Second PR #2 merge-gate fix pass verification (2026-07-09)
+
+Fresh commands completed on the second-pass working tree:
+
+```text
+npm exec -- pnpm install --frozen-lockfile: PASS
+npm exec -- pnpm format:check: PASS — all matched files use Prettier style
+npm exec -- pnpm lint: PASS — 27/27 Turbo tasks
+npm exec -- pnpm typecheck: PASS — 27/27 Turbo tasks
+env -u DATABASE_URL -u TEST_DATABASE_URL -u TEST_APP_DATABASE_URL npm exec -- pnpm test:
+  PASS — 27/27 Turbo tasks; DB-backed suites skipped as designed
+npm exec -- pnpm build: PASS — 21/21 Turbo tasks
+npm exec -- pnpm test:security with no explicit DSNs:
+  expected exit 1 before Turbo
+npm exec -- pnpm test:security with explicit DSNs:
+  PASS — DB 12/12, authorization 14/14, Turbo 5/5
+```
+
+The 12-test PostgreSQL DB suite now proves legacy app-role login/password cleanup before explicit
+test provisioning, true journal filename/checksum/timestamp metadata, atomic rollback when journal
+insert fails, advisory-lock serialization of concurrent callers, deterministic repeated resets,
+pre-journal parent-schema adoption followed by a no-op, app-role identity, RLS isolation, pooled
+context cleanup, and Teams-subject rejection. The full root and security gates passed after the
+final second-pass edits.
 
 ### Host/resource guardrail before verification
 
@@ -298,6 +323,7 @@ merge-gate changes.
 
 ## Current status
 
-Wave A2 remains limited to tenancy, identity, authorization, and RLS. The PR #2 merge-gate fixes
-are implemented and pass the fresh local static/build and PostgreSQL-backed security gates recorded
-above. PR #2 remains held pending a fresh independent exact-head review and GitHub Actions result.
+Wave A2 remains limited to tenancy, identity, authorization, and RLS. The second PR #2 merge-gate
+fix pass addresses the legacy-role credential and pre-journal adoption blockers and passes the
+fresh full local root and 26-test PostgreSQL-backed security gate. PR #2 remains held pending a new
+exact-head CI result and an independent incremental exact-head review.
