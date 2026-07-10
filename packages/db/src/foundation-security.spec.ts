@@ -1,11 +1,16 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { devFixtures, DEV_POLICY_VERSION } from "@throughline/tenancy";
+import {
+  createAsyncContextReferenceCodec,
+  devFixtures,
+  DEV_POLICY_VERSION
+} from "@throughline/tenancy";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { applyMigrations } from "./migrations.js";
 import { seedWaveA2DeterministicData } from "./seed.js";
 import { provisionTestAppRole, provisionTestFoundationRoles } from "./test-database.js";
+import { bootstrapWorkerContextReference } from "./worker-bootstrap.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -33,6 +38,9 @@ const ids = {
   workerA: "70000000-0000-7000-8000-000000000051",
   workerB: "70000000-0000-7000-8000-000000000052"
 } as const;
+
+const bootstrapSigningKey = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
+const contextCredentialMarker = `request-${ids.jobA}`;
 
 maybeDescribe("Foundation operational schema security", () => {
   const ownerPool = new pg.Pool({ connectionString: ownerUrl });
@@ -399,6 +407,153 @@ maybeDescribe("Foundation operational schema security", () => {
     ).toEqual([]);
   });
 
+  it("fails closed through the fixed bootstrap for missing, wrong, forged, cross-tenant, unknown, revoked, and expired bindings", async () => {
+    const codec = createAsyncContextReferenceCodec({
+      verificationKeys: new Map([["test-key", bootstrapSigningKey]]),
+      activeKeyId: "test-key",
+      clock: () => new Date()
+    });
+    const baseClaims = {
+      referenceId: ids.referenceA,
+      jobId: ids.jobA,
+      tenantId: devFixtures.tenantA,
+      workspaceId: devFixtures.workspaceA,
+      spaceId: devFixtures.rootSpaceA,
+      workerServicePrincipalId: ids.workerA,
+      policyVersionId: DEV_POLICY_VERSION
+    } as const;
+    const { token } = codec.issue({ ...baseClaims, ttlSeconds: 600 });
+    const expected = {
+      jobId: baseClaims.jobId,
+      tenantId: baseClaims.tenantId,
+      workspaceId: baseClaims.workspaceId,
+      spaceId: baseClaims.spaceId,
+      workerServicePrincipalId: baseClaims.workerServicePrincipalId,
+      policyVersionId: baseClaims.policyVersionId
+    };
+
+    await expect(
+      bootstrapWorkerContextReference({ pool: workerPool, token, codec, expected })
+    ).resolves.toMatchObject({ id: ids.referenceA });
+
+    for (const [pool, connectionString] of [
+      [ownerPool, ownerUrl!],
+      [appPool, appUrl!]
+    ] as const) {
+      let error: unknown;
+      try {
+        await bootstrapWorkerContextReference({ pool, token, codec, expected });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error).toMatchObject({
+        name: "WorkerContextBootstrapError",
+        message: "Worker context bootstrap failed"
+      });
+      const rendered = `${String(error)} ${JSON.stringify(error)}`;
+      expect(rendered).not.toContain(token);
+      expect(rendered).not.toContain(bootstrapSigningKey.toString("utf8"));
+      expect(rendered).not.toContain(contextCredentialMarker);
+      expect(rendered).not.toContain(connectionString);
+    }
+    expect(
+      await scopedWorkerReferenceIds(workerPool, {
+        tenantId: devFixtures.tenantA,
+        workspaceId: devFixtures.workspaceA,
+        jobId: ids.jobA,
+        referenceId: ids.referenceA,
+        workerPrincipalId: ids.workerA,
+        policyVersion: DEV_POLICY_VERSION
+      })
+    ).toEqual([]);
+
+    const wrongWorker = codec.issue({
+      ...baseClaims,
+      workerServicePrincipalId: ids.workerB,
+      ttlSeconds: 600
+    });
+    await expect(
+      bootstrapWorkerContextReference({
+        pool: workerPool,
+        token: wrongWorker.token,
+        codec,
+        expected: { ...expected, workerServicePrincipalId: ids.workerB }
+      })
+    ).resolves.toBeNull();
+
+    const tokenParts = token.split(".");
+    const payload = JSON.parse(
+      Buffer.from(tokenParts[4]!, "base64url").toString("utf8")
+    ) as unknown[];
+    payload[3] = devFixtures.tenantB;
+    tokenParts[4] = Buffer.from(JSON.stringify(payload), "utf8").toString("base64url");
+    await expect(
+      bootstrapWorkerContextReference({
+        pool: workerPool,
+        token: tokenParts.join("."),
+        codec,
+        expected
+      })
+    ).resolves.toBeNull();
+
+    const crossTenant = codec.issue({
+      ...baseClaims,
+      tenantId: devFixtures.tenantB,
+      workspaceId: devFixtures.workspaceB,
+      spaceId: devFixtures.rootSpaceB,
+      ttlSeconds: 600
+    });
+    await expect(
+      bootstrapWorkerContextReference({
+        pool: workerPool,
+        token: crossTenant.token,
+        codec,
+        expected: {
+          ...expected,
+          tenantId: devFixtures.tenantB,
+          workspaceId: devFixtures.workspaceB,
+          spaceId: devFixtures.rootSpaceB
+        }
+      })
+    ).resolves.toBeNull();
+
+    const unknown = codec.issue({
+      ...baseClaims,
+      referenceId: "70000000-0000-7000-8000-000000000039",
+      ttlSeconds: 600
+    });
+    await expect(
+      bootstrapWorkerContextReference({ pool: workerPool, token: unknown.token, codec, expected })
+    ).resolves.toBeNull();
+
+    await ownerPool.query(
+      `UPDATE ops.security_context_references
+       SET status = 'revoked', revoked_at = clock_timestamp(), revocation_reason = 'test'
+       WHERE id = $1`,
+      [ids.referenceA]
+    );
+    await expect(
+      bootstrapWorkerContextReference({ pool: workerPool, token, codec, expected })
+    ).resolves.toBeNull();
+    await ownerPool.query(
+      `UPDATE ops.security_context_references
+       SET status = 'active', revoked_at = NULL, revocation_reason = NULL,
+           issued_at = clock_timestamp() - interval '20 minutes',
+           expires_at = clock_timestamp() - interval '5 minutes'
+       WHERE id = $1`,
+      [ids.referenceA]
+    );
+    await expect(
+      bootstrapWorkerContextReference({ pool: workerPool, token, codec, expected })
+    ).resolves.toBeNull();
+    await ownerPool.query(
+      `UPDATE ops.security_context_references
+       SET issued_at = clock_timestamp(), expires_at = clock_timestamp() + interval '15 minutes'
+       WHERE id = $1`,
+      [ids.referenceA]
+    );
+  });
+
   it("prevents worker access to outbox and unrelated identity/domain surfaces", async () => {
     await expect(workerPool.query("SELECT id FROM ops.outbox_events")).rejects.toMatchObject({
       code: "42501"
@@ -589,12 +744,29 @@ async function seedFoundationRows(pool: pg.Pool): Promise<void> {
       membership: devFixtures.membershipBViewer
     }
   ]) {
+    const issuedAt = new Date();
+    const expiresAt = new Date(issuedAt.getTime() + 15 * 60 * 1_000);
+    const contextSnapshot = {
+      requestId: `request-${fixture.job}`,
+      traceId: `trace-${fixture.job}`,
+      tenantId: fixture.tenant,
+      workspaceId: fixture.workspace,
+      actorUserId: fixture.user,
+      actorMembershipId: fixture.membership,
+      requestedSpaceIds: [fixture.space],
+      membershipIds: [fixture.membership],
+      roleHints: ["owner"],
+      dataClassCeiling: "workspace",
+      policyVersion: DEV_POLICY_VERSION,
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: expiresAt.toISOString()
+    };
     await pool.query(
       `INSERT INTO ops.security_context_references
         (id, job_id, tenant_id, workspace_id, space_id, worker_service_principal_id,
          delegating_user_id, delegating_membership_id, policy_version_id, context_snapshot,
          issued_at, expires_at, status, signing_key_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'{}',clock_timestamp(),clock_timestamp()+interval '10 minutes','active','test-key')`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'active','test-key')`,
       [
         fixture.reference,
         fixture.job,
@@ -604,7 +776,10 @@ async function seedFoundationRows(pool: pg.Pool): Promise<void> {
         fixture.worker,
         fixture.user,
         fixture.membership,
-        DEV_POLICY_VERSION
+        DEV_POLICY_VERSION,
+        contextSnapshot,
+        issuedAt,
+        expiresAt
       ]
     );
     await pool.query(
