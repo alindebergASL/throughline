@@ -181,16 +181,17 @@ npm exec -- pnpm build: PASS — 21/21 Turbo tasks
 npm exec -- pnpm test:security with no explicit DSNs:
   expected exit 1 before Turbo
 npm exec -- pnpm test:security with explicit DSNs:
-  PASS — DB 14/14, authorization 14/14, Turbo 5/5
+  PASS — DB 15/15, authorization 14/14, Turbo 5/5
 ```
 
-The 14-test PostgreSQL DB suite now proves legacy app-role login/password cleanup before explicit
+The 15-test PostgreSQL DB suite now proves legacy app-role login/password cleanup before explicit
 test provisioning, true journal filename/checksum/timestamp metadata, atomic rollback when journal
 insert fails, advisory-lock serialization of concurrent callers, deterministic repeated resets,
 pre-journal parent-schema adoption followed by a no-op, fail-closed rejection of an unexpected
 same-name adoption constraint, search-path-independent structural FK adoption under PostgreSQL 16,
-app-role identity, RLS isolation, pooled context cleanup, and Teams-subject rejection. The full root
-and security gates passed after the final second-pass edits.
+explicit source/target cardinality enforcement when expected columns are absent, app-role identity,
+RLS isolation, pooled context cleanup, and Teams-subject rejection. The full root and security gates
+passed after the final second-pass edits.
 
 ### Host/resource guardrail before verification
 
@@ -326,5 +327,5 @@ merge-gate changes.
 
 Wave A2 remains limited to tenancy, identity, authorization, and RLS. The second PR #2 merge-gate
 fix pass addresses the legacy-role credential and pre-journal adoption blockers and passes the
-fresh full local root and 28-test PostgreSQL-backed security gate. PR #2 remains held pending a new
+fresh full local root and 29-test PostgreSQL-backed security gate. PR #2 remains held pending a new
 exact-head CI result and an independent incremental exact-head review.

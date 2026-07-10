@@ -318,6 +318,107 @@ maybeDescribe("Wave A2 database RLS security", () => {
     }
   });
 
+  it("fails closed when paired missing columns shrink the expected adoption constraint", async () => {
+    try {
+      await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
+        migrationId
+      ]);
+      await ownerPool.query(
+        "ALTER TABLE identity.workspaces DROP CONSTRAINT workspaces_default_space_fk"
+      );
+      await ownerPool.query(
+        "ALTER TABLE identity.workspaces RENAME COLUMN default_space_id TO default_space_id_adoption_omitted"
+      );
+      await ownerPool.query("ALTER TABLE access.spaces RENAME COLUMN id TO id_adoption_omitted");
+      await ownerPool.query(`
+        ALTER TABLE access.spaces
+        ADD CONSTRAINT spaces_tenant_workspace_adoption_unique
+        UNIQUE (tenant_id, workspace_id)
+      `);
+      await ownerPool.query(`
+        ALTER TABLE identity.workspaces
+        ADD CONSTRAINT workspaces_default_space_fk
+        FOREIGN KEY (tenant_id, id) REFERENCES access.spaces(tenant_id, workspace_id)
+        MATCH SIMPLE
+        ON UPDATE NO ACTION
+        ON DELETE NO ACTION
+        DEFERRABLE INITIALLY DEFERRED
+      `);
+
+      await expect
+        .soft(applyMigrations(ownerPool))
+        .rejects.toThrow(
+          "Existing constraint workspaces_default_space_fk does not match the expected definition"
+        );
+
+      const journal = await ownerPool.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM throughline_migrations.journal WHERE id = $1",
+        [migrationId]
+      );
+      expect.soft(journal.rows[0]?.count).toBe("0");
+    } finally {
+      try {
+        await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
+          migrationId
+        ]);
+      } finally {
+        try {
+          await ownerPool.query(
+            "ALTER TABLE identity.workspaces DROP CONSTRAINT IF EXISTS workspaces_default_space_fk"
+          );
+        } finally {
+          try {
+            await ownerPool.query(
+              "ALTER TABLE access.spaces DROP CONSTRAINT IF EXISTS spaces_tenant_workspace_adoption_unique"
+            );
+          } finally {
+            try {
+              await ownerPool.query(`
+                DO $cleanup$
+                BEGIN
+                  IF EXISTS (
+                    SELECT 1
+                    FROM pg_attribute
+                    WHERE attrelid = to_regclass('identity.workspaces')
+                      AND attname = 'default_space_id_adoption_omitted'
+                      AND attnum > 0
+                      AND NOT attisdropped
+                  ) THEN
+                    ALTER TABLE identity.workspaces
+                      RENAME COLUMN default_space_id_adoption_omitted TO default_space_id;
+                  END IF;
+                END
+                $cleanup$
+              `);
+            } finally {
+              try {
+                await ownerPool.query(`
+                  DO $cleanup$
+                  BEGIN
+                    IF EXISTS (
+                      SELECT 1
+                      FROM pg_attribute
+                      WHERE attrelid = to_regclass('access.spaces')
+                        AND attname = 'id_adoption_omitted'
+                        AND attnum > 0
+                        AND NOT attisdropped
+                    ) THEN
+                      ALTER TABLE access.spaces
+                        RENAME COLUMN id_adoption_omitted TO id;
+                    END IF;
+                  END
+                  $cleanup$
+                `);
+              } finally {
+                await applyMigrations(ownerPool);
+              }
+            }
+          }
+        }
+      }
+    }
+  });
+
   it("rolls migration SQL back when the journal insert fails", async () => {
     await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
       migrationId

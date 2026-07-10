@@ -182,32 +182,36 @@ BEGIN
   ELSIF NOT EXISTS (
     SELECT 1
     FROM pg_constraint AS constraint_record
+    CROSS JOIN LATERAL (
+      SELECT array_agg(attribute.attnum ORDER BY expected_column.ordinality) AS attnums
+      FROM unnest(ARRAY['tenant_id', 'id', 'default_space_id']) WITH ORDINALITY
+        AS expected_column(name, ordinality)
+      JOIN pg_attribute AS attribute
+        ON attribute.attrelid = to_regclass('identity.workspaces')
+        AND attribute.attname = expected_column.name
+      WHERE attribute.attnum > 0
+        AND NOT attribute.attisdropped
+    ) AS expected_source_columns
+    CROSS JOIN LATERAL (
+      SELECT array_agg(attribute.attnum ORDER BY expected_column.ordinality) AS attnums
+      FROM unnest(ARRAY['tenant_id', 'workspace_id', 'id']) WITH ORDINALITY
+        AS expected_column(name, ordinality)
+      JOIN pg_attribute AS attribute
+        ON attribute.attrelid = to_regclass('access.spaces')
+        AND attribute.attname = expected_column.name
+      WHERE attribute.attnum > 0
+        AND NOT attribute.attisdropped
+    ) AS expected_target_columns
     WHERE constraint_record.conname = 'workspaces_default_space_fk'
       AND constraint_record.conrelid = to_regclass('identity.workspaces')
       AND constraint_record.contype = 'f'
       AND constraint_record.confrelid = to_regclass('access.spaces')
-      AND constraint_record.conkey = ARRAY(
-        SELECT attribute.attnum
-        FROM unnest(ARRAY['tenant_id', 'id', 'default_space_id']) WITH ORDINALITY
-          AS expected_column(name, position)
-        JOIN pg_attribute AS attribute
-          ON attribute.attrelid = to_regclass('identity.workspaces')
-          AND attribute.attname = expected_column.name
-        WHERE attribute.attnum > 0
-          AND NOT attribute.attisdropped
-        ORDER BY expected_column.position
-      )
-      AND constraint_record.confkey = ARRAY(
-        SELECT attribute.attnum
-        FROM unnest(ARRAY['tenant_id', 'workspace_id', 'id']) WITH ORDINALITY
-          AS expected_column(name, position)
-        JOIN pg_attribute AS attribute
-          ON attribute.attrelid = to_regclass('access.spaces')
-          AND attribute.attname = expected_column.name
-        WHERE attribute.attnum > 0
-          AND NOT attribute.attisdropped
-        ORDER BY expected_column.position
-      )
+      AND cardinality(expected_source_columns.attnums) = 3
+      AND cardinality(constraint_record.conkey) = 3
+      AND constraint_record.conkey = expected_source_columns.attnums
+      AND cardinality(expected_target_columns.attnums) = 3
+      AND cardinality(constraint_record.confkey) = 3
+      AND constraint_record.confkey = expected_target_columns.attnums
       AND constraint_record.confmatchtype = 's'
       AND constraint_record.confupdtype = 'a'
       AND constraint_record.confdeltype = 'a'
