@@ -115,12 +115,14 @@ Suggested branch sequence:
 wave-0-preflight
 wave-a1-repo-foundation
 wave-a2-tenancy-rls
-wave-a3-work-graph
-wave-a4-truth-ledger
-wave-a5-agent-runtime
-wave-a6-account-research-mcp
-wave-a7-capture-review
-wave-a8-search-summary-today-pulse
+foundation-closure-async-isolation
+wave-b1-work-graph-source-capture
+wave-b2-truth-ledger
+wave-b3-governed-changeset-runtime
+wave-b4-extraction-review-ux
+wave-c1-account-research-mcp
+wave-c2-retrieval-derivation
+wave-c3-daily-use-shell
 ```
 
 Each wave should remain reviewable and bounded.
@@ -168,7 +170,30 @@ Not included:
 
 Implement only after Wave A1 is approved.
 
-### Wave A3+ — Continue using `docs/IMPLEMENTATION_KICKOFF_v0.1.md` and `backlog/phase0_backlog.csv`
+### Foundation Closure — Asynchronous isolation proof
+
+This is a bounded closure of deferred Wave A foundation gates, not Wave A3. Use
+`docs/status/WAVE_A_FOUNDATION_CLOSURE_PLAN.md` after explicit approval. It must remain limited to
+the database/outbox/SQS/worker path, asynchronous SecurityContext rehydration and reauthorization,
+scoped infrastructure keys, trace propagation, and PostgreSQL plus LocalStack integration evidence.
+
+### Wave B1 — Work graph and source capture
+
+### Wave B2 — Truth ledger
+
+### Wave B3 — Governed ChangeSet runtime
+
+### Wave B4 — Extraction and review UX
+
+### Wave C1 — Account Research MCP
+
+### Wave C2 — Retrieval and derivation
+
+### Wave C3 — Daily-use shell
+
+For B1 through C3, use the exact scope and gates in `docs/IMPLEMENTATION_KICKOFF_v0.1.md` and the
+issue dependencies in `backlog/phase0_backlog.csv`. The runbook does not supersede those canonical
+documents.
 
 Keep each wave bounded. Do not jump ahead.
 
