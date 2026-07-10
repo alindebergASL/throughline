@@ -10,7 +10,8 @@ export type AuthorizationAction =
   | "space.manage_access"
   | "identity.me.read"
   | "membership.read"
-  | "foundation.proof.create";
+  | "foundation.proof.create"
+  | "foundation.relay.publish";
 
 export interface AuthorizationService {
   can(

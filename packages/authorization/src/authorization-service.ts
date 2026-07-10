@@ -75,6 +75,9 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
     if (action === "foundation.proof.create") {
       return foundationProofCreateDecision(tx, context, resource, options);
     }
+    if (action === "foundation.relay.publish") {
+      return foundationRelayPublishDecision(tx, context, resource, options);
+    }
 
     const hasActivePolicyVersion = await loadActivePolicyVersion(tx, context);
     if (!hasActivePolicyVersion) {
@@ -203,6 +206,128 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
 
     return deny(context.policyVersion, "unsupported_action", "Action is not implemented in A2");
   }
+}
+
+async function foundationRelayPublishDecision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  resource: ResourceRef,
+  options: { explain?: boolean }
+): Promise<AuthorizationDecision> {
+  if (
+    !context.servicePrincipalId ||
+    context.actorUserId ||
+    context.actorMembershipId ||
+    context.agentPrincipalId
+  ) {
+    return deny(
+      context.policyVersion,
+      "foundation_relay_service_principal_required",
+      "Foundation relay publication requires one complete service principal"
+    );
+  }
+  if (
+    resource.type !== "space" ||
+    context.requestedSpaceIds.length !== 1 ||
+    context.requestedSpaceIds[0] !== resource.id
+  ) {
+    return deny(
+      context.policyVersion,
+      "foundation_space_scope_mismatch",
+      "Foundation relay publication is bound to one exact requested Space"
+    );
+  }
+
+  const tenant = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.tenants
+     WHERE id = $1
+     LIMIT 1`,
+    [context.tenantId]
+  );
+  if (tenant.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "tenant_not_active", "Tenant is not active");
+  }
+
+  const workspace = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.workspaces
+     WHERE id = $1 AND tenant_id = $2
+     LIMIT 1`,
+    [context.workspaceId, context.tenantId]
+  );
+  if (workspace.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "workspace_not_active", "Workspace is not active");
+  }
+
+  const policy = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.policy_versions
+     WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3
+     LIMIT 1`,
+    [context.policyVersion, context.tenantId, context.workspaceId]
+  );
+  if (policy.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "policy_version_not_active", "Policy version is not active");
+  }
+
+  const principal = await tx.query<{ purpose: string; status: string }>(
+    `SELECT purpose, status FROM identity.service_principals
+     WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3
+     LIMIT 1`,
+    [context.servicePrincipalId, context.tenantId, context.workspaceId]
+  );
+  if (principal.rows[0]?.status !== "active") {
+    return deny(
+      context.policyVersion,
+      "relay_principal_not_active",
+      "Relay service principal is not active in the exact scope"
+    );
+  }
+  if (principal.rows[0]?.purpose !== "system") {
+    return deny(
+      context.policyVersion,
+      "relay_principal_wrong_purpose",
+      "Relay service principal purpose must be system"
+    );
+  }
+
+  const space = await tx.query<{ id: string }>(
+    `SELECT id FROM access.spaces
+     WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3 AND archived_at IS NULL
+     LIMIT 1`,
+    [resource.id, context.tenantId, context.workspaceId]
+  );
+  if (!space.rows[0]) {
+    return deny(context.policyVersion, "space_not_found", "Space is not active in the exact scope");
+  }
+
+  const grant = await tx.query<{ id: string }>(
+    `SELECT id FROM access.access_relationships
+     WHERE tenant_id = $1
+       AND workspace_id = $2
+       AND subject_type = 'service_principal'
+       AND subject_id = $3
+       AND relation = 'manager'
+       AND resource_type = 'space'
+       AND resource_id = $4
+       AND source = 'direct'
+     LIMIT 1`,
+    [context.tenantId, context.workspaceId, context.servicePrincipalId, resource.id]
+  );
+  if (!grant.rows[0]) {
+    return deny(
+      context.policyVersion,
+      "relay_direct_manager_required",
+      "Relay service principal requires a direct manager grant on the exact Space"
+    );
+  }
+
+  return allow(
+    context.policyVersion,
+    "foundation_relay_direct_manager",
+    options.explain
+      ? "Active system relay principal has a direct manager grant on the exact Space"
+      : undefined,
+    ["direct_manager_space_grant"]
+  );
 }
 
 async function foundationProofCreateDecision(

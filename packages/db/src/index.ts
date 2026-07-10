@@ -2,6 +2,7 @@ export * from "./client.js";
 export * from "./async-context-repository.js";
 export * from "./foundation-proof-repository.js";
 export * from "./migrations.js";
+export * from "./relay-transaction.js";
 export * from "./schema.js";
 export * from "./seed.js";
 export * from "./test-database.js";

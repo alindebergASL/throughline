@@ -163,6 +163,151 @@ describe("foundation.proof.create exact authorization", () => {
   );
 });
 
+describe("foundation.relay.publish exact authorization", () => {
+  const relayContext = (overrides: Partial<SecurityContext> = {}): SecurityContext => ({
+    ...createDevSecurityContext("tenant-a-service"),
+    servicePrincipalId: devFixtures.relayServicePrincipalA,
+    requestedSpaceIds: [devFixtures.restrictedSpaceA],
+    ...overrides
+  });
+
+  function relayExecutor(
+    overrides: {
+      tenantStatus?: string;
+      workspaceStatus?: string;
+      policyStatus?: string;
+      purpose?: string;
+      principalStatus?: string;
+      spaceActive?: boolean;
+      grant?: { relation: string; source: string } | undefined;
+    } = {}
+  ) {
+    const queries: string[] = [];
+    const tx = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes("FROM identity.tenants")) {
+          return { rows: [{ status: overrides.tenantStatus ?? "active" }] };
+        }
+        if (sql.includes("FROM identity.workspaces")) {
+          return { rows: [{ status: overrides.workspaceStatus ?? "active" }] };
+        }
+        if (sql.includes("FROM identity.policy_versions")) {
+          return { rows: [{ status: overrides.policyStatus ?? "active" }] };
+        }
+        if (sql.includes("FROM identity.service_principals")) {
+          return {
+            rows: [
+              {
+                purpose: overrides.purpose ?? "system",
+                status: overrides.principalStatus ?? "active"
+              }
+            ]
+          };
+        }
+        if (sql.includes("FROM access.spaces")) {
+          return {
+            rows: overrides.spaceActive === false ? [] : [{ id: devFixtures.restrictedSpaceA }]
+          };
+        }
+        if (sql.includes("FROM access.access_relationships")) {
+          return {
+            rows:
+              overrides.grant === undefined
+                ? [{ id: "grant" }]
+                : overrides.grant.relation === "manager" && overrides.grant.source === "direct"
+                  ? [{ id: "grant" }]
+                  : []
+          };
+        }
+        throw new Error(`Unexpected relay authorization query: ${sql}`);
+      })
+    } as unknown as TenantQueryExecutor;
+    return { queries, tx };
+  }
+
+  it("allows exactly one active system relay principal with a direct manager grant", async () => {
+    const { queries, tx } = relayExecutor();
+    const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      relayContext(),
+      "foundation.relay.publish",
+      { type: "space", id: devFixtures.restrictedSpaceA },
+      tx as never
+    );
+
+    expect(decision).toMatchObject({
+      allowed: true,
+      reasonCode: "foundation_relay_direct_manager"
+    });
+    expect(queries).toHaveLength(6);
+    expect(queries.every((sql) => !/\bFOR\s+(?:SHARE|UPDATE)\b/i.test(sql))).toBe(true);
+  });
+
+  it.each([
+    ["missing scope", { requestedSpaceIds: [] }, {}, "foundation_space_scope_mismatch"],
+    [
+      "wrong scope",
+      { requestedSpaceIds: [devFixtures.rootSpaceA] },
+      {},
+      "foundation_space_scope_mismatch"
+    ],
+    [
+      "human actor",
+      {
+        servicePrincipalId: undefined,
+        actorUserId: devFixtures.userA,
+        actorMembershipId: devFixtures.membershipAOwner
+      },
+      {},
+      "foundation_relay_service_principal_required"
+    ],
+    [
+      "agent actor",
+      { servicePrincipalId: undefined, agentPrincipalId: devFixtures.agentPrincipalA },
+      {},
+      "foundation_relay_service_principal_required"
+    ],
+    ["inactive tenant", {}, { tenantStatus: "suspended" }, "tenant_not_active"],
+    ["inactive workspace", {}, { workspaceStatus: "archived" }, "workspace_not_active"],
+    ["inactive policy", {}, { policyStatus: "retired" }, "policy_version_not_active"],
+    ["disabled principal", {}, { principalStatus: "disabled" }, "relay_principal_not_active"],
+    ["wrong purpose", {}, { purpose: "worker" }, "relay_principal_wrong_purpose"],
+    ["inactive Space", {}, { spaceActive: false }, "space_not_found"],
+    [
+      "non-manager grant",
+      {},
+      { grant: { relation: "contributor", source: "direct" } },
+      "relay_direct_manager_required"
+    ],
+    [
+      "non-direct grant",
+      {},
+      { grant: { relation: "manager", source: "inherited" } },
+      "relay_direct_manager_required"
+    ]
+  ] as const)("denies %s", async (_name, contextOverrides, dbOverrides, reasonCode) => {
+    const { tx } = relayExecutor(dbOverrides);
+    const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      relayContext({ ...contextOverrides } as Partial<SecurityContext>),
+      "foundation.relay.publish",
+      { type: "space", id: devFixtures.restrictedSpaceA },
+      tx as never
+    );
+    expect(decision).toMatchObject({ allowed: false, reasonCode });
+  });
+
+  it("default-denies the same relay principal for every existing non-relay action", async () => {
+    const { tx } = relayExecutor();
+    const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      relayContext(),
+      "space.read",
+      { type: "space", id: devFixtures.restrictedSpaceA },
+      tx as never
+    );
+    expect(decision).toMatchObject({ allowed: false, reasonCode: "principal_default_denied" });
+  });
+});
+
 maybeDescribe("AuthorizationService database decisions", () => {
   let ownerPool: PgPool;
   let appPool: PgPool;
