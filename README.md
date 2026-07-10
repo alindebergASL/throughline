@@ -4,9 +4,9 @@ Throughline is an AI-native Work OS identified by active, trusted organizational
 first product is Account & Partner Operations, the first domain profile is AI Solutions, and the
 first loop is Engagement -> Memory -> Action.
 
-This repository is currently at Wave A1: monorepo and infrastructure skeleton only. Product
-features such as tenancy tables, RLS, ChangeSets, truth ledger behavior, MCP adapters,
-extraction, and production UI screens are intentionally deferred.
+This repository is currently implementing Wave A2: tenancy, identity, authorization, and RLS.
+Product features such as ChangeSets, truth ledger behavior, MCP adapters, extraction, semantic
+search, and production UI screens are intentionally deferred.
 
 ## Start here
 
@@ -69,7 +69,28 @@ pnpm lint
 pnpm typecheck
 pnpm test
 pnpm build
+pnpm test:security
 ```
+
+`pnpm test:security` is the authoritative PostgreSQL/RLS suite. It fails before Turbo starts unless
+both `TEST_DATABASE_URL` (the owner/migration connection) and `TEST_APP_DATABASE_URL` (the
+application connection) are explicitly present. It never falls back to `DATABASE_URL` and never
+derives one connection string from the other. For the local Compose database, load the explicit
+test values from `.env.example` before running it:
+
+```bash
+set -a
+. ./.env.example
+set +a
+pnpm test:security
+```
+
+Ordinary `pnpm test` remains usable without those variables and skips PostgreSQL-backed suites in
+that case. The dedicated security command never skips them. Security tests provision
+`throughline_app` login access from `TEST_APP_DATABASE_URL` through the owner connection, without
+logging the credential; the canonical schema migration contains no login secret. The tests also
+prove that the app pool's `current_user` is exactly `throughline_app` and that the role has
+`NOBYPASSRLS`.
 
 Run the focused Wave A1 smoke tests:
 
@@ -77,14 +98,24 @@ Run the focused Wave A1 smoke tests:
 pnpm test:smoke
 ```
 
-Note: these smoke tests verify the Wave A1 skeleton only. They do not claim the later kickoff proof of a traced request committing a row, emitting an outbox event, and being processed by a worker; database schema, transactional outbox behavior, and worker consumption are intentionally deferred until an approved later wave.
+Wave A2 migrations are applied in deterministic filename order through a durable
+`throughline_migrations.journal`. Each filename, SHA-256 checksum, and applied timestamp is
+recorded atomically with its SQL. Reapplying an unchanged migration is a no-op; changing an applied
+migration's checksum fails closed. Test resets remove and recreate the application schemas and
+journal deterministically.
+
+GitHub Actions runs Node.js 22 with PostgreSQL 16/pgvector, a frozen install, formatting, lint,
+typechecking, ordinary tests, build, and the serial PostgreSQL-backed security suite. CI uses
+isolated PostgreSQL trust authentication and explicit passwordless test DSNs rather than a
+committed reusable credential.
 
 ## Dependency notes
 
-Production dependencies are limited to the requested Wave A1 stack: Next.js/React for
-`apps/web`, NestJS with the Fastify adapter for `apps/api`, Drizzle as the database package
-foundation, and a small Fastify helmet plugin for default HTTP hardening. Local S3/SQS
-placeholders use LocalStack in Docker Compose and are not required for compile or unit tests.
+Production dependencies are limited to the requested Wave A stack: Next.js/React for `apps/web`,
+NestJS with the Fastify adapter for `apps/api`, Drizzle plus `pg` for PostgreSQL access, Zod for
+runtime SecurityContext validation, and a small Fastify helmet plugin for default HTTP hardening.
+Local S3/SQS placeholders use LocalStack in Docker Compose and are not required for compile or unit
+tests.
 
 ## First proof
 

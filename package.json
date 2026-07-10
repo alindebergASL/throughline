@@ -16,6 +16,7 @@
     "format:check": "prettier --check .",
     "typecheck": "turbo typecheck",
     "test": "turbo test",
+    "test:security": "node --import tsx scripts/require-security-dsns.ts && turbo test:security --filter=@throughline/db --filter=@throughline/authorization --concurrency=1",
     "test:smoke": "turbo test --filter=@throughline/api --filter=@throughline/agent-worker --filter=@throughline/testing"
   },
   "devDependencies": {
