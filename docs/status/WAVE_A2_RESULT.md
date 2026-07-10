@@ -365,11 +365,12 @@ merge. The authoritative post-merge state is recorded in **Final Merge Checkpoin
 
 ## Pre-merge status (historical)
 
-At this checkpoint, Wave A2 remained limited to tenancy, identity, authorization, and RLS. The migration-specific PASS at
-`51b8b6b19b0c39990ff41e4532f0b78193347aec` remains valid for that exact migration scope. The final
-closeout adds elapsed-context enforcement at the DB boundary and the missing catalog, no-context,
-and mismatched-write RLS evidence without changing migration SQL. PR #2 remains held pending a new
-exact-head CI result, an independent incremental exact-head review, and explicit merge authorization.
+At this checkpoint, Wave A2 remained limited to tenancy, identity, authorization, and RLS. The
+migration-specific PASS at `51b8b6b19b0c39990ff41e4532f0b78193347aec` applied to that exact
+migration scope. The final closeout added elapsed-context enforcement at the DB boundary and the
+missing catalog, no-context, and mismatched-write RLS evidence without changing migration SQL. PR
+#2 was held pending a new exact-head CI result, an independent incremental exact-head review, and
+explicit merge authorization.
 
 ## Final Merge Checkpoint
 

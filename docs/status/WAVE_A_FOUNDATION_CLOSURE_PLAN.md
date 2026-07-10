@@ -378,30 +378,41 @@ pre-transaction decision.
 #### SQS receipt lifecycle
 
 The LocalStack proof must configure a source queue and dead-letter queue with a redrive policy. Use a
-30-second visibility timeout, a 20-second handler deadline, and `maxReceiveCount=3`; these small test
-values provide two observable retries while keeping the integration suite bounded. Runtime values
-remain explicit configuration, and the handler deadline must stay below visibility timeout.
+30-second initial visibility timeout, a 20-second absolute handler deadline, and
+`maxReceiveCount=3`; these small test values provide two observable retries while keeping the
+integration suite bounded. Runtime values remain explicit configuration.
 
 For each actual SQS receipt:
 
 1. start the consumer span by extracting the signed envelope and persisted W3C propagation fields;
-2. if processing approaches 10 seconds of visibility remaining, extend visibility with
-   `ChangeMessageVisibility`; never continue after extension failure without treating the attempt as
-   retryable;
-3. call `DeleteMessage` only after the proof effect and idempotency record durably commit, or after
+2. if processing has not durably committed, attempt `ChangeMessageVisibility` at or before 15
+   seconds elapsed, while at least 15 seconds of the original visibility window remain; permit at
+   most one visibility extension per receipt for this bounded proof;
+3. set `VisibilityTimeout` to 30 seconds; when `ChangeMessageVisibility` succeeds, a new 30-second
+   visibility window begins at the time of that success;
+4. do not reset or extend the absolute 20-second handler deadline when visibility is extended;
+5. if the extension fails or times out before durable commit, abort or roll back the processing
+   attempt, do not call `DeleteMessage`, and leave the message retryable;
+6. call `DeleteMessage` only after the proof effect and idempotency record durably commit, or after
    an exact-scope/job/handler idempotency lookup confirms a duplicate committed earlier;
-4. on transient PostgreSQL, LocalStack, or visibility-extension failure, do not delete the message;
+7. on transient PostgreSQL or LocalStack failure, do not delete the message;
    allow visibility expiry/backoff and retry;
-5. on malformed/forged/expired/revoked/cross-scope/inactive-authority/stale/out-of-order terminal
+8. on malformed/forged/expired/revoked/cross-scope/inactive-authority/stale/out-of-order terminal
    denial, apply no effect, do not record success, emit only a sanitized reason code, and leave the
    message for the configured redrive policy to move to the DLQ;
-6. if `DeleteMessage` fails after commit, accept redelivery and resolve it through the duplicate
+9. if `DeleteMessage` fails after commit, accept redelivery and resolve it through the duplicate
    path without a second effect.
+
+Terminal denials intentionally remain undeleted and may be re-received until the native
+`maxReceiveCount=3` redrive policy moves them to the DLQ; the worker must not publish them directly
+to the DLQ.
 
 The queue body contains only the signed opaque reference and bounded routing/trace metadata—never a
 raw SecurityContext or product payload. Logs and spans must not copy the queue body/token. Tests
 must prove successful deletion, duplicate deletion, transient redelivery, terminal denial redrive
-to the DLQ after three receipts, visibility extension, and post-commit delete-failure recovery.
+to the DLQ after three receipts, one visibility extension attempted by 15 seconds elapsed with a
+new 30-second window on success, no reset of the absolute handler deadline, extension-failure
+rollback without deletion, and post-commit delete-failure recovery.
 
 ### 7. Infrastructure key builders are centralized and validated
 
