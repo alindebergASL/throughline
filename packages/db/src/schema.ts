@@ -13,6 +13,7 @@ import {
 
 export const identity = pgSchema("identity");
 export const access = pgSchema("access");
+export const ops = pgSchema("ops");
 
 const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -183,6 +184,189 @@ export const accessRelationships = access.table(
       table.workspaceId,
       table.subjectType,
       table.subjectId
+    )
+  ]
+);
+
+export const securityContextReferences = ops.table(
+  "security_context_references",
+  {
+    id: uuid("id").primaryKey(),
+    jobId: uuid("job_id").notNull(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    workerServicePrincipalId: uuid("worker_service_principal_id").notNull(),
+    delegatingUserId: uuid("delegating_user_id").notNull(),
+    delegatingMembershipId: uuid("delegating_membership_id").notNull(),
+    policyVersionId: text("policy_version_id").notNull(),
+    contextSnapshot: jsonb("context_snapshot").notNull(),
+    issuedAt: timestamp("issued_at", { withTimezone: true }).notNull(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    status: text("status").notNull().default("active"),
+    signingKeyId: text("signing_key_id").notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    revokedByUserId: uuid("revoked_by_user_id"),
+    revocationReason: text("revocation_reason"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    version: integer("version").notNull().default(1)
+  },
+  (table) => [
+    unique("security_context_references_scope_id_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.id
+    ),
+    unique("security_context_references_scope_job_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.jobId
+    ),
+    unique("security_context_references_outbox_binding_unique").on(
+      table.id,
+      table.jobId,
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId
+    ),
+    index("security_context_references_expiry_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.expiresAt
+    )
+  ]
+);
+
+export const foundationTestAggregates = ops.table(
+  "foundation_test_aggregates",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    proofKey: text("proof_key").notNull(),
+    pendingJobId: uuid("pending_job_id"),
+    lastEffectJobId: uuid("last_effect_job_id"),
+    effectCount: integer("effect_count").notNull().default(0),
+    aggregateVersion: integer("aggregate_version").notNull().default(1),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    unique("foundation_test_aggregates_scope_id_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.id
+    ),
+    unique("foundation_test_aggregates_proof_key_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.proofKey
+    ),
+    index("foundation_test_aggregates_pending_job_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.pendingJobId
+    )
+  ]
+);
+
+export const outboxEvents = ops.table(
+  "outbox_events",
+  {
+    id: uuid("id").primaryKey(),
+    eventType: text("event_type").notNull(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    aggregateType: text("aggregate_type").notNull(),
+    aggregateId: uuid("aggregate_id").notNull(),
+    aggregateVersion: integer("aggregate_version").notNull(),
+    causationId: uuid("causation_id").notNull(),
+    requestId: text("request_id").notNull(),
+    traceparent: text("traceparent").notNull(),
+    tracestate: text("tracestate"),
+    jobId: uuid("job_id").notNull(),
+    relayServicePrincipalId: uuid("relay_service_principal_id").notNull(),
+    contextReferenceId: uuid("context_reference_id").notNull(),
+    signedContextReference: text("signed_context_reference").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    publicationAttempts: integer("publication_attempts").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    claimedBy: text("claimed_by"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    lastRetryCode: text("last_retry_code"),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    publishedMessageId: text("published_message_id"),
+    terminalFailedAt: timestamp("terminal_failed_at", { withTimezone: true }),
+    terminalFailureCode: text("terminal_failure_code")
+  },
+  (table) => [
+    unique("outbox_events_scope_id_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.id
+    ),
+    unique("outbox_events_scope_job_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.jobId
+    ),
+    index("outbox_events_publishable_idx").on(table.nextAttemptAt, table.createdAt),
+    index("outbox_events_scope_created_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.createdAt
+    )
+  ]
+);
+
+export const idempotencyRecords = ops.table(
+  "idempotency_records",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    jobId: uuid("job_id").notNull(),
+    handlerKey: text("handler_key").notNull(),
+    contextReferenceId: uuid("context_reference_id").notNull(),
+    aggregateId: uuid("aggregate_id").notNull(),
+    aggregateVersion: integer("aggregate_version").notNull(),
+    effectHash: text("effect_hash").notNull(),
+    completedAt: timestamp("completed_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    unique("idempotency_records_scope_id_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.id
+    ),
+    unique("idempotency_records_effect_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.jobId,
+      table.handlerKey
+    ),
+    index("idempotency_records_aggregate_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.aggregateId,
+      table.completedAt
     )
   ]
 );

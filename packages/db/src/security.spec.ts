@@ -12,6 +12,7 @@ const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const maybeDescribe = ownerUrl && appUrl ? describe.sequential : describe.skip;
 const migrationId = "0001_wave_a2_identity_access_rls.sql";
+const migrationIds = [migrationId, "0002_foundation_closure_async_isolation.sql"];
 const migrationUrl = new URL("../migrations/0001_wave_a2_identity_access_rls.sql", import.meta.url);
 
 interface AppRoleState {
@@ -119,14 +120,17 @@ maybeDescribe("Wave A2 database RLS security", () => {
     );
   });
 
-  it("produces the same deterministic clean one-migration state on two resets", async () => {
+  it("produces the same deterministic clean migration state on two resets", async () => {
     const secondResetRun = await applyMigrations(ownerPool, { reset: true });
     const secondResetState = await readCleanMigrationState(ownerPool);
 
-    expect(firstResetRun).toEqual({ applied: [migrationId], skipped: [] });
+    expect(firstResetRun).toEqual({ applied: migrationIds, skipped: [] });
     expect(secondResetRun).toEqual(firstResetRun);
     expect(firstResetState).toEqual({
-      journal: [{ id: migrationId, checksum: expect.stringMatching(/^[a-f0-9]{64}$/) }],
+      journal: migrationIds.map((id) => ({
+        id,
+        checksum: expect.stringMatching(/^[a-f0-9]{64}$/)
+      })),
       tenantCount: "0"
     });
     expect(secondResetState).toEqual(firstResetState);
@@ -143,12 +147,9 @@ maybeDescribe("Wave A2 database RLS security", () => {
       `
     );
 
-    expect(journal.rows).toHaveLength(1);
-    expect(journal.rows[0]).toMatchObject({
-      id: migrationId,
-      checksum: expectedChecksum
-    });
-    expect(journal.rows[0]?.applied_at).not.toBeNull();
+    expect(journal.rows).toHaveLength(2);
+    expect(journal.rows[0]).toMatchObject({ id: migrationId, checksum: expectedChecksum });
+    expect(journal.rows.every(({ applied_at }) => applied_at !== null)).toBe(true);
   });
 
   it("adopts a parent-equivalent schema with the named constraint and no journal", async () => {
@@ -186,9 +187,9 @@ maybeDescribe("Wave A2 database RLS security", () => {
       );
       const hardenedRole = await readAppRoleState(ownerPool);
 
-      expect(adopted).toEqual({ applied: [migrationId], skipped: [] });
-      expect(repeated).toEqual({ applied: [], skipped: [migrationId] });
-      expect(journal.rows[0]?.count).toBe("1");
+      expect(adopted).toEqual({ applied: migrationIds, skipped: [] });
+      expect(repeated).toEqual({ applied: [], skipped: migrationIds });
+      expect(journal.rows[0]?.count).toBe("2");
       expect(hardenedRole).toMatchObject({
         rolcanlogin: false,
         rolbypassrls: false,
@@ -275,8 +276,8 @@ maybeDescribe("Wave A2 database RLS security", () => {
         [migrationId]
       );
 
-      expect(adopted).toEqual({ applied: [migrationId], skipped: [] });
-      expect(repeated).toEqual({ applied: [], skipped: [migrationId] });
+      expect(adopted).toEqual({ applied: migrationIds, skipped: [] });
+      expect(repeated).toEqual({ applied: [], skipped: migrationIds });
       expect(journal.rows[0]?.count).toBe("1");
     } finally {
       try {
@@ -288,9 +289,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
   });
 
   it("fails closed when the named adoption constraint has an unexpected definition", async () => {
-    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-      migrationId
-    ]);
+    await ownerPool.query("DELETE FROM throughline_migrations.journal");
     await ownerPool.query(
       "ALTER TABLE identity.workspaces DROP CONSTRAINT workspaces_default_space_fk"
     );
@@ -320,9 +319,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
 
   it("fails closed when paired missing columns shrink the expected adoption constraint", async () => {
     try {
-      await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-        migrationId
-      ]);
+      await ownerPool.query("DELETE FROM throughline_migrations.journal");
       await ownerPool.query(
         "ALTER TABLE identity.workspaces DROP CONSTRAINT workspaces_default_space_fk"
       );
@@ -358,9 +355,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
       expect.soft(journal.rows[0]?.count).toBe("0");
     } finally {
       try {
-        await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-          migrationId
-        ]);
+        await ownerPool.query("DELETE FROM throughline_migrations.journal");
       } finally {
         try {
           await ownerPool.query(
@@ -420,9 +415,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
   });
 
   it("rolls migration SQL back when the journal insert fails", async () => {
-    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-      migrationId
-    ]);
+    await ownerPool.query("DELETE FROM throughline_migrations.journal");
     await ownerPool.query("DROP POLICY tenants_current_tenant ON identity.tenants");
 
     try {
@@ -480,9 +473,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
   });
 
   it("serializes concurrent migration callers into one apply and one skip", async () => {
-    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-      migrationId
-    ]);
+    await ownerPool.query("DELETE FROM throughline_migrations.journal");
 
     try {
       const runs = await Promise.all([applyMigrations(ownerPool), applyMigrations(ownerPool)]);
@@ -493,8 +484,8 @@ maybeDescribe("Wave A2 database RLS security", () => {
 
       expect(runs).toEqual(
         expect.arrayContaining([
-          { applied: [migrationId], skipped: [] },
-          { applied: [], skipped: [migrationId] }
+          { applied: migrationIds, skipped: [] },
+          { applied: [], skipped: migrationIds }
         ])
       );
       expect(runs).toHaveLength(2);
