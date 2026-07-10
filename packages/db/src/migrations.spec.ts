@@ -17,6 +17,14 @@ describe("canonical Wave A2 migration", () => {
 });
 
 describe("canonical Foundation closure migration", () => {
+  it("adds only lock visibility for the current app user and rejects every updated row", async () => {
+    const sql = await readFoundationMigration();
+
+    expect(sql).toMatch(
+      /CREATE POLICY users_current_user_lock_only ON identity\.users\s+FOR UPDATE TO throughline_app\s+USING \(id = ops\.current_user_id\(\)\)\s+WITH CHECK \(false\);/
+    );
+  });
+
   it("configures dedicated relay and worker roles without login credentials", async () => {
     const sql = await readFile(
       new URL("../migrations/0002_foundation_closure_async_isolation.sql", import.meta.url),

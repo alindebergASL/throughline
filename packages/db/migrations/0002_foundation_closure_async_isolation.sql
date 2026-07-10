@@ -279,6 +279,12 @@ CREATE POLICY users_current_user_self_read ON identity.users
   FOR SELECT TO throughline_app
   USING (id = ops.current_user_id());
 
+DROP POLICY IF EXISTS users_current_user_lock_only ON identity.users;
+CREATE POLICY users_current_user_lock_only ON identity.users
+  FOR UPDATE TO throughline_app
+  USING (id = ops.current_user_id())
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS people_current_workspace ON identity.people;
 CREATE POLICY people_current_workspace ON identity.people
   TO throughline_app

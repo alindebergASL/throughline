@@ -65,9 +65,21 @@ importers:
       '@nestjs/platform-fastify':
         specifier: ^11.1.5
         version: 11.1.27(@nestjs/common@11.1.27(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.27(@nestjs/common@11.1.27(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))
+      '@throughline/authorization':
+        specifier: workspace:*
+        version: link:../../packages/authorization
+      '@throughline/core-types':
+        specifier: workspace:*
+        version: link:../../packages/core-types
+      '@throughline/db':
+        specifier: workspace:*
+        version: link:../../packages/db
       '@throughline/observability':
         specifier: workspace:*
         version: link:../../packages/observability
+      '@throughline/tenancy':
+        specifier: workspace:*
+        version: link:../../packages/tenancy
       reflect-metadata:
         specifier: ^0.2.2
         version: 0.2.2

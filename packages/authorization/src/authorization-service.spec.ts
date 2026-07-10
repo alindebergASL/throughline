@@ -9,6 +9,7 @@ import {
   seedWaveA2DeterministicData,
   type PgPool
 } from "@throughline/db";
+import type { TenantQueryExecutor } from "@throughline/db";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -34,6 +35,132 @@ describe("AuthorizationService context boundary", () => {
     });
     expect(connect).not.toHaveBeenCalled();
   });
+});
+
+describe("foundation.proof.create exact authorization", () => {
+  function executor(role: "owner" | "admin" | "member" = "owner", hasSpace = true) {
+    const queries: string[] = [];
+    const tx = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes("FROM identity.tenants")) return { rows: [{ status: "active" }] };
+        if (sql.includes("FROM identity.workspaces")) return { rows: [{ status: "active" }] };
+        if (sql.includes("FROM identity.policy_versions")) return { rows: [{ status: "active" }] };
+        if (sql.includes("FROM identity.memberships")) {
+          return {
+            rows: [{ role, membership_status: "active", user_status: "active" }]
+          };
+        }
+        if (sql.includes("FROM access.spaces")) {
+          return { rows: hasSpace ? [{ id: devFixtures.restrictedSpaceA }] : [] };
+        }
+        throw new Error(`Unexpected authorization query: ${sql}`);
+      })
+    } as unknown as TenantQueryExecutor;
+    return { queries, tx };
+  }
+
+  it.each(["owner", "admin"] as const)(
+    "allows an active %s only through the shared current Space-read decision",
+    async (role) => {
+      const { queries, tx } = executor(role);
+      const service = new PostgresAuthorizationService({} as PgPool);
+      const context = {
+        ...createDevSecurityContext("tenant-a-owner"),
+        requestedSpaceIds: [devFixtures.restrictedSpaceA]
+      };
+
+      const decision = await service.canInTransaction(
+        context,
+        "foundation.proof.create",
+        { type: "space", id: devFixtures.restrictedSpaceA },
+        tx as never
+      );
+
+      expect(decision).toMatchObject({
+        allowed: true,
+        reasonCode: "foundation_owner_or_admin_space_authorized",
+        evaluatedRelationships: ["workspace_admin_space_read"]
+      });
+      expect(queries.filter((sql) => sql.includes("FROM access.spaces"))).toHaveLength(1);
+      expect(queries.every((sql) => /FOR SHARE/.test(sql))).toBe(true);
+    }
+  );
+
+  it.each([
+    ["wrong", devFixtures.restrictedSpaceA, devFixtures.rootSpaceA, false],
+    ["cross-workspace", devFixtures.rootSpaceB, devFixtures.rootSpaceB, true],
+    ["archived", devFixtures.restrictedSpaceA, devFixtures.restrictedSpaceA, true]
+  ] as const)(
+    "denies %s Space scope without accepting an unlocked or stale target",
+    async (_case, resourceId, requestedSpaceId, reachesLockedLookup) => {
+      const { queries, tx } = executor("owner", false);
+      const service = new PostgresAuthorizationService({} as PgPool);
+      const context = {
+        ...createDevSecurityContext("tenant-a-owner"),
+        requestedSpaceIds: [requestedSpaceId]
+      };
+      const decision = await service.canInTransaction(
+        context,
+        "foundation.proof.create",
+        { type: "space", id: resourceId },
+        tx as never
+      );
+
+      expect(decision.allowed).toBe(false);
+      if (reachesLockedLookup) {
+        expect(decision.reasonCode).toBe("space_not_found");
+        expect(queries.at(-1)).toMatch(
+          /FROM access\.spaces[\s\S]*archived_at IS NULL[\s\S]*FOR SHARE/
+        );
+      } else {
+        expect(decision.reasonCode).toBe("foundation_space_scope_mismatch");
+        expect(queries).toEqual([]);
+      }
+    }
+  );
+
+  it("keeps lower roles closed before the shared Space decision", async () => {
+    const { queries, tx } = executor("member");
+    const service = new PostgresAuthorizationService({} as PgPool);
+    const context = {
+      ...createDevSecurityContext("tenant-a-owner"),
+      requestedSpaceIds: [devFixtures.restrictedSpaceA]
+    };
+    const decision = await service.canInTransaction(
+      context,
+      "foundation.proof.create",
+      { type: "space", id: devFixtures.restrictedSpaceA },
+      tx as never
+    );
+
+    expect(decision).toMatchObject({ allowed: false, reasonCode: "role_denied" });
+    expect(queries.some((sql) => sql.includes("FROM access.spaces"))).toBe(false);
+  });
+
+  it.each(["tenant-a-service", "tenant-a-agent"] as const)(
+    "keeps the exact action closed to %s",
+    async (identity) => {
+      const { queries, tx } = executor();
+      const service = new PostgresAuthorizationService({} as PgPool);
+      const context = {
+        ...createDevSecurityContext(identity),
+        requestedSpaceIds: [devFixtures.restrictedSpaceA]
+      };
+      const decision = await service.canInTransaction(
+        context,
+        "foundation.proof.create",
+        { type: "space", id: devFixtures.restrictedSpaceA },
+        tx as never
+      );
+
+      expect(decision).toMatchObject({
+        allowed: false,
+        reasonCode: "foundation_human_actor_required"
+      });
+      expect(queries).toEqual([]);
+    }
+  );
 });
 
 maybeDescribe("AuthorizationService database decisions", () => {

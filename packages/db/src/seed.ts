@@ -86,10 +86,17 @@ export async function seedWaveA2DeterministicData(pool: PgPool): Promise<void> {
   await pool.query(
     `
     INSERT INTO identity.service_principals (id, tenant_id, workspace_id, name, purpose, status)
-    VALUES ($1, $2, $3, 'Worker A', 'worker', 'active')
+    VALUES
+      ($1, $2, $3, 'Worker A', 'worker', 'active'),
+      ($4, $2, $3, 'Relay A', 'system', 'active')
     ON CONFLICT (id) DO NOTHING
     `,
-    [devFixtures.servicePrincipalA, devFixtures.tenantA, devFixtures.workspaceA]
+    [
+      devFixtures.servicePrincipalA,
+      devFixtures.tenantA,
+      devFixtures.workspaceA,
+      devFixtures.relayServicePrincipalA
+    ]
   );
 
   await pool.query(
@@ -151,6 +158,37 @@ export async function seedWaveA2DeterministicData(pool: PgPool): Promise<void> {
       devFixtures.workspaceA,
       devFixtures.tenantB,
       devFixtures.workspaceB
+    ]
+  );
+
+  await pool.query(
+    `
+    INSERT INTO access.access_relationships
+      (tenant_id, workspace_id, subject_type, subject_id, relation, resource_type, resource_id, source)
+    SELECT $1, $2, 'service_principal', grants.subject_id, grants.relation,
+           'space', $3, 'direct'
+    FROM (VALUES
+      ($4::uuid, 'contributor'::text),
+      ($5::uuid, 'manager'::text)
+    ) AS grants(subject_id, relation)
+    WHERE NOT EXISTS (
+      SELECT 1 FROM access.access_relationships existing
+      WHERE existing.tenant_id = $1
+        AND existing.workspace_id = $2
+        AND existing.subject_type = 'service_principal'
+        AND existing.subject_id = grants.subject_id
+        AND existing.relation = grants.relation
+        AND existing.resource_type = 'space'
+        AND existing.resource_id = $3
+        AND existing.source = 'direct'
+    )
+    `,
+    [
+      devFixtures.tenantA,
+      devFixtures.workspaceA,
+      devFixtures.restrictedSpaceA,
+      devFixtures.servicePrincipalA,
+      devFixtures.relayServicePrincipalA
     ]
   );
 }

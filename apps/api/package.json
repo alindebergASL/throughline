@@ -16,7 +16,11 @@
     "@nestjs/common": "^11.1.5",
     "@nestjs/core": "^11.1.5",
     "@nestjs/platform-fastify": "^11.1.5",
+    "@throughline/authorization": "workspace:*",
+    "@throughline/core-types": "workspace:*",
+    "@throughline/db": "workspace:*",
     "@throughline/observability": "workspace:*",
+    "@throughline/tenancy": "workspace:*",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
   },
