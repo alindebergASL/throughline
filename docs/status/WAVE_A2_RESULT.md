@@ -351,19 +351,49 @@ Minimal required changes: None. The implementation is ready to merge.
 That conclusion applies to the pre-hardening diff and is not a review verdict for the 2026-07-09
 merge-gate changes.
 
-## Known caveats
+## Known caveats at the pre-merge closeout
+
+This section preserves the historical caveats recorded before the final exact-head review and
+merge. The authoritative post-merge state is recorded in **Final Merge Checkpoint** below.
 
 - `pnpm test` without explicit security DSNs skips DB-backed RLS/security tests by design.
   `pnpm test:security` is authoritative and fails immediately unless both `TEST_DATABASE_URL` and
   `TEST_APP_DATABASE_URL` are explicitly set; it never falls back to `DATABASE_URL`.
 - In the original review, Fable was unavailable, so default Claude Code was used instead of
   `claude-fable-5`. The merge-gate hardening requires a new independent exact-head review.
-- The branch is not merged or deployed.
+- At this pre-merge checkpoint, the branch had not yet been merged or deployed.
 
-## Current status
+## Pre-merge status (historical)
 
-Wave A2 remains limited to tenancy, identity, authorization, and RLS. The migration-specific PASS at
+At this checkpoint, Wave A2 remained limited to tenancy, identity, authorization, and RLS. The migration-specific PASS at
 `51b8b6b19b0c39990ff41e4532f0b78193347aec` remains valid for that exact migration scope. The final
 closeout adds elapsed-context enforcement at the DB boundary and the missing catalog, no-context,
 and mismatched-write RLS evidence without changing migration SQL. PR #2 remains held pending a new
 exact-head CI result, an independent incremental exact-head review, and explicit merge authorization.
+
+## Final Merge Checkpoint
+
+PR #2 was squash-merged into `main` after explicit authorization and a fresh fail-closed
+pre-merge check.
+
+```text
+Authorized PR head: a038a60879fd423684dcb01c39e28666924da682
+Merged at: 2026-07-10T04:42:32Z
+Merged main: b6b2e41a933fcf18587d721d1e3233c490729d18
+Authorized-head and merged-main tree: 6a1cee1819d976998a86f0bb2bc050d992d147b2
+Final PR-head CI: 29062645164 — completed / success
+Post-merge main CI: 29069663250 — completed / success
+Independent exact-head review: PASS — no blocking findings
+```
+
+The authorized PR head and merged `main` have the identical tree recorded above. GitHub reports
+PR #2 as `MERGED`; the post-merge CI run passed on the exact merged-main SHA.
+
+The scoped A2 implementation—tenancy, identity, centralized authorization, transaction-local RLS
+context, and PostgreSQL default-deny evidence—is merged. This does **not** claim that the broader
+canonical Wave A foundation is closed. The transactional API/database/outbox path, SQS relay,
+idempotent worker consumption, signed asynchronous context reference and rehydration, live worker
+reauthorization, queue/cache/object-key isolation, and end-to-end OpenTelemetry propagation remain
+deferred to an explicitly approved Foundation Closure implementation.
+
+No deployment was performed. B1 was not started.
