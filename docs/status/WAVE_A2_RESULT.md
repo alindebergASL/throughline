@@ -193,6 +193,43 @@ explicit source/target cardinality enforcement when expected columns are absent,
 RLS isolation, pooled context cleanup, and Teams-subject rejection. The full root and security gates
 passed after the final second-pass edits.
 
+### Final A2 transaction-boundary and RLS-evidence closeout (2026-07-10)
+
+The DB transaction boundary now parses the `SecurityContext`, rejects an elapsed context with the
+stable `SecurityContext has expired` error, and only then acquires a pool connection. The focused
+unit regression uses a structurally valid context with `issuedAt < expiresAt <= now` and proves that
+neither `pool.connect()` nor the transaction callback runs. `PostgresAuthorizationService.can()`
+also has a no-database regression proving the same elapsed context returns `context_expired` before
+pool access. The pre-existing `expiresAt === issuedAt` tenancy test is now named as non-positive
+lifetime validation rather than elapsed-context enforcement.
+
+The PostgreSQL suite adds explicit evidence for all ten A2 protected tables:
+
+- every table is present in the catalog with both `relrowsecurity=true` and
+  `relforcerowsecurity=true`;
+- `throughline_app`, outside a tenant transaction and with no `app.*` tenant/workspace context,
+  sees zero rows across all ten protected tables;
+- a Tenant B/workspace B Space insert under Tenant A context is rejected by RLS `WITH CHECK` with
+  SQLSTATE `42501`, and an owner query proves no row persisted.
+
+Fresh final-closeout local commands:
+
+```text
+npm exec -- pnpm install --frozen-lockfile: PASS
+npm exec -- pnpm format:check: PASS
+npm exec -- pnpm lint: PASS — 27/27 Turbo tasks
+npm exec -- pnpm typecheck: PASS — 27/27 Turbo tasks
+env -u DATABASE_URL -u TEST_DATABASE_URL -u TEST_APP_DATABASE_URL npm exec -- pnpm test:
+  PASS — 27/27 Turbo tasks; DB-backed suites skipped as designed, ordinary boundary tests ran
+npm exec -- pnpm build: PASS — 21/21 Turbo tasks
+npm exec -- pnpm test:security with no explicit DSNs:
+  expected exit 1 before Turbo
+npm exec -- pnpm test:security with explicit DSNs:
+  PASS — DB 18/18, authorization 15/15, Turbo 5/5
+```
+
+No migration SQL changed in this final closeout pass.
+
 ### Host/resource guardrail before verification
 
 The previous Codex run had locked the host by launching heavy root checks concurrently. Hermes added an 8 GiB swapfile and used serial capped verification for this run.
@@ -325,7 +362,8 @@ merge-gate changes.
 
 ## Current status
 
-Wave A2 remains limited to tenancy, identity, authorization, and RLS. The second PR #2 merge-gate
-fix pass addresses the legacy-role credential and pre-journal adoption blockers and passes the
-fresh full local root and 29-test PostgreSQL-backed security gate. PR #2 remains held pending a new
-exact-head CI result and an independent incremental exact-head review.
+Wave A2 remains limited to tenancy, identity, authorization, and RLS. The migration-specific PASS at
+`51b8b6b19b0c39990ff41e4532f0b78193347aec` remains valid for that exact migration scope. The final
+closeout adds elapsed-context enforcement at the DB boundary and the missing catalog, no-context,
+and mismatched-write RLS evidence without changing migration SQL. PR #2 remains held pending a new
+exact-head CI result, an independent incremental exact-head review, and explicit merge authorization.

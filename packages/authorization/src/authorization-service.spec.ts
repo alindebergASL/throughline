@@ -1,6 +1,6 @@
 import type { SecurityContext } from "@throughline/core-types";
 import { createDevSecurityContext, devFixtures } from "@throughline/tenancy";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { PostgresAuthorizationService } from "./authorization-service.js";
 import {
   applyMigrations,
@@ -13,6 +13,28 @@ import {
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const maybeDescribe = ownerUrl && appUrl ? describe : describe.skip;
+
+describe("AuthorizationService context boundary", () => {
+  it("denies an elapsed SecurityContext without acquiring a database connection", async () => {
+    const connect = vi.fn();
+    const service = new PostgresAuthorizationService({ connect } as unknown as PgPool);
+    const context = createDevSecurityContext("tenant-a-owner", {
+      now: new Date("2000-01-01T00:00:00.000Z")
+    });
+
+    const decision = await service.can(context, "workspace.read", {
+      type: "workspace",
+      id: devFixtures.workspaceA
+    });
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reasonCode: "context_expired",
+      explanation: "SecurityContext has expired"
+    });
+    expect(connect).not.toHaveBeenCalled();
+  });
+});
 
 maybeDescribe("AuthorizationService database decisions", () => {
   let ownerPool: PgPool;

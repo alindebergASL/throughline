@@ -72,7 +72,7 @@ describe("SecurityContext validation", () => {
     ).toMatchObject({ servicePrincipalId: context.servicePrincipalId });
   });
 
-  it("rejects expired contexts", () => {
+  it("rejects contexts with a non-positive lifetime", () => {
     const context = createDevSecurityContext("tenant-a-owner");
 
     expect(() =>

@@ -1,6 +1,8 @@
 import type { SecurityContext } from "@throughline/core-types";
-import { parseSecurityContext } from "@throughline/tenancy";
+import { isSecurityContextExpired, parseSecurityContext } from "@throughline/tenancy";
 import type { PgPool, PgPoolClient, PgQueryResult } from "./client.js";
+
+export const SECURITY_CONTEXT_EXPIRED_MESSAGE = "SecurityContext has expired";
 
 export interface TenantQueryExecutor {
   query<T extends object = Record<string, unknown>>(
@@ -23,6 +25,11 @@ export async function withTenantTransaction<T>(
   fn: (tx: TenantDbTransaction) => Promise<T>
 ): Promise<T> {
   const context = parseSecurityContext(options.context);
+
+  if (isSecurityContextExpired(context)) {
+    throw new Error(SECURITY_CONTEXT_EXPIRED_MESSAGE);
+  }
+
   const client = await options.pool.connect();
 
   try {

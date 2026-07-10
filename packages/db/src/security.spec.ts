@@ -551,6 +551,148 @@ maybeDescribe("Wave A2 database RLS security", () => {
     }
   });
 
+  it("enables and forces RLS on the exact protected table catalog", async () => {
+    const protectedRelations = await ownerPool.query<{
+      relation_name: string;
+      relforcerowsecurity: boolean;
+      relrowsecurity: boolean;
+    }>(`
+      SELECT
+        namespace.nspname || '.' || relation.relname AS relation_name,
+        relation.relrowsecurity,
+        relation.relforcerowsecurity
+      FROM pg_class AS relation
+      JOIN pg_namespace AS namespace ON namespace.oid = relation.relnamespace
+      WHERE (namespace.nspname, relation.relname) IN (
+        ('identity', 'tenants'),
+        ('identity', 'workspaces'),
+        ('identity', 'users'),
+        ('identity', 'people'),
+        ('identity', 'memberships'),
+        ('identity', 'service_principals'),
+        ('identity', 'agent_principals'),
+        ('identity', 'policy_versions'),
+        ('access', 'spaces'),
+        ('access', 'access_relationships')
+      )
+      ORDER BY relation_name
+    `);
+
+    expect(protectedRelations.rows).toEqual(
+      [
+        "access.access_relationships",
+        "access.spaces",
+        "identity.agent_principals",
+        "identity.memberships",
+        "identity.people",
+        "identity.policy_versions",
+        "identity.service_principals",
+        "identity.tenants",
+        "identity.users",
+        "identity.workspaces"
+      ].map((relationName) => ({
+        relation_name: relationName,
+        relforcerowsecurity: true,
+        relrowsecurity: true
+      }))
+    );
+  });
+
+  it("defaults to no tenant context and no protected rows through the app role", async () => {
+    const client = await appPool.connect();
+
+    try {
+      const context = await client.query<{
+        tenant_id: string | null;
+        workspace_id: string | null;
+      }>(`
+        SELECT
+          NULLIF(current_setting('app.tenant_id', true), '') AS tenant_id,
+          NULLIF(current_setting('app.workspace_id', true), '') AS workspace_id
+      `);
+      const protectedCounts = await client.query<{
+        relation_name: string;
+        row_count: number;
+      }>(`
+        SELECT 'access.access_relationships' AS relation_name, count(*)::integer AS row_count
+        FROM access.access_relationships
+        UNION ALL
+        SELECT 'access.spaces', count(*)::integer FROM access.spaces
+        UNION ALL
+        SELECT 'identity.agent_principals', count(*)::integer FROM identity.agent_principals
+        UNION ALL
+        SELECT 'identity.memberships', count(*)::integer FROM identity.memberships
+        UNION ALL
+        SELECT 'identity.people', count(*)::integer FROM identity.people
+        UNION ALL
+        SELECT 'identity.policy_versions', count(*)::integer FROM identity.policy_versions
+        UNION ALL
+        SELECT 'identity.service_principals', count(*)::integer FROM identity.service_principals
+        UNION ALL
+        SELECT 'identity.tenants', count(*)::integer FROM identity.tenants
+        UNION ALL
+        SELECT 'identity.users', count(*)::integer FROM identity.users
+        UNION ALL
+        SELECT 'identity.workspaces', count(*)::integer FROM identity.workspaces
+        ORDER BY relation_name
+      `);
+
+      expect(context.rows[0]).toEqual({ tenant_id: null, workspace_id: null });
+      expect(protectedCounts.rows).toEqual(
+        [
+          "access.access_relationships",
+          "access.spaces",
+          "identity.agent_principals",
+          "identity.memberships",
+          "identity.people",
+          "identity.policy_versions",
+          "identity.service_principals",
+          "identity.tenants",
+          "identity.users",
+          "identity.workspaces"
+        ].map((relationName) => ({ relation_name: relationName, row_count: 0 }))
+      );
+    } finally {
+      client.release();
+    }
+  });
+
+  it("rejects a tenant B Space insert under tenant A context without persisting it", async () => {
+    const mismatchedSpaceId = "33333333-3333-4333-8333-333333333331";
+    const context = createDevSecurityContext("tenant-a-owner");
+
+    await ownerPool.query("DELETE FROM access.spaces WHERE id = $1", [mismatchedSpaceId]);
+
+    try {
+      let insertError: unknown;
+      try {
+        await withTenantTransaction({ pool: appPool, context }, async (tx) => {
+          await tx.query(
+            `
+            INSERT INTO access.spaces
+              (id, tenant_id, workspace_id, kind, name, slug, access_class, inheritance_mode)
+            VALUES ($1, $2, $3, 'knowledge', 'Mismatched RLS write',
+              'mismatched-rls-write', 'restricted', 'restricted')
+            `,
+            [mismatchedSpaceId, devFixtures.tenantB, devFixtures.workspaceB]
+          );
+        });
+      } catch (error) {
+        insertError = error;
+      }
+
+      expect.soft(insertError).toMatchObject({ code: "42501" });
+
+      const persisted = await ownerPool.query<{ count: string }>(
+        "SELECT count(*)::text AS count FROM access.spaces WHERE id = $1",
+        [mismatchedSpaceId]
+      );
+      expect(persisted.rows[0]?.count).toBe("0");
+    } finally {
+      await ownerPool.query("DELETE FROM access.spaces WHERE id = $1", [mismatchedSpaceId]);
+    }
+  });
+
   it("denies tenant B rows through the app role under tenant A context", async () => {
     const context = createDevSecurityContext("tenant-a-owner");
 
