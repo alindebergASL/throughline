@@ -13,7 +13,9 @@ const requiredEnvironment = [
   "FOUNDATION_SQS_DLQ_URL",
   "AWS_REGION",
   "AWS_ACCESS_KEY_ID",
-  "AWS_SECRET_ACCESS_KEY"
+  "AWS_SECRET_ACCESS_KEY",
+  "FOUNDATION_CONTEXT_VERIFICATION_KEYS_JSON",
+  "FOUNDATION_CONTEXT_ACTIVE_KEY_ID"
 ];
 
 const missing = requiredEnvironment.filter((name) => !process.env[name]?.trim());
