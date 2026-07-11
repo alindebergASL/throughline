@@ -6,6 +6,7 @@ import {
   type RelayClaimOptions,
   type RelayOutboxRepository
 } from "@throughline/db";
+import { withPropagatedSpan, type TraceCarrier } from "@throughline/observability";
 import { buildScopedQueueKey } from "@throughline/tenancy";
 
 export interface SqsSendMessageInput {
@@ -47,29 +48,47 @@ export class FoundationOutboxRelay {
     const event = await this.repository.claimNext(context, claimOptions);
     if (!event) return { status: "idle" };
 
-    const input = createSendMessageInput(this.queueUrl, event);
-    let acknowledgment: { MessageId?: string };
-    try {
-      acknowledgment = await this.sqs.send(this.commands.create(input));
-    } catch (error) {
-      await this.recordFailure(context, event, classifySqsPublicationError(error));
-      throw error;
-    }
+    return withPropagatedSpan(
+      {
+        name: "foundation.relay.publish",
+        parentCarrier: {
+          traceparent: event.traceparent,
+          ...(event.tracestate === undefined ? {} : { tracestate: event.tracestate })
+        },
+        attributes: {
+          "throughline.request.id": event.requestId,
+          "throughline.job.id": event.jobId,
+          "throughline.tenant.id": event.tenantId,
+          "throughline.workspace.id": event.workspaceId,
+          "throughline.space.id": event.spaceId
+        }
+      },
+      async ({ carrier }) => {
+        const input = createSendMessageInput(this.queueUrl, event, carrier);
+        let acknowledgment: { MessageId?: string };
+        try {
+          acknowledgment = await this.sqs.send(this.commands.create(input));
+        } catch (error) {
+          await this.recordFailure(context, event, classifySqsPublicationError(error));
+          throw error;
+        }
 
-    if (!acknowledgment.MessageId) {
-      await this.repository.markRetry(context, event, {
-        code: "missing_message_id",
-        delaySeconds: retryDelaySeconds(event.publicationAttempt)
-      });
-      throw new Error("SQS SendMessage acknowledgment did not include a MessageId");
-    }
+        if (!acknowledgment.MessageId) {
+          await this.repository.markRetry(context, event, {
+            code: "missing_message_id",
+            delaySeconds: retryDelaySeconds(event.publicationAttempt)
+          });
+          throw new Error("SQS SendMessage acknowledgment did not include a MessageId");
+        }
 
-    await this.repository.markPublished(context, event, acknowledgment.MessageId);
-    return {
-      status: "published",
-      eventId: event.eventId,
-      messageId: acknowledgment.MessageId
-    };
+        await this.repository.markPublished(context, event, acknowledgment.MessageId);
+        return {
+          status: "published" as const,
+          eventId: event.eventId,
+          messageId: acknowledgment.MessageId
+        };
+      }
+    );
   }
 
   private async recordFailure(
@@ -111,9 +130,15 @@ export function classifySqsPublicationError(error: unknown): ClassifiedPublicati
 
 export function createSendMessageInput(
   queueUrl: string,
-  event: ClaimedOutboxEvent
+  event: ClaimedOutboxEvent,
+  propagationCarrier: TraceCarrier = event
 ): SqsSendMessageInput {
   const envelope = toFoundationQueueEnvelope(event);
+  envelope.traceparent = propagationCarrier.traceparent;
+  delete envelope.tracestate;
+  if (propagationCarrier.tracestate !== undefined) {
+    envelope.tracestate = propagationCarrier.tracestate;
+  }
   validateFoundationQueueEnvelope(envelope);
   const attributes: SqsSendMessageInput["MessageAttributes"] = {
     routingKey: stringAttribute(buildScopedQueueKey(envelope.scope)),

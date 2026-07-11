@@ -8,6 +8,7 @@ import {
   upsertFoundationTestAggregate,
   withTenantTransaction
 } from "@throughline/db";
+import { withPropagatedSpan } from "@throughline/observability";
 import type { AsyncContextReferenceCodec } from "@throughline/tenancy";
 import { generateUuidV7, parseSecurityContext } from "@throughline/tenancy";
 import type { TransactionAwareAuthorizationService } from "@throughline/authorization";
@@ -76,54 +77,74 @@ export class FoundationProofService {
       if (!context.actorUserId || !context.actorMembershipId) {
         throw new ForbiddenException("Foundation proof requires a human actor");
       }
+      const delegatingUserId = context.actorUserId;
+      const delegatingMembershipId = context.actorMembershipId;
 
-      await insertFoundationContextReference(tx, {
-        id: issued.claims.referenceId,
-        jobId: issued.claims.jobId,
-        tenantId: context.tenantId,
-        workspaceId: context.workspaceId,
-        spaceId: input.spaceId,
-        workerServicePrincipalId: this.options.workerServicePrincipalId,
-        delegatingUserId: context.actorUserId,
-        delegatingMembershipId: context.actorMembershipId,
-        policyVersionId: context.policyVersion,
-        contextSnapshot: context,
-        issuedAt: new Date(issued.claims.issuedAt * 1_000),
-        expiresAt: referenceExpiry,
-        signingKeyId: issued.claims.signingKeyId
-      });
+      return withPropagatedSpan(
+        {
+          name: "foundation.api.outbox",
+          parentCarrier: {
+            ...(input.traceparent === undefined ? {} : { traceparent: input.traceparent }),
+            ...(input.tracestate === undefined ? {} : { tracestate: input.tracestate })
+          },
+          attributes: {
+            "throughline.request.id": context.requestId,
+            "throughline.job.id": issued.claims.jobId,
+            "throughline.tenant.id": context.tenantId,
+            "throughline.workspace.id": context.workspaceId,
+            "throughline.space.id": input.spaceId
+          }
+        },
+        async ({ carrier }) => {
+          await insertFoundationContextReference(tx, {
+            id: issued.claims.referenceId,
+            jobId: issued.claims.jobId,
+            tenantId: context.tenantId,
+            workspaceId: context.workspaceId,
+            spaceId: input.spaceId,
+            workerServicePrincipalId: this.options.workerServicePrincipalId,
+            delegatingUserId,
+            delegatingMembershipId,
+            policyVersionId: context.policyVersion,
+            contextSnapshot: context,
+            issuedAt: new Date(issued.claims.issuedAt * 1_000),
+            expiresAt: referenceExpiry,
+            signingKeyId: issued.claims.signingKeyId
+          });
 
-      const aggregate = await upsertFoundationTestAggregate(tx, {
-        id: this.options.uuidV7(),
-        tenantId: context.tenantId,
-        workspaceId: context.workspaceId,
-        spaceId: input.spaceId,
-        proofKey: input.proofKey,
-        jobId: issued.claims.jobId
-      });
+          const aggregate = await upsertFoundationTestAggregate(tx, {
+            id: this.options.uuidV7(),
+            tenantId: context.tenantId,
+            workspaceId: context.workspaceId,
+            spaceId: input.spaceId,
+            proofKey: input.proofKey,
+            jobId: issued.claims.jobId
+          });
 
-      await insertFoundationOutboxEvent(tx, {
-        id: this.options.uuidV7(),
-        tenantId: context.tenantId,
-        workspaceId: context.workspaceId,
-        spaceId: input.spaceId,
-        aggregateId: aggregate.id,
-        aggregateVersion: aggregate.aggregateVersion,
-        causationId: this.options.uuidV7(),
-        requestId: context.requestId,
-        traceparent: validTraceparent(input.traceparent),
-        ...(validTracestate(input.tracestate) ? { tracestate: input.tracestate } : {}),
-        jobId: issued.claims.jobId,
-        relayServicePrincipalId: this.options.relayServicePrincipalId,
-        contextReferenceId: issued.claims.referenceId,
-        signedContextReference: issued.token
-      });
+          await insertFoundationOutboxEvent(tx, {
+            id: this.options.uuidV7(),
+            tenantId: context.tenantId,
+            workspaceId: context.workspaceId,
+            spaceId: input.spaceId,
+            aggregateId: aggregate.id,
+            aggregateVersion: aggregate.aggregateVersion,
+            causationId: this.options.uuidV7(),
+            requestId: context.requestId,
+            traceparent: carrier.traceparent,
+            ...(carrier.tracestate === undefined ? {} : { tracestate: carrier.tracestate }),
+            jobId: issued.claims.jobId,
+            relayServicePrincipalId: this.options.relayServicePrincipalId,
+            contextReferenceId: issued.claims.referenceId,
+            signedContextReference: issued.token
+          });
 
-      return {
-        jobId: issued.claims.jobId,
-        aggregateId: aggregate.id,
-        aggregateVersion: aggregate.aggregateVersion
-      };
+          return {
+            jobId: issued.claims.jobId,
+            aggregateId: aggregate.id,
+            aggregateVersion: aggregate.aggregateVersion
+          };
+        }
+      );
     });
   }
 }
@@ -150,14 +171,4 @@ export function defaultFoundationProofRuntimeOptions(
   options: Omit<FoundationProofRuntimeOptions, "uuidV7"> & { uuidV7?: () => string }
 ): FoundationProofRuntimeOptions {
   return { ...options, uuidV7: options.uuidV7 ?? (() => generateUuidV7()) };
-}
-
-function validTraceparent(value: string | undefined): string {
-  return value && /^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/.test(value)
-    ? value
-    : "00-00000000000000000000000000000001-0000000000000001-01";
-}
-
-function validTracestate(value: string | undefined): boolean {
-  return value !== undefined && value.length > 0 && value.length <= 512 && !/[\r\n]/.test(value);
 }

@@ -1,6 +1,7 @@
 import {
   createRequestTraceContext,
   toWorkerTraceEnvelope,
+  withPropagatedSpan,
   type RequestTraceContext,
   type RequestTraceContextInput
 } from "@throughline/observability";
@@ -139,39 +140,57 @@ export async function rehydrateFoundationWorkerContext(
   }
 
   const snapshot = parseSecurityContext(stored.contextSnapshot);
-  const securityContext: SecurityContext = {
-    requestId: envelope.requestId,
-    traceId: envelope.traceparent.slice(3, 35),
-    tenantId: claims.tenantId,
-    workspaceId: claims.workspaceId,
-    servicePrincipalId: claims.workerServicePrincipalId,
-    delegatedByUserId: stored.delegatingUserId,
-    delegatedByMembershipId: stored.delegatingMembershipId,
-    requestedSpaceIds: [claims.spaceId],
-    membershipIds: [],
-    roleHints: [],
-    dataClassCeiling: snapshot.dataClassCeiling,
-    policyVersion: claims.policyVersionId,
-    issuedAt: toIsoString(stored.issuedAt),
-    expiresAt: toIsoString(stored.expiresAt)
-  };
+  return withPropagatedSpan(
+    {
+      name: "foundation.worker.receive",
+      parentCarrier: {
+        traceparent: envelope.traceparent,
+        ...(envelope.tracestate === undefined ? {} : { tracestate: envelope.tracestate })
+      },
+      attributes: {
+        "throughline.request.id": envelope.requestId,
+        "throughline.job.id": claims.jobId,
+        "throughline.tenant.id": claims.tenantId,
+        "throughline.workspace.id": claims.workspaceId,
+        "throughline.space.id": claims.spaceId
+      }
+    },
+    ({ carrier }) => {
+      const securityContext: SecurityContext = {
+        requestId: envelope.requestId,
+        traceId: carrier.traceparent.slice(3, 35),
+        tenantId: claims.tenantId,
+        workspaceId: claims.workspaceId,
+        servicePrincipalId: claims.workerServicePrincipalId,
+        delegatedByUserId: stored.delegatingUserId,
+        delegatedByMembershipId: stored.delegatingMembershipId,
+        requestedSpaceIds: [claims.spaceId],
+        membershipIds: [],
+        roleHints: [],
+        dataClassCeiling: snapshot.dataClassCeiling,
+        policyVersion: claims.policyVersionId,
+        issuedAt: toIsoString(stored.issuedAt),
+        expiresAt: toIsoString(stored.expiresAt)
+      };
 
-  const metadata = {
-    eventId: envelope.eventId,
-    jobId: envelope.jobId,
-    requestId: envelope.requestId,
-    traceparent: envelope.traceparent,
-    ...(envelope.tracestate === undefined ? {} : { tracestate: envelope.tracestate })
-  };
-  Object.defineProperty(metadata, "contextReferenceId", {
-    value: claims.referenceId,
-    enumerable: false,
-    writable: false
-  });
-  return {
-    securityContext,
-    metadata: metadata as RehydratedFoundationWorkerContext["metadata"]
-  };
+      const metadata = {
+        eventId: envelope.eventId,
+        jobId: envelope.jobId,
+        requestId: envelope.requestId,
+        traceparent: carrier.traceparent,
+        ...(carrier.tracestate === undefined ? {} : { tracestate: carrier.tracestate })
+      };
+      Object.defineProperty(metadata, "contextReferenceId", {
+        value: claims.referenceId,
+        enumerable: false,
+        writable: false
+      });
+      return {
+        securityContext,
+        metadata: metadata as RehydratedFoundationWorkerContext["metadata"]
+      };
+    }
+  );
 }
 
 function parseEnvelope(body: string): FoundationQueueEnvelope {
