@@ -308,6 +308,341 @@ describe("foundation.relay.publish exact authorization", () => {
   });
 });
 
+describe("foundation.worker.consume exact authorization", () => {
+  const workerId = "70000000-0000-7000-8000-000000000051";
+  const referenceId = "70000000-0000-7000-8000-000000000031";
+  const jobId = "70000000-0000-7000-8000-000000000021";
+  const delegatorUserId = "70000000-0000-7000-8000-000000000081";
+  const delegatorMembershipId = "70000000-0000-7000-8000-000000000083";
+
+  const workerContext = (overrides: Partial<SecurityContext> = {}): SecurityContext => ({
+    ...createDevSecurityContext("tenant-a-service"),
+    servicePrincipalId: workerId,
+    delegatedByUserId: delegatorUserId,
+    delegatedByMembershipId: delegatorMembershipId,
+    requestedSpaceIds: [devFixtures.restrictedSpaceA],
+    ...overrides
+  });
+
+  type WorkerBinding = {
+    referenceId: string;
+    jobId: string;
+    workerServicePrincipalId: string;
+    tenantId: string;
+    workspaceId: string;
+    spaceId: string;
+    policyVersionId: string;
+    delegatingUserId: string;
+    delegatingMembershipId: string;
+  };
+
+  const binding = (overrides: Partial<WorkerBinding> = {}): WorkerBinding => ({
+    referenceId,
+    jobId,
+    workerServicePrincipalId: workerId,
+    tenantId: devFixtures.tenantA,
+    workspaceId: devFixtures.workspaceA,
+    spaceId: devFixtures.restrictedSpaceA,
+    policyVersionId: "default-v1",
+    delegatingUserId: delegatorUserId,
+    delegatingMembershipId: delegatorMembershipId,
+    ...overrides
+  });
+
+  function workerExecutor(
+    overrides: Partial<{
+      tenantStatus: string;
+      workspaceStatus: string;
+      policyStatus: string;
+      purpose: string;
+      workerStatus: string;
+      userStatus: string;
+      membershipStatus: string;
+      membershipRole: "owner" | "admin" | "member" | "viewer";
+      spaceActive: boolean;
+      workerGrant: { relation: string; source: string } | null;
+      delegatorGrant: boolean;
+      referenceStatus: string;
+      referenceRevokedAt: Date | null;
+      referenceExpiresAt: Date;
+    }> = {}
+  ) {
+    const queries: Array<{ sql: string; values: readonly unknown[] | undefined }> = [];
+    const tx = {
+      query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+        queries.push({ sql, values });
+        if (sql.includes("FROM ops.security_context_references")) {
+          return {
+            rows: [
+              {
+                referenceId,
+                status: overrides.referenceStatus ?? "active",
+                revokedAt: overrides.referenceRevokedAt ?? null,
+                expiresAt: overrides.referenceExpiresAt ?? new Date("2099-01-01T00:00:00.000Z"),
+                tenantId: devFixtures.tenantA,
+                workspaceId: devFixtures.workspaceA,
+                spaceId: devFixtures.restrictedSpaceA,
+                jobId,
+                workerServicePrincipalId: workerId,
+                policyVersionId: "default-v1",
+                delegatingUserId: delegatorUserId,
+                delegatingMembershipId: delegatorMembershipId
+              }
+            ]
+          };
+        }
+        if (sql.includes("FROM identity.tenants")) {
+          return { rows: [{ status: overrides.tenantStatus ?? "active" }] };
+        }
+        if (sql.includes("FROM identity.workspaces")) {
+          return { rows: [{ status: overrides.workspaceStatus ?? "active" }] };
+        }
+        if (sql.includes("FROM identity.policy_versions")) {
+          return { rows: [{ status: overrides.policyStatus ?? "active" }] };
+        }
+        if (sql.includes("FROM identity.service_principals")) {
+          return {
+            rows: [
+              {
+                purpose: overrides.purpose ?? "worker",
+                status: overrides.workerStatus ?? "active"
+              }
+            ]
+          };
+        }
+        if (sql.includes("FROM identity.users")) {
+          return { rows: [{ status: overrides.userStatus ?? "active" }] };
+        }
+        if (sql.includes("FROM identity.memberships")) {
+          return {
+            rows: [
+              {
+                status: overrides.membershipStatus ?? "active",
+                role: overrides.membershipRole ?? "member"
+              }
+            ]
+          };
+        }
+        if (sql.includes("FROM access.spaces")) {
+          return { rows: overrides.spaceActive === false ? [] : [{ id: binding().spaceId }] };
+        }
+        if (sql.includes("FROM access.access_relationships")) {
+          if (sql.includes("subject_type = 'service_principal'")) {
+            const grant =
+              overrides.workerGrant === undefined
+                ? { relation: "contributor", source: "direct" }
+                : overrides.workerGrant;
+            return { rows: grant ? [grant] : [] };
+          }
+          return { rows: overrides.delegatorGrant === false ? [] : [{ id: "delegator-grant" }] };
+        }
+        throw new Error(`Unexpected worker authorization query: ${sql}`);
+      })
+    } as unknown as TenantQueryExecutor;
+    return { queries, tx };
+  }
+
+  const workerAuthorizationService = new PostgresAuthorizationService({} as PgPool) as unknown as {
+    canInTransaction(
+      context: SecurityContext,
+      action: string,
+      resource: { type: "space"; id: string },
+      tx: TenantQueryExecutor,
+      options: { workerBinding: WorkerBinding }
+    ): Promise<{ allowed: boolean; reasonCode: string; evaluatedRelationships?: string[] }>;
+  };
+
+  const authorizeWorker = (
+    context: SecurityContext,
+    workerBinding: WorkerBinding,
+    tx: TenantQueryExecutor
+  ) =>
+    workerAuthorizationService.canInTransaction(
+      context,
+      "foundation.worker.consume",
+      { type: "space", id: workerBinding.spaceId },
+      tx,
+      { workerBinding }
+    );
+
+  it("allows only the exact active worker and delegator pair with direct contributor authority", async () => {
+    const { queries, tx } = workerExecutor();
+
+    await expect(authorizeWorker(workerContext(), binding(), tx)).resolves.toMatchObject({
+      allowed: true,
+      reasonCode: "foundation_worker_direct_contributor",
+      evaluatedRelationships: ["worker_direct_contributor", "delegator_current_space_access"]
+    });
+
+    expect(queries.map(({ sql }) => sql.match(/FROM\s+([a-z_.]+)/)?.[1])).toEqual([
+      "ops.security_context_references",
+      "identity.tenants",
+      "identity.workspaces",
+      "identity.policy_versions",
+      "identity.service_principals",
+      "identity.users",
+      "identity.memberships",
+      "access.spaces",
+      "access.access_relationships",
+      "access.access_relationships"
+    ]);
+    expect(queries.every(({ sql }) => /FOR UPDATE/.test(sql))).toBe(true);
+
+    const [
+      reference,
+      tenant,
+      workspace,
+      policy,
+      worker,
+      user,
+      membership,
+      space,
+      workerGrant,
+      delegatorGrant
+    ] = queries;
+    expect(reference?.sql).toMatch(
+      /id = \$1[\s\S]*job_id = \$2[\s\S]*tenant_id = \$3[\s\S]*workspace_id = \$4[\s\S]*space_id = \$5[\s\S]*worker_service_principal_id = \$6[\s\S]*policy_version_id = \$7[\s\S]*delegating_user_id = \$8[\s\S]*delegating_membership_id = \$9[\s\S]*status = 'active'[\s\S]*revoked_at IS NULL[\s\S]*expires_at > clock_timestamp\(\)/
+    );
+    expect(reference?.values).toEqual([
+      referenceId,
+      jobId,
+      devFixtures.tenantA,
+      devFixtures.workspaceA,
+      devFixtures.restrictedSpaceA,
+      workerId,
+      "default-v1",
+      delegatorUserId,
+      delegatorMembershipId
+    ]);
+    expect(tenant?.sql).toMatch(/id = \$1[\s\S]*status = 'active'/);
+    expect(workspace?.sql).toMatch(/id = \$1[\s\S]*tenant_id = \$2[\s\S]*status = 'active'/);
+    expect(policy?.sql).toMatch(
+      /id = \$1[\s\S]*tenant_id = \$2[\s\S]*workspace_id = \$3[\s\S]*status = 'active'/
+    );
+    expect(worker?.sql).toMatch(
+      /id = \$1[\s\S]*tenant_id = \$2[\s\S]*workspace_id = \$3[\s\S]*purpose = 'worker'[\s\S]*status = 'active'/
+    );
+    expect(user?.sql).toMatch(/id = \$1[\s\S]*status = 'active'/);
+    expect(membership?.sql).toMatch(
+      /id = \$1[\s\S]*user_id = \$2[\s\S]*tenant_id = \$3[\s\S]*workspace_id = \$4[\s\S]*status = 'active'/
+    );
+    expect(space?.sql).toMatch(
+      /id = \$1[\s\S]*tenant_id = \$2[\s\S]*workspace_id = \$3[\s\S]*archived_at IS NULL/
+    );
+    expect(workerGrant?.sql).toMatch(
+      /subject_type = 'service_principal'[\s\S]*subject_id = \$1[\s\S]*relation = 'contributor'[\s\S]*resource_type = 'space'[\s\S]*resource_id = \$2[\s\S]*source = 'direct'/
+    );
+    expect(delegatorGrant?.sql).toMatch(
+      /subject_type IN \('membership', 'user'\)[\s\S]*subject_id IN \(\$1, \$2\)[\s\S]*relation IN \('owner', 'manager', 'contributor', 'viewer'\)[\s\S]*resource_type = 'space'[\s\S]*resource_id = \$3[\s\S]*source = 'direct'/
+    );
+  });
+
+  it.each([
+    ["manager", { workerGrant: { relation: "manager", source: "direct" } }],
+    ["viewer", { workerGrant: { relation: "viewer", source: "direct" } }],
+    ["inherited", { workerGrant: { relation: "contributor", source: "inherited" } }],
+    ["system", { workerGrant: { relation: "contributor", source: "system" } }],
+    ["missing", { workerGrant: null }]
+  ] as const)("denies a %s worker grant", async (_name, overrides) => {
+    const { tx } = workerExecutor(overrides);
+    await expect(authorizeWorker(workerContext(), binding(), tx)).resolves.toMatchObject({
+      allowed: false,
+      reasonCode: "worker_direct_contributor_required"
+    });
+  });
+
+  it.each([
+    ["suspended tenant", { tenantStatus: "suspended" }, "tenant_not_active"],
+    ["deleted tenant", { tenantStatus: "deleted" }, "tenant_not_active"],
+    ["archived workspace", { workspaceStatus: "archived" }, "workspace_not_active"],
+    ["retired policy", { policyStatus: "retired" }, "policy_version_not_active"],
+    ["wrong purpose", { purpose: "system" }, "worker_principal_wrong_purpose"],
+    ["disabled worker", { workerStatus: "disabled" }, "worker_principal_not_active"],
+    ["disabled delegator", { userStatus: "disabled" }, "delegator_user_not_active"],
+    ["suspended membership", { membershipStatus: "suspended" }, "delegator_membership_not_active"],
+    ["archived Space", { spaceActive: false }, "space_not_found"],
+    ["removed delegator authority", { delegatorGrant: false }, "delegator_space_access_denied"],
+    ["revoked reference", { referenceStatus: "revoked" }, "context_reference_not_active"],
+    [
+      "revocation timestamp",
+      { referenceRevokedAt: new Date("2026-01-01T00:00:00.000Z") },
+      "context_reference_not_active"
+    ],
+    [
+      "database-expired reference",
+      { referenceExpiresAt: new Date("2000-01-01T00:00:00.000Z") },
+      "context_reference_not_active"
+    ]
+  ] as const)("denies %s", async (_name, overrides, reasonCode) => {
+    const { tx } = workerExecutor(overrides);
+    await expect(authorizeWorker(workerContext(), binding(), tx)).resolves.toMatchObject({
+      allowed: false,
+      reasonCode
+    });
+  });
+
+  it.each([
+    ["principal", { servicePrincipalId: devFixtures.servicePrincipalA }, {}],
+    ["context delegator", { delegatedByUserId: devFixtures.userB }, {}],
+    ["reference", {}, { referenceId: "70000000-0000-7000-8000-000000000039" }],
+    ["job", {}, { jobId: "70000000-0000-7000-8000-000000000029" }],
+    ["worker", {}, { workerServicePrincipalId: devFixtures.servicePrincipalA }],
+    ["tenant", {}, { tenantId: devFixtures.tenantB }],
+    ["workspace", {}, { workspaceId: devFixtures.workspaceB }],
+    ["Space", {}, { spaceId: devFixtures.rootSpaceB }],
+    ["policy", {}, { policyVersionId: "other-v1" }],
+    ["delegator", {}, { delegatingMembershipId: devFixtures.membershipAViewer }]
+  ] as const)(
+    "denies a mismatched %s binding after only the exact reference lock",
+    async (_name, ctx, ref) => {
+      const { queries, tx } = workerExecutor();
+      await expect(
+        authorizeWorker(workerContext(ctx as Partial<SecurityContext>), binding(ref), tx)
+      ).resolves.toMatchObject({
+        allowed: false,
+        reasonCode: "foundation_worker_binding_mismatch"
+      });
+      expect(queries).toHaveLength(1);
+      expect(queries[0]?.sql).toMatch(/FROM ops\.security_context_references[\s\S]*FOR UPDATE/);
+    }
+  );
+
+  it.each(["owner", "admin"] as const)(
+    "preserves active %s delegator authority without requiring a direct Space relationship",
+    async (membershipRole) => {
+      const { queries, tx } = workerExecutor({ membershipRole, delegatorGrant: false });
+      await expect(authorizeWorker(workerContext(), binding(), tx)).resolves.toMatchObject({
+        allowed: true
+      });
+      expect(
+        queries.filter(({ sql }) => sql.includes("FROM access.access_relationships"))
+      ).toHaveLength(1);
+    }
+  );
+
+  it("does not treat snapshot role or Space hints as authority", async () => {
+    const { tx } = workerExecutor({ workerGrant: null, delegatorGrant: false });
+    await expect(
+      authorizeWorker(
+        workerContext({ roleHints: ["owner", "contributor"], membershipIds: ["snapshot"] }),
+        binding(),
+        tx
+      )
+    ).resolves.toMatchObject({ allowed: false });
+  });
+
+  it("preserves the service-principal default deny for every action except worker consume", async () => {
+    const { tx } = workerExecutor();
+    const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      workerContext(),
+      "space.read",
+      { type: "space", id: devFixtures.restrictedSpaceA },
+      tx as never
+    );
+    expect(decision).toMatchObject({ allowed: false, reasonCode: "principal_default_denied" });
+  });
+});
+
 maybeDescribe("AuthorizationService database decisions", () => {
   let ownerPool: PgPool;
   let appPool: PgPool;

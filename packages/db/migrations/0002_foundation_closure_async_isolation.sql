@@ -64,6 +64,38 @@ AS $$
   SELECT NULLIF(current_setting('app.worker_principal_id', true), '')::uuid
 $$;
 
+CREATE OR REPLACE FUNCTION ops.current_handler_key()
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT NULLIF(current_setting('app.handler_key', true), '')
+$$;
+
+CREATE OR REPLACE FUNCTION ops.current_aggregate_id()
+RETURNS uuid
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT NULLIF(current_setting('app.aggregate_id', true), '')::uuid
+$$;
+
+CREATE OR REPLACE FUNCTION ops.current_aggregate_version()
+RETURNS integer
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT NULLIF(current_setting('app.aggregate_version', true), '')::integer
+$$;
+
+CREATE OR REPLACE FUNCTION ops.current_effect_hash()
+RETURNS text
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT NULLIF(current_setting('app.effect_hash', true), '')
+$$;
+
 CREATE UNIQUE INDEX IF NOT EXISTS memberships_scope_id_user_unique
   ON identity.memberships (tenant_id, workspace_id, id, user_id);
 
@@ -463,6 +495,12 @@ CREATE POLICY tenants_worker_scope ON identity.tenants
   FOR SELECT TO throughline_worker
   USING (current_user = 'throughline_worker' AND id = ops.current_tenant_id());
 
+DROP POLICY IF EXISTS tenants_worker_lock_only ON identity.tenants;
+CREATE POLICY tenants_worker_lock_only ON identity.tenants
+  FOR UPDATE TO throughline_worker
+  USING (current_user = 'throughline_worker' AND id = ops.current_tenant_id())
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS workspaces_worker_scope ON identity.workspaces;
 CREATE POLICY workspaces_worker_scope ON identity.workspaces
   FOR SELECT TO throughline_worker
@@ -472,10 +510,26 @@ CREATE POLICY workspaces_worker_scope ON identity.workspaces
     AND id = ops.current_workspace_id()
   );
 
+DROP POLICY IF EXISTS workspaces_worker_lock_only ON identity.workspaces;
+CREATE POLICY workspaces_worker_lock_only ON identity.workspaces
+  FOR UPDATE TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND id = ops.current_workspace_id()
+  )
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS users_worker_scope ON identity.users;
 CREATE POLICY users_worker_scope ON identity.users
   FOR SELECT TO throughline_worker
   USING (current_user = 'throughline_worker' AND id = ops.current_user_id());
+
+DROP POLICY IF EXISTS users_worker_lock_only ON identity.users;
+CREATE POLICY users_worker_lock_only ON identity.users
+  FOR UPDATE TO throughline_worker
+  USING (current_user = 'throughline_worker' AND id = ops.current_user_id())
+  WITH CHECK (false);
 
 DROP POLICY IF EXISTS memberships_worker_scope ON identity.memberships;
 CREATE POLICY memberships_worker_scope ON identity.memberships
@@ -488,6 +542,18 @@ CREATE POLICY memberships_worker_scope ON identity.memberships
     AND user_id = ops.current_user_id()
   );
 
+DROP POLICY IF EXISTS memberships_worker_lock_only ON identity.memberships;
+CREATE POLICY memberships_worker_lock_only ON identity.memberships
+  FOR UPDATE TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND id = ops.current_membership_id()
+    AND user_id = ops.current_user_id()
+  )
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS service_principals_worker_scope ON identity.service_principals;
 CREATE POLICY service_principals_worker_scope ON identity.service_principals
   FOR SELECT TO throughline_worker
@@ -497,6 +563,17 @@ CREATE POLICY service_principals_worker_scope ON identity.service_principals
     AND workspace_id = ops.current_workspace_id()
     AND id = ops.current_worker_principal_id()
   );
+
+DROP POLICY IF EXISTS service_principals_worker_lock_only ON identity.service_principals;
+CREATE POLICY service_principals_worker_lock_only ON identity.service_principals
+  FOR UPDATE TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND id = ops.current_worker_principal_id()
+  )
+  WITH CHECK (false);
 
 DROP POLICY IF EXISTS policy_versions_worker_scope ON identity.policy_versions;
 CREATE POLICY policy_versions_worker_scope ON identity.policy_versions
@@ -508,6 +585,17 @@ CREATE POLICY policy_versions_worker_scope ON identity.policy_versions
     AND id = ops.current_policy_version()
   );
 
+DROP POLICY IF EXISTS policy_versions_worker_lock_only ON identity.policy_versions;
+CREATE POLICY policy_versions_worker_lock_only ON identity.policy_versions
+  FOR UPDATE TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND id = ops.current_policy_version()
+  )
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS spaces_worker_scope ON access.spaces;
 CREATE POLICY spaces_worker_scope ON access.spaces
   FOR SELECT TO throughline_worker
@@ -517,6 +605,17 @@ CREATE POLICY spaces_worker_scope ON access.spaces
     AND workspace_id = ops.current_workspace_id()
     AND id = ops.current_space_id()
   );
+
+DROP POLICY IF EXISTS spaces_worker_lock_only ON access.spaces;
+CREATE POLICY spaces_worker_lock_only ON access.spaces
+  FOR UPDATE TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND id = ops.current_space_id()
+  )
+  WITH CHECK (false);
 
 DROP POLICY IF EXISTS access_relationships_worker_scope ON access.access_relationships;
 CREATE POLICY access_relationships_worker_scope ON access.access_relationships
@@ -534,6 +633,40 @@ CREATE POLICY access_relationships_worker_scope ON access.access_relationships
     )
   );
 
+DROP POLICY IF EXISTS access_relationships_worker_principal_lock_only ON access.access_relationships;
+CREATE POLICY access_relationships_worker_principal_lock_only ON access.access_relationships
+  FOR UPDATE TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND resource_type = 'space'
+    AND resource_id = ops.current_space_id()
+    AND relation = 'contributor'
+    AND source = 'direct'
+    AND subject_type = 'service_principal'
+    AND subject_id = ops.current_worker_principal_id()
+  )
+  WITH CHECK (false);
+
+DROP POLICY IF EXISTS access_relationships_worker_delegator_lock_only ON access.access_relationships;
+CREATE POLICY access_relationships_worker_delegator_lock_only ON access.access_relationships
+  FOR UPDATE TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND resource_type = 'space'
+    AND resource_id = ops.current_space_id()
+    AND (relation = 'contributor' OR relation IN ('owner', 'manager', 'viewer'))
+    AND source = 'direct'
+    AND (
+      (subject_type = 'membership' AND subject_id = ops.current_membership_id())
+      OR (subject_type = 'user' AND subject_id = ops.current_user_id())
+    )
+  )
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS security_context_references_worker_bootstrap ON ops.security_context_references;
 CREATE POLICY security_context_references_worker_bootstrap ON ops.security_context_references
   FOR SELECT TO throughline_worker
@@ -548,9 +681,38 @@ CREATE POLICY security_context_references_worker_bootstrap ON ops.security_conte
     AND policy_version_id = ops.current_policy_version()
   );
 
+DROP POLICY IF EXISTS security_context_references_worker_lock_only ON ops.security_context_references;
+CREATE POLICY security_context_references_worker_lock_only ON ops.security_context_references
+  FOR UPDATE TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND space_id = ops.current_space_id()
+    AND id = ops.current_context_reference_id()
+    AND job_id = ops.current_job_id()
+    AND worker_service_principal_id = ops.current_worker_principal_id()
+    AND policy_version_id = ops.current_policy_version()
+    AND delegating_user_id = ops.current_user_id()
+    AND delegating_membership_id = ops.current_membership_id()
+  )
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS foundation_test_aggregates_worker_scope ON ops.foundation_test_aggregates;
-CREATE POLICY foundation_test_aggregates_worker_scope ON ops.foundation_test_aggregates
-  TO throughline_worker
+DROP POLICY IF EXISTS foundation_test_aggregates_worker_job_select ON ops.foundation_test_aggregates;
+CREATE POLICY foundation_test_aggregates_worker_job_select ON ops.foundation_test_aggregates
+  FOR SELECT TO throughline_worker
+  USING (
+    current_user = 'throughline_worker'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND space_id = ops.current_space_id()
+    AND (pending_job_id = ops.current_job_id() OR last_effect_job_id = ops.current_job_id())
+  );
+
+DROP POLICY IF EXISTS foundation_test_aggregates_worker_pending_update ON ops.foundation_test_aggregates;
+CREATE POLICY foundation_test_aggregates_worker_pending_update ON ops.foundation_test_aggregates
+  FOR UPDATE TO throughline_worker
   USING (
     current_user = 'throughline_worker'
     AND tenant_id = ops.current_tenant_id()
@@ -563,7 +725,8 @@ CREATE POLICY foundation_test_aggregates_worker_scope ON ops.foundation_test_agg
     AND tenant_id = ops.current_tenant_id()
     AND workspace_id = ops.current_workspace_id()
     AND space_id = ops.current_space_id()
-    AND pending_job_id = ops.current_job_id()
+    AND pending_job_id IS NULL
+    AND last_effect_job_id = ops.current_job_id()
   );
 
 DROP POLICY IF EXISTS idempotency_records_worker_scope ON ops.idempotency_records;
@@ -576,6 +739,10 @@ CREATE POLICY idempotency_records_worker_scope ON ops.idempotency_records
     AND space_id = ops.current_space_id()
     AND job_id = ops.current_job_id()
     AND context_reference_id = ops.current_context_reference_id()
+    AND handler_key = ops.current_handler_key()
+    AND aggregate_id = ops.current_aggregate_id()
+    AND aggregate_version = ops.current_aggregate_version()
+    AND effect_hash = ops.current_effect_hash()
   );
 
 DROP POLICY IF EXISTS idempotency_records_worker_insert ON ops.idempotency_records;
@@ -588,6 +755,10 @@ CREATE POLICY idempotency_records_worker_insert ON ops.idempotency_records
     AND space_id = ops.current_space_id()
     AND job_id = ops.current_job_id()
     AND context_reference_id = ops.current_context_reference_id()
+    AND handler_key = ops.current_handler_key()
+    AND aggregate_id = ops.current_aggregate_id()
+    AND aggregate_version = ops.current_aggregate_version()
+    AND effect_hash = ops.current_effect_hash()
   );
 
 REVOKE ALL PRIVILEGES ON SCHEMA identity, access, ops FROM throughline_relay, throughline_worker;
@@ -615,7 +786,11 @@ GRANT EXECUTE ON FUNCTION
   ops.current_policy_version(),
   ops.current_job_id(),
   ops.current_context_reference_id(),
-  ops.current_worker_principal_id()
+  ops.current_worker_principal_id(),
+  ops.current_handler_key(),
+  ops.current_aggregate_id(),
+  ops.current_aggregate_version(),
+  ops.current_effect_hash()
 TO throughline_worker;
 
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA ops TO throughline_app;
@@ -636,6 +811,15 @@ GRANT SELECT (id, status) ON identity.users TO throughline_worker;
 GRANT SELECT (id, tenant_id, workspace_id, user_id, role, status) ON identity.memberships
   TO throughline_worker;
 
+GRANT UPDATE (id) ON identity.tenants TO throughline_worker;
+GRANT UPDATE (id) ON identity.workspaces TO throughline_worker;
+GRANT UPDATE (id) ON identity.users TO throughline_worker;
+GRANT UPDATE (id) ON identity.memberships TO throughline_worker;
+GRANT UPDATE (id) ON identity.policy_versions TO throughline_worker;
+GRANT UPDATE (id) ON identity.service_principals TO throughline_worker;
+GRANT UPDATE (id) ON access.spaces TO throughline_worker;
+GRANT UPDATE (id) ON access.access_relationships TO throughline_worker;
+
 GRANT SELECT (
   id, event_type, tenant_id, workspace_id, space_id, aggregate_type, aggregate_id,
   aggregate_version, causation_id, request_id, traceparent, tracestate, job_id,
@@ -650,11 +834,12 @@ GRANT UPDATE (
 ) ON ops.outbox_events TO throughline_relay;
 
 GRANT SELECT ON ops.security_context_references TO throughline_worker;
+GRANT UPDATE (id) ON ops.security_context_references TO throughline_worker;
 GRANT SELECT (
   id, tenant_id, workspace_id, space_id, proof_key, pending_job_id, last_effect_job_id,
   effect_count, aggregate_version, created_at, updated_at
 ) ON ops.foundation_test_aggregates TO throughline_worker;
-GRANT UPDATE (last_effect_job_id, effect_count, aggregate_version, updated_at)
+GRANT UPDATE (pending_job_id, last_effect_job_id, effect_count, aggregate_version, updated_at)
   ON ops.foundation_test_aggregates TO throughline_worker;
 GRANT SELECT, INSERT ON ops.idempotency_records TO throughline_worker;
 

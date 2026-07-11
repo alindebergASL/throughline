@@ -9,9 +9,15 @@
     "build": "tsc -p tsconfig.json",
     "lint": "eslint .",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:foundation-real": "node scripts/run-foundation-worker-integration.mjs"
   },
   "dependencies": {
-    "@throughline/observability": "workspace:*"
+    "@aws-sdk/client-sqs": "^3.840.0",
+    "@throughline/authorization": "workspace:*",
+    "@throughline/core-types": "workspace:*",
+    "@throughline/db": "workspace:*",
+    "@throughline/observability": "workspace:*",
+    "@throughline/tenancy": "workspace:*"
   }
 }

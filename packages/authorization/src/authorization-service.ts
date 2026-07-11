@@ -2,7 +2,13 @@ import type { AuthorizationDecision, ResourceRef, SecurityContext } from "@throu
 import type { PgPool, TenantQueryExecutor } from "@throughline/db";
 import { withTenantTransaction } from "@throughline/db";
 import { isSecurityContextExpired, parseSecurityContext } from "@throughline/tenancy";
-import type { AuthorizationAction, TransactionAwareAuthorizationService } from "./types.js";
+import type {
+  AuthorizationAction,
+  AuthorizationDecisionOptions,
+  TransactionAuthorizationDecisionOptions,
+  TransactionAwareAuthorizationService,
+  WorkerAuthorizationBinding
+} from "./types.js";
 
 type MembershipRole = "owner" | "admin" | "member" | "viewer";
 
@@ -19,7 +25,7 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
     inputContext: SecurityContext,
     action: AuthorizationAction,
     resource: ResourceRef,
-    options: { explain?: boolean } = {}
+    options: AuthorizationDecisionOptions = {}
   ): Promise<AuthorizationDecision> {
     const contextResult = parseContextForDecision(inputContext);
     if (!contextResult.ok) {
@@ -45,7 +51,7 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
     action: AuthorizationAction,
     resource: ResourceRef,
     tx: TenantQueryExecutor,
-    options: { explain?: boolean } = {}
+    options: TransactionAuthorizationDecisionOptions = {}
   ): Promise<AuthorizationDecision> {
     const contextResult = parseContextForDecision(inputContext);
     if (!contextResult.ok) {
@@ -70,13 +76,16 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
     action: AuthorizationAction,
     resource: ResourceRef,
     tx: TenantQueryExecutor,
-    options: { explain?: boolean }
+    options: TransactionAuthorizationDecisionOptions
   ): Promise<AuthorizationDecision> {
     if (action === "foundation.proof.create") {
       return foundationProofCreateDecision(tx, context, resource, options);
     }
     if (action === "foundation.relay.publish") {
       return foundationRelayPublishDecision(tx, context, resource, options);
+    }
+    if (action === "foundation.worker.consume") {
+      return foundationWorkerConsumeDecision(tx, context, resource, options);
     }
 
     const hasActivePolicyVersion = await loadActivePolicyVersion(tx, context);
@@ -206,6 +215,329 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
 
     return deny(context.policyVersion, "unsupported_action", "Action is not implemented in A2");
   }
+}
+
+async function foundationWorkerConsumeDecision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  resource: ResourceRef,
+  options: TransactionAuthorizationDecisionOptions
+): Promise<AuthorizationDecision> {
+  const binding = options.workerBinding;
+  if (!binding) {
+    return deny(
+      context.policyVersion,
+      "foundation_worker_binding_required",
+      "Foundation worker consumption requires an exact transaction binding"
+    );
+  }
+
+  const reference = await tx.query<{
+    referenceId: string;
+    status: string;
+    revokedAt: Date | null;
+    expiresAt: Date;
+    tenantId: string;
+    workspaceId: string;
+    spaceId: string;
+    jobId: string;
+    workerServicePrincipalId: string;
+    policyVersionId: string;
+    delegatingUserId: string;
+    delegatingMembershipId: string;
+  }>(
+    `SELECT
+       id AS "referenceId",
+       status,
+       revoked_at AS "revokedAt",
+       expires_at AS "expiresAt",
+       tenant_id AS "tenantId",
+       workspace_id AS "workspaceId",
+       space_id AS "spaceId",
+       job_id AS "jobId",
+       worker_service_principal_id AS "workerServicePrincipalId",
+       policy_version_id AS "policyVersionId",
+       delegating_user_id AS "delegatingUserId",
+       delegating_membership_id AS "delegatingMembershipId"
+     FROM ops.security_context_references
+     WHERE id = $1
+       AND job_id = $2
+       AND tenant_id = $3
+       AND workspace_id = $4
+       AND space_id = $5
+       AND worker_service_principal_id = $6
+       AND policy_version_id = $7
+       AND delegating_user_id = $8
+       AND delegating_membership_id = $9
+       AND status = 'active'
+       AND revoked_at IS NULL
+       AND expires_at > clock_timestamp()
+     LIMIT 1
+     FOR UPDATE`,
+    workerBindingValues(binding)
+  );
+
+  if (!workerBindingMatchesContext(context, resource, binding)) {
+    return deny(
+      context.policyVersion,
+      "foundation_worker_binding_mismatch",
+      "Foundation worker transaction binding does not match the rehydrated context"
+    );
+  }
+  const lockedReference = reference.rows[0];
+  if (lockedReference && !workerBindingMatchesReference(binding, lockedReference)) {
+    return deny(
+      context.policyVersion,
+      "foundation_worker_binding_mismatch",
+      "Foundation worker transaction binding does not match the locked reference"
+    );
+  }
+  if (
+    !lockedReference ||
+    lockedReference.status !== "active" ||
+    lockedReference.revokedAt !== null ||
+    new Date(lockedReference.expiresAt).getTime() <= Date.now()
+  ) {
+    return deny(
+      context.policyVersion,
+      "context_reference_not_active",
+      "Worker context reference is not active"
+    );
+  }
+
+  const tenant = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.tenants
+     WHERE id = $1 AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [binding.tenantId]
+  );
+  if (tenant.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "tenant_not_active", "Tenant is not active");
+  }
+
+  const workspace = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.workspaces
+     WHERE id = $1 AND tenant_id = $2 AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [binding.workspaceId, binding.tenantId]
+  );
+  if (workspace.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "workspace_not_active", "Workspace is not active");
+  }
+
+  const policy = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.policy_versions
+     WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3 AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [binding.policyVersionId, binding.tenantId, binding.workspaceId]
+  );
+  if (policy.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "policy_version_not_active", "Policy version is not active");
+  }
+
+  const worker = await tx.query<{ purpose: string; status: string }>(
+    `SELECT purpose, status FROM identity.service_principals
+     WHERE id = $1
+       AND tenant_id = $2
+       AND workspace_id = $3
+       AND purpose = 'worker'
+       AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [binding.workerServicePrincipalId, binding.tenantId, binding.workspaceId]
+  );
+  if (worker.rows[0]?.status !== "active") {
+    return deny(
+      context.policyVersion,
+      "worker_principal_not_active",
+      "Worker principal is not active"
+    );
+  }
+  if (worker.rows[0]?.purpose !== "worker") {
+    return deny(
+      context.policyVersion,
+      "worker_principal_wrong_purpose",
+      "Worker principal purpose must be worker"
+    );
+  }
+
+  const user = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.users
+     WHERE id = $1 AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [binding.delegatingUserId]
+  );
+  if (user.rows[0]?.status !== "active") {
+    return deny(
+      context.policyVersion,
+      "delegator_user_not_active",
+      "Delegating user is not active"
+    );
+  }
+
+  const membership = await tx.query<{ status: string; role: MembershipRole }>(
+    `SELECT status, role FROM identity.memberships
+     WHERE id = $1
+       AND user_id = $2
+       AND tenant_id = $3
+       AND workspace_id = $4
+       AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [
+      binding.delegatingMembershipId,
+      binding.delegatingUserId,
+      binding.tenantId,
+      binding.workspaceId
+    ]
+  );
+  const delegator = membership.rows[0];
+  if (!delegator || delegator.status !== "active") {
+    return deny(
+      context.policyVersion,
+      "delegator_membership_not_active",
+      "Delegating membership is not active"
+    );
+  }
+
+  const space = await tx.query<{ id: string }>(
+    `SELECT id FROM access.spaces
+     WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3 AND archived_at IS NULL
+     LIMIT 1
+     FOR UPDATE`,
+    [binding.spaceId, binding.tenantId, binding.workspaceId]
+  );
+  if (space.rows.length !== 1) {
+    return deny(context.policyVersion, "space_not_found", "Space is not active in the exact scope");
+  }
+
+  const workerGrant = await tx.query<{ relation: string; source: string }>(
+    `SELECT relation, source FROM access.access_relationships
+     WHERE subject_type = 'service_principal'
+       AND subject_id = $1
+       AND relation = 'contributor'
+       AND resource_type = 'space'
+       AND resource_id = $2
+       AND source = 'direct'
+       AND tenant_id = $3
+       AND workspace_id = $4
+     LIMIT 1
+     FOR UPDATE`,
+    [binding.workerServicePrincipalId, binding.spaceId, binding.tenantId, binding.workspaceId]
+  );
+  if (workerGrant.rows[0]?.relation !== "contributor" || workerGrant.rows[0]?.source !== "direct") {
+    return deny(
+      context.policyVersion,
+      "worker_direct_contributor_required",
+      "Worker requires a direct contributor grant on the exact Space"
+    );
+  }
+
+  if (delegator.role !== "owner" && delegator.role !== "admin") {
+    const delegatorGrant = await tx.query<{ id: string }>(
+      `SELECT id FROM access.access_relationships
+       WHERE subject_type IN ('membership', 'user')
+         AND subject_id IN ($1, $2)
+         AND relation IN ('owner', 'manager', 'contributor', 'viewer')
+         AND resource_type = 'space'
+         AND resource_id = $3
+         AND source = 'direct'
+         AND tenant_id = $4
+         AND workspace_id = $5
+       LIMIT 1
+       FOR UPDATE`,
+      [
+        binding.delegatingMembershipId,
+        binding.delegatingUserId,
+        binding.spaceId,
+        binding.tenantId,
+        binding.workspaceId
+      ]
+    );
+    if (delegatorGrant.rows.length !== 1) {
+      return deny(
+        context.policyVersion,
+        "delegator_space_access_denied",
+        "Delegator has no direct current-Space authority"
+      );
+    }
+  }
+
+  return allow(
+    context.policyVersion,
+    "foundation_worker_direct_contributor",
+    options.explain
+      ? "Active worker and delegator are authorized on the exact current Space"
+      : undefined,
+    ["worker_direct_contributor", "delegator_current_space_access"]
+  );
+}
+
+function workerBindingValues(binding: WorkerAuthorizationBinding): readonly string[] {
+  return [
+    binding.referenceId,
+    binding.jobId,
+    binding.tenantId,
+    binding.workspaceId,
+    binding.spaceId,
+    binding.workerServicePrincipalId,
+    binding.policyVersionId,
+    binding.delegatingUserId,
+    binding.delegatingMembershipId
+  ];
+}
+
+function workerBindingMatchesReference(
+  binding: WorkerAuthorizationBinding,
+  reference: {
+    referenceId: string;
+    tenantId: string;
+    workspaceId: string;
+    spaceId: string;
+    jobId: string;
+    workerServicePrincipalId: string;
+    policyVersionId: string;
+    delegatingUserId: string;
+    delegatingMembershipId: string;
+  }
+): boolean {
+  return (
+    binding.referenceId === reference.referenceId &&
+    binding.tenantId === reference.tenantId &&
+    binding.workspaceId === reference.workspaceId &&
+    binding.spaceId === reference.spaceId &&
+    binding.jobId === reference.jobId &&
+    binding.workerServicePrincipalId === reference.workerServicePrincipalId &&
+    binding.policyVersionId === reference.policyVersionId &&
+    binding.delegatingUserId === reference.delegatingUserId &&
+    binding.delegatingMembershipId === reference.delegatingMembershipId
+  );
+}
+
+function workerBindingMatchesContext(
+  context: SecurityContext,
+  resource: ResourceRef,
+  binding: WorkerAuthorizationBinding
+): boolean {
+  return (
+    !context.actorUserId &&
+    !context.actorMembershipId &&
+    !context.agentPrincipalId &&
+    context.servicePrincipalId === binding.workerServicePrincipalId &&
+    context.delegatedByUserId === binding.delegatingUserId &&
+    context.delegatedByMembershipId === binding.delegatingMembershipId &&
+    context.tenantId === binding.tenantId &&
+    context.workspaceId === binding.workspaceId &&
+    context.policyVersion === binding.policyVersionId &&
+    resource.type === "space" &&
+    resource.id === binding.spaceId &&
+    context.requestedSpaceIds.length === 1 &&
+    context.requestedSpaceIds[0] === binding.spaceId
+  );
 }
 
 async function foundationRelayPublishDecision(

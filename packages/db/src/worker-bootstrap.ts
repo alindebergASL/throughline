@@ -19,6 +19,7 @@ export interface WorkerContextReferenceBootstrapOptions {
   token: string;
   codec: AsyncContextReferenceCodec;
   expected: BootstrapExpectedBindings;
+  signal?: AbortSignal;
 }
 
 export class WorkerContextBootstrapError extends Error {
@@ -35,6 +36,7 @@ export class WorkerContextBootstrapError extends Error {
 export async function bootstrapWorkerContextReference(
   options: WorkerContextReferenceBootstrapOptions
 ): Promise<WorkerBootstrapContextReference | null> {
+  assertBootstrapNotAborted(options.signal);
   if (!hasCompleteExpectedBindings(options.expected)) return null;
 
   let claims: AsyncContextReferenceClaims;
@@ -45,25 +47,59 @@ export async function bootstrapWorkerContextReference(
     throw new WorkerContextBootstrapError();
   }
 
-  const client = await options.pool.connect();
+  assertBootstrapNotAborted(options.signal);
+  let client: PgPoolClient;
   try {
+    client = await options.pool.connect();
+  } catch {
+    throw new WorkerContextBootstrapError();
+  }
+  let released = false;
+  let transactionOpen = false;
+  let releaseWithError: Error | undefined;
+  const abortError = new WorkerContextBootstrapError();
+  const destroyForAbort = () => {
+    if (released) return;
+    released = true;
+    client.release(abortError);
+  };
+  options.signal?.addEventListener("abort", destroyForAbort, { once: true });
+  if (options.signal?.aborted) destroyForAbort();
+
+  try {
+    assertBootstrapNotAborted(options.signal);
     await client.query("BEGIN");
+    transactionOpen = true;
     await assertDedicatedWorkerRole(client);
     await setVerifiedBootstrapBindings(client, claims);
     const row = await findWorkerBootstrapContextReference(client, claims);
     const usable = toUsableReference(row, claims);
+    assertBootstrapNotAborted(options.signal);
     await client.query("COMMIT");
+    transactionOpen = false;
     return usable;
   } catch {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      // The safe bootstrap error below deliberately excludes driver detail.
+    if (transactionOpen && !released) {
+      try {
+        await client.query("ROLLBACK");
+        transactionOpen = false;
+      } catch {
+        releaseWithError = new WorkerContextBootstrapError();
+      }
     }
     throw new WorkerContextBootstrapError();
   } finally {
-    client.release();
+    options.signal?.removeEventListener("abort", destroyForAbort);
+    if (!released) {
+      released = true;
+      if (releaseWithError) client.release(releaseWithError);
+      else client.release();
+    }
   }
+}
+
+function assertBootstrapNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new WorkerContextBootstrapError();
 }
 
 async function assertDedicatedWorkerRole(client: PgPoolClient): Promise<void> {

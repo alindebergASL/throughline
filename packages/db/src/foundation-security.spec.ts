@@ -36,11 +36,19 @@ const ids = {
   relayA: "70000000-0000-7000-8000-000000000041",
   relayB: "70000000-0000-7000-8000-000000000042",
   workerA: "70000000-0000-7000-8000-000000000051",
-  workerB: "70000000-0000-7000-8000-000000000052"
+  workerB: "70000000-0000-7000-8000-000000000052",
+  delegatorUserA: "70000000-0000-7000-8000-000000000081",
+  delegatorPersonA: "70000000-0000-7000-8000-000000000082",
+  delegatorMembershipA: "70000000-0000-7000-8000-000000000083",
+  delegatorGrantA: "70000000-0000-7000-8000-000000000084"
 } as const;
 
 const bootstrapSigningKey = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
 const contextCredentialMarker = `request-${ids.jobA}`;
+const fixedHandlerKey = "foundation.worker.consume.v1";
+const fixedEffectHash = createHash("sha256")
+  .update("foundation-worker-effect:aggregate-a:version-1-to-2")
+  .digest("hex");
 
 maybeDescribe("Foundation operational schema security", () => {
   const ownerPool = new pg.Pool({ connectionString: ownerUrl });
@@ -566,6 +574,308 @@ maybeDescribe("Foundation operational schema security", () => {
     ).rejects.toMatchObject({ code: "42501" });
   });
 
+  it("grants UPDATE(id) as the only worker UPDATE column on every authority table", async () => {
+    for (const [schema, table] of [
+      ["identity", "tenants"],
+      ["identity", "workspaces"],
+      ["identity", "users"],
+      ["identity", "memberships"],
+      ["identity", "policy_versions"],
+      ["identity", "service_principals"],
+      ["access", "spaces"],
+      ["access", "access_relationships"],
+      ["ops", "security_context_references"]
+    ] as const) {
+      const grants = await ownerPool.query<{ columnName: string }>(
+        `SELECT column_name AS "columnName"
+         FROM information_schema.column_privileges
+         WHERE grantee = 'throughline_worker'
+           AND privilege_type = 'UPDATE'
+           AND table_schema = $1
+           AND table_name = $2
+         ORDER BY column_name`,
+        [schema, table]
+      );
+      expect(grants.rows, `${schema}.${table}`).toEqual([{ columnName: "id" }]);
+    }
+  });
+
+  it("keeps throughline_worker outside pg_signal_backend", async () => {
+    const membership = await ownerPool.query<{
+      directMembership: boolean;
+      effectiveMember: boolean;
+    }>(`
+      SELECT
+        EXISTS (
+          SELECT 1
+          FROM pg_auth_members memberships
+          JOIN pg_roles granted ON granted.oid = memberships.roleid
+          JOIN pg_roles member ON member.oid = memberships.member
+          WHERE granted.rolname = 'pg_signal_backend'
+            AND member.rolname = 'throughline_worker'
+        ) AS "directMembership",
+        pg_has_role('throughline_worker', 'pg_signal_backend', 'MEMBER') AS "effectiveMember"
+    `);
+    expect(membership.rows).toEqual([{ directMembership: false, effectiveMember: false }]);
+  });
+
+  it("allows fixed same-role cancellation but cannot cancel app, relay, or owner backends", async () => {
+    const canceller = await workerPool.connect();
+    const workerTarget = await workerPool.connect();
+    const protectedTargets = await Promise.all([
+      appPool.connect(),
+      relayPool.connect(),
+      ownerPool.connect()
+    ]);
+    try {
+      const workerIdentity = await workerTarget.query<{ pid: number }>(
+        'SELECT pg_backend_pid()::integer AS "pid"'
+      );
+      const sleeping = workerTarget.query("SELECT pg_sleep(5)");
+      await waitForActiveBackend(ownerPool, workerIdentity.rows[0]!.pid);
+      await expect(
+        canceller.query<{ cancelled: boolean }>(
+          "SELECT pg_catalog.pg_cancel_backend($1) AS cancelled",
+          [workerIdentity.rows[0]!.pid]
+        )
+      ).resolves.toMatchObject({ rows: [{ cancelled: true }] });
+      await expect(sleeping).rejects.toMatchObject({ code: "57014" });
+      await expect(workerTarget.query("SELECT 1 AS alive")).resolves.toMatchObject({
+        rows: [{ alive: 1 }]
+      });
+
+      for (const target of protectedTargets) {
+        const identity = await target.query<{ pid: number }>(
+          'SELECT pg_backend_pid()::integer AS "pid"'
+        );
+        const attempt = await canceller
+          .query<{ cancelled: boolean }>("SELECT pg_catalog.pg_cancel_backend($1) AS cancelled", [
+            identity.rows[0]!.pid
+          ])
+          .then((result) => result.rows[0]?.cancelled ?? false)
+          .catch((error: unknown) => {
+            expect(error).toMatchObject({ code: "42501" });
+            return false;
+          });
+        expect(attempt).toBe(false);
+        await expect(target.query("SELECT 1 AS alive")).resolves.toMatchObject({
+          rows: [{ alive: 1 }]
+        });
+      }
+    } finally {
+      canceller.release();
+      workerTarget.release();
+      for (const target of protectedTargets) target.release();
+    }
+  });
+
+  it("lets the worker row-lock every exact live-authority row without granting mutation", async () => {
+    const client = await workerPool.connect();
+    try {
+      await client.query("BEGIN");
+      await setLocal(client, {
+        tenantId: devFixtures.tenantA,
+        workspaceId: devFixtures.workspaceA,
+        spaceId: devFixtures.rootSpaceA,
+        userId: ids.delegatorUserA,
+        membershipId: ids.delegatorMembershipA,
+        jobId: ids.jobA,
+        referenceId: ids.referenceA,
+        workerPrincipalId: ids.workerA,
+        policyVersion: DEV_POLICY_VERSION
+      });
+
+      for (const [table, predicate, values] of [
+        [
+          "ops.security_context_references",
+          "id = $1 AND job_id = $2 AND tenant_id = $3 AND workspace_id = $4 AND space_id = $5 AND worker_service_principal_id = $6 AND policy_version_id = $7 AND delegating_user_id = $8 AND delegating_membership_id = $9 AND status = 'active' AND revoked_at IS NULL AND expires_at > clock_timestamp()",
+          [
+            ids.referenceA,
+            ids.jobA,
+            devFixtures.tenantA,
+            devFixtures.workspaceA,
+            devFixtures.rootSpaceA,
+            ids.workerA,
+            DEV_POLICY_VERSION,
+            ids.delegatorUserA,
+            ids.delegatorMembershipA
+          ]
+        ],
+        ["identity.tenants", "id = $1 AND status = 'active'", [devFixtures.tenantA]],
+        [
+          "identity.workspaces",
+          "tenant_id = $1 AND id = $2 AND status = 'active'",
+          [devFixtures.tenantA, devFixtures.workspaceA]
+        ],
+        [
+          "identity.policy_versions",
+          "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND status = 'active'",
+          [devFixtures.tenantA, devFixtures.workspaceA, DEV_POLICY_VERSION]
+        ],
+        [
+          "identity.service_principals",
+          "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND purpose = 'worker' AND status = 'active'",
+          [devFixtures.tenantA, devFixtures.workspaceA, ids.workerA]
+        ],
+        ["identity.users", "id = $1 AND status = 'active'", [ids.delegatorUserA]],
+        [
+          "identity.memberships",
+          "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND user_id = $4 AND status = 'active'",
+          [
+            devFixtures.tenantA,
+            devFixtures.workspaceA,
+            ids.delegatorMembershipA,
+            ids.delegatorUserA
+          ]
+        ],
+        [
+          "access.spaces",
+          "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND archived_at IS NULL",
+          [devFixtures.tenantA, devFixtures.workspaceA, devFixtures.rootSpaceA]
+        ],
+        [
+          "access.access_relationships",
+          "tenant_id = $1 AND workspace_id = $2 AND subject_type = 'service_principal' AND subject_id = $3 AND resource_type = 'space' AND resource_id = $4 AND relation = 'contributor' AND source = 'direct'",
+          [devFixtures.tenantA, devFixtures.workspaceA, ids.workerA, devFixtures.rootSpaceA]
+        ],
+        [
+          "access.access_relationships",
+          "tenant_id = $1 AND workspace_id = $2 AND subject_type = 'membership' AND subject_id = $3 AND resource_type = 'space' AND resource_id = $4 AND relation = 'contributor' AND source = 'direct'",
+          [
+            devFixtures.tenantA,
+            devFixtures.workspaceA,
+            ids.delegatorMembershipA,
+            devFixtures.rootSpaceA
+          ]
+        ]
+      ] as const) {
+        const locked = await client.query<{ id: string }>(
+          `SELECT id FROM ${table} WHERE ${predicate} FOR UPDATE`,
+          [...values]
+        );
+        expect(locked.rowCount, table).toBe(1);
+        await expect(
+          client.query(`UPDATE ${table} SET id = id WHERE ${predicate}`, [...values])
+        ).rejects.toMatchObject({ code: "42501" });
+        await client.query("ROLLBACK");
+        await client.query("BEGIN");
+        await setLocal(client, {
+          tenantId: devFixtures.tenantA,
+          workspaceId: devFixtures.workspaceA,
+          spaceId: devFixtures.rootSpaceA,
+          userId: ids.delegatorUserA,
+          membershipId: ids.delegatorMembershipA,
+          jobId: ids.jobA,
+          referenceId: ids.referenceA,
+          workerPrincipalId: ids.workerA,
+          policyVersion: DEV_POLICY_VERSION
+        });
+        await expect(
+          client.query(`DELETE FROM ${table} WHERE ${predicate}`, [...values])
+        ).rejects.toMatchObject({ code: "42501" });
+        await client.query("ROLLBACK");
+        await client.query("BEGIN");
+        await setLocal(client, {
+          tenantId: devFixtures.tenantA,
+          workspaceId: devFixtures.workspaceA,
+          spaceId: devFixtures.rootSpaceA,
+          userId: ids.delegatorUserA,
+          membershipId: ids.delegatorMembershipA,
+          jobId: ids.jobA,
+          referenceId: ids.referenceA,
+          workerPrincipalId: ids.workerA,
+          policyVersion: DEV_POLICY_VERSION
+        });
+      }
+      await client.query("ROLLBACK");
+    } finally {
+      client.release();
+    }
+  });
+
+  it.each([
+    ["tenant status", "identity.tenants", "status = 'suspended'", devFixtures.tenantA],
+    ["workspace status", "identity.workspaces", "status = 'archived'", devFixtures.workspaceA],
+    ["user status", "identity.users", "status = 'disabled'", ids.delegatorUserA],
+    ["membership status", "identity.memberships", "status = 'suspended'", ids.delegatorMembershipA],
+    ["membership role", "identity.memberships", "role = 'owner'", ids.delegatorMembershipA],
+    ["policy status", "identity.policy_versions", "status = 'retired'", DEV_POLICY_VERSION],
+    ["service-principal purpose", "identity.service_principals", "purpose = 'system'", ids.workerA],
+    ["service-principal status", "identity.service_principals", "status = 'disabled'", ids.workerA],
+    ["Space archive", "access.spaces", "archived_at = clock_timestamp()", devFixtures.rootSpaceA],
+    [
+      "relationship relation",
+      "access.access_relationships",
+      "relation = 'owner'",
+      ids.delegatorGrantA
+    ],
+    [
+      "relationship source",
+      "access.access_relationships",
+      "source = 'system'",
+      ids.delegatorGrantA
+    ],
+    ["reference status", "ops.security_context_references", "status = 'revoked'", ids.referenceA]
+  ] as const)("rejects worker authority mutation: %s", async (_name, table, mutation, id) => {
+    const client = await workerPool.connect();
+    try {
+      await client.query("BEGIN");
+      await setLocal(client, workerAuthoritySettings());
+      await expect(
+        client.query(`SELECT id FROM ${table} WHERE id = $1 FOR UPDATE`, [id])
+      ).resolves.toMatchObject({ rowCount: 1 });
+      await expect(
+        client.query(`UPDATE ${table} SET ${mutation} WHERE id = $1`, [id])
+      ).rejects.toMatchObject({ code: "42501" });
+      await client.query("ROLLBACK");
+    } finally {
+      client.release();
+    }
+  });
+
+  it("keeps cross-tenant/workspace/Space authority and reference rows invisible to worker locks", async () => {
+    const client = await workerPool.connect();
+    try {
+      await client.query("BEGIN");
+      await setLocal(client, {
+        tenantId: devFixtures.tenantA,
+        workspaceId: devFixtures.workspaceA,
+        spaceId: devFixtures.rootSpaceA,
+        userId: ids.delegatorUserA,
+        membershipId: ids.delegatorMembershipA,
+        jobId: ids.jobA,
+        referenceId: ids.referenceA,
+        workerPrincipalId: ids.workerA,
+        policyVersion: DEV_POLICY_VERSION
+      });
+      for (const [table, id] of [
+        ["identity.tenants", devFixtures.tenantB],
+        ["identity.workspaces", devFixtures.workspaceB],
+        ["identity.users", devFixtures.userB],
+        ["identity.memberships", devFixtures.membershipBViewer],
+        ["identity.service_principals", ids.workerB],
+        ["access.spaces", devFixtures.rootSpaceB],
+        ["ops.security_context_references", ids.referenceB]
+      ]) {
+        const result = await client.query(`SELECT id FROM ${table} WHERE id = $1 FOR UPDATE`, [id]);
+        expect(result.rows, table).toEqual([]);
+      }
+      const crossPolicy = await client.query(
+        "SELECT id FROM identity.policy_versions WHERE tenant_id = $1 FOR UPDATE",
+        [devFixtures.tenantB]
+      );
+      const crossGrant = await client.query(
+        "SELECT id FROM access.access_relationships WHERE tenant_id = $1 FOR UPDATE",
+        [devFixtures.tenantB]
+      );
+      expect(crossPolicy.rows).toEqual([]);
+      expect(crossGrant.rows).toEqual([]);
+      await client.query("ROLLBACK");
+    } finally {
+      client.release();
+    }
+  });
+
   it("allows worker proof/idempotency writes only for the exact bound job and reference", async () => {
     const client = await workerPool.connect();
     try {
@@ -577,16 +887,51 @@ maybeDescribe("Foundation operational schema security", () => {
         jobId: ids.jobA,
         referenceId: ids.referenceA,
         workerPrincipalId: ids.workerA,
-        policyVersion: DEV_POLICY_VERSION
+        policyVersion: DEV_POLICY_VERSION,
+        userId: ids.delegatorUserA,
+        membershipId: ids.delegatorMembershipA,
+        handlerKey: fixedHandlerKey,
+        aggregateId: ids.aggregateA,
+        aggregateVersion: "2",
+        effectHash: fixedEffectHash
       });
+      const before = await client.query(
+        `SELECT id FROM ops.idempotency_records
+         WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
+           AND job_id = $4 AND context_reference_id = $5
+           AND handler_key = $6 AND aggregate_id = $7
+           AND aggregate_version = $8 AND effect_hash = $9`,
+        [
+          devFixtures.tenantA,
+          devFixtures.workspaceA,
+          devFixtures.rootSpaceA,
+          ids.jobA,
+          ids.referenceA,
+          fixedHandlerKey,
+          ids.aggregateA,
+          2,
+          fixedEffectHash
+        ]
+      );
+      expect(before.rows).toEqual([]);
       const updated = await client.query<{ id: string }>(
         `UPDATE ops.foundation_test_aggregates
-         SET effect_count = effect_count + 1,
+         SET pending_job_id = NULL,
              last_effect_job_id = $1,
+             effect_count = effect_count + 1,
              aggregate_version = aggregate_version + 1,
              updated_at = clock_timestamp()
+         WHERE id = $2 AND tenant_id = $3 AND workspace_id = $4 AND space_id = $5
+           AND pending_job_id = $1 AND aggregate_version = $6
          RETURNING id`,
-        [ids.jobA]
+        [
+          ids.jobA,
+          ids.aggregateA,
+          devFixtures.tenantA,
+          devFixtures.workspaceA,
+          devFixtures.rootSpaceA,
+          1
+        ]
       );
       expect(updated.rows).toEqual([{ id: ids.aggregateA }]);
       await expect(
@@ -594,16 +939,17 @@ maybeDescribe("Foundation operational schema security", () => {
           `INSERT INTO ops.idempotency_records
              (id, tenant_id, workspace_id, space_id, job_id, handler_key,
               context_reference_id, aggregate_id, aggregate_version, effect_hash)
-           VALUES ($1, $2, $3, $4, $5, 'foundation-proof', $6, $7, 2, $8)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 2, $9)`,
           [
             crypto.randomUUID(),
             devFixtures.tenantA,
             devFixtures.workspaceA,
             devFixtures.rootSpaceA,
             ids.jobA,
+            fixedHandlerKey,
             ids.referenceA,
             ids.aggregateA,
-            "0".repeat(64)
+            fixedEffectHash
           ]
         )
       ).resolves.toMatchObject({ rowCount: 1 });
@@ -680,6 +1026,29 @@ function assertDistinctRuntimeDsns(
 
 async function seedFoundationRows(pool: pg.Pool): Promise<void> {
   await pool.query(
+    `INSERT INTO identity.users (id, auth_provider, auth_subject, primary_email, status)
+     VALUES ($1, 'dev', 'foundation-member-a', 'foundation-member-a@example.com', 'active')`,
+    [ids.delegatorUserA]
+  );
+  await pool.query(
+    `INSERT INTO identity.people
+       (id, tenant_id, workspace_id, display_name, primary_email, is_internal)
+     VALUES ($1,$2,$3,'Foundation Member A','foundation-member-a@example.com',true)`,
+    [ids.delegatorPersonA, devFixtures.tenantA, devFixtures.workspaceA]
+  );
+  await pool.query(
+    `INSERT INTO identity.memberships
+       (id, tenant_id, workspace_id, user_id, person_id, role, status)
+     VALUES ($1,$2,$3,$4,$5,'member','active')`,
+    [
+      ids.delegatorMembershipA,
+      devFixtures.tenantA,
+      devFixtures.workspaceA,
+      ids.delegatorUserA,
+      ids.delegatorPersonA
+    ]
+  );
+  await pool.query(
     `INSERT INTO identity.service_principals (id, tenant_id, workspace_id, name, purpose, status)
      VALUES
        ($1, $2, $3, 'Relay A', 'system', 'active'), ($4, $5, $6, 'Relay B', 'system', 'active'),
@@ -697,12 +1066,13 @@ async function seedFoundationRows(pool: pg.Pool): Promise<void> {
   );
   await pool.query(
     `INSERT INTO access.access_relationships
-       (tenant_id, workspace_id, subject_type, subject_id, relation, resource_type, resource_id, source)
+       (id, tenant_id, workspace_id, subject_type, subject_id, relation, resource_type, resource_id, source)
      VALUES
-       ($1, $2, 'service_principal', $3, 'manager', 'space', $4, 'direct'),
-       ($5, $6, 'service_principal', $7, 'manager', 'space', $8, 'direct'),
-       ($1, $2, 'service_principal', $9, 'contributor', 'space', $4, 'direct'),
-       ($5, $6, 'service_principal', $10, 'contributor', 'space', $8, 'direct')`,
+       (gen_random_uuid(), $1, $2, 'service_principal', $3, 'manager', 'space', $4, 'direct'),
+       (gen_random_uuid(), $5, $6, 'service_principal', $7, 'manager', 'space', $8, 'direct'),
+       (gen_random_uuid(), $1, $2, 'service_principal', $9, 'contributor', 'space', $4, 'direct'),
+       (gen_random_uuid(), $5, $6, 'service_principal', $10, 'contributor', 'space', $8, 'direct'),
+       ($11, $1, $2, 'membership', $12, 'contributor', 'space', $4, 'direct')`,
     [
       devFixtures.tenantA,
       devFixtures.workspaceA,
@@ -713,7 +1083,9 @@ async function seedFoundationRows(pool: pg.Pool): Promise<void> {
       ids.relayB,
       devFixtures.rootSpaceB,
       ids.workerA,
-      ids.workerB
+      ids.workerB,
+      ids.delegatorGrantA,
+      ids.delegatorMembershipA
     ]
   );
   for (const fixture of [
@@ -727,8 +1099,8 @@ async function seedFoundationRows(pool: pg.Pool): Promise<void> {
       reference: ids.referenceA,
       relay: ids.relayA,
       worker: ids.workerA,
-      user: devFixtures.userA,
-      membership: devFixtures.membershipAOwner
+      user: ids.delegatorUserA,
+      membership: ids.delegatorMembershipA
     },
     {
       tenant: devFixtures.tenantB,
@@ -751,11 +1123,12 @@ async function seedFoundationRows(pool: pg.Pool): Promise<void> {
       traceId: `trace-${fixture.job}`,
       tenantId: fixture.tenant,
       workspaceId: fixture.workspace,
-      actorUserId: fixture.user,
-      actorMembershipId: fixture.membership,
+      servicePrincipalId: fixture.worker,
+      delegatedByUserId: fixture.user,
+      delegatedByMembershipId: fixture.membership,
       requestedSpaceIds: [fixture.space],
       membershipIds: [fixture.membership],
-      roleHints: ["owner"],
+      roleHints: ["member"],
       dataClassCeiling: "workspace",
       policyVersion: DEV_POLICY_VERSION,
       issuedAt: issuedAt.toISOString(),
@@ -825,6 +1198,12 @@ type ScopeSettings = {
   jobId?: string;
   referenceId?: string;
   workerPrincipalId?: string;
+  userId?: string;
+  membershipId?: string;
+  handlerKey?: string;
+  aggregateId?: string;
+  aggregateVersion?: string;
+  effectHash?: string;
 };
 
 async function setLocal(client: pg.PoolClient, settings: ScopeSettings): Promise<void> {
@@ -836,10 +1215,45 @@ async function setLocal(client: pg.PoolClient, settings: ScopeSettings): Promise
     ["app.policy_version", settings.policyVersion],
     ["app.job_id", settings.jobId],
     ["app.context_reference_id", settings.referenceId],
-    ["app.worker_principal_id", settings.workerPrincipalId]
+    ["app.worker_principal_id", settings.workerPrincipalId],
+    ["app.user_id", settings.userId],
+    ["app.membership_id", settings.membershipId],
+    ["app.handler_key", settings.handlerKey],
+    ["app.aggregate_id", settings.aggregateId],
+    ["app.aggregate_version", settings.aggregateVersion],
+    ["app.effect_hash", settings.effectHash]
   ];
   for (const [name, value] of pairs)
     await client.query("SELECT set_config($1, $2, true)", [name, value ?? ""]);
+}
+
+function workerAuthoritySettings(): ScopeSettings {
+  return {
+    tenantId: devFixtures.tenantA,
+    workspaceId: devFixtures.workspaceA,
+    spaceId: devFixtures.rootSpaceA,
+    userId: ids.delegatorUserA,
+    membershipId: ids.delegatorMembershipA,
+    jobId: ids.jobA,
+    referenceId: ids.referenceA,
+    workerPrincipalId: ids.workerA,
+    policyVersion: DEV_POLICY_VERSION
+  };
+}
+
+async function waitForActiveBackend(pool: pg.Pool, pid: number): Promise<void> {
+  const deadline = Date.now() + 2_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ active: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active'
+       ) AS active`,
+      [pid]
+    );
+    if (result.rows[0]?.active) return;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`backend ${pid} did not become active`);
 }
 
 async function scopedRelayEventIds(pool: pg.Pool, settings: ScopeSettings): Promise<string[]> {

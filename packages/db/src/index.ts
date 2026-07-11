@@ -8,3 +8,4 @@ export * from "./seed.js";
 export * from "./test-database.js";
 export * from "./transaction.js";
 export * from "./worker-bootstrap.js";
+export * from "./worker-transaction.js";

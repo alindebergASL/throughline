@@ -101,7 +101,209 @@ describe("canonical Foundation closure migration", () => {
     );
     expect(sql).not.toMatch(/GRANT .* ON ALL TABLES.*throughline_(?:relay|worker)/i);
   });
+
+  it("gives the worker only UPDATE(id) lock capability on every authority and reference row", async () => {
+    const sql = await readFoundationMigration();
+
+    const authorityTables = [
+      "identity.tenants",
+      "identity.workspaces",
+      "identity.users",
+      "identity.memberships",
+      "identity.policy_versions",
+      "identity.service_principals",
+      "access.spaces",
+      "access.access_relationships",
+      "ops.security_context_references"
+    ];
+    for (const table of authorityTables) {
+      expect(sql).toMatch(
+        new RegExp(
+          `GRANT\\s+UPDATE\\s*\\(id\\)\\s+ON\\s+${table.replace(".", "\\.")}\\s+TO\\s+throughline_worker`,
+          "i"
+        )
+      );
+      const escaped = table.replace(".", "\\.");
+      const columnGrants = [
+        ...sql.matchAll(
+          new RegExp(
+            `GRANT\\s+UPDATE\\s*\\(([^)]+)\\)\\s+ON\\s+${escaped}\\s+TO\\s+throughline_worker`,
+            "gi"
+          )
+        )
+      ].flatMap((match) =>
+        match[1]!
+          .split(",")
+          .map((column) => column.trim().replaceAll('"', ""))
+          .filter(Boolean)
+      );
+      expect(columnGrants, table).toEqual(["id"]);
+    }
+
+    expect(sql).not.toMatch(
+      /GRANT\s+UPDATE\s+ON\s+(?:identity|access|ops)\.[a-z_]+\s+TO\s+throughline_worker/i
+    );
+    expect(sql).not.toMatch(/GRANT\s+(?:ALL|DELETE)\b[\s\S]*?TO\s+throughline_worker/i);
+    expect(sql).not.toMatch(
+      /GRANT\s+UPDATE\s*\([^)]*\b(?:status|role|purpose|archived_at|relation|source|signing_key_id|context_snapshot)\b[^)]*\)\s+ON\s+(?:identity|access|ops)\.[a-z_]+\s+TO\s+throughline_worker/i
+    );
+  });
+
+  it("uses full-scope worker lock-only UPDATE policies with impossible writes", async () => {
+    const sql = await readFoundationMigration();
+    const exactPolicies = [
+      ["identity.tenants", ["id = ops.current_tenant_id()"]],
+      [
+        "identity.workspaces",
+        ["tenant_id = ops.current_tenant_id()", "id = ops.current_workspace_id()"]
+      ],
+      ["identity.users", ["id = ops.current_user_id()"]],
+      [
+        "identity.memberships",
+        [
+          "tenant_id = ops.current_tenant_id()",
+          "workspace_id = ops.current_workspace_id()",
+          "id = ops.current_membership_id()",
+          "user_id = ops.current_user_id()"
+        ]
+      ],
+      [
+        "identity.policy_versions",
+        [
+          "tenant_id = ops.current_tenant_id()",
+          "workspace_id = ops.current_workspace_id()",
+          "id = ops.current_policy_version()"
+        ]
+      ],
+      [
+        "identity.service_principals",
+        [
+          "tenant_id = ops.current_tenant_id()",
+          "workspace_id = ops.current_workspace_id()",
+          "id = ops.current_worker_principal_id()"
+        ]
+      ],
+      [
+        "access.spaces",
+        [
+          "tenant_id = ops.current_tenant_id()",
+          "workspace_id = ops.current_workspace_id()",
+          "id = ops.current_space_id()"
+        ]
+      ],
+      [
+        "ops.security_context_references",
+        [
+          "tenant_id = ops.current_tenant_id()",
+          "workspace_id = ops.current_workspace_id()",
+          "space_id = ops.current_space_id()",
+          "id = ops.current_context_reference_id()",
+          "job_id = ops.current_job_id()",
+          "worker_service_principal_id = ops.current_worker_principal_id()",
+          "policy_version_id = ops.current_policy_version()",
+          "delegating_user_id = ops.current_user_id()",
+          "delegating_membership_id = ops.current_membership_id()"
+        ]
+      ]
+    ] as const;
+
+    for (const [table, bindings] of exactPolicies) {
+      const policy = workerUpdatePolicy(sql, table);
+      expect(policy).toContain("current_user = 'throughline_worker'");
+      for (const binding of bindings) expect(policy, `${table}: ${binding}`).toContain(binding);
+      expect(policy).toMatch(/WITH CHECK \(false\);$/);
+    }
+
+    const relationshipPolicies = workerUpdatePolicies(sql, "access.access_relationships");
+    expect(relationshipPolicies.length).toBeGreaterThanOrEqual(1);
+    expect(relationshipPolicies.length).toBeLessThanOrEqual(2);
+    for (const policy of relationshipPolicies) {
+      for (const binding of [
+        "tenant_id = ops.current_tenant_id()",
+        "workspace_id = ops.current_workspace_id()",
+        "resource_type = 'space'",
+        "resource_id = ops.current_space_id()",
+        "relation = 'contributor'",
+        "source = 'direct'"
+      ]) {
+        expect(policy).toContain(binding);
+      }
+      expect(policy).toMatch(/WITH CHECK \(false\);$/);
+    }
+    const relationships = relationshipPolicies.join("\n");
+    expect(relationships).toContain("subject_type = 'service_principal'");
+    expect(relationships).toContain("subject_id = ops.current_worker_principal_id()");
+    expect(relationships).toContain("subject_type = 'membership'");
+    expect(relationships).toContain("subject_id = ops.current_membership_id()");
+  });
+
+  it("splits exact pending/last-effect visibility from the one-way pending mutation", async () => {
+    const sql = await readFoundationMigration();
+
+    expect(sql).toMatch(
+      /CREATE POLICY foundation_test_aggregates_worker_job_select[\s\S]*?FOR SELECT TO throughline_worker[\s\S]*?tenant_id = ops\.current_tenant_id\(\)[\s\S]*?workspace_id = ops\.current_workspace_id\(\)[\s\S]*?space_id = ops\.current_space_id\(\)[\s\S]*?\(pending_job_id = ops\.current_job_id\(\) OR last_effect_job_id = ops\.current_job_id\(\)\)/
+    );
+    expect(sql).toMatch(
+      /CREATE POLICY foundation_test_aggregates_worker_pending_update[\s\S]*?FOR UPDATE TO throughline_worker[\s\S]*?USING \([\s\S]*?tenant_id = ops\.current_tenant_id\(\)[\s\S]*?workspace_id = ops\.current_workspace_id\(\)[\s\S]*?space_id = ops\.current_space_id\(\)[\s\S]*?pending_job_id = ops\.current_job_id\(\)[\s\S]*?WITH CHECK \([\s\S]*?tenant_id = ops\.current_tenant_id\(\)[\s\S]*?workspace_id = ops\.current_workspace_id\(\)[\s\S]*?space_id = ops\.current_space_id\(\)[\s\S]*?pending_job_id IS NULL[\s\S]*?last_effect_job_id = ops\.current_job_id\(\)/
+    );
+    expect(sql).toMatch(
+      /GRANT UPDATE \([\s\S]*?pending_job_id[\s\S]*?last_effect_job_id[\s\S]*?effect_count[\s\S]*?aggregate_version[\s\S]*?updated_at[\s\S]*?\)\s+ON ops\.foundation_test_aggregates TO throughline_worker;/
+    );
+  });
+
+  it("binds exact committed-idempotency visibility to handler, aggregate version, and effect hash", async () => {
+    const sql = await readFoundationMigration();
+
+    for (const binding of [
+      "tenant_id = ops.current_tenant_id()",
+      "workspace_id = ops.current_workspace_id()",
+      "space_id = ops.current_space_id()",
+      "job_id = ops.current_job_id()",
+      "context_reference_id = ops.current_context_reference_id()",
+      "handler_key = ops.current_handler_key()",
+      "aggregate_id = ops.current_aggregate_id()",
+      "aggregate_version = ops.current_aggregate_version()",
+      "effect_hash = ops.current_effect_hash()"
+    ]) {
+      expect(sql).toContain(binding);
+    }
+  });
+
+  it("keeps the canonical migration credential-free and rejects privilege bypass mechanisms", async () => {
+    const sql = await readFoundationMigration();
+
+    expect(sql).toMatch(/ALTER ROLE throughline_worker[\s\S]*?NOLOGIN[\s\S]*?NOBYPASSRLS/);
+    expect(sql).toMatch(/ALTER ROLE throughline_relay[\s\S]*?NOLOGIN[\s\S]*?NOBYPASSRLS/);
+    expect(sql).not.toMatch(/PASSWORD\s+'[^']+'/i);
+    expect(sql).not.toMatch(/SECURITY\s+DEFINER/i);
+    expect(sql).not.toMatch(/CREATE\s+(?:CONSTRAINT\s+)?TRIGGER/i);
+    expect(sql).not.toMatch(/(?<!NO)BYPASSRLS/i);
+    expect(sql).not.toMatch(
+      /ALTER\s+(?:TABLE|SEQUENCE|FUNCTION)[\s\S]*?OWNER\s+TO\s+throughline_(?:worker|relay)/i
+    );
+    expect(sql).not.toMatch(
+      /GRANT\s+UPDATE\s+ON\s+ops\.foundation_test_aggregates\s+TO\s+throughline_worker/i
+    );
+  });
 });
+
+function workerUpdatePolicy(sql: string, table: string): string {
+  const policies = workerUpdatePolicies(sql, table);
+  expect(policies, table).toHaveLength(1);
+  return policies[0]!;
+}
+
+function workerUpdatePolicies(sql: string, table: string): string[] {
+  const escaped = table.replace(".", "\\.");
+  return [
+    ...sql.matchAll(
+      new RegExp(
+        `CREATE POLICY [a-z_]+ ON ${escaped}\\s+FOR UPDATE TO throughline_worker[\\s\\S]*?WITH CHECK \\(false\\);`,
+        "gi"
+      )
+    )
+  ].map(([policy]) => policy);
+}
 
 async function readFoundationMigration(): Promise<string> {
   return readFile(

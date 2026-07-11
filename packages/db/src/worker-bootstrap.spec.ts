@@ -207,6 +207,49 @@ describe("fixed worker context-reference bootstrap", () => {
     }
   });
 
+  it("destroys a blocked bootstrap connection on abort and never releases it reusable", async () => {
+    const signer = codec();
+    const token = signer.issue({ ...bindings, ttlSeconds: 600 }).token;
+    const controller = new AbortController();
+    const release = vi.fn();
+    const query = vi.fn(async (sql: string) => {
+      if (sql === 'SELECT current_user AS "currentUser"') {
+        return { rows: [{ currentUser: "throughline_worker" }], rowCount: 1 };
+      }
+      if (sql.includes("FROM ops.security_context_references")) {
+        return new Promise<never>((_resolve, reject) => {
+          controller.signal.addEventListener("abort", () => reject(new Error("query aborted")), {
+            once: true
+          });
+        });
+      }
+      return { rows: [], rowCount: 0 };
+    });
+    const client = { query, release } as unknown as PgPoolClient;
+    const pool = { connect: vi.fn().mockResolvedValue(client) } as unknown as PgPool;
+
+    const pending = bootstrapWorkerContextReference({
+      pool,
+      token,
+      codec: signer,
+      expected: expected(),
+      signal: controller.signal
+    });
+    await vi.waitFor(() => {
+      expect(
+        query.mock.calls.some(([sql]) =>
+          String(sql).includes("FROM ops.security_context_references")
+        )
+      ).toBe(true);
+    });
+    controller.abort();
+
+    await expect(pending).rejects.toMatchObject({ name: "WorkerContextBootstrapError" });
+    expect(release).toHaveBeenCalledOnce();
+    expect(release.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+    expect(query).not.toHaveBeenCalledWith("ROLLBACK");
+  });
+
   it("rolls back with a safe error that contains no token, key, or SecurityContext body", async () => {
     const signer = codec();
     const token = signer.issue({ ...bindings, ttlSeconds: 600 }).token;

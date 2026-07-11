@@ -47,9 +47,24 @@ importers:
 
   apps/agent-worker:
     dependencies:
+      '@aws-sdk/client-sqs':
+        specifier: ^3.840.0
+        version: 3.1085.0
+      '@throughline/authorization':
+        specifier: workspace:*
+        version: link:../../packages/authorization
+      '@throughline/core-types':
+        specifier: workspace:*
+        version: link:../../packages/core-types
+      '@throughline/db':
+        specifier: workspace:*
+        version: link:../../packages/db
       '@throughline/observability':
         specifier: workspace:*
         version: link:../../packages/observability
+      '@throughline/tenancy':
+        specifier: workspace:*
+        version: link:../../packages/tenancy
 
   apps/api:
     dependencies:
