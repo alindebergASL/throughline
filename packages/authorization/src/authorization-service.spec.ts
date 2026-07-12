@@ -240,7 +240,32 @@ describe("foundation.relay.publish exact authorization", () => {
       reasonCode: "foundation_relay_direct_manager"
     });
     expect(queries).toHaveLength(6);
-    expect(queries.every((sql) => !/\bFOR\s+(?:SHARE|UPDATE)\b/i.test(sql))).toBe(true);
+    expect(queries.every((sql) => /\bFOR\s+(?:SHARE|KEY\s+SHARE|UPDATE)\b/i.test(sql))).toBe(true);
+    expect(queries.join("\n")).not.toMatch(/\bNOT\s+EXISTS\b/i);
+    expect(
+      queries.map((sql) => sql.match(/FROM\s+((?:identity|access)\.[a-z_]+)/i)?.[1]?.toLowerCase())
+    ).toEqual([
+      "identity.tenants",
+      "identity.workspaces",
+      "identity.policy_versions",
+      "identity.service_principals",
+      "access.spaces",
+      "access.access_relationships"
+    ]);
+    expect(queries[0]).toMatch(/id = \$1[\s\S]*FOR SHARE/);
+    expect(queries[1]).toMatch(/id = \$1 AND tenant_id = \$2[\s\S]*FOR SHARE/);
+    expect(queries[2]).toMatch(
+      /id = \$1 AND tenant_id = \$2 AND workspace_id = \$3[\s\S]*FOR SHARE/
+    );
+    expect(queries[3]).toMatch(
+      /id = \$1 AND tenant_id = \$2 AND workspace_id = \$3[\s\S]*FOR SHARE/
+    );
+    expect(queries[4]).toMatch(
+      /id = \$1 AND tenant_id = \$2 AND workspace_id = \$3 AND archived_at IS NULL[\s\S]*FOR SHARE/
+    );
+    expect(queries[5]).toMatch(
+      /tenant_id = \$1[\s\S]*workspace_id = \$2[\s\S]*subject_type = 'service_principal'[\s\S]*subject_id = \$3[\s\S]*relation = 'manager'[\s\S]*resource_type = 'space'[\s\S]*resource_id = \$4[\s\S]*source = 'direct'[\s\S]*FOR SHARE/
+    );
   });
 
   it.each([

@@ -18,6 +18,8 @@ export type FoundationTestConfigErrorCode =
   | "MISSING_VARIABLE"
   | "MALFORMED_URL"
   | "DATABASE_URLS_NOT_DISTINCT"
+  | "NON_LOOPBACK_DATABASE_URL"
+  | "DATABASE_ROLE_MISMATCH"
   | "NON_LOOPBACK_LOCALSTACK_URL"
   | "QUEUE_URLS_NOT_DISTINCT"
   | "QUEUE_ENDPOINT_MISMATCH"
@@ -34,6 +36,8 @@ const ERROR_MESSAGES: Record<FoundationTestConfigErrorCode, string> = {
   MISSING_VARIABLE: "A required Foundation test variable is missing or blank.",
   MALFORMED_URL: "A Foundation test URL is malformed or uses an unsupported protocol.",
   DATABASE_URLS_NOT_DISTINCT: "Foundation database role URLs must be pairwise distinct.",
+  NON_LOOPBACK_DATABASE_URL: "Foundation PostgreSQL URLs must use a loopback host.",
+  DATABASE_ROLE_MISMATCH: "Foundation PostgreSQL URLs must use their exact test roles.",
   NON_LOOPBACK_LOCALSTACK_URL: "Foundation LocalStack URLs must use a loopback host.",
   QUEUE_URLS_NOT_DISTINCT: "Foundation source and dead-letter queues must be distinct.",
   QUEUE_ENDPOINT_MISMATCH: "Foundation queue URLs must use the configured LocalStack endpoint.",
@@ -89,6 +93,12 @@ const SAFE_KEY_ID = /^[A-Za-z0-9_-]+$/;
 const AWS_REGION = /^(?:us|af|ap|ca|eu|il|me|mx|sa)-(?:[a-z]+-)+\d$/;
 const TEST_RESOURCE_NAME = /test/i;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const EXPECTED_DATABASE_ROLES = [
+  new Set<string>(["postgres", "throughline"]),
+  new Set<string>(["throughline_app"]),
+  new Set<string>(["throughline_relay"]),
+  new Set<string>(["throughline_worker"])
+] as const;
 
 function fail(code: FoundationTestConfigErrorCode): never {
   throw new FoundationTestConfigError(code);
@@ -181,9 +191,20 @@ export function parseFoundationTestEnv(environment: Environment): FoundationTest
     values.TEST_RELAY_DATABASE_URL,
     values.TEST_WORKER_DATABASE_URL
   ];
-  const databaseIdentities = databaseUrls.map((value) => parsePostgresUrl(value).href);
+  const parsedDatabaseUrls = databaseUrls.map((value) => parsePostgresUrl(value));
+  const databaseIdentities = parsedDatabaseUrls.map((url) => url.href);
   if (new Set(databaseIdentities).size !== databaseIdentities.length) {
     fail("DATABASE_URLS_NOT_DISTINCT");
+  }
+  for (const [index, url] of parsedDatabaseUrls.entries()) {
+    if (!LOOPBACK_HOSTS.has(url.hostname)) fail("NON_LOOPBACK_DATABASE_URL");
+    if (!EXPECTED_DATABASE_ROLES[index]?.has(decodeURIComponent(url.username))) {
+      fail("DATABASE_ROLE_MISMATCH");
+    }
+    const databaseName = url.pathname.replace(/^\//, "");
+    if (!databaseName || databaseName.includes("/") || !TEST_RESOURCE_NAME.test(databaseName)) {
+      fail("NON_TEST_RESOURCE_NAME");
+    }
   }
 
   const endpoint = parseLoopbackUrl(values.FOUNDATION_SQS_ENDPOINT);

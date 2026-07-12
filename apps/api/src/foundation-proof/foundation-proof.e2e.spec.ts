@@ -21,6 +21,31 @@ import { FoundationProofModule } from "./foundation-proof.module.js";
 import { FoundationProofService } from "./foundation-proof.service.js";
 
 const proofUrl = "/__test/foundation-proof";
+type EnvironmentSnapshot = Readonly<{
+  authAdapter: string | undefined;
+  nodeEnv: string | undefined;
+}>;
+
+function captureEnvironment(): EnvironmentSnapshot {
+  return {
+    authAdapter: process.env.AUTH_ADAPTER,
+    nodeEnv: process.env.NODE_ENV
+  };
+}
+
+function enableFoundationTestEnvironment(): void {
+  process.env.AUTH_ADAPTER = "dev";
+  process.env.NODE_ENV = "test";
+}
+
+function restoreEnvironment(snapshot: EnvironmentSnapshot): void {
+  if (snapshot.authAdapter === undefined) delete process.env.AUTH_ADAPTER;
+  else process.env.AUTH_ADAPTER = snapshot.authAdapter;
+  if (snapshot.nodeEnv === undefined) delete process.env.NODE_ENV;
+  else process.env.NODE_ENV = snapshot.nodeEnv;
+}
+
+const fileEnvironment = captureEnvironment();
 interface ProofBody {
   spaceId: string;
   proofKey: string;
@@ -71,6 +96,21 @@ async function createApp(importedModule: Type<unknown> | DynamicModule) {
 }
 
 describe("test-only foundation proof request boundary", () => {
+  let previousEnvironment: EnvironmentSnapshot;
+
+  beforeAll(() => {
+    previousEnvironment = captureEnvironment();
+    enableFoundationTestEnvironment();
+  });
+
+  afterAll(() => {
+    try {
+      // This suite owns no external resources.
+    } finally {
+      restoreEnvironment(previousEnvironment);
+    }
+  });
+
   it("resolves a valid deterministic dev identity and passes only server-built authority", async () => {
     const create = vi.fn().mockResolvedValue({ jobId: "job", aggregateVersion: 1 });
     const module = FoundationProofModule.register({
@@ -236,35 +276,46 @@ maybeDescribeDatabase("foundation proof PostgreSQL transaction", () => {
   let ownerPool: PgPool;
   let appPool: PgPool;
   let app: NestFastifyApplication;
+  let previousEnvironment: EnvironmentSnapshot;
 
   beforeAll(async () => {
     if (!ownerUrl || !appUrl) throw new Error("Foundation proof database DSNs are required");
-    process.env.AUTH_ADAPTER = "dev";
-    process.env.NODE_ENV = "test";
-    ownerPool = createPgPool(ownerUrl);
-    await applyMigrations(ownerPool, { reset: true });
-    await provisionTestAppRole(ownerPool, appUrl);
-    await seedWaveA2DeterministicData(ownerPool);
-    appPool = createPgPool(appUrl);
-    const codec = createAsyncContextReferenceCodec({
-      verificationKeys: new Map([["task5", new Uint8Array(32).fill(7)]]),
-      activeKeyId: "task5",
-      clock: () => new Date()
-    });
-    app = await createApp(
-      FoundationProofModule.register({
-        pool: appPool,
-        contextReferenceCodec: codec,
-        relayServicePrincipalId: devFixtures.relayServicePrincipalA,
-        workerServicePrincipalId: devFixtures.servicePrincipalA
-      })
-    );
+    previousEnvironment = captureEnvironment();
+    enableFoundationTestEnvironment();
+    try {
+      ownerPool = createPgPool(ownerUrl);
+      await applyMigrations(ownerPool, { reset: true });
+      await provisionTestAppRole(ownerPool, appUrl);
+      await seedWaveA2DeterministicData(ownerPool);
+      appPool = createPgPool(appUrl);
+      const codec = createAsyncContextReferenceCodec({
+        verificationKeys: new Map([["task5", new Uint8Array(32).fill(7)]]),
+        activeKeyId: "task5",
+        clock: () => new Date()
+      });
+      app = await createApp(
+        FoundationProofModule.register({
+          pool: appPool,
+          contextReferenceCodec: codec,
+          relayServicePrincipalId: devFixtures.relayServicePrincipalA,
+          workerServicePrincipalId: devFixtures.servicePrincipalA
+        })
+      );
+    } catch (error) {
+      restoreEnvironment(previousEnvironment);
+      throw error;
+    }
   });
 
   afterAll(async () => {
-    await app?.close();
-    await appPool?.end();
-    await ownerPool?.end();
+    try {
+      await app?.close();
+      await appPool?.end();
+      if (ownerPool) await applyMigrations(ownerPool, { reset: true });
+      await ownerPool?.end();
+    } finally {
+      restoreEnvironment(previousEnvironment);
+    }
   });
 
   async function request(identity: string, requestId: string, body = validBody) {
@@ -490,5 +541,11 @@ maybeDescribeDatabase("foundation proof PostgreSQL transaction", () => {
       await ownerPool.query("DROP TRIGGER task5_fail_outbox ON ops.outbox_events");
       await ownerPool.query("DROP FUNCTION ops.task5_fail_outbox() ");
     }
+  });
+});
+
+describe("foundation proof environment restoration", () => {
+  it("restores the caller's sentinel values after every environment-owning suite", () => {
+    expect(captureEnvironment()).toEqual(fileEnvironment);
   });
 });

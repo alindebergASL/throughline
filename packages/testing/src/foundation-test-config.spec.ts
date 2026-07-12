@@ -27,7 +27,7 @@ const keyMaterial = Buffer.alloc(32, 7).toString("base64");
 
 function validEnvironment(): FoundationEnvironment {
   return {
-    TEST_DATABASE_URL: "postgres://foundation_owner@127.0.0.1:5432/throughline_foundation_test",
+    TEST_DATABASE_URL: "postgres://postgres@127.0.0.1:5432/throughline_foundation_test",
     TEST_APP_DATABASE_URL: "postgres://throughline_app@127.0.0.1:5432/throughline_foundation_test",
     TEST_RELAY_DATABASE_URL:
       "postgres://throughline_relay@127.0.0.1:5432/throughline_foundation_test",
@@ -127,6 +127,64 @@ describe("Foundation test environment preflight", () => {
           environment[names[left]!]!
         ]);
       }
+    }
+  });
+
+  it("allows only loopback PostgreSQL hosts", async () => {
+    for (const [variable, value] of [
+      ["TEST_DATABASE_URL", "postgres://postgres@db.internal:5432/throughline_foundation_test"],
+      [
+        "TEST_APP_DATABASE_URL",
+        "postgres://throughline_app@192.168.1.20:5432/throughline_foundation_test"
+      ],
+      [
+        "TEST_RELAY_DATABASE_URL",
+        "postgres://throughline_relay@example.com:5432/throughline_foundation_test"
+      ],
+      [
+        "TEST_WORKER_DATABASE_URL",
+        "postgres://throughline_worker@10.0.0.8:5432/throughline_foundation_test"
+      ]
+    ] as const) {
+      await expectRejected(
+        { ...validEnvironment(), [variable]: value },
+        "NON_LOOPBACK_DATABASE_URL",
+        [value]
+      );
+    }
+  });
+
+  it("requires the exact owner, app, relay, and worker database roles", async () => {
+    for (const [variable, role] of [
+      ["TEST_DATABASE_URL", "wrong_owner"],
+      ["TEST_APP_DATABASE_URL", "wrong_app"],
+      ["TEST_RELAY_DATABASE_URL", "wrong_relay"],
+      ["TEST_WORKER_DATABASE_URL", "wrong_worker"]
+    ] as const) {
+      const original = new URL(validEnvironment()[variable]);
+      original.username = role;
+      await expectRejected(
+        { ...validEnvironment(), [variable]: original.href },
+        "DATABASE_ROLE_MISMATCH",
+        [original.href]
+      );
+    }
+  });
+
+  it("requires every PostgreSQL database name to be explicitly test-only", async () => {
+    for (const variable of [
+      "TEST_DATABASE_URL",
+      "TEST_APP_DATABASE_URL",
+      "TEST_RELAY_DATABASE_URL",
+      "TEST_WORKER_DATABASE_URL"
+    ] as const) {
+      const unsafe = new URL(validEnvironment()[variable]);
+      unsafe.pathname = "/throughline_production";
+      await expectRejected(
+        { ...validEnvironment(), [variable]: unsafe.href },
+        "NON_TEST_RESOURCE_NAME",
+        [unsafe.href]
+      );
     }
   });
 

@@ -21,6 +21,7 @@ import {
 } from "@throughline/tenancy";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { rehydrateFoundationWorkerContext } from "../../../agent-worker/src/worker-context.js";
+import { consumeFoundationRuntimeJob } from "../../../agent-worker/src/main.js";
 import { FoundationOutboxRelay } from "../../../outbox-relay/src/relay.js";
 import {
   defaultFoundationProofRuntimeOptions,
@@ -28,9 +29,13 @@ import {
 } from "./foundation-proof.service.js";
 
 const spanNames = {
-  api: "foundation.api.outbox",
+  api: "foundation.api.request",
+  commit: "foundation.api.database-outbox-commit",
   relay: "foundation.relay.publish",
-  worker: "foundation.worker.receive"
+  workerReceive: "foundation.worker.receive",
+  workerRehydrate: "foundation.worker.rehydrate",
+  workerAuthorize: "foundation.worker.authorize",
+  workerHandle: "foundation.worker.handle"
 } as const;
 
 const now = new Date("2030-07-11T03:00:00.000Z");
@@ -113,6 +118,7 @@ describe("Foundation OpenTelemetry continuity", () => {
         }
       | undefined;
     let workerResult: Awaited<ReturnType<typeof rehydrateFoundationWorkerContext>> | undefined;
+    let durableWorkerResult: Awaited<ReturnType<typeof consumeFoundationRuntimeJob>> | undefined;
     const tracer = trace.getTracer("throughline-task8-contract-test");
     await tracer.startActiveSpan("task8.external-client", async (rootSpan: Span) => {
       const root = rootSpan.spanContext();
@@ -175,28 +181,64 @@ describe("Foundation OpenTelemetry continuity", () => {
         })),
         clock: () => now
       });
+      const rehydrated = requiredWorkerResult(workerResult);
+      durableWorkerResult = await consumeFoundationRuntimeJob({
+        pool: createWorkerPool(rehydrated.metadata.jobId),
+        authorization: {
+          canInTransaction: vi.fn(async () => ({
+            allowed: true,
+            reasonCode: "allowed",
+            policyVersion: context.policyVersion
+          }))
+        },
+        job: {
+          jobId: rehydrated.metadata.jobId,
+          contextReferenceId: rehydrated.metadata.contextReferenceId,
+          securityContext: rehydrated.securityContext,
+          continuationCarrier: rehydrated.metadata.continuationCarrier
+        },
+        deadline: { absoluteDeadlineMs: Date.now() + 20_000, now: Date.now }
+      });
       rootSpan.end();
     });
     await provider.forceFlush();
 
     const spans = exporter.getFinishedSpans();
     const apiSpan = requiredSpan(spans, spanNames.api);
+    const commitSpan = requiredSpan(spans, spanNames.commit);
     const relaySpan = requiredSpan(spans, spanNames.relay);
-    const workerSpan = requiredSpan(spans, spanNames.worker);
+    const workerReceiveSpan = requiredSpan(spans, spanNames.workerReceive);
+    const workerRehydrateSpan = requiredSpan(spans, spanNames.workerRehydrate);
+    const workerAuthorizeSpan = requiredSpan(spans, spanNames.workerAuthorize);
+    const workerHandleSpan = requiredSpan(spans, spanNames.workerHandle);
     const outbox = requiredWrite(writes, "outbox");
     const message = requiredQueueInput(queueInput);
     const result = requiredWorkerResult(workerResult);
+    expect(durableWorkerResult).toMatchObject({ status: "applied", effectCount: 1 });
     const clientSpan = requiredSpan(spans, "task8.external-client");
 
     expect(
       new Set(
-        [apiSpan, relaySpan, workerSpan, clientSpan].map((span) => span.spanContext().traceId)
+        [
+          apiSpan,
+          commitSpan,
+          relaySpan,
+          workerReceiveSpan,
+          workerRehydrateSpan,
+          workerAuthorizeSpan,
+          workerHandleSpan,
+          clientSpan
+        ].map((span) => span.spanContext().traceId)
       )
     ).toEqual(new Set([clientSpan.spanContext().traceId]));
     expect(parentSpanId(apiSpan)).toBe(clientSpan.spanContext().spanId);
-    expect(parentSpanId(relaySpan)).toBe(apiSpan.spanContext().spanId);
-    expect(parentSpanId(workerSpan)).toBe(relaySpan.spanContext().spanId);
-    expect(spanIdFromTraceparent(String(outbox[8]))).toBe(apiSpan.spanContext().spanId);
+    expect(parentSpanId(commitSpan)).toBe(apiSpan.spanContext().spanId);
+    expect(parentSpanId(relaySpan)).toBe(commitSpan.spanContext().spanId);
+    expect(parentSpanId(workerReceiveSpan)).toBe(relaySpan.spanContext().spanId);
+    expect(parentSpanId(workerRehydrateSpan)).toBe(workerReceiveSpan.spanContext().spanId);
+    expect(parentSpanId(workerAuthorizeSpan)).toBe(workerRehydrateSpan.spanContext().spanId);
+    expect(parentSpanId(workerHandleSpan)).toBe(workerAuthorizeSpan.spanContext().spanId);
+    expect(spanIdFromTraceparent(String(outbox[8]))).toBe(commitSpan.spanContext().spanId);
     expect(spanIdFromTraceparent(JSON.parse(message.MessageBody).traceparent)).toBe(
       relaySpan.spanContext().spanId
     );
@@ -204,7 +246,7 @@ describe("Foundation OpenTelemetry continuity", () => {
       JSON.parse(message.MessageBody).traceparent
     );
     expect(spanIdFromTraceparent(result.metadata.traceparent)).toBe(
-      workerSpan.spanContext().spanId
+      workerReceiveSpan.spanContext().spanId
     );
 
     const expected = {
@@ -214,7 +256,15 @@ describe("Foundation OpenTelemetry continuity", () => {
       "throughline.workspace.id": context.workspaceId,
       "throughline.space.id": devFixtures.restrictedSpaceA
     };
-    for (const span of [apiSpan, relaySpan, workerSpan]) {
+    for (const span of [
+      apiSpan,
+      commitSpan,
+      relaySpan,
+      workerReceiveSpan,
+      workerRehydrateSpan,
+      workerAuthorizeSpan,
+      workerHandleSpan
+    ]) {
       expect(span.attributes).toMatchObject(expected);
     }
     expectSanitized(spans, {
@@ -232,6 +282,54 @@ function requiredWrite(writes: Map<string, readonly unknown[]>, name: string) {
   const values = writes.get(name);
   if (!values) throw new Error(`Missing mocked ${name} write`);
   return values;
+}
+
+function createWorkerPool(jobId: string): PgPool {
+  const aggregate = {
+    id: "70000000-0000-7000-8000-000000000181",
+    pendingJobId: jobId,
+    lastEffectJobId: null,
+    effectCount: 0,
+    aggregateVersion: 1
+  };
+  const query = vi.fn(async (sql: string) => {
+    if (sql.includes("current_user") && sql.includes("pg_backend_pid")) {
+      return {
+        rows: [{ currentUser: "throughline_worker", backendPid: 801 }],
+        rowCount: 1
+      };
+    }
+    if (sql.includes("FROM ops.foundation_test_aggregates")) {
+      return { rows: [aggregate], rowCount: 1 };
+    }
+    if (sql.includes("INSERT INTO ops.idempotency_records")) {
+      return { rows: [{ id: "70000000-0000-7000-8000-000000000191" }], rowCount: 1 };
+    }
+    if (sql.includes("UPDATE ops.foundation_test_aggregates")) {
+      return { rows: [{ aggregateVersion: 2, effectCount: 1 }], rowCount: 1 };
+    }
+    return { rows: [], rowCount: 0 };
+  });
+  const cancellationQuery = vi.fn(async (sql: string) => {
+    if (sql.includes("current_user") && sql.includes("pg_backend_pid")) {
+      return {
+        rows: [{ currentUser: "throughline_worker", backendPid: 802 }],
+        rowCount: 1
+      };
+    }
+    return { rows: [], rowCount: 0 };
+  });
+  const clients = [
+    { query, release: vi.fn() },
+    { query: cancellationQuery, release: vi.fn() }
+  ] as unknown as PgPoolClient[];
+  return {
+    connect: vi.fn(async () => {
+      const client = clients.shift();
+      if (!client) throw new Error("Unexpected worker connection");
+      return client;
+    })
+  } as unknown as PgPool;
 }
 
 function claimedEvent(values: readonly unknown[]): ClaimedOutboxEvent {

@@ -50,6 +50,51 @@ const fixedEffectHash = createHash("sha256")
   .update("foundation-worker-effect:aggregate-a:version-1-to-2")
   .digest("hex");
 
+const relayAuthorityContracts = [
+  {
+    schema: "identity",
+    table: "tenants",
+    policyStem: "tenants",
+    using:
+      "current_user = 'throughline_relay' AND id = ops.current_tenant_id() AND status = 'active'"
+  },
+  {
+    schema: "identity",
+    table: "workspaces",
+    policyStem: "workspaces",
+    using:
+      "current_user = 'throughline_relay' AND tenant_id = ops.current_tenant_id() AND id = ops.current_workspace_id() AND status = 'active'"
+  },
+  {
+    schema: "identity",
+    table: "policy_versions",
+    policyStem: "policy_versions",
+    using:
+      "current_user = 'throughline_relay' AND tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id() AND id = ops.current_policy_version() AND status = 'active'"
+  },
+  {
+    schema: "identity",
+    table: "service_principals",
+    policyStem: "service_principals",
+    using:
+      "current_user = 'throughline_relay' AND tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id() AND id = ops.current_service_principal_id() AND purpose = 'system' AND status = 'active'"
+  },
+  {
+    schema: "access",
+    table: "spaces",
+    policyStem: "spaces",
+    using:
+      "current_user = 'throughline_relay' AND tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id() AND id = ops.current_space_id() AND archived_at IS NULL"
+  },
+  {
+    schema: "access",
+    table: "access_relationships",
+    policyStem: "access_relationships",
+    using:
+      "current_user = 'throughline_relay' AND tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id() AND resource_type = 'space' AND resource_id = ops.current_space_id() AND subject_type = 'service_principal' AND subject_id = ops.current_service_principal_id() AND relation = 'manager' AND source = 'direct'"
+  }
+] as const;
+
 maybeDescribe("Foundation operational schema security", () => {
   const ownerPool = new pg.Pool({ connectionString: ownerUrl });
   const appPool = new pg.Pool({ connectionString: appUrl });
@@ -349,6 +394,536 @@ maybeDescribe("Foundation operational schema security", () => {
     });
   });
 
+  it("proves relay authority relations and descendants cannot escape forced RLS or ownership", async () => {
+    const relations = await ownerPool.query<{
+      rootName: string;
+      relationName: string;
+      relationKind: string;
+      relrowsecurity: boolean;
+      relforcerowsecurity: boolean;
+      ownerName: string;
+      depth: number;
+    }>(`
+      WITH RECURSIVE roots(root_oid) AS (
+        SELECT unnest(ARRAY[${relayAuthorityContracts
+          .map(({ schema, table }) => `'${schema}.${table}'::regclass`)
+          .join(", ")}])
+      ), descendants(root_oid, relation_oid, depth) AS (
+        SELECT root_oid, root_oid, 0 FROM roots
+        UNION ALL
+        SELECT descendants.root_oid, inheritance.inhrelid, descendants.depth + 1
+        FROM descendants
+        JOIN pg_inherits AS inheritance ON inheritance.inhparent = descendants.relation_oid
+      )
+      SELECT descendants.root_oid::regclass::text AS "rootName",
+             descendants.relation_oid::regclass::text AS "relationName",
+             relation.relkind AS "relationKind",
+             relation.relrowsecurity, relation.relforcerowsecurity,
+             pg_get_userbyid(relation.relowner) AS "ownerName", descendants.depth
+      FROM descendants
+      JOIN pg_class AS relation ON relation.oid = descendants.relation_oid
+      ORDER BY "rootName", descendants.depth, "relationName"
+    `);
+    expect(relations.rows).toHaveLength(relayAuthorityContracts.length);
+    expect(relations.rows.map(({ relationName }) => relationName).sort()).toEqual(
+      relayAuthorityContracts.map(({ schema, table }) => `${schema}.${table}`).sort()
+    );
+    for (const relation of relations.rows) {
+      expect(relation.depth, relation.relationName).toBe(0);
+      expect(relation.relationKind, relation.relationName).toBe("r");
+      expect(relation.relrowsecurity, relation.relationName).toBe(true);
+      expect(relation.relforcerowsecurity, relation.relationName).toBe(true);
+      expect(relation.ownerName, relation.relationName).not.toBe("throughline_relay");
+    }
+  });
+
+  it("proves relay has no privileged or inherited role path", async () => {
+    const role = await ownerPool.query<{
+      rolsuper: boolean;
+      rolbypassrls: boolean;
+      rolcreatedb: boolean;
+      rolcreaterole: boolean;
+      rolreplication: boolean;
+      rolinherit: boolean;
+    }>(`
+      SELECT rolsuper, rolbypassrls, rolcreatedb, rolcreaterole, rolreplication, rolinherit
+      FROM pg_roles WHERE rolname = 'throughline_relay'
+    `);
+    expect(role.rows).toEqual([
+      {
+        rolsuper: false,
+        rolbypassrls: false,
+        rolcreatedb: false,
+        rolcreaterole: false,
+        rolreplication: false,
+        rolinherit: false
+      }
+    ]);
+
+    const memberships = await ownerPool.query<{ grantedRole: string; depth: number }>(`
+      WITH RECURSIVE effective_roles(role_oid, depth) AS (
+        SELECT oid, 0 FROM pg_roles WHERE rolname = 'throughline_relay'
+        UNION
+        SELECT membership.roleid, effective_roles.depth + 1
+        FROM effective_roles
+        JOIN pg_auth_members AS membership ON membership.member = effective_roles.role_oid
+      )
+      SELECT role.rolname AS "grantedRole", effective_roles.depth
+      FROM effective_roles
+      JOIN pg_roles AS role ON role.oid = effective_roles.role_oid
+      WHERE effective_roles.depth > 0
+      ORDER BY effective_roles.depth, role.rolname
+    `);
+    expect(memberships.rows).toEqual([]);
+  });
+
+  it("proves relay UPDATE(id) is the only effective authority write privilege", async () => {
+    // Result-ready bounded residual: UPDATE(id) also permits stronger row-lock clauses on rows
+    // visible through RLS. This is accepted only while RelayOutboxRepository and its authorization
+    // service remain fixed, fully parameterized, and expose no arbitrary SQL callback.
+    const effective = await ownerPool.query<{
+      relationName: string;
+      columnName: string;
+      tableUpdate: boolean;
+      columnUpdate: boolean;
+    }>(`
+      WITH authority_relations AS (
+        SELECT unnest(ARRAY[${relayAuthorityContracts
+          .map(({ schema, table }) => `'${schema}.${table}'::regclass`)
+          .join(", ")}]) AS relation_oid
+      )
+      SELECT relation_oid::regclass::text AS "relationName", attribute.attname AS "columnName",
+             has_table_privilege('throughline_relay', relation_oid, 'UPDATE') AS "tableUpdate",
+             has_column_privilege('throughline_relay', relation_oid, attribute.attnum, 'UPDATE')
+               AS "columnUpdate"
+      FROM authority_relations
+      JOIN pg_attribute AS attribute ON attribute.attrelid = relation_oid
+      WHERE attribute.attnum > 0 AND NOT attribute.attisdropped
+      ORDER BY "relationName", attribute.attnum
+    `);
+    for (const row of effective.rows) {
+      expect(row.tableUpdate, row.relationName).toBe(false);
+      expect(row.columnUpdate, `${row.relationName}.${row.columnName}`).toBe(
+        row.columnName === "id"
+      );
+    }
+
+    const aclUpdatePaths = await ownerPool.query<{
+      relationName: string;
+      columnName: string | null;
+      grantee: string;
+      grantable: boolean;
+    }>(`
+      WITH RECURSIVE effective_roles(role_oid) AS (
+        SELECT oid FROM pg_roles WHERE rolname = 'throughline_relay'
+        UNION
+        SELECT membership.roleid
+        FROM effective_roles
+        JOIN pg_auth_members AS membership ON membership.member = effective_roles.role_oid
+      ), authority_relations AS (
+        SELECT unnest(ARRAY[${relayAuthorityContracts
+          .map(({ schema, table }) => `'${schema}.${table}'::regclass`)
+          .join(", ")}]) AS relation_oid
+      ), table_acl AS (
+        SELECT relation.oid AS relation_oid, NULL::text AS column_name, acl.grantee,
+               acl.is_grantable
+        FROM authority_relations
+        JOIN pg_class AS relation ON relation.oid = authority_relations.relation_oid
+        CROSS JOIN LATERAL unnest(
+          coalesce(relation.relacl, acldefault('r', relation.relowner))
+        ) AS acl_item
+        CROSS JOIN LATERAL aclexplode(ARRAY[acl_item]) acl
+        WHERE acl.privilege_type = 'UPDATE'
+      ), column_acl AS (
+        SELECT relation_oid, attribute.attname, acl.grantee, acl.is_grantable
+        FROM authority_relations
+        JOIN pg_attribute AS attribute ON attribute.attrelid = relation_oid
+        CROSS JOIN LATERAL unnest(coalesce(attribute.attacl, '{}'::aclitem[])) AS acl_item
+        CROSS JOIN LATERAL aclexplode(ARRAY[acl_item]) acl
+        WHERE attribute.attnum > 0 AND NOT attribute.attisdropped
+          AND acl.privilege_type = 'UPDATE'
+      )
+      SELECT relation_oid::regclass::text AS "relationName", column_name AS "columnName",
+             CASE WHEN grantee = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(grantee) END AS grantee,
+             is_grantable AS grantable
+      FROM (SELECT * FROM table_acl UNION ALL SELECT * FROM column_acl) AS paths
+      WHERE grantee = 0 OR grantee IN (SELECT role_oid FROM effective_roles)
+      ORDER BY "relationName", "columnName" NULLS FIRST, grantee
+    `);
+    expect(aclUpdatePaths.rows).toEqual(
+      relayAuthorityContracts
+        .map(({ schema, table }) => ({
+          relationName: `${schema}.${table}`,
+          columnName: "id",
+          grantee: "throughline_relay",
+          grantable: false
+        }))
+        .sort((left, right) => left.relationName.localeCompare(right.relationName))
+    );
+
+    const informationSchemaPaths = await ownerPool.query<{
+      relationName: string;
+      columnName: string;
+      grantee: string;
+      grantable: string;
+    }>(
+      `
+      WITH RECURSIVE effective_roles(role_name, role_oid) AS (
+        SELECT rolname, oid FROM pg_roles WHERE rolname = 'throughline_relay'
+        UNION
+        SELECT granted.rolname, granted.oid
+        FROM effective_roles
+        JOIN pg_auth_members AS membership ON membership.member = effective_roles.role_oid
+        JOIN pg_roles AS granted ON granted.oid = membership.roleid
+      )
+      SELECT format('%I.%I', privilege.table_schema, privilege.table_name) AS "relationName",
+             privilege.column_name AS "columnName", privilege.grantee,
+             privilege.is_grantable AS grantable
+      FROM information_schema.column_privileges AS privilege
+      WHERE privilege.privilege_type = 'UPDATE'
+        AND (
+          privilege.grantee = 'PUBLIC'
+          OR privilege.grantee IN (SELECT role_name FROM effective_roles)
+        )
+        AND format('%I.%I', privilege.table_schema, privilege.table_name) = ANY($1::text[])
+      ORDER BY "relationName", "columnName", privilege.grantee
+    `,
+      [relayAuthorityContracts.map(({ schema, table }) => `${schema}.${table}`)]
+    );
+    expect(informationSchemaPaths.rows).toEqual(
+      relayAuthorityContracts
+        .map(({ schema, table }) => ({
+          relationName: `${schema}.${table}`,
+          columnName: "id",
+          grantee: "throughline_relay",
+          grantable: "NO"
+        }))
+        .sort((left, right) => left.relationName.localeCompare(right.relationName))
+    );
+
+    const tableUpdatePaths = await ownerPool.query<{ relationName: string; grantee: string }>(
+      `
+      WITH RECURSIVE effective_roles(role_name, role_oid) AS (
+        SELECT rolname, oid FROM pg_roles WHERE rolname = 'throughline_relay'
+        UNION
+        SELECT granted.rolname, granted.oid
+        FROM effective_roles
+        JOIN pg_auth_members AS membership ON membership.member = effective_roles.role_oid
+        JOIN pg_roles AS granted ON granted.oid = membership.roleid
+      )
+      SELECT format('%I.%I', privilege.table_schema, privilege.table_name) AS "relationName",
+             privilege.grantee
+      FROM information_schema.table_privileges AS privilege
+      WHERE privilege.privilege_type = 'UPDATE'
+        AND (
+          privilege.grantee = 'PUBLIC'
+          OR privilege.grantee IN (SELECT role_name FROM effective_roles)
+        )
+        AND format('%I.%I', privilege.table_schema, privilege.table_name) = ANY($1::text[])
+      ORDER BY "relationName", privilege.grantee
+    `,
+      [relayAuthorityContracts.map(({ schema, table }) => `${schema}.${table}`)]
+    );
+    expect(tableUpdatePaths.rows).toEqual([]);
+  });
+
+  it("proves relay has no other effective authority mutation or schema-create path", async () => {
+    for (const { schema, table } of relayAuthorityContracts) {
+      const relation = `${schema}.${table}`;
+      for (const privilege of ["INSERT", "DELETE", "TRUNCATE", "TRIGGER", "REFERENCES"]) {
+        const result = await ownerPool.query<{ allowed: boolean }>(
+          "SELECT has_table_privilege('throughline_relay', $1, $2) AS allowed",
+          [relation, privilege]
+        );
+        expect(result.rows[0]?.allowed, `${relation}: ${privilege}`).toBe(false);
+      }
+      const schemaCreate = await ownerPool.query<{ allowed: boolean }>(
+        "SELECT has_schema_privilege('throughline_relay', $1, 'CREATE') AS allowed",
+        [schema]
+      );
+      expect(schemaCreate.rows[0]?.allowed, `${schema}: CREATE`).toBe(false);
+    }
+
+    const unsafeHooks = await ownerPool.query<{ objectName: string }>(`
+      WITH authority_relations AS (
+        SELECT unnest(ARRAY[${relayAuthorityContracts
+          .map(({ schema, table }) => `'${schema}.${table}'::regclass`)
+          .join(", ")}]) AS relation_oid
+      )
+      SELECT format('%s trigger %I', trigger.tgrelid::regclass, trigger.tgname) AS "objectName"
+      FROM authority_relations
+      JOIN pg_trigger AS trigger ON trigger.tgrelid = relation_oid
+      WHERE NOT trigger.tgisinternal
+        AND (trigger.tgtype & 2) = 2
+        AND (trigger.tgtype & 16) = 16
+      UNION ALL
+      SELECT format('%s rule %I', rewrite.ev_class::regclass, rewrite.rulename)
+      FROM authority_relations
+      JOIN pg_rewrite AS rewrite ON rewrite.ev_class = relation_oid
+      WHERE rewrite.rulename <> '_RETURN'
+      ORDER BY 1
+    `);
+    expect(unsafeHooks.rows).toEqual([]);
+  });
+
+  it("enumerates the exact twelve effective relay UPDATE policies and their expressions", async () => {
+    const policies = await ownerPool.query<{
+      relationName: string;
+      policyName: string;
+      command: string;
+      permissive: boolean;
+      roles: string[];
+      usingExpression: string | null;
+      checkExpression: string | null;
+    }>(`
+      WITH RECURSIVE effective_roles(role_oid) AS (
+        SELECT oid FROM pg_roles WHERE rolname = 'throughline_relay'
+        UNION
+        SELECT membership.roleid
+        FROM effective_roles
+        JOIN pg_auth_members AS membership ON membership.member = effective_roles.role_oid
+      ), authority_relations AS (
+        SELECT unnest(ARRAY[${relayAuthorityContracts
+          .map(({ schema, table }) => `'${schema}.${table}'::regclass`)
+          .join(", ")}]) AS relation_oid
+      )
+      SELECT policy.polrelid::regclass::text AS "relationName", policy.polname AS "policyName",
+             policy.polcmd AS command, policy.polpermissive AS permissive,
+             ARRAY(
+               SELECT (CASE WHEN role_oid = 0 THEN 'PUBLIC' ELSE pg_get_userbyid(role_oid) END)::text
+               FROM unnest(policy.polroles) AS role_oid ORDER BY 1
+             ) AS roles,
+             pg_get_expr(policy.polqual, policy.polrelid) AS "usingExpression",
+             pg_get_expr(policy.polwithcheck, policy.polrelid) AS "checkExpression"
+      FROM authority_relations
+      JOIN pg_policy AS policy ON policy.polrelid = authority_relations.relation_oid
+      WHERE policy.polcmd IN ('*', 'w')
+        AND (
+          0 = ANY(policy.polroles)
+          OR policy.polroles && ARRAY(SELECT role_oid FROM effective_roles)::oid[]
+        )
+      ORDER BY "relationName", "policyName"
+    `);
+    expect(policies.rows).toHaveLength(12);
+    for (const contract of relayAuthorityContracts) {
+      const relationName = `${contract.schema}.${contract.table}`;
+      const applicable = policies.rows.filter((policy) => policy.relationName === relationName);
+      expect(applicable, relationName).toHaveLength(2);
+      expect(
+        applicable.every(({ command }) => command === "w"),
+        relationName
+      ).toBe(true);
+      expect(
+        applicable.every(({ roles }) => roles.join(",") === "throughline_relay"),
+        relationName
+      ).toBe(true);
+
+      const scoped = applicable.find(
+        ({ policyName }) => policyName === `${contract.policyStem}_relay_lock_only`
+      );
+      expect(scoped, `${relationName} scoped`).toBeDefined();
+      expect(scoped?.permissive).toBe(true);
+      expect(normalizePolicyExpression(scoped?.usingExpression)).toBe(
+        normalizePolicyExpression(contract.using)
+      );
+      expect(normalizePolicyExpression(scoped?.checkExpression)).toBe("false");
+
+      const guard = applicable.find(
+        ({ policyName }) => policyName === `${contract.policyStem}_relay_no_write`
+      );
+      expect(guard, `${relationName} guard`).toBeDefined();
+      expect(guard?.permissive).toBe(false);
+      expect(normalizePolicyExpression(guard?.usingExpression)).toBe("true");
+      expect(normalizePolicyExpression(guard?.checkExpression)).toBe("false");
+      expect(
+        applicable.some(({ permissive }) => permissive) &&
+          applicable.some(
+            ({ permissive, checkExpression }) =>
+              !permissive && normalizePolicyExpression(checkExpression) === "false"
+          ),
+        `${relationName} future permissive-policy guard`
+      ).toBe(true);
+    }
+  });
+
+  it("lets relay FOR SHARE-lock each exact authority predicate row", async () => {
+    const client = await relayPool.connect();
+    try {
+      await client.query("BEGIN");
+      await setLocal(client, relayAuthoritySettings());
+      for (const [table, predicate, values] of relayAuthorityRows()) {
+        const locked = await client.query<{ id: string }>(
+          `SELECT id FROM ${table} WHERE ${predicate} FOR SHARE`,
+          [...values]
+        );
+        expect(locked.rowCount, table).toBe(1);
+      }
+      await client.query("ROLLBACK");
+    } finally {
+      client.release();
+    }
+  });
+
+  it.each(relayAuthorityRows())(
+    "proves relay FOR SHARE holds a real tuple lock on %s",
+    async (table, predicate, values, mutation) => {
+      const relay = await relayPool.connect();
+      const owner = await ownerPool.connect();
+      let mutationPromise: Promise<unknown> | undefined;
+      try {
+        await relay.query("BEGIN");
+        await setLocal(relay, relayAuthoritySettings());
+        await expect(
+          relay.query(`SELECT id FROM ${table} WHERE ${predicate} FOR SHARE`, [...values])
+        ).resolves.toMatchObject({ rowCount: 1 });
+
+        await owner.query("BEGIN");
+        const ownerPid = await owner.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+        mutationPromise = owner.query(`UPDATE ${table} SET ${mutation} WHERE ${predicate}`, [
+          ...values
+        ]);
+        await expect(
+          waitForBlockedBackend(ownerPool, ownerPid.rows[0]!.pid)
+        ).resolves.toBeUndefined();
+
+        await relay.query("ROLLBACK");
+        await expect(mutationPromise).resolves.toMatchObject({ rowCount: 1 });
+        await owner.query("ROLLBACK");
+      } finally {
+        await relay.query("ROLLBACK").catch(() => undefined);
+        await owner.query("ROLLBACK").catch(() => undefined);
+        await Promise.allSettled(mutationPromise ? [mutationPromise] : []);
+        relay.release();
+        owner.release();
+      }
+    }
+  );
+
+  it("default-denies relay no-op updates, rejects mutable updates with 42501, and persists no change", async () => {
+    const before = await relayAuthoritySnapshot(ownerPool);
+
+    for (const [table, predicate, values, mutation] of relayAuthorityRows()) {
+      await expectRelayStatementDenied(
+        relayPool,
+        `UPDATE ${table} SET id = id WHERE ${predicate}`,
+        values,
+        relayAuthoritySettings()
+      );
+      await expectRelayStatementDenied(
+        relayPool,
+        `UPDATE ${table} SET ${mutation} WHERE ${predicate}`,
+        values,
+        relayAuthoritySettings()
+      );
+    }
+
+    await expect(relayAuthoritySnapshot(ownerPool)).resolves.toEqual(before);
+  });
+
+  it.each(relayAuthorityRows())(
+    "denies every SQL write surface and preserves the full row digest for %s",
+    async (table, predicate, values) => {
+      const before = await relationDigest(ownerPool, table);
+      const columns = await authorityColumnNames(ownerPool, table);
+      const existing = await ownerPool.query<{ id: string }>(
+        `SELECT id::text AS id FROM ${table} WHERE ${predicate}`,
+        [...values]
+      );
+      expect(existing.rows, table).toHaveLength(1);
+      const existingId = existing.rows[0]!.id;
+      const conflictTarget =
+        table === "identity.policy_versions" ? "(tenant_id, workspace_id, id)" : "(id)";
+      const differentId = crypto.randomUUID();
+      const statements: Array<readonly [string, readonly unknown[]]> = [
+        [`UPDATE ${table} SET id = id WHERE ${predicate}`, values],
+        [
+          `UPDATE ${table} SET id = $${values.length + 1} WHERE ${predicate}`,
+          [...values, differentId]
+        ],
+        [`DELETE FROM ${table} WHERE ${predicate}`, values],
+        [`TRUNCATE TABLE ${table}`, []],
+        [
+          `MERGE INTO ${table} AS target USING (VALUES ($1::text)) AS source(id)
+           ON target.id::text = source.id
+           WHEN MATCHED THEN UPDATE SET id = target.id`,
+          [existingId]
+        ],
+        [`INSERT INTO ${table} (id) VALUES ($1)`, [differentId]],
+        [
+          `INSERT INTO ${table}
+           SELECT * FROM ${table} WHERE id::text = $1
+           ON CONFLICT ${conflictTarget} DO UPDATE SET id = EXCLUDED.id`,
+          [existingId]
+        ]
+      ];
+      for (const column of columns.filter((column) => column !== "id")) {
+        statements.push([`UPDATE ${table} SET ${column} = ${column} WHERE ${predicate}`, values]);
+        statements.push([
+          `UPDATE ${table} SET id = id, ${column} = ${column} WHERE ${predicate}`,
+          values
+        ]);
+      }
+
+      for (const [sql, parameters] of statements) {
+        await expectRelayStatementDenied(relayPool, sql, parameters, relayAuthoritySettings());
+      }
+      await expect(relationDigest(ownerPool, table)).resolves.toBe(before);
+      await expect(relayPool.query("SELECT current_user AS role")).resolves.toMatchObject({
+        rows: [{ role: "throughline_relay" }]
+      });
+    }
+  );
+
+  it("keeps cross-scope authority rows invisible to relay FOR SHARE locks", async () => {
+    const client = await relayPool.connect();
+    try {
+      await client.query("BEGIN");
+      await setLocal(client, relayAuthoritySettings());
+      for (const [table, predicate, values] of relayCrossScopeAuthorityRows()) {
+        const locked = await client.query(`SELECT id FROM ${table} WHERE ${predicate} FOR SHARE`, [
+          ...values
+        ]);
+        expect(locked.rows, table).toEqual([]);
+      }
+      await client.query("ROLLBACK");
+    } finally {
+      client.release();
+    }
+  });
+
+  it.each(relayAuthorityRows())(
+    "fails closed for missing, malformed, stale, and wrong context on %s",
+    async (table, predicate, values) => {
+      for (const requiredSetting of relayRequiredSettings(table)) {
+        const missing = { ...relayAuthoritySettings(), [requiredSetting]: undefined };
+        await expectRelayLockRows(relayPool, table, predicate, values, missing, 0);
+
+        const malformed = relayAuthoritySettings();
+        await expectMalformedRelayContextClosed(
+          relayPool,
+          table,
+          predicate,
+          values,
+          requiredSetting,
+          malformed
+        );
+
+        const wrong = {
+          ...relayAuthoritySettings(),
+          [requiredSetting]: wrongRelaySetting(requiredSetting)
+        };
+        await expectRelayLockRows(relayPool, table, predicate, values, wrong, 0);
+      }
+
+      try {
+        await setRelayAuthorityLiveState(ownerPool, table, false);
+        await expectRelayLockRows(relayPool, table, predicate, values, relayAuthoritySettings(), 0);
+      } finally {
+        await setRelayAuthorityLiveState(ownerPool, table, true);
+      }
+    }
+  );
+
   it("allows relay claim metadata updates only inside its exact transaction-local scope", async () => {
     const client = await relayPool.connect();
     try {
@@ -631,7 +1206,7 @@ maybeDescribe("Foundation operational schema security", () => {
       const workerIdentity = await workerTarget.query<{ pid: number }>(
         'SELECT pg_backend_pid()::integer AS "pid"'
       );
-      const sleeping = workerTarget.query("SELECT pg_sleep(5)");
+      const sleeping = workerTarget.query("SELECT pg_sleep(5)").catch((error: unknown) => error);
       await waitForActiveBackend(ownerPool, workerIdentity.rows[0]!.pid);
       await expect(
         canceller.query<{ cancelled: boolean }>(
@@ -639,7 +1214,7 @@ maybeDescribe("Foundation operational schema security", () => {
           [workerIdentity.rows[0]!.pid]
         )
       ).resolves.toMatchObject({ rows: [{ cancelled: true }] });
-      await expect(sleeping).rejects.toMatchObject({ code: "57014" });
+      expect(await sleeping).toMatchObject({ code: "57014" });
       await expect(workerTarget.query("SELECT 1 AS alive")).resolves.toMatchObject({
         rows: [{ alive: 1 }]
       });
@@ -1205,6 +1780,346 @@ type ScopeSettings = {
   aggregateVersion?: string;
   effectHash?: string;
 };
+
+type RelayAuthorityRow = readonly [
+  table: string,
+  predicate: string,
+  values: readonly string[],
+  mutation: string
+];
+
+function relayAuthoritySettings(): ScopeSettings {
+  return {
+    tenantId: devFixtures.tenantA,
+    workspaceId: devFixtures.workspaceA,
+    spaceId: devFixtures.rootSpaceA,
+    servicePrincipalId: ids.relayA,
+    policyVersion: DEV_POLICY_VERSION
+  };
+}
+
+function relayAuthorityRows(): readonly RelayAuthorityRow[] {
+  return [
+    [
+      "identity.tenants",
+      "id = $1 AND status = 'active'",
+      [devFixtures.tenantA],
+      "status = 'suspended'"
+    ],
+    [
+      "identity.workspaces",
+      "tenant_id = $1 AND id = $2 AND status = 'active'",
+      [devFixtures.tenantA, devFixtures.workspaceA],
+      "status = 'archived'"
+    ],
+    [
+      "identity.policy_versions",
+      "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND status = 'active'",
+      [devFixtures.tenantA, devFixtures.workspaceA, DEV_POLICY_VERSION],
+      "status = 'retired'"
+    ],
+    [
+      "identity.service_principals",
+      "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND purpose = 'system' AND status = 'active'",
+      [devFixtures.tenantA, devFixtures.workspaceA, ids.relayA],
+      "status = 'disabled'"
+    ],
+    [
+      "access.spaces",
+      "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND archived_at IS NULL",
+      [devFixtures.tenantA, devFixtures.workspaceA, devFixtures.rootSpaceA],
+      "archived_at = clock_timestamp()"
+    ],
+    [
+      "access.access_relationships",
+      "tenant_id = $1 AND workspace_id = $2 AND subject_type = 'service_principal' AND subject_id = $3 AND resource_type = 'space' AND resource_id = $4 AND relation = 'manager' AND source = 'direct'",
+      [devFixtures.tenantA, devFixtures.workspaceA, ids.relayA, devFixtures.rootSpaceA],
+      "relation = 'owner'"
+    ]
+  ];
+}
+
+function relayCrossScopeAuthorityRows(): readonly RelayAuthorityRow[] {
+  return [
+    [
+      "identity.tenants",
+      "id = $1 AND status = 'active'",
+      [devFixtures.tenantB],
+      "status = 'suspended'"
+    ],
+    [
+      "identity.workspaces",
+      "tenant_id = $1 AND id = $2 AND status = 'active'",
+      [devFixtures.tenantB, devFixtures.workspaceB],
+      "status = 'archived'"
+    ],
+    [
+      "identity.policy_versions",
+      "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND status = 'active'",
+      [devFixtures.tenantB, devFixtures.workspaceB, DEV_POLICY_VERSION],
+      "status = 'retired'"
+    ],
+    [
+      "identity.service_principals",
+      "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND purpose = 'system' AND status = 'active'",
+      [devFixtures.tenantB, devFixtures.workspaceB, ids.relayB],
+      "status = 'disabled'"
+    ],
+    [
+      "access.spaces",
+      "tenant_id = $1 AND workspace_id = $2 AND id = $3 AND archived_at IS NULL",
+      [devFixtures.tenantB, devFixtures.workspaceB, devFixtures.rootSpaceB],
+      "archived_at = clock_timestamp()"
+    ],
+    [
+      "access.access_relationships",
+      "tenant_id = $1 AND workspace_id = $2 AND subject_type = 'service_principal' AND subject_id = $3 AND resource_type = 'space' AND resource_id = $4 AND relation = 'manager' AND source = 'direct'",
+      [devFixtures.tenantB, devFixtures.workspaceB, ids.relayB, devFixtures.rootSpaceB],
+      "relation = 'owner'"
+    ]
+  ];
+}
+
+async function relayAuthoritySnapshot(pool: pg.Pool): Promise<Record<string, unknown>[]> {
+  const snapshot = await pool.query<Record<string, unknown>>(`
+    SELECT 'identity.tenants' AS table_name, id::text, status::text AS mutable_value
+    FROM identity.tenants WHERE id = '${devFixtures.tenantA}'
+    UNION ALL
+    SELECT 'identity.workspaces', id::text, status::text
+    FROM identity.workspaces WHERE id = '${devFixtures.workspaceA}'
+    UNION ALL
+    SELECT 'identity.policy_versions', id::text, status::text
+    FROM identity.policy_versions
+    WHERE tenant_id = '${devFixtures.tenantA}' AND workspace_id = '${devFixtures.workspaceA}'
+      AND id = '${DEV_POLICY_VERSION}'
+    UNION ALL
+    SELECT 'identity.service_principals', id::text, status::text
+    FROM identity.service_principals WHERE id = '${ids.relayA}'
+    UNION ALL
+    SELECT 'access.spaces', id::text, coalesce(archived_at::text, '<null>')
+    FROM access.spaces WHERE id = '${devFixtures.rootSpaceA}'
+    UNION ALL
+    SELECT 'access.access_relationships', id::text, relation::text
+    FROM access.access_relationships
+    WHERE tenant_id = '${devFixtures.tenantA}' AND workspace_id = '${devFixtures.workspaceA}'
+      AND subject_type = 'service_principal' AND subject_id = '${ids.relayA}'
+      AND resource_type = 'space' AND resource_id = '${devFixtures.rootSpaceA}'
+      AND source = 'direct'
+    ORDER BY table_name
+  `);
+  return snapshot.rows;
+}
+
+async function relationDigest(pool: pg.Pool, table: string): Promise<string> {
+  const result = await pool.query<{ digest: string }>(`
+    SELECT encode(
+      digest(
+        coalesce(jsonb_agg(to_jsonb(authority_row) ORDER BY to_jsonb(authority_row)::text)::text, '[]'),
+        'sha256'
+      ),
+      'hex'
+    ) AS digest
+    FROM ${table} AS authority_row
+  `);
+  return result.rows[0]!.digest;
+}
+
+async function authorityColumnNames(pool: pg.Pool, table: string): Promise<string[]> {
+  const [schema, relation] = table.split(".") as [string, string];
+  const result = await pool.query<{ columnName: string }>(
+    `SELECT attribute.attname AS "columnName"
+     FROM pg_attribute AS attribute
+     WHERE attribute.attrelid = format('%I.%I', $1::text, $2::text)::regclass
+       AND attribute.attnum > 0 AND NOT attribute.attisdropped
+     ORDER BY attribute.attnum`,
+    [schema, relation]
+  );
+  return result.rows.map(({ columnName }) => columnName);
+}
+
+async function expectRelayStatementDenied(
+  pool: pg.Pool,
+  sql: string,
+  parameters: readonly unknown[],
+  settings: ScopeSettings
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await setLocal(client, settings);
+    await expect(client.query(sql, [...parameters]), sql).rejects.toMatchObject({ code: "42501" });
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+  await expect(pool.query("SELECT 1 AS reusable")).resolves.toMatchObject({
+    rows: [{ reusable: 1 }]
+  });
+}
+
+async function expectRelayLockRows(
+  pool: pg.Pool,
+  table: string,
+  predicate: string,
+  values: readonly string[],
+  settings: ScopeSettings,
+  expectedRows: number
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await setLocal(client, settings);
+    const result = await client.query(`SELECT id FROM ${table} WHERE ${predicate} FOR SHARE`, [
+      ...values
+    ]);
+    expect(result.rowCount, table).toBe(expectedRows);
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+}
+
+type RelaySettingKey =
+  | "tenantId"
+  | "workspaceId"
+  | "spaceId"
+  | "servicePrincipalId"
+  | "policyVersion";
+
+function relayRequiredSettings(table: string): readonly RelaySettingKey[] {
+  if (table === "identity.tenants") return ["tenantId"];
+  if (table === "identity.workspaces") return ["tenantId", "workspaceId"];
+  if (table === "identity.policy_versions") {
+    return ["tenantId", "workspaceId", "policyVersion"];
+  }
+  if (table === "identity.service_principals") {
+    return ["tenantId", "workspaceId", "servicePrincipalId"];
+  }
+  if (table === "access.spaces") return ["tenantId", "workspaceId", "spaceId"];
+  return ["tenantId", "workspaceId", "spaceId", "servicePrincipalId"];
+}
+
+function wrongRelaySetting(key: RelaySettingKey): string {
+  const wrong = {
+    tenantId: devFixtures.tenantB,
+    workspaceId: devFixtures.workspaceB,
+    spaceId: devFixtures.rootSpaceB,
+    servicePrincipalId: ids.relayB,
+    policyVersion: "stale-policy-v0"
+  } satisfies Record<RelaySettingKey, string>;
+  return wrong[key];
+}
+
+async function expectMalformedRelayContextClosed(
+  pool: pg.Pool,
+  table: string,
+  predicate: string,
+  values: readonly string[],
+  key: RelaySettingKey,
+  settings: ScopeSettings
+): Promise<void> {
+  const settingNames = {
+    tenantId: "app.tenant_id",
+    workspaceId: "app.workspace_id",
+    spaceId: "app.space_id",
+    servicePrincipalId: "app.service_principal_id",
+    policyVersion: "app.policy_version"
+  } satisfies Record<RelaySettingKey, string>;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await setLocal(client, settings);
+    await client.query("SELECT set_config($1, $2, true)", [
+      settingNames[key],
+      key === "policyVersion" ? "malformed-policy" : "not-a-uuid"
+    ]);
+    try {
+      const result = await client.query(`SELECT id FROM ${table} WHERE ${predicate} FOR SHARE`, [
+        ...values
+      ]);
+      expect(result.rows, `${table}: ${key}`).toEqual([]);
+    } catch (error) {
+      expect(error, `${table}: ${key}`).toMatchObject({ code: "22P02" });
+    }
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+}
+
+async function setRelayAuthorityLiveState(
+  pool: pg.Pool,
+  table: string,
+  active: boolean
+): Promise<void> {
+  const mutations: Record<string, readonly [string, readonly unknown[]]> = {
+    "identity.tenants": [
+      "UPDATE identity.tenants SET status = $2 WHERE id = $1",
+      [devFixtures.tenantA, active ? "active" : "suspended"]
+    ],
+    "identity.workspaces": [
+      "UPDATE identity.workspaces SET status = $2 WHERE id = $1",
+      [devFixtures.workspaceA, active ? "active" : "archived"]
+    ],
+    "identity.policy_versions": [
+      `UPDATE identity.policy_versions SET status = $4
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        DEV_POLICY_VERSION,
+        active ? "active" : "retired"
+      ]
+    ],
+    "identity.service_principals": [
+      "UPDATE identity.service_principals SET status = $2 WHERE id = $1",
+      [ids.relayA, active ? "active" : "disabled"]
+    ],
+    "access.spaces": [
+      `UPDATE access.spaces
+       SET archived_at = CASE WHEN $2::boolean THEN NULL ELSE clock_timestamp() END
+       WHERE id = $1`,
+      [devFixtures.rootSpaceA, active]
+    ],
+    "access.access_relationships": [
+      `UPDATE access.access_relationships SET relation = $5
+       WHERE tenant_id = $1 AND workspace_id = $2
+         AND subject_type = 'service_principal' AND subject_id = $3
+         AND resource_type = 'space' AND resource_id = $4 AND source = 'direct'`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        ids.relayA,
+        devFixtures.rootSpaceA,
+        active ? "manager" : "owner"
+      ]
+    ]
+  };
+  const mutation = mutations[table];
+  if (!mutation) throw new Error(`Unknown relay authority table: ${table}`);
+  const result = await pool.query(mutation[0], [...mutation[1]]);
+  expect(result.rowCount, `${table}: live=${active}`).toBe(1);
+}
+
+async function waitForBlockedBackend(pool: pg.Pool, pid: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ blockers: number[] }>(
+      "SELECT pg_blocking_pids($1)::integer[] AS blockers",
+      [pid]
+    );
+    if ((result.rows[0]?.blockers.length ?? 0) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Backend ${pid} did not expose the expected tuple-lock blocker`);
+}
+
+function normalizePolicyExpression(expression: string | null | undefined): string {
+  return (expression ?? "")
+    .toLowerCase()
+    .replace(/::(?:text|name)\b/g, "")
+    .replace(/[()\s]/g, "");
+}
 
 async function setLocal(client: pg.PoolClient, settings: ScopeSettings): Promise<void> {
   const pairs: Array<[string, string | undefined]> = [

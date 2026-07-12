@@ -9,8 +9,10 @@ import {
   bootstrapWorkerContextReference,
   consumeFoundationWorkerJob,
   createPgPool,
+  type FoundationWorkerAuthorization,
   type PgPool
 } from "@throughline/db";
+import { withPropagatedSpan, type TraceCarrier } from "@throughline/observability";
 import {
   createAsyncContextReferenceCodec,
   type AsyncContextReferenceCodec
@@ -40,12 +42,21 @@ export interface FoundationWorkerRuntimeEnvironment {
   FOUNDATION_SQS_QUEUE_URL: string;
   FOUNDATION_WORKER_SERVICE_PRINCIPAL_ID: string;
   FOUNDATION_POLICY_VERSION_ID: string;
-  FOUNDATION_CONTEXT_SIGNING_KEY_ID: string;
-  FOUNDATION_CONTEXT_SIGNING_KEY_BASE64: string;
+  FOUNDATION_CONTEXT_VERIFICATION_KEYS_JSON: string;
+  FOUNDATION_CONTEXT_ACTIVE_KEY_ID: string;
   AWS_REGION: string;
   AWS_ACCESS_KEY_ID: string;
   AWS_SECRET_ACCESS_KEY: string;
 }
+
+export interface FoundationWorkerContextKeys {
+  activeKeyId: string;
+  verificationKeys: ReadonlyMap<string, Uint8Array>;
+}
+
+export type ParsedFoundationWorkerRuntimeEnvironment = FoundationWorkerRuntimeEnvironment & {
+  contextKeys: FoundationWorkerContextKeys;
+};
 
 export interface FoundationWorkerRuntime {
   consumer: FoundationSqsConsumer<RuntimeRehydratedJob>;
@@ -53,10 +64,11 @@ export interface FoundationWorkerRuntime {
   close: () => Promise<void>;
 }
 
-interface RuntimeRehydratedJob {
+export interface RuntimeRehydratedJob {
   jobId: string;
   contextReferenceId: string;
   securityContext: Awaited<ReturnType<typeof rehydrateFoundationWorkerContext>>["securityContext"];
+  continuationCarrier: TraceCarrier;
 }
 
 interface RuntimeLogger {
@@ -68,15 +80,15 @@ interface RuntimeLogger {
 
 export function parseFoundationWorkerRuntimeEnvironment(
   source: NodeJS.ProcessEnv | Partial<FoundationWorkerRuntimeEnvironment>
-): FoundationWorkerRuntimeEnvironment {
+): ParsedFoundationWorkerRuntimeEnvironment {
   const required = [
     "TEST_WORKER_DATABASE_URL",
     "FOUNDATION_SQS_ENDPOINT",
     "FOUNDATION_SQS_QUEUE_URL",
     "FOUNDATION_WORKER_SERVICE_PRINCIPAL_ID",
     "FOUNDATION_POLICY_VERSION_ID",
-    "FOUNDATION_CONTEXT_SIGNING_KEY_ID",
-    "FOUNDATION_CONTEXT_SIGNING_KEY_BASE64",
+    "FOUNDATION_CONTEXT_VERIFICATION_KEYS_JSON",
+    "FOUNDATION_CONTEXT_ACTIVE_KEY_ID",
     "AWS_REGION",
     "AWS_ACCESS_KEY_ID",
     "AWS_SECRET_ACCESS_KEY"
@@ -86,7 +98,11 @@ export function parseFoundationWorkerRuntimeEnvironment(
     if (!value) throw new Error(`Foundation worker runtime configuration is incomplete: ${name}`);
     return [name, value] as const;
   });
-  const environment = Object.fromEntries(entries) as unknown as FoundationWorkerRuntimeEnvironment;
+  const configured = Object.fromEntries(entries) as unknown as FoundationWorkerRuntimeEnvironment;
+  const environment: ParsedFoundationWorkerRuntimeEnvironment = {
+    ...configured,
+    contextKeys: parseFoundationContextVerificationKeys(configured)
+  };
   validateWorkerDatabaseUrl(environment.TEST_WORKER_DATABASE_URL);
   validateLocalSqs(environment);
   if (!UUID_PATTERN.test(environment.FOUNDATION_WORKER_SERVICE_PRINCIPAL_ID)) {
@@ -95,17 +111,16 @@ export function parseFoundationWorkerRuntimeEnvironment(
   if (!POLICY_VERSION_PATTERN.test(environment.FOUNDATION_POLICY_VERSION_ID)) {
     throw new Error("Foundation worker policy configuration is invalid");
   }
-  parseSigningKey(environment);
   return environment;
 }
 
-export function parseFoundationContextSigningKey(
+export function parseFoundationContextVerificationKeys(
   environment: Pick<
     FoundationWorkerRuntimeEnvironment,
-    "FOUNDATION_CONTEXT_SIGNING_KEY_ID" | "FOUNDATION_CONTEXT_SIGNING_KEY_BASE64"
+    "FOUNDATION_CONTEXT_VERIFICATION_KEYS_JSON" | "FOUNDATION_CONTEXT_ACTIVE_KEY_ID"
   >
-): { keyId: string; key: Uint8Array } {
-  return parseSigningKey(environment);
+): FoundationWorkerContextKeys {
+  return parseVerificationKeys(environment);
 }
 
 export function composeFoundationWorkerRuntime(
@@ -121,13 +136,12 @@ export function composeFoundationWorkerRuntime(
 ): FoundationWorkerRuntime {
   const environment = parseFoundationWorkerRuntimeEnvironment(input);
   const pool = dependencies.pool ?? createPgPool(environment.TEST_WORKER_DATABASE_URL);
-  const signing = parseSigningKey(environment);
   const clock = dependencies.clock ?? (() => new Date());
   const codec =
     dependencies.codec ??
     createAsyncContextReferenceCodec({
-      verificationKeys: new Map([[signing.keyId, signing.key]]),
-      activeKeyId: signing.keyId,
+      verificationKeys: environment.contextKeys.verificationKeys,
+      activeKeyId: environment.contextKeys.activeKeyId,
       clock
     });
   const logger = dependencies.logger ?? fixedConsoleLogger;
@@ -171,18 +185,15 @@ export function composeFoundationWorkerRuntime(
       return {
         jobId: result.metadata.jobId,
         contextReferenceId: result.metadata.contextReferenceId,
-        securityContext: result.securityContext
+        securityContext: result.securityContext,
+        continuationCarrier: result.metadata.continuationCarrier
       };
     },
     consume: (job, { signal, deadline }) =>
-      consumeFoundationWorkerJob({
+      consumeFoundationRuntimeJob({
         pool,
         authorization,
-        input: {
-          context: job.securityContext,
-          jobId: job.jobId,
-          contextReferenceId: job.contextReferenceId
-        },
+        job,
         signal,
         deadline
       })
@@ -196,6 +207,51 @@ export function composeFoundationWorkerRuntime(
       if (!dependencies.pool) await pool.end();
     }
   };
+}
+
+export function consumeFoundationRuntimeJob(input: {
+  pool: PgPool;
+  authorization: FoundationWorkerAuthorization;
+  job: RuntimeRehydratedJob;
+  signal?: AbortSignal;
+  deadline: { absoluteDeadlineMs: number; now(): number };
+}) {
+  const context = input.job.securityContext;
+  const spaceId = context.requestedSpaceIds[0];
+  const attributes = {
+    "throughline.request.id": context.requestId,
+    "throughline.job.id": input.job.jobId,
+    "throughline.tenant.id": context.tenantId,
+    "throughline.workspace.id": context.workspaceId,
+    "throughline.space.id": spaceId
+  } as const;
+  return withPropagatedSpan(
+    {
+      name: "foundation.worker.authorize",
+      parentCarrier: input.job.continuationCarrier,
+      attributes
+    },
+    ({ carrier: authorizationCarrier }) =>
+      withPropagatedSpan(
+        {
+          name: "foundation.worker.handle",
+          parentCarrier: authorizationCarrier,
+          attributes
+        },
+        () =>
+          consumeFoundationWorkerJob({
+            pool: input.pool,
+            authorization: input.authorization,
+            input: {
+              context,
+              jobId: input.job.jobId,
+              contextReferenceId: input.job.contextReferenceId
+            },
+            ...(input.signal === undefined ? {} : { signal: input.signal }),
+            deadline: input.deadline
+          })
+      )
+  );
 }
 
 export async function runConsumerLoop(
@@ -298,22 +354,43 @@ function validateLocalSqs(environment: FoundationWorkerRuntimeEnvironment): void
   }
 }
 
-function parseSigningKey(
+function parseVerificationKeys(
   environment: Pick<
     FoundationWorkerRuntimeEnvironment,
-    "FOUNDATION_CONTEXT_SIGNING_KEY_ID" | "FOUNDATION_CONTEXT_SIGNING_KEY_BASE64"
+    "FOUNDATION_CONTEXT_VERIFICATION_KEYS_JSON" | "FOUNDATION_CONTEXT_ACTIVE_KEY_ID"
   >
-): { keyId: string; key: Uint8Array } {
-  const keyId = environment.FOUNDATION_CONTEXT_SIGNING_KEY_ID;
-  const encoded = environment.FOUNDATION_CONTEXT_SIGNING_KEY_BASE64;
-  if (!KEY_ID_PATTERN.test(keyId) || !/^[A-Za-z0-9+/]+={0,2}$/.test(encoded)) {
-    throw new Error("Foundation worker signing key configuration is invalid");
+): FoundationWorkerContextKeys {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(environment.FOUNDATION_CONTEXT_VERIFICATION_KEYS_JSON);
+  } catch {
+    throw new Error("Foundation worker verification key map is invalid");
   }
-  const key = Buffer.from(encoded, "base64");
-  if (key.length < 32 || key.toString("base64") !== encoded) {
-    throw new Error("Foundation worker signing key configuration is invalid");
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
+    throw new Error("Foundation worker verification key map is invalid");
   }
-  return { keyId, key: new Uint8Array(key) };
+  const verificationKeys = new Map<string, Uint8Array>();
+  for (const [keyId, material] of Object.entries(parsed)) {
+    if (!KEY_ID_PATTERN.test(keyId) || typeof material !== "string") {
+      throw new Error("Foundation worker verification key is invalid");
+    }
+    if (!/^[A-Za-z0-9+/]{43}=$/.test(material)) {
+      throw new Error("Foundation worker verification key is invalid");
+    }
+    const decoded = Buffer.from(material, "base64");
+    if (decoded.byteLength !== 32 || decoded.toString("base64") !== material) {
+      throw new Error("Foundation worker verification key is invalid");
+    }
+    verificationKeys.set(keyId, new Uint8Array(decoded));
+  }
+  const activeKeyId = environment.FOUNDATION_CONTEXT_ACTIVE_KEY_ID;
+  if (!KEY_ID_PATTERN.test(activeKeyId)) {
+    throw new Error("Foundation worker active verification key is invalid");
+  }
+  if (!verificationKeys.has(activeKeyId)) {
+    throw new Error("Foundation worker active verification key is not present");
+  }
+  return { activeKeyId, verificationKeys: new Map(verificationKeys) };
 }
 
 function extractContextReference(body: string): string {

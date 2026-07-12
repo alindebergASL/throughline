@@ -573,7 +573,8 @@ async function foundationRelayPublishDecision(
   const tenant = await tx.query<{ status: string }>(
     `SELECT status FROM identity.tenants
      WHERE id = $1
-     LIMIT 1`,
+     LIMIT 1
+     FOR SHARE`,
     [context.tenantId]
   );
   if (tenant.rows[0]?.status !== "active") {
@@ -583,7 +584,8 @@ async function foundationRelayPublishDecision(
   const workspace = await tx.query<{ status: string }>(
     `SELECT status FROM identity.workspaces
      WHERE id = $1 AND tenant_id = $2
-     LIMIT 1`,
+     LIMIT 1
+     FOR SHARE`,
     [context.workspaceId, context.tenantId]
   );
   if (workspace.rows[0]?.status !== "active") {
@@ -593,7 +595,8 @@ async function foundationRelayPublishDecision(
   const policy = await tx.query<{ status: string }>(
     `SELECT status FROM identity.policy_versions
      WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3
-     LIMIT 1`,
+     LIMIT 1
+     FOR SHARE`,
     [context.policyVersion, context.tenantId, context.workspaceId]
   );
   if (policy.rows[0]?.status !== "active") {
@@ -603,7 +606,8 @@ async function foundationRelayPublishDecision(
   const principal = await tx.query<{ purpose: string; status: string }>(
     `SELECT purpose, status FROM identity.service_principals
      WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3
-     LIMIT 1`,
+     LIMIT 1
+     FOR SHARE`,
     [context.servicePrincipalId, context.tenantId, context.workspaceId]
   );
   if (principal.rows[0]?.status !== "active") {
@@ -624,7 +628,8 @@ async function foundationRelayPublishDecision(
   const space = await tx.query<{ id: string }>(
     `SELECT id FROM access.spaces
      WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3 AND archived_at IS NULL
-     LIMIT 1`,
+     LIMIT 1
+     FOR SHARE`,
     [resource.id, context.tenantId, context.workspaceId]
   );
   if (!space.rows[0]) {
@@ -641,7 +646,8 @@ async function foundationRelayPublishDecision(
        AND resource_type = 'space'
        AND resource_id = $4
        AND source = 'direct'
-     LIMIT 1`,
+     LIMIT 1
+     FOR SHARE`,
     [context.tenantId, context.workspaceId, context.servicePrincipalId, resource.id]
   );
   if (!grant.rows[0]) {

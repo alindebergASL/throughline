@@ -43,109 +43,124 @@ export class FoundationProofService {
       ...input.context,
       requestedSpaceIds: [input.spaceId]
     });
-
-    return withTenantTransaction({ pool: this.pool, context }, async (tx) => {
-      await assertFoundationProofAppRole(tx);
-
-      const decision = await this.authorization.canInTransaction(
-        context,
-        "foundation.proof.create",
-        { type: "space", id: input.spaceId },
-        tx
-      );
-      if (!decision.allowed) {
-        throw new ForbiddenException({
-          statusCode: 403,
-          error: "Forbidden",
-          message: "Foundation proof authorization denied",
-          reasonCode: decision.reasonCode
-        });
-      }
-
-      const issued = this.codec.issue({
-        tenantId: context.tenantId,
-        workspaceId: context.workspaceId,
-        spaceId: input.spaceId,
-        workerServicePrincipalId: this.options.workerServicePrincipalId,
-        policyVersionId: context.policyVersion,
-        ttlSeconds: 600
-      });
-      const referenceExpiry = new Date(issued.claims.expiresAt * 1_000);
-      if (referenceExpiry.getTime() > Date.parse(context.expiresAt)) {
-        throw new Error("Signed context reference exceeds the SecurityContext expiry");
-      }
-      if (!context.actorUserId || !context.actorMembershipId) {
-        throw new ForbiddenException("Foundation proof requires a human actor");
-      }
-      const delegatingUserId = context.actorUserId;
-      const delegatingMembershipId = context.actorMembershipId;
-
-      return withPropagatedSpan(
-        {
-          name: "foundation.api.outbox",
-          parentCarrier: {
-            ...(input.traceparent === undefined ? {} : { traceparent: input.traceparent }),
-            ...(input.tracestate === undefined ? {} : { tracestate: input.tracestate })
-          },
-          attributes: {
-            "throughline.request.id": context.requestId,
-            "throughline.job.id": issued.claims.jobId,
-            "throughline.tenant.id": context.tenantId,
-            "throughline.workspace.id": context.workspaceId,
-            "throughline.space.id": input.spaceId
-          }
-        },
-        async ({ carrier }) => {
-          await insertFoundationContextReference(tx, {
-            id: issued.claims.referenceId,
-            jobId: issued.claims.jobId,
-            tenantId: context.tenantId,
-            workspaceId: context.workspaceId,
-            spaceId: input.spaceId,
-            workerServicePrincipalId: this.options.workerServicePrincipalId,
-            delegatingUserId,
-            delegatingMembershipId,
-            policyVersionId: context.policyVersion,
-            contextSnapshot: context,
-            issuedAt: new Date(issued.claims.issuedAt * 1_000),
-            expiresAt: referenceExpiry,
-            signingKeyId: issued.claims.signingKeyId
-          });
-
-          const aggregate = await upsertFoundationTestAggregate(tx, {
-            id: this.options.uuidV7(),
-            tenantId: context.tenantId,
-            workspaceId: context.workspaceId,
-            spaceId: input.spaceId,
-            proofKey: input.proofKey,
-            jobId: issued.claims.jobId
-          });
-
-          await insertFoundationOutboxEvent(tx, {
-            id: this.options.uuidV7(),
-            tenantId: context.tenantId,
-            workspaceId: context.workspaceId,
-            spaceId: input.spaceId,
-            aggregateId: aggregate.id,
-            aggregateVersion: aggregate.aggregateVersion,
-            causationId: this.options.uuidV7(),
-            requestId: context.requestId,
-            traceparent: carrier.traceparent,
-            ...(carrier.tracestate === undefined ? {} : { tracestate: carrier.tracestate }),
-            jobId: issued.claims.jobId,
-            relayServicePrincipalId: this.options.relayServicePrincipalId,
-            contextReferenceId: issued.claims.referenceId,
-            signedContextReference: issued.token
-          });
-
-          return {
-            jobId: issued.claims.jobId,
-            aggregateId: aggregate.id,
-            aggregateVersion: aggregate.aggregateVersion
-          };
-        }
-      );
+    const issued = this.codec.issue({
+      tenantId: context.tenantId,
+      workspaceId: context.workspaceId,
+      spaceId: input.spaceId,
+      workerServicePrincipalId: this.options.workerServicePrincipalId,
+      policyVersionId: context.policyVersion,
+      ttlSeconds: 600
     });
+    const referenceExpiry = new Date(issued.claims.expiresAt * 1_000);
+    if (referenceExpiry.getTime() > Date.parse(context.expiresAt)) {
+      throw new Error("Signed context reference exceeds the SecurityContext expiry");
+    }
+    if (!context.actorUserId || !context.actorMembershipId) {
+      throw new ForbiddenException("Foundation proof requires a human actor");
+    }
+    const delegatingUserId = context.actorUserId;
+    const delegatingMembershipId = context.actorMembershipId;
+    const attributes = {
+      "throughline.request.id": context.requestId,
+      "throughline.job.id": issued.claims.jobId,
+      "throughline.tenant.id": context.tenantId,
+      "throughline.workspace.id": context.workspaceId,
+      "throughline.space.id": input.spaceId
+    } as const;
+
+    return withPropagatedSpan(
+      {
+        name: "foundation.api.request",
+        parentCarrier: {
+          ...(input.traceparent === undefined ? {} : { traceparent: input.traceparent }),
+          ...(input.tracestate === undefined ? {} : { tracestate: input.tracestate })
+        },
+        attributes
+      },
+      ({ carrier: requestCarrier }) =>
+        withPropagatedSpan(
+          {
+            name: "foundation.api.database-outbox-commit",
+            parentCarrier: requestCarrier,
+            attributes
+          },
+          ({ carrier: commitCarrier }) =>
+            withTenantTransaction({ pool: this.pool, context }, async (tx) => {
+              await assertFoundationProofAppRole(tx);
+
+              const decision = await this.authorization.canInTransaction(
+                context,
+                "foundation.proof.create",
+                { type: "space", id: input.spaceId },
+                tx
+              );
+              if (!decision.allowed) {
+                throw new ForbiddenException({
+                  statusCode: 403,
+                  error: "Forbidden",
+                  message: "Foundation proof authorization denied",
+                  reasonCode: decision.reasonCode
+                });
+              }
+
+              const delegatedContext = {
+                ...context,
+                requestedSpaceIds: [input.spaceId],
+                issuedAt: new Date(issued.claims.issuedAt * 1_000).toISOString(),
+                expiresAt: referenceExpiry.toISOString()
+              };
+              await insertFoundationContextReference(tx, {
+                id: issued.claims.referenceId,
+                jobId: issued.claims.jobId,
+                tenantId: context.tenantId,
+                workspaceId: context.workspaceId,
+                spaceId: input.spaceId,
+                workerServicePrincipalId: this.options.workerServicePrincipalId,
+                delegatingUserId,
+                delegatingMembershipId,
+                policyVersionId: context.policyVersion,
+                contextSnapshot: delegatedContext,
+                issuedAt: new Date(issued.claims.issuedAt * 1_000),
+                expiresAt: referenceExpiry,
+                signingKeyId: issued.claims.signingKeyId
+              });
+
+              const aggregate = await upsertFoundationTestAggregate(tx, {
+                id: this.options.uuidV7(),
+                tenantId: context.tenantId,
+                workspaceId: context.workspaceId,
+                spaceId: input.spaceId,
+                proofKey: input.proofKey,
+                jobId: issued.claims.jobId
+              });
+
+              await insertFoundationOutboxEvent(tx, {
+                id: this.options.uuidV7(),
+                tenantId: context.tenantId,
+                workspaceId: context.workspaceId,
+                spaceId: input.spaceId,
+                aggregateId: aggregate.id,
+                aggregateVersion: aggregate.aggregateVersion,
+                causationId: this.options.uuidV7(),
+                requestId: context.requestId,
+                traceparent: commitCarrier.traceparent,
+                ...(commitCarrier.tracestate === undefined
+                  ? {}
+                  : { tracestate: commitCarrier.tracestate }),
+                jobId: issued.claims.jobId,
+                relayServicePrincipalId: this.options.relayServicePrincipalId,
+                contextReferenceId: issued.claims.referenceId,
+                signedContextReference: issued.token
+              });
+
+              return {
+                jobId: issued.claims.jobId,
+                aggregateId: aggregate.id,
+                aggregateVersion: aggregate.aggregateVersion
+              };
+            })
+        )
+    );
   }
 }
 

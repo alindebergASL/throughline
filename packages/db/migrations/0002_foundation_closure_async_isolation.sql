@@ -420,6 +420,24 @@ CREATE POLICY tenants_relay_scope ON identity.tenants
   FOR SELECT TO throughline_relay
   USING (current_user = 'throughline_relay' AND id = ops.current_tenant_id());
 
+DROP POLICY IF EXISTS tenants_relay_lock_only ON identity.tenants;
+CREATE POLICY tenants_relay_lock_only ON identity.tenants
+  AS PERMISSIVE
+  FOR UPDATE TO throughline_relay
+  USING (
+    current_user = 'throughline_relay'
+    AND id = ops.current_tenant_id()
+    AND status = 'active'
+  )
+  WITH CHECK (false);
+
+DROP POLICY IF EXISTS tenants_relay_no_write ON identity.tenants;
+CREATE POLICY tenants_relay_no_write ON identity.tenants
+  AS RESTRICTIVE
+  FOR UPDATE TO throughline_relay
+  USING (true)
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS workspaces_relay_scope ON identity.workspaces;
 CREATE POLICY workspaces_relay_scope ON identity.workspaces
   FOR SELECT TO throughline_relay
@@ -428,6 +446,25 @@ CREATE POLICY workspaces_relay_scope ON identity.workspaces
     AND tenant_id = ops.current_tenant_id()
     AND id = ops.current_workspace_id()
   );
+
+DROP POLICY IF EXISTS workspaces_relay_lock_only ON identity.workspaces;
+CREATE POLICY workspaces_relay_lock_only ON identity.workspaces
+  AS PERMISSIVE
+  FOR UPDATE TO throughline_relay
+  USING (
+    current_user = 'throughline_relay'
+    AND tenant_id = ops.current_tenant_id()
+    AND id = ops.current_workspace_id()
+    AND status = 'active'
+  )
+  WITH CHECK (false);
+
+DROP POLICY IF EXISTS workspaces_relay_no_write ON identity.workspaces;
+CREATE POLICY workspaces_relay_no_write ON identity.workspaces
+  AS RESTRICTIVE
+  FOR UPDATE TO throughline_relay
+  USING (true)
+  WITH CHECK (false);
 
 DROP POLICY IF EXISTS service_principals_relay_scope ON identity.service_principals;
 CREATE POLICY service_principals_relay_scope ON identity.service_principals
@@ -439,6 +476,27 @@ CREATE POLICY service_principals_relay_scope ON identity.service_principals
     AND id = ops.current_service_principal_id()
   );
 
+DROP POLICY IF EXISTS service_principals_relay_lock_only ON identity.service_principals;
+CREATE POLICY service_principals_relay_lock_only ON identity.service_principals
+  AS PERMISSIVE
+  FOR UPDATE TO throughline_relay
+  USING (
+    current_user = 'throughline_relay'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND id = ops.current_service_principal_id()
+    AND purpose = 'system'
+    AND status = 'active'
+  )
+  WITH CHECK (false);
+
+DROP POLICY IF EXISTS service_principals_relay_no_write ON identity.service_principals;
+CREATE POLICY service_principals_relay_no_write ON identity.service_principals
+  AS RESTRICTIVE
+  FOR UPDATE TO throughline_relay
+  USING (true)
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS policy_versions_relay_scope ON identity.policy_versions;
 CREATE POLICY policy_versions_relay_scope ON identity.policy_versions
   FOR SELECT TO throughline_relay
@@ -449,6 +507,26 @@ CREATE POLICY policy_versions_relay_scope ON identity.policy_versions
     AND id = ops.current_policy_version()
   );
 
+DROP POLICY IF EXISTS policy_versions_relay_lock_only ON identity.policy_versions;
+CREATE POLICY policy_versions_relay_lock_only ON identity.policy_versions
+  AS PERMISSIVE
+  FOR UPDATE TO throughline_relay
+  USING (
+    current_user = 'throughline_relay'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND id = ops.current_policy_version()
+    AND status = 'active'
+  )
+  WITH CHECK (false);
+
+DROP POLICY IF EXISTS policy_versions_relay_no_write ON identity.policy_versions;
+CREATE POLICY policy_versions_relay_no_write ON identity.policy_versions
+  AS RESTRICTIVE
+  FOR UPDATE TO throughline_relay
+  USING (true)
+  WITH CHECK (false);
+
 DROP POLICY IF EXISTS spaces_relay_scope ON access.spaces;
 CREATE POLICY spaces_relay_scope ON access.spaces
   FOR SELECT TO throughline_relay
@@ -458,6 +536,26 @@ CREATE POLICY spaces_relay_scope ON access.spaces
     AND workspace_id = ops.current_workspace_id()
     AND id = ops.current_space_id()
   );
+
+DROP POLICY IF EXISTS spaces_relay_lock_only ON access.spaces;
+CREATE POLICY spaces_relay_lock_only ON access.spaces
+  AS PERMISSIVE
+  FOR UPDATE TO throughline_relay
+  USING (
+    current_user = 'throughline_relay'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND id = ops.current_space_id()
+    AND archived_at IS NULL
+  )
+  WITH CHECK (false);
+
+DROP POLICY IF EXISTS spaces_relay_no_write ON access.spaces;
+CREATE POLICY spaces_relay_no_write ON access.spaces
+  AS RESTRICTIVE
+  FOR UPDATE TO throughline_relay
+  USING (true)
+  WITH CHECK (false);
 
 DROP POLICY IF EXISTS access_relationships_relay_scope ON access.access_relationships;
 CREATE POLICY access_relationships_relay_scope ON access.access_relationships
@@ -471,6 +569,30 @@ CREATE POLICY access_relationships_relay_scope ON access.access_relationships
     AND subject_type = 'service_principal'
     AND subject_id = ops.current_service_principal_id()
   );
+
+DROP POLICY IF EXISTS access_relationships_relay_lock_only ON access.access_relationships;
+CREATE POLICY access_relationships_relay_lock_only ON access.access_relationships
+  AS PERMISSIVE
+  FOR UPDATE TO throughline_relay
+  USING (
+    current_user = 'throughline_relay'
+    AND tenant_id = ops.current_tenant_id()
+    AND workspace_id = ops.current_workspace_id()
+    AND resource_type = 'space'
+    AND resource_id = ops.current_space_id()
+    AND subject_type = 'service_principal'
+    AND subject_id = ops.current_service_principal_id()
+    AND relation = 'manager'
+    AND source = 'direct'
+  )
+  WITH CHECK (false);
+
+DROP POLICY IF EXISTS access_relationships_relay_no_write ON access.access_relationships;
+CREATE POLICY access_relationships_relay_no_write ON access.access_relationships
+  AS RESTRICTIVE
+  FOR UPDATE TO throughline_relay
+  USING (true)
+  WITH CHECK (false);
 
 DROP POLICY IF EXISTS outbox_events_relay_scope ON ops.outbox_events;
 CREATE POLICY outbox_events_relay_scope ON ops.outbox_events
@@ -811,14 +933,14 @@ GRANT SELECT (id, status) ON identity.users TO throughline_worker;
 GRANT SELECT (id, tenant_id, workspace_id, user_id, role, status) ON identity.memberships
   TO throughline_worker;
 
-GRANT UPDATE (id) ON identity.tenants TO throughline_worker;
-GRANT UPDATE (id) ON identity.workspaces TO throughline_worker;
+GRANT UPDATE (id) ON identity.tenants TO throughline_relay, throughline_worker;
+GRANT UPDATE (id) ON identity.workspaces TO throughline_relay, throughline_worker;
 GRANT UPDATE (id) ON identity.users TO throughline_worker;
 GRANT UPDATE (id) ON identity.memberships TO throughline_worker;
-GRANT UPDATE (id) ON identity.policy_versions TO throughline_worker;
-GRANT UPDATE (id) ON identity.service_principals TO throughline_worker;
-GRANT UPDATE (id) ON access.spaces TO throughline_worker;
-GRANT UPDATE (id) ON access.access_relationships TO throughline_worker;
+GRANT UPDATE (id) ON identity.policy_versions TO throughline_relay, throughline_worker;
+GRANT UPDATE (id) ON identity.service_principals TO throughline_relay, throughline_worker;
+GRANT UPDATE (id) ON access.spaces TO throughline_relay, throughline_worker;
+GRANT UPDATE (id) ON access.access_relationships TO throughline_relay, throughline_worker;
 
 GRANT SELECT (
   id, event_type, tenant_id, workspace_id, space_id, aggregate_type, aggregate_id,

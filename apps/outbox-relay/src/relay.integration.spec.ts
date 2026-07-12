@@ -48,6 +48,65 @@ interface AwsTestSdk {
   PurgeQueueCommand: new (input: object) => object;
 }
 
+const relayAuthorityMutationCases = [
+  {
+    name: "tenant",
+    mutateSql: "UPDATE identity.tenants SET status = 'suspended' WHERE id = $1",
+    restoreSql: "UPDATE identity.tenants SET status = 'active' WHERE id = $1",
+    parameters: [devFixtures.tenantA]
+  },
+  {
+    name: "workspace",
+    mutateSql: "UPDATE identity.workspaces SET status = 'archived' WHERE id = $1",
+    restoreSql: "UPDATE identity.workspaces SET status = 'active' WHERE id = $1",
+    parameters: [devFixtures.workspaceA]
+  },
+  {
+    name: "policy version",
+    mutateSql: `UPDATE identity.policy_versions SET status = 'retired'
+                WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+    restoreSql: `UPDATE identity.policy_versions SET status = 'active'
+                 WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+    parameters: [devFixtures.tenantA, devFixtures.workspaceA, DEV_POLICY_VERSION]
+  },
+  {
+    name: "relay service principal",
+    mutateSql: "UPDATE identity.service_principals SET status = 'disabled' WHERE id = $1",
+    restoreSql: "UPDATE identity.service_principals SET status = 'active' WHERE id = $1",
+    parameters: [devFixtures.relayServicePrincipalA]
+  },
+  {
+    name: "Space",
+    mutateSql: "UPDATE access.spaces SET archived_at = clock_timestamp() WHERE id = $1",
+    restoreSql: "UPDATE access.spaces SET archived_at = NULL WHERE id = $1",
+    parameters: [devFixtures.restrictedSpaceA]
+  },
+  {
+    name: "direct manager relationship",
+    mutateSql: `UPDATE access.access_relationships SET relation = 'viewer'
+                WHERE tenant_id = $1 AND workspace_id = $2
+                  AND subject_type = 'service_principal' AND subject_id = $3
+                  AND resource_type = 'space' AND resource_id = $4
+                  AND relation = 'manager' AND source = 'direct'`,
+    restoreSql: `UPDATE access.access_relationships SET relation = 'manager'
+                 WHERE tenant_id = $1 AND workspace_id = $2
+                   AND subject_type = 'service_principal' AND subject_id = $3
+                   AND resource_type = 'space' AND resource_id = $4
+                   AND relation = 'viewer' AND source = 'direct'`,
+    parameters: [
+      devFixtures.tenantA,
+      devFixtures.workspaceA,
+      devFixtures.relayServicePrincipalA,
+      devFixtures.restrictedSpaceA
+    ]
+  }
+] as const;
+
+const relayFirstBarrierCases = relayAuthorityMutationCases.flatMap((authority) => [
+  { authority, relayOutcome: "commit" as const },
+  { authority, relayOutcome: "rollback" as const }
+]);
+
 integration("Foundation relay PostgreSQL + LocalStack integration", () => {
   let ownerPool: PgPool;
   let appPool: PgPool;
@@ -245,6 +304,159 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     expect((first ?? second)?.eventId).toBe(event.eventId);
   });
 
+  it.each(relayFirstBarrierCases)(
+    "holds $authority.name mutation behind relay authorization until relay $relayOutcome",
+    async ({ authority, relayOutcome }) => {
+      const event = await insertCommittedEvent(
+        ownerPool,
+        `relay-first-${authority.name}-${relayOutcome}`
+      );
+      const claimed = await repository.claimNext(relayContext(), {
+        claimedBy: `relay-result-${relayOutcome}`,
+        leaseSeconds: 30
+      });
+      expect(claimed).toMatchObject({ eventId: event.eventId });
+      const realAuthorization = new PostgresAuthorizationService(relayPool);
+      let releaseAuthorization!: () => void;
+      const authorizationReleased = new Promise<void>((resolve) => {
+        releaseAuthorization = resolve;
+      });
+      let authorizationReached!: () => void;
+      const reachedAuthorization = new Promise<void>((resolve) => {
+        authorizationReached = resolve;
+      });
+      const barrierAuthorization = {
+        canInTransaction: async (
+          ...args: Parameters<typeof realAuthorization.canInTransaction>
+        ) => {
+          const decision = await realAuthorization.canInTransaction(...args);
+          authorizationReached();
+          await authorizationReleased;
+          if (relayOutcome === "rollback") throw new Error("injected relay rollback");
+          return decision;
+        }
+      };
+      const barrierRepository = new RelayOutboxRepository(relayPool, barrierAuthorization as never);
+      const owner = await ownerPool.connect();
+      let resultWrite: Promise<unknown> | undefined;
+      let mutation: Promise<unknown> | undefined;
+      try {
+        resultWrite = barrierRepository.markPublished(
+          relayContext(),
+          claimed!,
+          `relay-result-${relayOutcome}`
+        );
+        await reachedAuthorization;
+
+        const pid = await owner.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+        mutation = owner.query(authority.mutateSql, [...authority.parameters]);
+        await expect(waitForBlockingPid(ownerPool, pid.rows[0]!.pid)).resolves.toBeUndefined();
+
+        releaseAuthorization();
+        if (relayOutcome === "commit") {
+          await expect(resultWrite).resolves.toBeUndefined();
+        } else {
+          await expect(resultWrite).rejects.toThrow("injected relay rollback");
+        }
+        await expect(mutation).resolves.toMatchObject({ rowCount: 1 });
+      } finally {
+        releaseAuthorization();
+        await Promise.allSettled([resultWrite, mutation].filter(Boolean) as Promise<unknown>[]);
+        owner.release();
+        await ownerPool.query(authority.restoreSql, [...authority.parameters]);
+      }
+
+      const result = await resultFields(event.eventId);
+      expect(result?.published_at === null, `${authority.name}: ${relayOutcome}`).toBe(
+        relayOutcome === "rollback"
+      );
+      expect(result?.terminal_failed_at).toBeNull();
+    }
+  );
+
+  it.each(relayAuthorityMutationCases)(
+    "denies and publishes nothing when the $name mutation commits first",
+    async (authority) => {
+      const event = await insertCommittedEvent(ownerPool, `authority-first-${authority.name}`);
+      const before = await eventState(event.eventId);
+      const owner = await ownerPool.connect();
+      let publication: Promise<unknown> | undefined;
+      let sends = 0;
+      const proofRelay = new FoundationOutboxRelay(
+        repository,
+        {
+          send: async () => {
+            sends += 1;
+            return { MessageId: generateUuidV7() };
+          }
+        },
+        queueUrl!
+      );
+      try {
+        await owner.query("BEGIN");
+        const pid = await owner.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+        await expect(
+          owner.query(authority.mutateSql, [...authority.parameters])
+        ).resolves.toMatchObject({ rowCount: 1 });
+
+        publication = proofRelay.publishNext(relayContext(), {
+          claimedBy: `authority-first-${authority.name}`,
+          leaseSeconds: 30
+        });
+        await expect(waitForRelayBlockedBy(ownerPool, pid.rows[0]!.pid)).resolves.toBeUndefined();
+        await owner.query("COMMIT");
+        await expect(publication).rejects.toThrow("Relay publication is not authorized");
+      } finally {
+        await owner.query("ROLLBACK").catch(() => undefined);
+        await Promise.allSettled(publication ? [publication] : []);
+        owner.release();
+        await ownerPool.query(authority.restoreSql, [...authority.parameters]);
+      }
+      expect(sends).toBe(0);
+      await expect(eventState(event.eventId)).resolves.toEqual(before);
+    }
+  );
+
+  it.each(relayAuthorityMutationCases)(
+    "releases the relay after a winning $name mutation rolls back without deadlock",
+    async (authority) => {
+      const event = await insertCommittedEvent(ownerPool, `authority-rollback-${authority.name}`);
+      const owner = await ownerPool.connect();
+      let claim: Promise<unknown> | undefined;
+      try {
+        await owner.query("BEGIN");
+        const pid = await owner.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+        await expect(
+          owner.query(authority.mutateSql, [...authority.parameters])
+        ).resolves.toMatchObject({ rowCount: 1 });
+        claim = repository.claimNext(relayContext(), {
+          claimedBy: `authority-rollback-${authority.name}`,
+          leaseSeconds: 30
+        });
+        await expect(waitForRelayBlockedBy(ownerPool, pid.rows[0]!.pid)).resolves.toBeUndefined();
+        await owner.query("ROLLBACK");
+        await expect(claim).resolves.toMatchObject({ eventId: event.eventId });
+      } finally {
+        await owner.query("ROLLBACK").catch(() => undefined);
+        await Promise.allSettled(claim ? [claim] : []);
+        owner.release();
+        await ownerPool.query(authority.restoreSql, [...authority.parameters]);
+      }
+    }
+  );
+
+  it("uses one deterministic authority lock order for concurrent relay transactions", async () => {
+    const first = await insertCommittedEvent(ownerPool, "deterministic-order-a");
+    const second = await insertCommittedEvent(ownerPool, "deterministic-order-b");
+    const results = await Promise.all([
+      repository.claimNext(relayContext(), { claimedBy: "ordered-a", leaseSeconds: 30 }),
+      repository.claimNext(relayContext(), { claimedBy: "ordered-b", leaseSeconds: 30 })
+    ]);
+    expect(results.map((result) => result?.eventId).sort()).toEqual(
+      [first.eventId, second.eventId].sort()
+    );
+  });
+
   it("cannot see or complete an owner event before commit, then claims it after commit", async () => {
     const owner = await ownerPool.connect();
     let event: Awaited<ReturnType<typeof insertEventRows>>;
@@ -327,7 +539,7 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
       );
       await expectDeniedWithoutEventUpdate(
         { ...relayContext(), servicePrincipalId: devFixtures.servicePrincipalA },
-        "relay_principal_wrong_purpose",
+        "relay_principal_not_active",
         event.eventId
       );
     } finally {
@@ -537,6 +749,25 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     );
     return result.rows[0];
   }
+
+  async function eventState(eventId: string) {
+    const result = await ownerPool.query<{
+      publication_attempts: number;
+      claimed_at: Date | null;
+      claimed_by: string | null;
+      claim_expires_at: Date | null;
+      published_at: Date | null;
+      published_message_id: string | null;
+      terminal_failed_at: Date | null;
+      terminal_failure_code: string | null;
+    }>(
+      `SELECT publication_attempts, claimed_at, claimed_by, claim_expires_at,
+              published_at, published_message_id, terminal_failed_at, terminal_failure_code
+       FROM ops.outbox_events WHERE id = $1`,
+      [eventId]
+    );
+    return result.rows[0];
+  }
 });
 
 function relayContext(): SecurityContext {
@@ -643,4 +874,35 @@ async function insertEventRows(
     ]
   );
   return { eventId, jobId };
+}
+
+async function waitForBlockingPid(pool: PgPool, pid: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ blockers: number[] }>(
+      "SELECT pg_blocking_pids($1)::integer[] AS blockers",
+      [pid]
+    );
+    if ((result.rows[0]?.blockers.length ?? 0) > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("Concurrent relay authority revocation did not wait for decision locks");
+}
+
+async function waitForRelayBlockedBy(pool: PgPool, blockerPid: number): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ pid: number }>(
+      `SELECT activity.pid
+       FROM pg_stat_activity AS activity
+       WHERE activity.usename = 'throughline_relay'
+         AND $1 = ANY(pg_blocking_pids(activity.pid))
+       ORDER BY activity.pid
+       LIMIT 1`,
+      [blockerPid]
+    );
+    if (result.rows.length === 1) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`Relay did not expose the expected authority blocker ${blockerPid}`);
 }

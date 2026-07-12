@@ -420,34 +420,54 @@ describe("Foundation worker context rehydration RED contract", () => {
     expect(result.securityContext.dataClassCeiling).not.toBe("confidential");
   });
 
-  it("keeps queue request/trace metadata out of authority construction", async () => {
-    const result = await rehydrate(
-      input({
-        messageAttributes: {
-          eventId: "untrusted-event-metadata",
-          requestId: "untrusted-request-metadata",
-          traceparent: "untrusted-trace-metadata",
-          workerServicePrincipalId: ids.otherWorker,
-          roleHints: ["owner"],
-          dataClassCeiling: "confidential"
-        }
-      })
-    );
+  it.each([
+    ["tenantId", ids.otherTenant],
+    ["workspaceId", ids.otherWorkspace],
+    ["spaceId", ids.otherSpace],
+    ["jobId", "70000000-0000-7000-8000-000000000022"],
+    ["eventId", "70000000-0000-7000-8000-000000000012"],
+    ["requestId", "different-request"],
+    ["traceparent", "00-11111111111111111111111111111111-2222222222222222-01"],
+    ["tracestate", "other=value"]
+  ] as const)(
+    "denies a conflicting SQS %s attribute before bootstrap or handler access",
+    async (name, value) => {
+      const bootstrapReference = vi.fn(async () => reference());
+      await expect(
+        rehydrate(
+          input({
+            messageAttributes: {
+              [name]: { DataType: "String", StringValue: value }
+            },
+            bootstrapReference
+          })
+        )
+      ).rejects.toMatchObject({ code: "invalid_envelope" });
+      expect(bootstrapReference).not.toHaveBeenCalled();
+    }
+  );
 
-    expect(result.metadata).toEqual({
-      eventId: ids.event,
-      jobId: ids.job,
-      requestId: "request-from-queue",
-      traceparent,
-      tracestate: "vendor=value"
-    });
-    expect(result.securityContext).toMatchObject({
-      tenantId: ids.tenant,
-      workspaceId: ids.workspace,
-      servicePrincipalId: ids.worker,
-      requestedSpaceIds: [ids.space],
-      dataClassCeiling: "restricted"
-    });
+  it("ignores an unknown non-authority attribute when the validated routing attributes agree", async () => {
+    const bootstrapReference = vi.fn(async () => reference());
+    await expect(
+      rehydrate(
+        input({
+          messageAttributes: {
+            tenantId: { DataType: "String", StringValue: ids.tenant },
+            workspaceId: { DataType: "String", StringValue: ids.workspace },
+            spaceId: { DataType: "String", StringValue: ids.space },
+            jobId: { DataType: "String", StringValue: ids.job },
+            eventId: { DataType: "String", StringValue: ids.event },
+            requestId: { DataType: "String", StringValue: "request-from-queue" },
+            traceparent: { DataType: "String", StringValue: traceparent },
+            tracestate: { DataType: "String", StringValue: "vendor=value" },
+            diagnosticHint: { DataType: "String", StringValue: "ignored" }
+          },
+          bootstrapReference
+        })
+      )
+    ).resolves.toBeDefined();
+    expect(bootstrapReference).toHaveBeenCalledOnce();
   });
 
   it("returns and logs only safe denial data without the raw token or SecurityContext", async () => {

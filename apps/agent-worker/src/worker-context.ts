@@ -3,7 +3,8 @@ import {
   toWorkerTraceEnvelope,
   withPropagatedSpan,
   type RequestTraceContext,
-  type RequestTraceContextInput
+  type RequestTraceContextInput,
+  type TraceCarrier
 } from "@throughline/observability";
 import type { SecurityContext } from "@throughline/core-types";
 import type { AsyncContextReferenceClaims, AsyncContextReferenceCodec } from "@throughline/tenancy";
@@ -98,6 +99,7 @@ export interface RehydratedFoundationWorkerContext {
     requestId: string;
     traceparent: string;
     tracestate?: string;
+    continuationCarrier: TraceCarrier;
   };
 }
 
@@ -112,34 +114,8 @@ export async function rehydrateFoundationWorkerContext(
   input: RehydrateFoundationWorkerContextInput
 ): Promise<RehydratedFoundationWorkerContext> {
   const envelope = parseEnvelope(input.body);
+  assertRoutingAttributesMatch(input.messageAttributes, envelope);
   assertNotAborted(input.signal);
-  let claims: AsyncContextReferenceClaims;
-  try {
-    claims = input.codec.verify(envelope.contextReference, {
-      jobId: envelope.jobId,
-      tenantId: envelope.scope.tenantId,
-      workspaceId: envelope.scope.workspaceId,
-      spaceId: envelope.scope.spaceId,
-      workerServicePrincipalId: input.targetWorkerServicePrincipalId,
-      policyVersionId: input.targetPolicyVersionId
-    });
-  } catch {
-    throw denied(input.logger);
-  }
-
-  let stored: BootstrapReference | null;
-  try {
-    stored = await input.bootstrapReference(claims);
-  } catch {
-    throw denied(input.logger);
-  }
-  assertNotAborted(input.signal);
-  const now = input.clock();
-  if (!isValidStoredReference(stored, claims, now)) {
-    throw denied(input.logger);
-  }
-
-  const snapshot = parseSecurityContext(stored.contextSnapshot);
   return withPropagatedSpan(
     {
       name: "foundation.worker.receive",
@@ -149,48 +125,138 @@ export async function rehydrateFoundationWorkerContext(
       },
       attributes: {
         "throughline.request.id": envelope.requestId,
-        "throughline.job.id": claims.jobId,
-        "throughline.tenant.id": claims.tenantId,
-        "throughline.workspace.id": claims.workspaceId,
-        "throughline.space.id": claims.spaceId
+        "throughline.job.id": envelope.jobId,
+        "throughline.tenant.id": envelope.scope.tenantId,
+        "throughline.workspace.id": envelope.scope.workspaceId,
+        "throughline.space.id": envelope.scope.spaceId
       }
     },
-    ({ carrier }) => {
-      const securityContext: SecurityContext = {
-        requestId: envelope.requestId,
-        traceId: carrier.traceparent.slice(3, 35),
-        tenantId: claims.tenantId,
-        workspaceId: claims.workspaceId,
-        servicePrincipalId: claims.workerServicePrincipalId,
-        delegatedByUserId: stored.delegatingUserId,
-        delegatedByMembershipId: stored.delegatingMembershipId,
-        requestedSpaceIds: [claims.spaceId],
-        membershipIds: [],
-        roleHints: [],
-        dataClassCeiling: snapshot.dataClassCeiling,
-        policyVersion: claims.policyVersionId,
-        issuedAt: toIsoString(stored.issuedAt),
-        expiresAt: toIsoString(stored.expiresAt)
-      };
+    ({ carrier: receiveCarrier }) =>
+      withPropagatedSpan(
+        {
+          name: "foundation.worker.rehydrate",
+          parentCarrier: receiveCarrier,
+          attributes: {
+            "throughline.request.id": envelope.requestId,
+            "throughline.job.id": envelope.jobId,
+            "throughline.tenant.id": envelope.scope.tenantId,
+            "throughline.workspace.id": envelope.scope.workspaceId,
+            "throughline.space.id": envelope.scope.spaceId
+          }
+        },
+        async ({ carrier: rehydrateCarrier }) => {
+          let claims: AsyncContextReferenceClaims;
+          try {
+            claims = input.codec.verify(envelope.contextReference, {
+              jobId: envelope.jobId,
+              tenantId: envelope.scope.tenantId,
+              workspaceId: envelope.scope.workspaceId,
+              spaceId: envelope.scope.spaceId,
+              workerServicePrincipalId: input.targetWorkerServicePrincipalId,
+              policyVersionId: input.targetPolicyVersionId
+            });
+          } catch {
+            throw denied(input.logger);
+          }
 
-      const metadata = {
-        eventId: envelope.eventId,
-        jobId: envelope.jobId,
-        requestId: envelope.requestId,
-        traceparent: carrier.traceparent,
-        ...(carrier.tracestate === undefined ? {} : { tracestate: carrier.tracestate })
-      };
-      Object.defineProperty(metadata, "contextReferenceId", {
-        value: claims.referenceId,
-        enumerable: false,
-        writable: false
-      });
-      return {
-        securityContext,
-        metadata: metadata as RehydratedFoundationWorkerContext["metadata"]
-      };
-    }
+          let stored: BootstrapReference | null;
+          try {
+            stored = await input.bootstrapReference(claims);
+          } catch {
+            throw denied(input.logger);
+          }
+          assertNotAborted(input.signal);
+          const now = input.clock();
+          if (!isValidStoredReference(stored, claims, now)) {
+            throw denied(input.logger);
+          }
+
+          const snapshot = parseSecurityContext(stored.contextSnapshot);
+          const securityContext: SecurityContext = {
+            requestId: envelope.requestId,
+            traceId: receiveCarrier.traceparent.slice(3, 35),
+            tenantId: claims.tenantId,
+            workspaceId: claims.workspaceId,
+            servicePrincipalId: claims.workerServicePrincipalId,
+            delegatedByUserId: stored.delegatingUserId,
+            delegatedByMembershipId: stored.delegatingMembershipId,
+            requestedSpaceIds: [claims.spaceId],
+            membershipIds: [],
+            roleHints: [],
+            dataClassCeiling: snapshot.dataClassCeiling,
+            policyVersion: claims.policyVersionId,
+            issuedAt: toIsoString(stored.issuedAt),
+            expiresAt: toIsoString(stored.expiresAt)
+          };
+
+          const metadata = {
+            eventId: envelope.eventId,
+            jobId: envelope.jobId,
+            requestId: envelope.requestId,
+            traceparent: receiveCarrier.traceparent,
+            ...(receiveCarrier.tracestate === undefined
+              ? {}
+              : { tracestate: receiveCarrier.tracestate })
+          };
+          Object.defineProperties(metadata, {
+            contextReferenceId: {
+              value: claims.referenceId,
+              enumerable: false,
+              writable: false
+            },
+            continuationCarrier: {
+              value: Object.freeze({ ...rehydrateCarrier }),
+              enumerable: false,
+              writable: false
+            }
+          });
+          return {
+            securityContext,
+            metadata: metadata as RehydratedFoundationWorkerContext["metadata"]
+          };
+        }
+      )
   );
+}
+
+const CONSISTENCY_ATTRIBUTES = [
+  "tenantId",
+  "workspaceId",
+  "spaceId",
+  "jobId",
+  "eventId",
+  "requestId",
+  "traceparent",
+  "tracestate"
+] as const;
+
+function assertRoutingAttributesMatch(
+  attributes: Readonly<Record<string, unknown>> | undefined,
+  envelope: FoundationQueueEnvelope
+): void {
+  if (!attributes) return;
+  const expected: Record<(typeof CONSISTENCY_ATTRIBUTES)[number], string | undefined> = {
+    tenantId: envelope.scope.tenantId,
+    workspaceId: envelope.scope.workspaceId,
+    spaceId: envelope.scope.spaceId,
+    jobId: envelope.jobId,
+    eventId: envelope.eventId,
+    requestId: envelope.requestId,
+    traceparent: envelope.traceparent,
+    tracestate: envelope.tracestate
+  };
+  for (const name of CONSISTENCY_ATTRIBUTES) {
+    if (!Object.hasOwn(attributes, name)) continue;
+    const attribute = attributes[name];
+    if (
+      !isPlainRecord(attribute) ||
+      (attribute.DataType !== undefined && attribute.DataType !== "String") ||
+      typeof attribute.StringValue !== "string" ||
+      attribute.StringValue !== expected[name]
+    ) {
+      throw new FoundationWorkerContextError("invalid_envelope");
+    }
+  }
 }
 
 function parseEnvelope(body: string): FoundationQueueEnvelope {
