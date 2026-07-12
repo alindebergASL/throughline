@@ -4,8 +4,9 @@
 - **Authorized base:** `6dec188bbd341576e966d0df7040f2eeddba3418`
 - **Task 9 checkpoint:** `bfc99efe2a16161eb305d75e5df3c8b1ce1124c7`
 - **Previously blocked implementation:** `d8df5d1ad910a0f6770ae01b4b6f2e73f0a6b957`
-- **Reviewed implementation:** `e44a4907ed82eb5f95cb3c8f8a842fdcf95eaa71`
-- **Tested and reviewed tree:** `f32c1e9d8f37b0d958a997973310dedb64067545`
+- **Reviewed implementation and CI-race correction:** `6f075e11edb68ad5dd73aaac56ddf01a1032918e`
+- **Tested and reviewed tree:** `5c1fcd072bd291afd91b7738385a2315741d568c`
+- **Production implementation checkpoint:** `e44a4907ed82eb5f95cb3c8f8a842fdcf95eaa71`
 - **Branch:** `foundation-closure-async-isolation`
 
 ## Scope and outcome
@@ -102,6 +103,25 @@ The event ID is correlation metadata only. It is not part of the signed authorit
 replace the signed job, Tenant, Workspace, Space, worker-principal, policy-version, expiry, or
 reference bindings.
 
+## GitHub Actions fixture-race correction
+
+The first pull-request Actions execution for reviewed result head
+`77e8c389ada6c009166656819c3405717b1fa064` failed in the Foundation gate:
+<https://github.com/alindebergASL/throughline/actions/runs/29209051826>. Formatting, lint,
+typecheck, ordinary tests, build, and the standalone PostgreSQL security gate had already passed.
+
+The raw log showed `foundation-security.spec.ts` and `worker-transaction.postgres.spec.ts` running
+concurrently against one shared PostgreSQL database. Both files reset and provision the disposable
+schema and roles. The worker file therefore changed the shared fixture while the security file was
+executing, producing missing-schema, `NOLOGIN`, and transaction-aborted cascade failures. This was a
+test-runner file-parallelism race, not a production authorization failure.
+
+`package.json` now adds Vitest `--no-file-parallelism` to all six direct authoritative Foundation
+Vitest invocations. The pinned Vitest 3.2.6 recognizes that option and executes the files with one
+worker. The exact corrected database invocation passed both files and all 87 tests, after which the
+entire fresh disposable-resource gate below was rerun. Production implementation paths remained
+byte-identical to `e44a4907ed82eb5f95cb3c8f8a842fdcf95eaa71`.
+
 ## Authoritative gate
 
 The final gate used a newly provisioned disposable PostgreSQL database, a LocalStack source queue
@@ -110,14 +130,14 @@ Turbo tasks to execute without cache reliance.
 
 | Command | Exit | Duration | Observed result |
 | --- | ---: | ---: | --- |
-| `npm exec -- pnpm install --frozen-lockfile` | 0 | 1.931 s | frozen installation state accepted |
-| `npm exec -- pnpm format:check` | 0 | 7.405 s | formatting accepted |
-| `npm exec -- pnpm lint` | 0 | 140.815 s | all lint tasks passed |
-| `npm exec -- pnpm typecheck` | 0 | 109.226 s | all typecheck tasks passed |
-| `npm exec -- pnpm test` | 0 | 74.414 s | 404 passed; 204 expected environment-gated skips |
-| `npm exec -- pnpm build` | 0 | 108.314 s | all build tasks passed |
-| `npm exec -- pnpm test:security` | 0 | 25.043 s | DB 18 passed; authorization 70 passed |
-| `npm exec -- pnpm test:foundation` | 0 | 77.776 s | all authoritative suites passed with zero skips |
+| `npm exec -- pnpm install --frozen-lockfile` | 0 | 2.172 s | frozen installation state accepted |
+| `npm exec -- pnpm format:check` | 0 | 8.327 s | formatting accepted |
+| `npm exec -- pnpm lint` | 0 | 151.254 s | all lint tasks passed |
+| `npm exec -- pnpm typecheck` | 0 | 107.863 s | all typecheck tasks passed |
+| `npm exec -- pnpm test` | 0 | 70.766 s | 404 passed; 204 expected environment-gated skips |
+| `npm exec -- pnpm build` | 0 | 103.700 s | all build tasks passed |
+| `npm exec -- pnpm test:security` | 0 | 24.197 s | DB 18 passed; authorization 70 passed |
+| `npm exec -- pnpm test:foundation` | 0 | 73.524 s | all authoritative suites passed with zero skips |
 
 The Foundation invocation recorded these executions:
 
@@ -140,7 +160,7 @@ zero skips.
 ## Fail-closed preflight evidence
 
 The legacy negative probe ran `pnpm test:security` without owner or app database variables. It exited
-`1` in 1.123 seconds, identified both `TEST_DATABASE_URL` and `TEST_APP_DATABASE_URL` as missing,
+`1` in 1.257 seconds, identified both `TEST_DATABASE_URL` and `TEST_APP_DATABASE_URL` as missing,
 and stopped before Turbo/Vitest execution or skip reporting. No configured DSN, database password,
 or verification-key value appeared in its output.
 
@@ -168,21 +188,22 @@ The disposable database, source queue, DLQ, and bucket were then deleted, and in
 checks confirmed that all four resource classes were gone.
 
 The tested pre-gate and post-gate binary patches were byte-identical, and the tested staged tree was
-exactly `f32c1e9d8f37b0d958a997973310dedb64067545`, the tree committed at the reviewed implementation
-SHA.
+exactly `5c1fcd072bd291afd91b7738385a2315741d568c`, the tree committed at the reviewed implementation and
+CI-race-correction SHA.
 
 ## Independent review
 
 Claude Fable was unavailable because of its spend limit and is therefore not review evidence.
 
-A fresh isolated, read-only fallback Codex reviewer inspected the exact implementation head, the
-base and Task 10 diffs, the accepted BLOCK, RED evidence, authoritative raw logs, canonical kickoff,
-both backlog formats, Build Spec, ADRs 015–020, repository instructions, and the Foundation Closure
-plan. It returned:
+A fresh isolated, read-only fallback Codex reviewer inspected the exact implementation and
+CI-race-correction head, the base and Task 10 diffs, the accepted BLOCK, failed Actions evidence,
+corrected serial proof, authoritative raw logs, canonical kickoff, both backlog formats, Build Spec,
+ADRs 015–020, repository instructions, and the Foundation Closure plan. It returned:
 
 - `VERDICT: PASS`
-- `REVIEWED_SHA: e44a4907ed82eb5f95cb3c8f8a842fdcf95eaa71`
-- `REVIEWED_TREE: f32c1e9d8f37b0d958a997973310dedb64067545`
+- `REVIEWED_SHA: 6f075e11edb68ad5dd73aaac56ddf01a1032918e`
+- `REVIEWED_TREE: 5c1fcd072bd291afd91b7738385a2315741d568c`
+- `PRODUCTION_PATHS_UNCHANGED_FROM_E44: yes`
 - `BLOCKING_FINDINGS: none`
 - `FILES_MODIFIED: none`
 
@@ -193,10 +214,13 @@ residual described above. None violated a Foundation Closure acceptance criterio
 
 ## Explicit stop state
 
-This result records implementation and review evidence only. At the time this document was written:
+This result records implementation and review evidence only. At the time this revision was written:
 
 - no deployment occurred;
 - B1 was not started;
 - no merge occurred;
-- no canonical document or accepted ADR was changed; and
-- no GitHub Actions success, PR URL, or result-document commit SHA existed to report.
+- no canonical document or accepted ADR was changed;
+- PR <https://github.com/alindebergASL/throughline/pull/4> was open at the prior reviewed result head;
+- its first Actions run had the fixture-race failure recorded above;
+- no Actions success existed for `6f075e11edb68ad5dd73aaac56ddf01a1032918e`; and
+- the SHA for this separate result-document correction did not yet exist.
