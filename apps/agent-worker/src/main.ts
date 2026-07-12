@@ -31,6 +31,7 @@ import {
   rehydrateFoundationWorkerContext,
   type FoundationQueueEnvelope
 } from "./worker-context.js";
+import { timingSafeEqual } from "node:crypto";
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const KEY_ID_PATTERN = /^[A-Za-z0-9_-]{1,32}$/;
@@ -103,6 +104,7 @@ export function parseFoundationWorkerRuntimeEnvironment(
     ...configured,
     contextKeys: parseFoundationContextVerificationKeys(configured)
   };
+  rejectKnownTestOnlyKeyInProduction(source, environment.contextKeys);
   validateWorkerDatabaseUrl(environment.TEST_WORKER_DATABASE_URL);
   validateLocalSqs(environment);
   if (!UUID_PATTERN.test(environment.FOUNDATION_WORKER_SERVICE_PRINCIPAL_ID)) {
@@ -112,6 +114,23 @@ export function parseFoundationWorkerRuntimeEnvironment(
     throw new Error("Foundation worker policy configuration is invalid");
   }
   return environment;
+}
+
+const CI_DUMMY_CONTEXT_KEY = Buffer.alloc(32, 7);
+
+function rejectKnownTestOnlyKeyInProduction(
+  source: NodeJS.ProcessEnv | Partial<FoundationWorkerRuntimeEnvironment>,
+  keys: FoundationWorkerContextKeys
+): void {
+  if ((source as NodeJS.ProcessEnv).NODE_ENV !== "production") return;
+  for (const material of keys.verificationKeys.values()) {
+    if (
+      material.byteLength === CI_DUMMY_CONTEXT_KEY.byteLength &&
+      timingSafeEqual(Buffer.from(material), CI_DUMMY_CONTEXT_KEY)
+    ) {
+      throw new Error("Foundation worker production context key configuration is invalid");
+    }
+  }
 }
 
 export function parseFoundationContextVerificationKeys(

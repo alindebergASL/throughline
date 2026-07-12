@@ -135,7 +135,13 @@ export class FoundationSqsConsumer<Job> {
     let extensionPromise: Promise<void> | undefined;
 
     const extensionHandle = this.options.scheduler.setTimeout(() => {
-      if (!active || terminalReason || this.remaining(startedAt) <= 0) return;
+      if (!active || terminalReason) return;
+      const remainingDeadlineMs = deadline.absoluteDeadlineMs - this.options.scheduler.now();
+      if (remainingDeadlineMs <= 0) {
+        terminalReason = "deadline_exceeded";
+        abortController.abort();
+        return;
+      }
       extensionPromise = this.options.sqs
         .changeMessageVisibility(
           {
@@ -143,7 +149,7 @@ export class FoundationSqsConsumer<Job> {
             ReceiptHandle: receiptHandle,
             VisibilityTimeout: 30
           },
-          { signal: abortController.signal, remainingDeadlineMs: 5_000 }
+          { signal: abortController.signal, remainingDeadlineMs }
         )
         .catch(() => {
           if (!terminalReason) terminalReason = "visibility_extension_failed";

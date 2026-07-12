@@ -8,7 +8,7 @@ import {
 } from "@throughline/observability";
 import type { SecurityContext } from "@throughline/core-types";
 import type { AsyncContextReferenceClaims, AsyncContextReferenceCodec } from "@throughline/tenancy";
-import { parseSecurityContext } from "@throughline/tenancy";
+import { buildScopedQueueKey, parseSecurityContext } from "@throughline/tenancy";
 
 export interface WorkerBootstrapContext extends RequestTraceContext {
   worker: "agent-worker";
@@ -220,39 +220,55 @@ export async function rehydrateFoundationWorkerContext(
 }
 
 const CONSISTENCY_ATTRIBUTES = [
+  "routingKey",
   "tenantId",
   "workspaceId",
   "spaceId",
   "jobId",
   "eventId",
   "requestId",
-  "traceparent",
-  "tracestate"
+  "traceparent"
 ] as const;
 
 function assertRoutingAttributesMatch(
   attributes: Readonly<Record<string, unknown>> | undefined,
   envelope: FoundationQueueEnvelope
 ): void {
-  if (!attributes) return;
+  if (!attributes) throw new FoundationWorkerContextError("invalid_envelope");
   const expected: Record<(typeof CONSISTENCY_ATTRIBUTES)[number], string | undefined> = {
+    routingKey: buildScopedQueueKey(envelope.scope),
     tenantId: envelope.scope.tenantId,
     workspaceId: envelope.scope.workspaceId,
     spaceId: envelope.scope.spaceId,
     jobId: envelope.jobId,
     eventId: envelope.eventId,
     requestId: envelope.requestId,
-    traceparent: envelope.traceparent,
-    tracestate: envelope.tracestate
+    traceparent: envelope.traceparent
   };
   for (const name of CONSISTENCY_ATTRIBUTES) {
-    if (!Object.hasOwn(attributes, name)) continue;
+    if (!Object.hasOwn(attributes, name)) {
+      throw new FoundationWorkerContextError("invalid_envelope");
+    }
     const attribute = attributes[name];
     if (
       !isPlainRecord(attribute) ||
-      (attribute.DataType !== undefined && attribute.DataType !== "String") ||
+      attribute.DataType !== "String" ||
       typeof attribute.StringValue !== "string" ||
       attribute.StringValue !== expected[name]
+    ) {
+      throw new FoundationWorkerContextError("invalid_envelope");
+    }
+  }
+  const hasTracestateAttribute = Object.hasOwn(attributes, "tracestate");
+  if (hasTracestateAttribute !== (envelope.tracestate !== undefined)) {
+    throw new FoundationWorkerContextError("invalid_envelope");
+  }
+  if (hasTracestateAttribute) {
+    const attribute = attributes.tracestate;
+    if (
+      !isPlainRecord(attribute) ||
+      attribute.DataType !== "String" ||
+      attribute.StringValue !== envelope.tracestate
     ) {
       throw new FoundationWorkerContextError("invalid_envelope");
     }

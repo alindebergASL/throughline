@@ -1,13 +1,13 @@
-import type { FoundationQueueEnvelope, SecurityContext } from "@throughline/core-types";
-import {
-  toFoundationQueueEnvelope,
-  type ClaimedOutboxEvent,
-  type RelayClaimIdentity,
-  type RelayClaimOptions,
-  type RelayOutboxRepository
+import type { SecurityContext } from "@throughline/core-types";
+import type {
+  DeepReadonly,
+  RelayClaimIdentity,
+  RelayClaimOptions,
+  RelayOutboxRepository,
+  RelayPublicationPublisher,
+  RelayPublicationRequest
 } from "@throughline/db";
 import { withPropagatedSpan, type TraceCarrier } from "@throughline/observability";
-import { buildScopedQueueKey } from "@throughline/tenancy";
 
 export interface SqsSendMessageInput {
   QueueUrl: string;
@@ -20,7 +20,10 @@ export interface SqsSendMessageCommand {
 }
 
 export interface SqsPublisherClient {
-  send(command: SqsSendMessageCommand): Promise<{ MessageId?: string }>;
+  send(
+    command: SqsSendMessageCommand,
+    options?: { readonly abortSignal?: AbortSignal }
+  ): Promise<{ readonly MessageId?: string }>;
 }
 
 export interface SqsCommandFactory {
@@ -32,63 +35,46 @@ export type RelayPublishResult =
   | { status: "published"; eventId: string; messageId: string };
 
 export class FoundationOutboxRelay {
+  private readonly publisher: RelayPublicationPublisher;
+
   constructor(
     private readonly repository: RelayOutboxRepository,
-    private readonly sqs: SqsPublisherClient,
-    private readonly queueUrl: string,
-    private readonly commands: SqsCommandFactory = { create: (input) => ({ input }) }
+    sqs: SqsPublisherClient,
+    queueUrl: string,
+    commands: SqsCommandFactory = { create: (input) => ({ input }) },
+    sendTimeoutMs = 10_000
   ) {
-    if (!queueUrl) throw new Error("Foundation source queue URL is required");
+    this.publisher = new FoundationSqsPublisher(sqs, queueUrl, commands, sendTimeoutMs);
   }
 
   async publishNext(
     context: SecurityContext,
     claimOptions: RelayClaimOptions
   ): Promise<RelayPublishResult> {
-    const event = await this.repository.claimNext(context, claimOptions);
-    if (!event) return { status: "idle" };
+    const claim = await this.repository.claimNext(context, claimOptions);
+    if (!claim) return { status: "idle" };
+    return this.publishClaimed(context, claim);
+  }
 
-    return withPropagatedSpan(
-      {
-        name: "foundation.relay.publish",
-        parentCarrier: {
-          traceparent: event.traceparent,
-          ...(event.tracestate === undefined ? {} : { tracestate: event.tracestate })
-        },
-        attributes: {
-          "throughline.request.id": event.requestId,
-          "throughline.job.id": event.jobId,
-          "throughline.tenant.id": event.tenantId,
-          "throughline.workspace.id": event.workspaceId,
-          "throughline.space.id": event.spaceId
-        }
-      },
-      async ({ carrier }) => {
-        const input = createSendMessageInput(this.queueUrl, event, carrier);
-        let acknowledgment: { MessageId?: string };
-        try {
-          acknowledgment = await this.sqs.send(this.commands.create(input));
-        } catch (error) {
-          await this.recordFailure(context, event, classifySqsPublicationError(error));
-          throw error;
-        }
-
-        if (!acknowledgment.MessageId) {
-          await this.repository.markRetry(context, event, {
-            code: "missing_message_id",
-            delaySeconds: retryDelaySeconds(event.publicationAttempt)
-          });
-          throw new Error("SQS SendMessage acknowledgment did not include a MessageId");
-        }
-
-        await this.repository.markPublished(context, event, acknowledgment.MessageId);
-        return {
-          status: "published" as const,
-          eventId: event.eventId,
-          messageId: acknowledgment.MessageId
-        };
+  async publishClaimed(
+    context: SecurityContext,
+    claim: RelayClaimIdentity
+  ): Promise<Exclude<RelayPublishResult, { status: "idle" }>> {
+    try {
+      const result = await this.repository.publishClaimed(context, claim, this.publisher);
+      if (result.status === "unresolved") {
+        await this.repository.recordRetry(context, claim, {
+          code: "publication_outcome_unresolved",
+          delaySeconds: retryDelaySeconds(claim.publicationAttempt)
+        });
+        throw new RelayPublicationUnresolvedError();
       }
-    );
+      return result;
+    } catch (error) {
+      if (error instanceof RelayPublicationUnresolvedError) throw error;
+      await this.recordFailure(context, claim, classifySqsPublicationError(error));
+      throw error;
+    }
   }
 
   private async recordFailure(
@@ -97,13 +83,96 @@ export class FoundationOutboxRelay {
     failure: ClassifiedPublicationError
   ): Promise<void> {
     if (failure.kind === "terminal") {
-      await this.repository.markTerminal(context, claim, failure.code);
+      await this.repository.recordTerminal(context, claim, failure.code);
       return;
     }
-    await this.repository.markRetry(context, claim, {
+    await this.repository.recordRetry(context, claim, {
       code: failure.code,
       delaySeconds: retryDelaySeconds(claim.publicationAttempt)
     });
+  }
+}
+
+export class FoundationSqsPublisher implements RelayPublicationPublisher {
+  constructor(
+    private readonly sqs: SqsPublisherClient,
+    private readonly queueUrl: string,
+    private readonly commands: SqsCommandFactory,
+    private readonly sendTimeoutMs: number
+  ) {
+    if (!queueUrl) throw new Error("Foundation source queue URL is required");
+    if (!Number.isInteger(sendTimeoutMs) || sendTimeoutMs < 1 || sendTimeoutMs > 60_000) {
+      throw new Error("Foundation SQS send timeout is invalid");
+    }
+  }
+
+  publish(request: DeepReadonly<RelayPublicationRequest>): Promise<{ readonly messageId: string }> {
+    return withPropagatedSpan(
+      {
+        name: "foundation.relay.publish",
+        parentCarrier: {
+          traceparent: request.envelope.traceparent,
+          ...(request.envelope.tracestate === undefined
+            ? {}
+            : { tracestate: request.envelope.tracestate })
+        },
+        attributes: {
+          "throughline.request.id": request.envelope.requestId,
+          "throughline.job.id": request.envelope.jobId,
+          "throughline.tenant.id": request.envelope.scope.tenantId,
+          "throughline.workspace.id": request.envelope.scope.workspaceId,
+          "throughline.space.id": request.envelope.scope.spaceId
+        }
+      },
+      ({ carrier }) => this.sendAndSettle(request, carrier)
+    );
+  }
+
+  private async sendAndSettle(
+    request: DeepReadonly<RelayPublicationRequest>,
+    carrier: TraceCarrier
+  ): Promise<{ readonly messageId: string }> {
+    const abortController = new AbortController();
+    const input = createSendMessageInput(this.queueUrl, request, carrier);
+    const sendPromise = this.sqs.send(this.commands.create(input), {
+      abortSignal: abortController.signal
+    });
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<"timeout">((resolve) => {
+      timeoutHandle = setTimeout(() => {
+        abortController.abort();
+        resolve("timeout");
+      }, this.sendTimeoutMs);
+    });
+    try {
+      const outcome = await Promise.race([
+        sendPromise.then((acknowledgment) => ({ kind: "settled" as const, acknowledgment })),
+        timeout.then(() => ({ kind: "timeout" as const }))
+      ]);
+      if (outcome.kind === "timeout") {
+        await sendPromise.catch(() => undefined);
+        throw Object.assign(new Error("SQS SendMessage did not settle before its deadline"), {
+          name: "TimeoutError"
+        });
+      }
+      const messageId = outcome.acknowledgment.MessageId;
+      if (typeof messageId !== "string" || messageId.length < 1 || messageId.length > 200) {
+        throw Object.assign(
+          new Error("SQS SendMessage acknowledgment did not include a valid MessageId"),
+          { name: "MissingMessageId" }
+        );
+      }
+      return { messageId };
+    } finally {
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    }
+  }
+}
+
+class RelayPublicationUnresolvedError extends Error {
+  constructor() {
+    super("SQS publication outcome remains unresolved and is retryable");
+    this.name = "RelayPublicationUnresolvedError";
   }
 }
 
@@ -130,51 +199,34 @@ export function classifySqsPublicationError(error: unknown): ClassifiedPublicati
 
 export function createSendMessageInput(
   queueUrl: string,
-  event: ClaimedOutboxEvent,
-  propagationCarrier: TraceCarrier = event
+  request: DeepReadonly<RelayPublicationRequest>,
+  propagationCarrier: TraceCarrier = request.envelope
 ): SqsSendMessageInput {
-  const envelope = toFoundationQueueEnvelope(event);
-  envelope.traceparent = propagationCarrier.traceparent;
-  delete envelope.tracestate;
-  if (propagationCarrier.tracestate !== undefined) {
-    envelope.tracestate = propagationCarrier.tracestate;
-  }
-  validateFoundationQueueEnvelope(envelope);
+  const envelope = {
+    ...request.envelope,
+    scope: { ...request.envelope.scope },
+    traceparent: propagationCarrier.traceparent,
+    ...(propagationCarrier.tracestate === undefined
+      ? {}
+      : { tracestate: propagationCarrier.tracestate })
+  };
   const attributes: SqsSendMessageInput["MessageAttributes"] = {
-    routingKey: stringAttribute(buildScopedQueueKey(envelope.scope)),
+    routingKey: stringAttribute(request.routingKey),
     tenantId: stringAttribute(envelope.scope.tenantId),
     workspaceId: stringAttribute(envelope.scope.workspaceId),
     spaceId: stringAttribute(envelope.scope.spaceId),
     eventId: stringAttribute(envelope.eventId),
-    eventType: stringAttribute(event.eventType),
     jobId: stringAttribute(envelope.jobId),
+    requestId: stringAttribute(envelope.requestId),
     traceparent: stringAttribute(envelope.traceparent)
   };
-  if (envelope.tracestate !== undefined) {
+  if (envelope.tracestate !== undefined)
     attributes.tracestate = stringAttribute(envelope.tracestate);
-  }
   return {
     QueueUrl: queueUrl,
     MessageBody: JSON.stringify(envelope),
     MessageAttributes: attributes
   };
-}
-
-function validateFoundationQueueEnvelope(envelope: FoundationQueueEnvelope): void {
-  const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-  if (
-    envelope.version !== "v1" ||
-    !uuid.test(envelope.eventId) ||
-    !uuid.test(envelope.jobId) ||
-    !envelope.requestId ||
-    !/^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/.test(envelope.traceparent) ||
-    !/^tlctx\.v1\.hs256\.[A-Za-z0-9_-]{1,32}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(
-      envelope.contextReference
-    )
-  ) {
-    throw new Error("Claimed outbox row does not form a valid Foundation queue envelope");
-  }
-  buildScopedQueueKey(envelope.scope);
 }
 
 function stringAttribute(value: string) {

@@ -13,7 +13,7 @@ import {
 import { DEV_POLICY_VERSION, devFixtures, generateUuidV7 } from "@throughline/tenancy";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { composeRelayRuntime, type RelayRuntimeEnvironment } from "./main.js";
-import { FoundationOutboxRelay } from "./relay.js";
+import { FoundationOutboxRelay, type SqsSendMessageInput } from "./relay.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -158,7 +158,7 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     await ownerPool.query(
       `UPDATE ops.outbox_events
        SET terminal_failed_at = clock_timestamp(), terminal_failure_code = 'test_isolation',
-           claimed_at = NULL, claimed_by = NULL, claim_expires_at = NULL
+           claimed_at = NULL, claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
        WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
          AND published_at IS NULL AND terminal_failed_at IS NULL`,
       [devFixtures.tenantA, devFixtures.workspaceA, devFixtures.restrictedSpaceA]
@@ -294,6 +294,188 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     });
   });
 
+  it("keeps a real accepted SendMessage retry-safe and proves duplicate publication is possible when the marker transaction rolls back", async () => {
+    const event = await insertCommittedEvent(ownerPool, "accepted-before-marker-failure");
+    const claim = await repository.claimNext(relayContext(), {
+      claimedBy: "accepted-before-marker-failure",
+      leaseSeconds: 30
+    });
+    expect(claim).toMatchObject({ eventId: event.eventId, publicationAttempt: 1 });
+
+    const testSuffix = generateUuidV7().replaceAll("-", "").slice(0, 16);
+    const triggerName = `throughline_test_publish_${testSuffix}`;
+    const functionName = `throughline_test_raise_${testSuffix}`;
+    const sentInputs: SqsSendMessageInput[] = [];
+    const acceptedMessageIds: string[] = [];
+    let testTriggerInstalled = false;
+    let cleanupError: unknown;
+    const realRelay = new FoundationOutboxRelay(
+      repository,
+      {
+        send: async (command) => {
+          sentInputs.push(copySendInput(command.input));
+          const acknowledgment = (await sqs.send(command)) as { MessageId?: string };
+          if (typeof acknowledgment.MessageId === "string") {
+            acceptedMessageIds.push(acknowledgment.MessageId);
+          }
+          return acknowledgment;
+        }
+      },
+      queueUrl!,
+      { create: (input) => new sdk.SendMessageCommand(input) as never }
+    );
+
+    try {
+      await ownerPool.query(
+        `CREATE FUNCTION ops.${functionName}() RETURNS trigger
+         LANGUAGE plpgsql AS $test_failure$
+         BEGIN
+           RAISE EXCEPTION 'owner-installed exact-row publication marker failure';
+         END
+         $test_failure$`
+      );
+      await ownerPool.query(
+        `CREATE TRIGGER ${triggerName}
+         BEFORE UPDATE OF published_at ON ops.outbox_events
+         FOR EACH ROW
+         WHEN (OLD.id = '${event.eventId}'::uuid AND NEW.published_at IS NOT NULL)
+         EXECUTE FUNCTION ops.${functionName}()`
+      );
+      testTriggerInstalled = true;
+
+      await expect(realRelay.publishClaimed(relayContext(), claim!)).rejects.toThrow(
+        "SQS publication outcome remains unresolved and is retryable"
+      );
+      expect(sentInputs).toHaveLength(1);
+      await expect(eventState(event.eventId)).resolves.toMatchObject({
+        publication_attempts: 1,
+        claimed_at: null,
+        claimed_by: null,
+        claim_token: null,
+        published_at: null,
+        published_message_id: null,
+        terminal_failed_at: null
+      });
+      await expect(peekEventMessages(sqs, sdk, queueUrl!, event.eventId)).resolves.toHaveLength(1);
+
+      await removePublicationFailureTrigger(
+        ownerPool,
+        triggerName,
+        functionName,
+        testTriggerInstalled
+      );
+      testTriggerInstalled = false;
+      await ownerPool.query(
+        "UPDATE ops.outbox_events SET next_attempt_at = clock_timestamp() WHERE id = $1",
+        [event.eventId]
+      );
+
+      const retryClaim = await repository.claimNext(relayContext(), {
+        claimedBy: "accepted-before-marker-retry",
+        leaseSeconds: 30
+      });
+      expect(retryClaim).toMatchObject({ eventId: event.eventId, publicationAttempt: 2 });
+      await expect(realRelay.publishClaimed(relayContext(), retryClaim!)).resolves.toMatchObject({
+        status: "published",
+        eventId: event.eventId
+      });
+
+      expect(sentInputs).toHaveLength(2);
+      expect(acceptedMessageIds).toHaveLength(2);
+      expect(new Set(acceptedMessageIds).size).toBe(2);
+      expect(sentInputs[1]).toEqual(sentInputs[0]);
+      const firstEnvelope = JSON.parse(sentInputs[0]!.MessageBody) as {
+        eventId: string;
+        jobId: string;
+        contextReference: string;
+        scope: { tenantId: string; workspaceId: string; spaceId: string };
+      };
+      const secondEnvelope = JSON.parse(sentInputs[1]!.MessageBody) as typeof firstEnvelope;
+      expect(secondEnvelope).toEqual(firstEnvelope);
+      expect(firstEnvelope).toMatchObject({
+        eventId: event.eventId,
+        jobId: event.jobId,
+        scope: {
+          tenantId: devFixtures.tenantA,
+          workspaceId: devFixtures.workspaceA,
+          spaceId: devFixtures.restrictedSpaceA
+        }
+      });
+      expect(sentInputs[1]!.MessageAttributes.routingKey).toEqual(
+        sentInputs[0]!.MessageAttributes.routingKey
+      );
+      expect(workerIdempotencyIdentity(secondEnvelope)).toBe(
+        workerIdempotencyIdentity(firstEnvelope)
+      );
+      expect(acceptedMessageIds[0]).not.toBe(acceptedMessageIds[1]);
+      await expect(eventState(event.eventId)).resolves.toMatchObject({
+        publication_attempts: 2,
+        published_at: expect.any(Date),
+        published_message_id: expect.any(String),
+        terminal_failed_at: null
+      });
+    } finally {
+      const cleanupResults = await Promise.allSettled([
+        removePublicationFailureTrigger(ownerPool, triggerName, functionName, testTriggerInstalled),
+        sqs.send(new sdk.PurgeQueueCommand({ QueueUrl: queueUrl }))
+      ]);
+      const cleanupFailure = cleanupResults.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected"
+      );
+      if (cleanupFailure) cleanupError = cleanupFailure.reason;
+    }
+
+    if (cleanupError) throw cleanupError;
+    await expectNoTestPublicationDatabaseObjects(ownerPool, triggerName, functionName);
+  });
+
+  it("resolves an ambiguous client response after real COMMIT from a fresh exact database lookup without a second send", async () => {
+    const event = await insertCommittedEvent(ownerPool, "ambiguous-after-commit");
+    const claim = await repository.claimNext(relayContext(), {
+      claimedBy: "ambiguous-after-commit",
+      leaseSeconds: 30
+    });
+    expect(claim).toMatchObject({ eventId: event.eventId, publicationAttempt: 1 });
+
+    const ambiguity = createAfterCommitAmbiguityPool(relayPool);
+    const ambiguousRepository = new RelayOutboxRepository(
+      ambiguity.pool,
+      new PostgresAuthorizationService(relayPool)
+    );
+    const sentInputs: SqsSendMessageInput[] = [];
+    const realRelay = new FoundationOutboxRelay(
+      ambiguousRepository,
+      {
+        send: async (command) => {
+          sentInputs.push(copySendInput(command.input));
+          return (await sqs.send(command)) as { MessageId?: string };
+        }
+      },
+      queueUrl!,
+      { create: (input) => new sdk.SendMessageCommand(input) as never }
+    );
+
+    try {
+      await expect(realRelay.publishClaimed(relayContext(), claim!)).resolves.toMatchObject({
+        status: "published",
+        eventId: event.eventId
+      });
+      expect(ambiguity.injectedCommitResponses).toBe(1);
+      expect(ambiguity.connections).toBe(2);
+      expect(ambiguity.realCommitDelegations).toBe(2);
+      expect(sentInputs).toHaveLength(1);
+      await expect(eventState(event.eventId)).resolves.toMatchObject({
+        publication_attempts: 1,
+        published_at: expect.any(Date),
+        published_message_id: expect.any(String),
+        terminal_failed_at: null
+      });
+      await expect(peekEventMessages(sqs, sdk, queueUrl!, event.eventId)).resolves.toHaveLength(1);
+    } finally {
+      await sqs.send(new sdk.PurgeQueueCommand({ QueueUrl: queueUrl }));
+    }
+  });
+
   it("two concurrent relay attempts cannot both claim one row", async () => {
     const event = await insertCommittedEvent(ownerPool, "concurrent");
     const [first, second] = await Promise.all([
@@ -316,51 +498,47 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
         leaseSeconds: 30
       });
       expect(claimed).toMatchObject({ eventId: event.eventId });
-      const realAuthorization = new PostgresAuthorizationService(relayPool);
-      let releaseAuthorization!: () => void;
-      const authorizationReleased = new Promise<void>((resolve) => {
-        releaseAuthorization = resolve;
+      let releaseSend!: () => void;
+      const sendReleased = new Promise<void>((resolve) => {
+        releaseSend = resolve;
       });
-      let authorizationReached!: () => void;
-      const reachedAuthorization = new Promise<void>((resolve) => {
-        authorizationReached = resolve;
+      let sendReached!: () => void;
+      const reachedSend = new Promise<void>((resolve) => {
+        sendReached = resolve;
       });
-      const barrierAuthorization = {
-        canInTransaction: async (
-          ...args: Parameters<typeof realAuthorization.canInTransaction>
-        ) => {
-          const decision = await realAuthorization.canInTransaction(...args);
-          authorizationReached();
-          await authorizationReleased;
-          if (relayOutcome === "rollback") throw new Error("injected relay rollback");
-          return decision;
-        }
-      };
-      const barrierRepository = new RelayOutboxRepository(relayPool, barrierAuthorization as never);
+      const proofRelay = new FoundationOutboxRelay(
+        repository,
+        {
+          send: async (command) => {
+            sendReached();
+            await sendReleased;
+            if (relayOutcome === "rollback") throw new Error("injected relay rollback");
+            return (await sqs.send(command)) as { MessageId?: string };
+          }
+        },
+        queueUrl!,
+        { create: (input) => new sdk.SendMessageCommand(input) as never }
+      );
       const owner = await ownerPool.connect();
       let resultWrite: Promise<unknown> | undefined;
       let mutation: Promise<unknown> | undefined;
       try {
-        resultWrite = barrierRepository.markPublished(
-          relayContext(),
-          claimed!,
-          `relay-result-${relayOutcome}`
-        );
-        await reachedAuthorization;
+        resultWrite = proofRelay.publishClaimed(relayContext(), claimed!);
+        await reachedSend;
 
         const pid = await owner.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
         mutation = owner.query(authority.mutateSql, [...authority.parameters]);
         await expect(waitForBlockingPid(ownerPool, pid.rows[0]!.pid)).resolves.toBeUndefined();
 
-        releaseAuthorization();
+        releaseSend();
         if (relayOutcome === "commit") {
-          await expect(resultWrite).resolves.toBeUndefined();
+          await expect(resultWrite).resolves.toMatchObject({ status: "published" });
         } else {
           await expect(resultWrite).rejects.toThrow("injected relay rollback");
         }
         await expect(mutation).resolves.toMatchObject({ rowCount: 1 });
       } finally {
-        releaseAuthorization();
+        releaseSend();
         await Promise.allSettled([resultWrite, mutation].filter(Boolean) as Promise<unknown>[]);
         owner.release();
         await ownerPool.query(authority.restoreSql, [...authority.parameters]);
@@ -378,19 +556,19 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     "denies and publishes nothing when the $name mutation commits first",
     async (authority) => {
       const event = await insertCommittedEvent(ownerPool, `authority-first-${authority.name}`);
-      const before = await eventState(event.eventId);
       const owner = await ownerPool.connect();
       let publication: Promise<unknown> | undefined;
       let sends = 0;
       const proofRelay = new FoundationOutboxRelay(
         repository,
         {
-          send: async () => {
+          send: async (command) => {
             sends += 1;
-            return { MessageId: generateUuidV7() };
+            return (await sqs.send(command)) as { MessageId?: string };
           }
         },
-        queueUrl!
+        queueUrl!,
+        { create: (input) => new sdk.SendMessageCommand(input) as never }
       );
       try {
         await owner.query("BEGIN");
@@ -413,7 +591,32 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
         await ownerPool.query(authority.restoreSql, [...authority.parameters]);
       }
       expect(sends).toBe(0);
-      await expect(eventState(event.eventId)).resolves.toEqual(before);
+      const queueState = (await sqs.send(
+        new sdk.ReceiveMessageCommand({
+          QueueUrl: queueUrl,
+          MaxNumberOfMessages: 1,
+          WaitTimeSeconds: 0
+        })
+      )) as { Messages?: unknown[] };
+      expect(queueState.Messages ?? []).toHaveLength(0);
+      await expect(
+        ownerPool.query(
+          `SELECT aggregate.effect_count
+           FROM ops.foundation_test_aggregates aggregate
+           JOIN ops.outbox_events event ON event.aggregate_id = aggregate.id
+           WHERE event.id = $1`,
+          [event.eventId]
+        )
+      ).resolves.toMatchObject({ rows: [{ effect_count: 0 }] });
+      await expect(eventState(event.eventId)).resolves.toMatchObject({
+        publication_attempts: 1,
+        claimed_at: null,
+        claimed_by: null,
+        claim_token: null,
+        published_at: null,
+        published_message_id: null,
+        terminal_failed_at: null
+      });
     }
   );
 
@@ -422,23 +625,31 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     async (authority) => {
       const event = await insertCommittedEvent(ownerPool, `authority-rollback-${authority.name}`);
       const owner = await ownerPool.connect();
-      let claim: Promise<unknown> | undefined;
+      let publication: Promise<unknown> | undefined;
+      const proofRelay = new FoundationOutboxRelay(
+        repository,
+        { send: async () => ({ MessageId: generateUuidV7() }) },
+        queueUrl!
+      );
       try {
         await owner.query("BEGIN");
         const pid = await owner.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
         await expect(
           owner.query(authority.mutateSql, [...authority.parameters])
         ).resolves.toMatchObject({ rowCount: 1 });
-        claim = repository.claimNext(relayContext(), {
+        publication = proofRelay.publishNext(relayContext(), {
           claimedBy: `authority-rollback-${authority.name}`,
           leaseSeconds: 30
         });
         await expect(waitForRelayBlockedBy(ownerPool, pid.rows[0]!.pid)).resolves.toBeUndefined();
         await owner.query("ROLLBACK");
-        await expect(claim).resolves.toMatchObject({ eventId: event.eventId });
+        await expect(publication).resolves.toMatchObject({
+          status: "published",
+          eventId: event.eventId
+        });
       } finally {
         await owner.query("ROLLBACK").catch(() => undefined);
-        await Promise.allSettled(claim ? [claim] : []);
+        await Promise.allSettled(publication ? [publication] : []);
         owner.release();
         await ownerPool.query(authority.restoreSql, [...authority.parameters]);
       }
@@ -448,13 +659,22 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
   it("uses one deterministic authority lock order for concurrent relay transactions", async () => {
     const first = await insertCommittedEvent(ownerPool, "deterministic-order-a");
     const second = await insertCommittedEvent(ownerPool, "deterministic-order-b");
-    const results = await Promise.all([
+    const claims = await Promise.all([
       repository.claimNext(relayContext(), { claimedBy: "ordered-a", leaseSeconds: 30 }),
       repository.claimNext(relayContext(), { claimedBy: "ordered-b", leaseSeconds: 30 })
     ]);
-    expect(results.map((result) => result?.eventId).sort()).toEqual(
+    expect(claims.map((result) => result?.eventId).sort()).toEqual(
       [first.eventId, second.eventId].sort()
     );
+    await expect(
+      Promise.all(
+        claims.map((claim) =>
+          repository.publishClaimed(relayContext(), claim!, {
+            publish: async () => ({ messageId: generateUuidV7() })
+          })
+        )
+      )
+    ).resolves.toHaveLength(2);
   });
 
   it("cannot see or complete an owner event before commit, then claims it after commit", async () => {
@@ -471,14 +691,15 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
         })
       ).resolves.toBeUndefined();
       await expect(
-        repository.markPublished(
+        repository.publishClaimed(
           relayContext(),
           {
             eventId: event.eventId,
             claimedBy: "barrier-before-commit",
-            publicationAttempt: 1
-          },
-          "impossible-before-commit"
+            publicationAttempt: 1,
+            claimToken: Buffer.alloc(32, 1).toString("base64url")
+          } as never,
+          { publish: async () => ({ messageId: "impossible-before-commit" }) }
         )
       ).rejects.toThrow(/stale or outside/);
 
@@ -537,11 +758,13 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
         "UPDATE identity.service_principals SET status = 'active' WHERE id = $1",
         [devFixtures.relayServicePrincipalA]
       );
-      await expectDeniedWithoutEventUpdate(
-        { ...relayContext(), servicePrincipalId: devFixtures.servicePrincipalA },
-        "relay_principal_not_active",
-        event.eventId
-      );
+      await expect(
+        authorization.can(
+          { ...relayContext(), servicePrincipalId: devFixtures.servicePrincipalA },
+          "foundation.relay.publish",
+          { type: "space", id: devFixtures.restrictedSpaceA }
+        )
+      ).resolves.toMatchObject({ allowed: false, reasonCode: "relay_principal_not_active" });
     } finally {
       await ownerPool.query(
         "UPDATE identity.service_principals SET status = 'active' WHERE id = $1",
@@ -563,12 +786,154 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     try {
       await removeRelayGrant();
       await expect(
-        repository.markPublished(relayContext(), claim!, "must-not-be-persisted")
+        repository.publishClaimed(relayContext(), claim!, {
+          publish: async () => ({ messageId: "must-not-be-persisted" })
+        })
       ).rejects.toThrow("Relay publication is not authorized");
       expect(await resultFields(event.eventId)).toEqual(before);
     } finally {
       await replaceRelayGrant("manager");
     }
+  });
+
+  it("denies wrong-token, stale, wrong-scope, and expired claims without invoking the publisher", async () => {
+    const event = await insertCommittedEvent(ownerPool, "claim-identity-denials");
+    const claim = await repository.claimNext(relayContext(), {
+      claimedBy: "claim-identity-denials",
+      leaseSeconds: 30
+    });
+    expect(claim).toBeDefined();
+    let sends = 0;
+    const publisher = {
+      publish: async () => {
+        sends += 1;
+        return { messageId: "must-not-send" };
+      }
+    };
+    await expect(
+      repository.publishClaimed(
+        relayContext(),
+        {
+          ...claim!,
+          claimToken: Buffer.alloc(32, 9).toString("base64url")
+        } as never,
+        publisher
+      )
+    ).rejects.toThrow(/stale or outside/);
+    await expect(
+      repository.publishClaimed(
+        relayContext(),
+        {
+          ...claim!,
+          publicationAttempt: claim!.publicationAttempt + 1
+        },
+        publisher
+      )
+    ).rejects.toThrow(/stale or outside/);
+    await expect(
+      repository.publishClaimed(
+        { ...relayContext(), requestedSpaceIds: [devFixtures.rootSpaceB] },
+        claim!,
+        publisher
+      )
+    ).rejects.toThrow(/stale or outside/);
+    await ownerPool.query(
+      `UPDATE ops.outbox_events
+       SET claimed_at = clock_timestamp() - interval '2 seconds',
+           claim_expires_at = clock_timestamp() - interval '1 second'
+       WHERE id = $1`,
+      [event.eventId]
+    );
+    await expect(repository.publishClaimed(relayContext(), claim!, publisher)).rejects.toThrow(
+      /stale or outside/
+    );
+    expect(sends).toBe(0);
+    await expect(resultFields(event.eventId)).resolves.toMatchObject({ published_at: null });
+  });
+
+  it("recovers a crash after claim with a new token and no inherited publication authority", async () => {
+    const event = await insertCommittedEvent(ownerPool, "claim-crash-recovery");
+    const abandoned = await repository.claimNext(relayContext(), {
+      claimedBy: "crashed-relay",
+      leaseSeconds: 30
+    });
+    expect(abandoned).toBeDefined();
+    await ownerPool.query(
+      `UPDATE ops.outbox_events
+       SET claimed_at = clock_timestamp() - interval '2 seconds',
+           claim_expires_at = clock_timestamp() - interval '1 second'
+       WHERE id = $1`,
+      [event.eventId]
+    );
+    const recovered = await repository.claimNext(relayContext(), {
+      claimedBy: "replacement-relay",
+      leaseSeconds: 30
+    });
+    expect(recovered).toMatchObject({ eventId: event.eventId, publicationAttempt: 2 });
+    expect(recovered?.claimToken).not.toBe(abandoned?.claimToken);
+    await expect(
+      repository.publishClaimed(relayContext(), abandoned!, {
+        publish: async () => ({ messageId: "must-not-send" })
+      })
+    ).rejects.toThrow(/stale or outside/);
+  });
+
+  it("serializes concurrent final publications so only one real SendMessage becomes active", async () => {
+    const event = await insertCommittedEvent(ownerPool, "concurrent-final-send");
+    const claim = await repository.claimNext(relayContext(), {
+      claimedBy: "concurrent-final-send",
+      leaseSeconds: 30
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let reached!: () => void;
+    const sendReached = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    let activeSends = 0;
+    let maximumActiveSends = 0;
+    const first = new FoundationOutboxRelay(
+      repository,
+      {
+        send: async (command) => {
+          activeSends += 1;
+          maximumActiveSends = Math.max(maximumActiveSends, activeSends);
+          reached();
+          await released;
+          const acknowledgment = (await sqs.send(command)) as { MessageId?: string };
+          activeSends -= 1;
+          return acknowledgment;
+        }
+      },
+      queueUrl!,
+      { create: (input) => new sdk.SendMessageCommand(input) as never }
+    );
+    let secondSendInvocations = 0;
+    const second = new FoundationOutboxRelay(
+      repository,
+      {
+        send: async () => {
+          secondSendInvocations += 1;
+          return { MessageId: generateUuidV7() };
+        }
+      },
+      queueUrl!
+    );
+    const firstPublication = first.publishClaimed(relayContext(), claim!);
+    await sendReached;
+    const secondPublication = second.publishClaimed(relayContext(), claim!);
+    await expect(waitForBlockedFinalPublication(ownerPool)).resolves.toBeUndefined();
+    expect(secondSendInvocations).toBe(0);
+    release();
+    await expect(firstPublication).resolves.toMatchObject({
+      status: "published",
+      eventId: event.eventId
+    });
+    await expect(secondPublication).rejects.toThrow(/stale or outside/);
+    expect(maximumActiveSends).toBe(1);
+    expect(secondSendInvocations).toBe(0);
   });
 
   it("rejects missing/cross scope, owner/app/worker pools, and immutable updates", async () => {
@@ -583,7 +948,7 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
         { ...relayContext(), requestedSpaceIds: [devFixtures.rootSpaceB] },
         { claimedBy: "x", leaseSeconds: 30 }
       )
-    ).rejects.toThrow(/not authorized/);
+    ).resolves.toBeUndefined();
     for (const pool of [ownerPool, appPool, workerPool]) {
       const unsafe = new RelayOutboxRepository(pool, new PostgresAuthorizationService(pool));
       await expect(
@@ -598,14 +963,15 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
   it("cannot mark an unpublished/unclaimed event successful and duplicate publication keeps stable identity", async () => {
     const event = await insertCommittedEvent(ownerPool, "duplicate");
     await expect(
-      repository.markPublished(
+      repository.publishClaimed(
         relayContext(),
         {
           eventId: event.eventId,
           claimedBy: "never-claimed",
-          publicationAttempt: 1
-        },
-        "forbidden-message"
+          publicationAttempt: 1,
+          claimToken: Buffer.alloc(32, 1).toString("base64url")
+        } as never,
+        { publish: async () => ({ messageId: "forbidden-message" }) }
       )
     ).rejects.toThrow(/stale or outside/);
 
@@ -626,7 +992,7 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     });
     await ownerPool.query(
       `UPDATE ops.outbox_events SET published_at = NULL, published_message_id = NULL,
-       claimed_at = NULL, claimed_by = NULL, claim_expires_at = NULL WHERE id = $1`,
+       claimed_at = NULL, claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL WHERE id = $1`,
       [event.eventId]
     );
     await duplicateRelay.publishNext(relayContext(), {
@@ -701,6 +1067,14 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
     reasonCode: string,
     eventId: string
   ): Promise<void> {
+    await ownerPool.query(
+      `UPDATE ops.outbox_events
+       SET publication_attempts = 0, next_attempt_at = clock_timestamp(),
+           claimed_at = NULL, claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL,
+           last_retry_code = NULL
+       WHERE id = $1`,
+      [eventId]
+    );
     const authorization = new PostgresAuthorizationService(relayPool);
     await expect(
       authorization.can(context, "foundation.relay.publish", {
@@ -714,7 +1088,34 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
         claimedBy: `denied-${reasonCode}`,
         leaseSeconds: 30
       })
-    ).rejects.toThrow(/not authorized/);
+    ).resolves.toBeDefined();
+    const claim = await scopedRepository.claimNext(context, {
+      claimedBy: `denied-second-${reasonCode}`,
+      leaseSeconds: 30
+    });
+    expect(claim).toBeUndefined();
+    const persistedClaim = await ownerPool.query<{
+      event_id: string;
+      claimed_by: string;
+      publication_attempt: number;
+      claim_token: string;
+    }>(
+      `SELECT id AS event_id, claimed_by, publication_attempts AS publication_attempt, claim_token
+       FROM ops.outbox_events WHERE id = $1`,
+      [eventId]
+    );
+    await expect(
+      scopedRepository.publishClaimed(
+        context,
+        {
+          eventId: persistedClaim.rows[0]!.event_id,
+          claimedBy: persistedClaim.rows[0]!.claimed_by,
+          publicationAttempt: persistedClaim.rows[0]!.publication_attempt,
+          claimToken: persistedClaim.rows[0]!.claim_token
+        } as never,
+        { publish: async () => ({ messageId: "must-not-send" }) }
+      )
+    ).rejects.toThrow("Relay publication is not authorized");
     const persisted = await ownerPool.query<{
       publication_attempts: number;
       claimed_by: string | null;
@@ -726,8 +1127,8 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
       [eventId]
     );
     expect(persisted.rows[0]).toEqual({
-      publication_attempts: 0,
-      claimed_by: null,
+      publication_attempts: 1,
+      claimed_by: `denied-${reasonCode}`,
       published_at: null,
       terminal_failed_at: null
     });
@@ -755,13 +1156,14 @@ integration("Foundation relay PostgreSQL + LocalStack integration", () => {
       publication_attempts: number;
       claimed_at: Date | null;
       claimed_by: string | null;
+      claim_token: string | null;
       claim_expires_at: Date | null;
       published_at: Date | null;
       published_message_id: string | null;
       terminal_failed_at: Date | null;
       terminal_failure_code: string | null;
     }>(
-      `SELECT publication_attempts, claimed_at, claimed_by, claim_expires_at,
+      `SELECT publication_attempts, claimed_at, claimed_by, claim_token, claim_expires_at,
               published_at, published_message_id, terminal_failed_at, terminal_failure_code
        FROM ops.outbox_events WHERE id = $1`,
       [eventId]
@@ -876,22 +1278,37 @@ async function insertEventRows(
   return { eventId, jobId };
 }
 
+async function waitForBlockedFinalPublication(pool: PgPool): Promise<void> {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
+    const result = await pool.query<{ pid: number }>(
+      `SELECT activity.pid
+       FROM pg_stat_activity AS activity
+       WHERE activity.usename = 'throughline_relay'
+         AND cardinality(pg_blocking_pids(activity.pid)) > 0
+         AND activity.query LIKE '%FROM ops.outbox_events%'
+       ORDER BY activity.pid
+       LIMIT 1`
+    );
+    if (result.rows.length === 1) return;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  throw new Error("Concurrent final publication did not reach the outbox row lock barrier");
+}
+
 async function waitForBlockingPid(pool: PgPool, pid: number): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
     const result = await pool.query<{ blockers: number[] }>(
       "SELECT pg_blocking_pids($1)::integer[] AS blockers",
       [pid]
     );
     if ((result.rows[0]?.blockers.length ?? 0) > 0) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
   throw new Error("Concurrent relay authority revocation did not wait for decision locks");
 }
 
 async function waitForRelayBlockedBy(pool: PgPool, blockerPid: number): Promise<void> {
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
+  for (let attempt = 0; attempt < 1_000; attempt += 1) {
     const result = await pool.query<{ pid: number }>(
       `SELECT activity.pid
        FROM pg_stat_activity AS activity
@@ -902,7 +1319,142 @@ async function waitForRelayBlockedBy(pool: PgPool, blockerPid: number): Promise<
       [blockerPid]
     );
     if (result.rows.length === 1) return;
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise<void>((resolve) => setImmediate(resolve));
   }
   throw new Error(`Relay did not expose the expected authority blocker ${blockerPid}`);
+}
+
+function copySendInput(input: SqsSendMessageInput): SqsSendMessageInput {
+  return {
+    QueueUrl: input.QueueUrl,
+    MessageBody: input.MessageBody,
+    MessageAttributes: Object.fromEntries(
+      Object.entries(input.MessageAttributes).map(([name, attribute]) => [name, { ...attribute }])
+    )
+  };
+}
+
+function workerIdempotencyIdentity(envelope: {
+  jobId: string;
+  contextReference: string;
+  scope: { tenantId: string; workspaceId: string; spaceId: string };
+}): string {
+  return [
+    envelope.scope.tenantId,
+    envelope.scope.workspaceId,
+    envelope.scope.spaceId,
+    envelope.jobId,
+    "foundation.worker.consume.v1",
+    envelope.contextReference
+  ].join(":");
+}
+
+async function peekEventMessages(
+  sqs: InstanceType<AwsTestSdk["SQSClient"]>,
+  sdk: AwsTestSdk,
+  queueUrl: string,
+  eventId: string
+): Promise<Array<Record<string, unknown>>> {
+  const messages = new Map<string, Record<string, unknown>>();
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const response = (await sqs.send(
+      new sdk.ReceiveMessageCommand({
+        QueueUrl: queueUrl,
+        MaxNumberOfMessages: 10,
+        VisibilityTimeout: 0,
+        WaitTimeSeconds: 1,
+        MessageAttributeNames: ["All"]
+      })
+    )) as { Messages?: Array<Record<string, unknown>> };
+    for (const message of response.Messages ?? []) {
+      const body = JSON.parse(message.Body as string) as { eventId?: string };
+      if (body.eventId !== eventId) continue;
+      const messageId = message.MessageId;
+      if (typeof messageId === "string") messages.set(messageId, message);
+    }
+  }
+  return [...messages.values()];
+}
+
+async function removePublicationFailureTrigger(
+  pool: PgPool,
+  triggerName: string,
+  functionName: string,
+  triggerInstalled: boolean
+): Promise<void> {
+  if (triggerInstalled) {
+    await pool.query(`DROP TRIGGER IF EXISTS ${triggerName} ON ops.outbox_events`);
+  }
+  await pool.query(`DROP FUNCTION IF EXISTS ops.${functionName}()`);
+}
+
+async function expectNoTestPublicationDatabaseObjects(
+  pool: PgPool,
+  triggerName: string,
+  functionName: string
+): Promise<void> {
+  const result = await pool.query<{ object_count: number }>(
+    `SELECT (
+       (SELECT count(*) FROM pg_trigger
+        WHERE NOT tgisinternal
+          AND (tgname = $1 OR tgname LIKE 'throughline_test_publish_%'))
+       +
+       (SELECT count(*) FROM pg_proc procedure
+        JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+        WHERE namespace.nspname = 'ops'
+          AND (procedure.proname = $2 OR procedure.proname LIKE 'throughline_test_raise_%'))
+       +
+       (SELECT count(*) FROM pg_rewrite
+        WHERE rulename LIKE 'throughline_test_%')
+     )::integer AS object_count`,
+    [triggerName, functionName]
+  );
+  expect(result.rows).toEqual([{ object_count: 0 }]);
+}
+
+function createAfterCommitAmbiguityPool(realPool: PgPool): {
+  pool: PgPool;
+  connections: number;
+  realCommitDelegations: number;
+  injectedCommitResponses: number;
+} {
+  const result = {
+    pool: undefined as unknown as PgPool,
+    connections: 0,
+    realCommitDelegations: 0,
+    injectedCommitResponses: 0
+  };
+  result.pool = {
+    connect: async () => {
+      result.connections += 1;
+      const client = await realPool.connect();
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "query") {
+            return async (text: unknown, ...args: unknown[]) => {
+              const query = target.query as unknown as (
+                text: unknown,
+                ...args: unknown[]
+              ) => Promise<unknown>;
+              const queryResult = await query.call(target, text, ...args);
+              if (typeof text === "string" && text.trim().toUpperCase() === "COMMIT") {
+                result.realCommitDelegations += 1;
+                if (result.injectedCommitResponses === 0) {
+                  result.injectedCommitResponses += 1;
+                  throw Object.assign(
+                    new Error("client response became ambiguous after real COMMIT"),
+                    { name: "ConnectionError" }
+                  );
+                }
+              }
+              return queryResult;
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      }) as PgPoolClient;
+    }
+  } as unknown as PgPool;
+  return result;
 }

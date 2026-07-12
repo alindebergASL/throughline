@@ -422,6 +422,7 @@ integration("Foundation worker PostgreSQL + LocalStack integration RED contract"
 
   afterAll(async () => {
     if (ownerPool) await removeRollbackTrigger().catch(() => undefined);
+    if (sqs) await clearQueues();
     sqs?.destroy();
     await workerPool?.end();
     await relayPool?.end();
@@ -872,12 +873,18 @@ integration("Foundation worker PostgreSQL + LocalStack integration RED contract"
       tracestate: "throughline=test"
     });
     expect(sent.MessageAttributes).toEqual({
+      routingKey: {
+        DataType: "String",
+        StringValue: `tenant/${devFixtures.tenantA}/workspace/${devFixtures.workspaceA}/space/${devFixtures.restrictedSpaceA}`
+      },
       tenantId: { DataType: "String", StringValue: devFixtures.tenantA },
       workspaceId: { DataType: "String", StringValue: devFixtures.workspaceA },
       spaceId: { DataType: "String", StringValue: devFixtures.restrictedSpaceA },
       eventId: { DataType: "String", StringValue: message.eventId },
       jobId: { DataType: "String", StringValue: ids.job },
-      traceparent: { DataType: "String", StringValue: traceparent }
+      requestId: { DataType: "String", StringValue: "task-7-integration" },
+      traceparent: { DataType: "String", StringValue: traceparent },
+      tracestate: { DataType: "String", StringValue: "throughline=test" }
     });
     expect(sent.Body).not.toMatch(
       /actorUserId|actorMembershipId|membershipIds|roleHints|dataClassCeiling|servicePrincipalId/i
@@ -1211,12 +1218,20 @@ integration("Foundation worker PostgreSQL + LocalStack integration RED contract"
 
   function queueMessageAttributes(message: ReturnType<typeof envelope>) {
     return {
+      routingKey: {
+        DataType: "String",
+        StringValue: `tenant/${message.scope.tenantId}/workspace/${message.scope.workspaceId}/space/${message.scope.spaceId}`
+      },
       tenantId: { DataType: "String", StringValue: message.scope.tenantId },
       workspaceId: { DataType: "String", StringValue: message.scope.workspaceId },
       spaceId: { DataType: "String", StringValue: message.scope.spaceId },
       eventId: { DataType: "String", StringValue: message.eventId },
       jobId: { DataType: "String", StringValue: message.jobId },
-      traceparent: { DataType: "String", StringValue: traceparent }
+      requestId: { DataType: "String", StringValue: message.requestId },
+      traceparent: { DataType: "String", StringValue: message.traceparent },
+      ...(message.tracestate === undefined
+        ? {}
+        : { tracestate: { DataType: "String", StringValue: message.tracestate } })
     };
   }
 
@@ -1235,14 +1250,7 @@ integration("Foundation worker PostgreSQL + LocalStack integration RED contract"
     return {
       MessageId: response.MessageId,
       Body: body,
-      MessageAttributes: {
-        tenantId: { DataType: "String", StringValue: parsed.scope.tenantId },
-        workspaceId: { DataType: "String", StringValue: parsed.scope.workspaceId },
-        spaceId: { DataType: "String", StringValue: parsed.scope.spaceId },
-        eventId: { DataType: "String", StringValue: parsed.eventId },
-        jobId: { DataType: "String", StringValue: parsed.jobId },
-        traceparent: { DataType: "String", StringValue: traceparent }
-      }
+      MessageAttributes: queueMessageAttributes(parsed)
     };
   }
 

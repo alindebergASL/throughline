@@ -196,6 +196,7 @@ CREATE TABLE IF NOT EXISTS ops.outbox_events (
   next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   claimed_at timestamptz,
   claimed_by text,
+  claim_token text CHECK (claim_token IS NULL OR claim_token ~ '^[A-Za-z0-9_-]{43}$'),
   claim_expires_at timestamptz,
   last_retry_code text,
   published_at timestamptz,
@@ -222,8 +223,11 @@ CREATE TABLE IF NOT EXISTS ops.outbox_events (
     FOREIGN KEY (context_reference_id, job_id, tenant_id, workspace_id, space_id)
     REFERENCES ops.security_context_references(id, job_id, tenant_id, workspace_id, space_id),
   CONSTRAINT outbox_events_claim_check CHECK (
-    (claimed_at IS NULL AND claimed_by IS NULL AND claim_expires_at IS NULL)
-    OR (claimed_at IS NOT NULL AND claimed_by IS NOT NULL AND claim_expires_at > claimed_at)
+    (claimed_at IS NULL AND claimed_by IS NULL AND claim_token IS NULL AND claim_expires_at IS NULL)
+    OR (
+      claimed_at IS NOT NULL AND claimed_by IS NOT NULL AND claim_token IS NOT NULL
+      AND claim_expires_at > claimed_at
+    )
   ),
   CONSTRAINT outbox_events_publication_check CHECK (
     (published_at IS NULL AND published_message_id IS NULL)
@@ -946,12 +950,12 @@ GRANT SELECT (
   id, event_type, tenant_id, workspace_id, space_id, aggregate_type, aggregate_id,
   aggregate_version, causation_id, request_id, traceparent, tracestate, job_id,
   relay_service_principal_id, context_reference_id, signed_context_reference, created_at,
-  publication_attempts, next_attempt_at, claimed_at, claimed_by, claim_expires_at,
+  publication_attempts, next_attempt_at, claimed_at, claimed_by, claim_token, claim_expires_at,
   last_retry_code, published_at, published_message_id, terminal_failed_at, terminal_failure_code
 ) ON ops.outbox_events TO throughline_relay;
 
 GRANT UPDATE (
-  publication_attempts, next_attempt_at, claimed_at, claimed_by, claim_expires_at,
+  publication_attempts, next_attempt_at, claimed_at, claimed_by, claim_token, claim_expires_at,
   last_retry_code, published_at, published_message_id, terminal_failed_at, terminal_failure_code
 ) ON ops.outbox_events TO throughline_relay;
 

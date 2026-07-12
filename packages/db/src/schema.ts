@@ -302,6 +302,7 @@ export const outboxEvents = ops.table(
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
     claimedAt: timestamp("claimed_at", { withTimezone: true }),
     claimedBy: text("claimed_by"),
+    claimToken: text("claim_token"),
     claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
     lastRetryCode: text("last_retry_code"),
     publishedAt: timestamp("published_at", { withTimezone: true }),

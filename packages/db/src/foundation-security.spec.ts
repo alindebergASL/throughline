@@ -373,6 +373,7 @@ maybeDescribe("Foundation operational schema security", () => {
         .map(({ column_name }) => column_name)
     ).toEqual([
       "claim_expires_at",
+      "claim_token",
       "claimed_at",
       "claimed_by",
       "last_retry_code",
@@ -940,6 +941,7 @@ maybeDescribe("Foundation operational schema security", () => {
          SET publication_attempts = publication_attempts + 1,
              claimed_at = clock_timestamp(),
              claimed_by = 'relay-test',
+             claim_token = 'AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM',
              claim_expires_at = clock_timestamp() + interval '30 seconds'
          RETURNING id`
       );

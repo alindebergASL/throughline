@@ -4,15 +4,20 @@ import type {
   ResourceRef,
   SecurityContext
 } from "@throughline/core-types";
-import { parseSecurityContext } from "@throughline/tenancy";
+import { buildScopedQueueKey, parseSecurityContext } from "@throughline/tenancy";
+import { randomBytes } from "node:crypto";
 import type { PgPool } from "./client.js";
 import { withTenantTransaction, type TenantDbTransaction } from "./transaction.js";
 
 const RELAY_ROLE = "throughline_relay";
 const ROLE_ERROR = "Dedicated relay database role is required";
+const CLAIM_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 export const FOUNDATION_OUTBOX_EVENT_TYPE = "foundation.proof.created.v1" as const;
 export const FOUNDATION_OUTBOX_AGGREGATE_TYPE = "foundation_test_aggregate" as const;
+
+declare const claimTokenBrand: unique symbol;
+export type RelayClaimToken = string & { readonly [claimTokenBrand]: true };
 
 export interface RelayAuthorizationService {
   canInTransaction(
@@ -29,29 +34,40 @@ export interface RelayClaimOptions {
 }
 
 export interface RelayClaimIdentity {
-  eventId: string;
-  claimedBy: string;
-  publicationAttempt: number;
+  readonly eventId: string;
+  readonly claimedBy: string;
+  readonly publicationAttempt: number;
+  readonly claimToken: RelayClaimToken;
 }
 
-export interface ClaimedOutboxEvent extends RelayClaimIdentity {
-  eventType: typeof FOUNDATION_OUTBOX_EVENT_TYPE;
-  tenantId: string;
-  workspaceId: string;
-  spaceId: string;
-  aggregateType: typeof FOUNDATION_OUTBOX_AGGREGATE_TYPE;
-  aggregateId: string;
-  aggregateVersion: number;
-  causationId: string;
-  requestId: string;
-  traceparent: string;
-  tracestate?: string;
-  jobId: string;
-  contextReferenceId: string;
-  signedContextReference: string;
+export type DeepReadonly<T> = T extends (...args: never[]) => unknown
+  ? T
+  : T extends readonly (infer U)[]
+    ? readonly DeepReadonly<U>[]
+    : T extends object
+      ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+      : T;
+
+export interface RelayPublicationRequest {
+  readonly eventType: typeof FOUNDATION_OUTBOX_EVENT_TYPE;
+  readonly aggregateType: typeof FOUNDATION_OUTBOX_AGGREGATE_TYPE;
+  readonly aggregateId: string;
+  readonly aggregateVersion: number;
+  readonly causationId: string;
+  readonly contextReferenceId: string;
+  readonly routingKey: string;
+  readonly envelope: FoundationQueueEnvelope;
 }
 
-interface ClaimedOutboxRow {
+export interface RelayPublicationPublisher {
+  publish(request: DeepReadonly<RelayPublicationRequest>): Promise<{ readonly messageId: string }>;
+}
+
+export type PublishClaimedResult =
+  | { readonly status: "published"; readonly eventId: string; readonly messageId: string }
+  | { readonly status: "unresolved"; readonly eventId: string; readonly messageId: string };
+
+interface LockedOutboxRow {
   event_id: string;
   event_type: string;
   tenant_id: string;
@@ -67,8 +83,6 @@ interface ClaimedOutboxRow {
   job_id: string;
   context_reference_id: string;
   signed_context_reference: string;
-  claimed_by: string;
-  publication_attempt: number;
 }
 
 export class RelayOutboxRepository {
@@ -80,24 +94,20 @@ export class RelayOutboxRepository {
   async claimNext(
     inputContext: SecurityContext,
     options: RelayClaimOptions
-  ): Promise<ClaimedOutboxEvent | undefined> {
+  ): Promise<RelayClaimIdentity | undefined> {
     const context = validateRelayContext(inputContext);
     validateClaimOptions(options);
     const spaceId = context.requestedSpaceIds[0]!;
+    const claimToken = generateClaimToken();
 
     return withTenantTransaction({ pool: this.pool, context }, async (tx) => {
       await assertRelayRole(tx);
-      const decision = await this.authorization.canInTransaction(
-        context,
-        "foundation.relay.publish",
-        { type: "space", id: spaceId },
-        tx
-      );
-      if (!decision.allowed) {
-        throw new Error("Relay publication is not authorized");
-      }
-
-      const claimed = await tx.query<ClaimedOutboxRow>(
+      const claimed = await tx.query<{
+        event_id: string;
+        claimed_by: string;
+        publication_attempt: number;
+        claim_token: string;
+      }>(
         `WITH eligible AS (
            SELECT id
            FROM ops.outbox_events
@@ -105,8 +115,8 @@ export class RelayOutboxRepository {
              AND workspace_id = $2
              AND space_id = $3
              AND relay_service_principal_id = $4
-             AND event_type = $7
-             AND aggregate_type = $8
+             AND event_type = $8
+             AND aggregate_type = $9
              AND published_at IS NULL
              AND terminal_failed_at IS NULL
              AND next_attempt_at <= clock_timestamp()
@@ -119,7 +129,8 @@ export class RelayOutboxRepository {
          SET publication_attempts = event.publication_attempts + 1,
              claimed_at = clock_timestamp(),
              claimed_by = $5,
-             claim_expires_at = clock_timestamp() + ($6 * interval '1 second'),
+             claim_token = $6,
+             claim_expires_at = clock_timestamp() + ($7 * interval '1 second'),
              last_retry_code = NULL
          FROM eligible
          WHERE event.id = eligible.id
@@ -127,80 +138,122 @@ export class RelayOutboxRepository {
            AND event.workspace_id = $2
            AND event.space_id = $3
            AND event.relay_service_principal_id = $4
-           AND event.event_type = $7
-           AND event.aggregate_type = $8
+           AND event.event_type = $8
+           AND event.aggregate_type = $9
            AND event.published_at IS NULL
            AND event.terminal_failed_at IS NULL
-         RETURNING
-           event.id AS event_id, event.event_type, event.tenant_id, event.workspace_id,
-           event.space_id, event.aggregate_type, event.aggregate_id, event.aggregate_version,
-           event.causation_id, event.request_id, event.traceparent, event.tracestate,
-           event.job_id, event.context_reference_id, event.signed_context_reference,
-           event.claimed_by, event.publication_attempts AS publication_attempt`,
+         RETURNING event.id AS event_id, event.claimed_by,
+           event.publication_attempts AS publication_attempt, event.claim_token`,
         [
           context.tenantId,
           context.workspaceId,
           spaceId,
           context.servicePrincipalId,
           options.claimedBy,
+          claimToken,
           options.leaseSeconds,
           FOUNDATION_OUTBOX_EVENT_TYPE,
           FOUNDATION_OUTBOX_AGGREGATE_TYPE
         ]
       );
-      return claimed.rows[0] ? mapClaimedRow(claimed.rows[0]) : undefined;
+      const row = claimed.rows[0];
+      if (!row) return undefined;
+      return mapClaimIdentity(row);
     });
   }
 
-  async markPublished(
+  async publishClaimed(
     inputContext: SecurityContext,
-    claim: RelayClaimIdentity,
-    messageId: string
-  ): Promise<void> {
-    validateResultValue("SQS message ID", messageId);
+    inputClaim: RelayClaimIdentity,
+    publisher: RelayPublicationPublisher
+  ): Promise<PublishClaimedResult> {
     const context = validateRelayContext(inputContext);
-    validateClaimIdentity(claim);
+    const claim = validateClaimIdentity(inputClaim);
+    validatePublisher(publisher);
     const spaceId = context.requestedSpaceIds[0]!;
-    await withTenantTransaction({ pool: this.pool, context }, async (tx) => {
-      await this.authorizeResultTransaction(tx, context, spaceId);
-      const result = await tx.query<{ id: string }>(
-        `UPDATE ops.outbox_events
-         SET published_at = clock_timestamp(), published_message_id = $4,
-             claimed_at = NULL, claimed_by = NULL, claim_expires_at = NULL
-         WHERE id = $1
-           AND claimed_by = $2
-           AND publication_attempts = $3
-           AND claim_expires_at > clock_timestamp()
-           AND tenant_id = $5
-           AND workspace_id = $6
-           AND space_id = $7
-           AND relay_service_principal_id = $8
-           AND event_type = $9
-           AND aggregate_type = $10
-           AND published_at IS NULL
-           AND terminal_failed_at IS NULL
-         RETURNING id`,
-        [
-          claim.eventId,
-          claim.claimedBy,
-          claim.publicationAttempt,
-          messageId,
-          context.tenantId,
-          context.workspaceId,
-          spaceId,
-          context.servicePrincipalId,
-          FOUNDATION_OUTBOX_EVENT_TYPE,
-          FOUNDATION_OUTBOX_AGGREGATE_TYPE
-        ]
-      );
-      assertOneUpdatedRow(result.rows);
-    });
+    let acknowledgedMessageId: string | undefined;
+
+    try {
+      return await withTenantTransaction({ pool: this.pool, context }, async (tx) => {
+        await assertRelayRole(tx);
+        const locked = await tx.query<LockedOutboxRow>(
+          `SELECT id AS event_id, event_type, tenant_id, workspace_id, space_id,
+                  aggregate_type, aggregate_id, aggregate_version, causation_id, request_id,
+                  traceparent, tracestate, job_id, context_reference_id, signed_context_reference
+           FROM ops.outbox_events
+           WHERE id = $1
+             AND tenant_id = $2
+             AND workspace_id = $3
+             AND space_id = $4
+             AND relay_service_principal_id = $5
+             AND event_type = $6
+             AND aggregate_type = $7
+             AND claimed_by = $8
+             AND publication_attempts = $9
+             AND claim_token = $10
+             AND claim_expires_at > clock_timestamp()
+             AND published_at IS NULL
+             AND terminal_failed_at IS NULL
+           LIMIT 1
+           FOR UPDATE`,
+          claimValues(context, spaceId, claim)
+        );
+        const row = locked.rows[0];
+        if (!row || locked.rows.length !== 1) throw staleClaimError();
+
+        const decision = await this.authorization.canInTransaction(
+          context,
+          "foundation.relay.publish",
+          { type: "space", id: spaceId },
+          tx
+        );
+        if (!decision.allowed) throw new Error("Relay publication is not authorized");
+
+        const request = deepFreeze(createPublicationRequest(row));
+        const acknowledgment = await publisher.publish(request);
+        validateResultValue("SQS message ID", acknowledgment.messageId);
+        acknowledgedMessageId = acknowledgment.messageId;
+
+        const marked = await tx.query<{ id: string }>(
+          `UPDATE ops.outbox_events
+           SET published_at = clock_timestamp(), published_message_id = $11
+           WHERE id = $1
+             AND tenant_id = $2
+             AND workspace_id = $3
+             AND space_id = $4
+             AND relay_service_principal_id = $5
+             AND event_type = $6
+             AND aggregate_type = $7
+             AND claimed_by = $8
+             AND publication_attempts = $9
+             AND claim_token = $10
+             AND claim_expires_at > clock_timestamp()
+             AND published_at IS NULL
+             AND terminal_failed_at IS NULL
+           RETURNING id`,
+          [...claimValues(context, spaceId, claim), acknowledgment.messageId]
+        );
+        assertOneUpdatedRow(marked.rows);
+        return {
+          status: "published" as const,
+          eventId: claim.eventId,
+          messageId: acknowledgment.messageId
+        };
+      });
+    } catch (error) {
+      if (!acknowledgedMessageId) throw error;
+      const published = await this.isExactClaimPublished(context, claim, acknowledgedMessageId);
+      if (published) {
+        return { status: "published", eventId: claim.eventId, messageId: acknowledgedMessageId };
+      }
+      return { status: "unresolved", eventId: claim.eventId, messageId: acknowledgedMessageId };
+    }
   }
 
-  async markRetry(
+  async recordRetry(
     inputContext: SecurityContext,
-    claim: RelayClaimIdentity,
-    failure: { code: string; delaySeconds: number }
+    inputClaim: RelayClaimIdentity,
+    failure: { readonly code: string; readonly delaySeconds: number }
   ): Promise<void> {
     validateResultValue("retry code", failure.code);
     if (
@@ -210,106 +263,96 @@ export class RelayOutboxRepository {
     ) {
       throw new Error("Retry delay must be an integer from 0 through 3600 seconds");
     }
-    const context = validateRelayContext(inputContext);
-    validateClaimIdentity(claim);
-    const spaceId = context.requestedSpaceIds[0]!;
-    await withTenantTransaction({ pool: this.pool, context }, async (tx) => {
-      await this.authorizeResultTransaction(tx, context, spaceId);
-      const result = await tx.query<{ id: string }>(
-        `UPDATE ops.outbox_events
-         SET last_retry_code = $4,
-             next_attempt_at = clock_timestamp() + ($5 * interval '1 second'),
-             claimed_at = NULL, claimed_by = NULL, claim_expires_at = NULL
-         WHERE id = $1
-           AND claimed_by = $2
-           AND publication_attempts = $3
-           AND claim_expires_at > clock_timestamp()
-           AND tenant_id = $6
-           AND workspace_id = $7
-           AND space_id = $8
-           AND relay_service_principal_id = $9
-           AND event_type = $10
-           AND aggregate_type = $11
-           AND published_at IS NULL
-           AND terminal_failed_at IS NULL
-         RETURNING id`,
-        [
-          claim.eventId,
-          claim.claimedBy,
-          claim.publicationAttempt,
-          failure.code,
-          failure.delaySeconds,
-          context.tenantId,
-          context.workspaceId,
-          spaceId,
-          context.servicePrincipalId,
-          FOUNDATION_OUTBOX_EVENT_TYPE,
-          FOUNDATION_OUTBOX_AGGREGATE_TYPE
-        ]
-      );
-      assertOneUpdatedRow(result.rows);
-    });
+    await this.recordFailure(inputContext, inputClaim, failure.code, failure.delaySeconds, false);
   }
 
-  async markTerminal(
+  async recordTerminal(
     inputContext: SecurityContext,
-    claim: RelayClaimIdentity,
+    inputClaim: RelayClaimIdentity,
     code: string
   ): Promise<void> {
     validateResultValue("terminal failure code", code);
+    await this.recordFailure(inputContext, inputClaim, code, 0, true);
+  }
+
+  private async recordFailure(
+    inputContext: SecurityContext,
+    inputClaim: RelayClaimIdentity,
+    code: string,
+    delaySeconds: number,
+    terminal: boolean
+  ): Promise<void> {
     const context = validateRelayContext(inputContext);
-    validateClaimIdentity(claim);
+    const claim = validateClaimIdentity(inputClaim);
     const spaceId = context.requestedSpaceIds[0]!;
     await withTenantTransaction({ pool: this.pool, context }, async (tx) => {
-      await this.authorizeResultTransaction(tx, context, spaceId);
+      await assertRelayRole(tx);
       const result = await tx.query<{ id: string }>(
-        `UPDATE ops.outbox_events
-         SET terminal_failed_at = clock_timestamp(), terminal_failure_code = $4,
-             claimed_at = NULL, claimed_by = NULL, claim_expires_at = NULL
-         WHERE id = $1
-           AND claimed_by = $2
-           AND publication_attempts = $3
-           AND claim_expires_at > clock_timestamp()
-           AND tenant_id = $5
-           AND workspace_id = $6
-           AND space_id = $7
-           AND relay_service_principal_id = $8
-           AND event_type = $9
-           AND aggregate_type = $10
-           AND published_at IS NULL
-           AND terminal_failed_at IS NULL
-         RETURNING id`,
-        [
-          claim.eventId,
-          claim.claimedBy,
-          claim.publicationAttempt,
-          code,
-          context.tenantId,
-          context.workspaceId,
-          spaceId,
-          context.servicePrincipalId,
-          FOUNDATION_OUTBOX_EVENT_TYPE,
-          FOUNDATION_OUTBOX_AGGREGATE_TYPE
-        ]
+        terminal
+          ? `UPDATE ops.outbox_events
+             SET terminal_failed_at = clock_timestamp(), terminal_failure_code = $11,
+                 claimed_at = NULL, claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
+             WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3 AND space_id = $4
+               AND relay_service_principal_id = $5 AND event_type = $6 AND aggregate_type = $7
+               AND claimed_by = $8 AND publication_attempts = $9 AND claim_token = $10
+               AND claim_expires_at > clock_timestamp() AND published_at IS NULL
+               AND terminal_failed_at IS NULL RETURNING id`
+          : `UPDATE ops.outbox_events
+             SET last_retry_code = $11, next_attempt_at = clock_timestamp() + ($12 * interval '1 second'),
+                 claimed_at = NULL, claimed_by = NULL, claim_token = NULL, claim_expires_at = NULL
+             WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3 AND space_id = $4
+               AND relay_service_principal_id = $5 AND event_type = $6 AND aggregate_type = $7
+               AND claimed_by = $8 AND publication_attempts = $9 AND claim_token = $10
+               AND claim_expires_at > clock_timestamp() AND published_at IS NULL
+               AND terminal_failed_at IS NULL RETURNING id`,
+        terminal
+          ? [...claimValues(context, spaceId, claim), code]
+          : [...claimValues(context, spaceId, claim), code, delaySeconds]
       );
       assertOneUpdatedRow(result.rows);
     });
   }
 
-  private async authorizeResultTransaction(
-    tx: TenantDbTransaction,
+  private async isExactClaimPublished(
     context: SecurityContext,
-    spaceId: string
-  ): Promise<void> {
-    await assertRelayRole(tx);
-    const decision = await this.authorization.canInTransaction(
-      context,
-      "foundation.relay.publish",
-      { type: "space", id: spaceId },
-      tx
-    );
-    if (!decision.allowed) throw new Error("Relay publication is not authorized");
+    claim: RelayClaimIdentity,
+    messageId: string
+  ): Promise<boolean> {
+    const spaceId = context.requestedSpaceIds[0]!;
+    return withTenantTransaction({ pool: this.pool, context }, async (tx) => {
+      await assertRelayRole(tx);
+      const result = await tx.query<{ id: string }>(
+        `SELECT id
+         FROM ops.outbox_events
+         WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3 AND space_id = $4
+           AND relay_service_principal_id = $5 AND event_type = $6 AND aggregate_type = $7
+           AND claimed_by = $8 AND publication_attempts = $9 AND claim_token = $10
+           AND published_message_id = $11 AND published_at IS NOT NULL
+         LIMIT 1`,
+        [...claimValues(context, spaceId, claim), messageId]
+      );
+      return result.rows.length === 1;
+    });
   }
+}
+
+function claimValues(
+  context: SecurityContext,
+  spaceId: string,
+  claim: RelayClaimIdentity
+): unknown[] {
+  return [
+    claim.eventId,
+    context.tenantId,
+    context.workspaceId,
+    spaceId,
+    context.servicePrincipalId,
+    FOUNDATION_OUTBOX_EVENT_TYPE,
+    FOUNDATION_OUTBOX_AGGREGATE_TYPE,
+    claim.claimedBy,
+    claim.publicationAttempt,
+    claim.claimToken
+  ];
 }
 
 async function assertRelayRole(tx: TenantDbTransaction): Promise<void> {
@@ -319,17 +362,68 @@ async function assertRelayRole(tx: TenantDbTransaction): Promise<void> {
   } catch {
     throw new Error(ROLE_ERROR);
   }
-  if (
-    result.rows.length !== 1 ||
-    typeof result.rows[0]?.current_user !== "string" ||
-    result.rows[0].current_user !== RELAY_ROLE
-  ) {
+  if (result.rows.length !== 1 || result.rows[0]?.current_user !== RELAY_ROLE)
     throw new Error(ROLE_ERROR);
-  }
 }
 
-function assertOneUpdatedRow(rows: readonly { id: string }[]): void {
-  if (rows.length !== 1) throw new Error("Relay claim is stale or outside the exact scope");
+function createPublicationRequest(row: LockedOutboxRow): RelayPublicationRequest {
+  assertFoundationEventType(row.event_type, row.aggregate_type);
+  if (
+    !/^00-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}$/.test(row.traceparent) ||
+    !/^tlctx\.v1\.hs256\.[A-Za-z0-9_-]{1,32}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(
+      row.signed_context_reference
+    ) ||
+    row.request_id.length < 1 ||
+    row.request_id.length > 200
+  ) {
+    throw new Error("Locked outbox row does not form a valid Foundation publication request");
+  }
+  const envelope: FoundationQueueEnvelope = {
+    version: "v1",
+    eventId: row.event_id,
+    jobId: row.job_id,
+    scope: { tenantId: row.tenant_id, workspaceId: row.workspace_id, spaceId: row.space_id },
+    contextReference: row.signed_context_reference,
+    requestId: row.request_id,
+    traceparent: row.traceparent,
+    ...(row.tracestate === null ? {} : { tracestate: row.tracestate })
+  };
+  return {
+    eventType: FOUNDATION_OUTBOX_EVENT_TYPE,
+    aggregateType: FOUNDATION_OUTBOX_AGGREGATE_TYPE,
+    aggregateId: row.aggregate_id,
+    aggregateVersion: row.aggregate_version,
+    causationId: row.causation_id,
+    contextReferenceId: row.context_reference_id,
+    routingKey: buildScopedQueueKey(envelope.scope),
+    envelope
+  };
+}
+
+function deepFreeze<T>(value: T): DeepReadonly<T> {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+    Object.freeze(value);
+  }
+  return value as DeepReadonly<T>;
+}
+
+function generateClaimToken(): RelayClaimToken {
+  return randomBytes(32).toString("base64url") as RelayClaimToken;
+}
+
+function mapClaimIdentity(row: {
+  event_id: string;
+  claimed_by: string;
+  publication_attempt: number;
+  claim_token: string;
+}): RelayClaimIdentity {
+  return validateClaimIdentity({
+    eventId: row.event_id,
+    claimedBy: row.claimed_by,
+    publicationAttempt: row.publication_attempt,
+    claimToken: row.claim_token as RelayClaimToken
+  });
 }
 
 function validateRelayContext(input: SecurityContext): SecurityContext {
@@ -357,57 +451,32 @@ function validateClaimOptions(options: RelayClaimOptions): void {
   }
 }
 
-function validateClaimIdentity(claim: RelayClaimIdentity): void {
+function validateClaimIdentity(claim: RelayClaimIdentity): RelayClaimIdentity {
   validateResultValue("event ID", claim.eventId);
   validateResultValue("claim owner", claim.claimedBy);
   if (!Number.isInteger(claim.publicationAttempt) || claim.publicationAttempt < 1) {
     throw new Error("Publication attempt must be a positive integer");
   }
+  if (!CLAIM_TOKEN_PATTERN.test(claim.claimToken)) throw staleClaimError();
+  return Object.freeze({ ...claim });
+}
+
+function validatePublisher(publisher: RelayPublicationPublisher): void {
+  if (!publisher || typeof publisher.publish !== "function")
+    throw new Error("Typed relay publisher is required");
 }
 
 function validateResultValue(name: string, value: string): void {
-  if (value.length < 1 || value.length > 200) throw new Error(`${name} is invalid`);
+  if (typeof value !== "string" || value.length < 1 || value.length > 200)
+    throw new Error(`${name} is invalid`);
 }
 
-function mapClaimedRow(row: ClaimedOutboxRow): ClaimedOutboxEvent {
-  assertFoundationEventType(row.event_type, row.aggregate_type);
-  return {
-    eventId: row.event_id,
-    eventType: FOUNDATION_OUTBOX_EVENT_TYPE,
-    tenantId: row.tenant_id,
-    workspaceId: row.workspace_id,
-    spaceId: row.space_id,
-    aggregateType: FOUNDATION_OUTBOX_AGGREGATE_TYPE,
-    aggregateId: row.aggregate_id,
-    aggregateVersion: row.aggregate_version,
-    causationId: row.causation_id,
-    requestId: row.request_id,
-    traceparent: row.traceparent,
-    ...(row.tracestate === null ? {} : { tracestate: row.tracestate }),
-    jobId: row.job_id,
-    contextReferenceId: row.context_reference_id,
-    signedContextReference: row.signed_context_reference,
-    claimedBy: row.claimed_by,
-    publicationAttempt: row.publication_attempt
-  };
+function assertOneUpdatedRow(rows: readonly { id: string }[]): void {
+  if (rows.length !== 1) throw staleClaimError();
 }
 
-export function toFoundationQueueEnvelope(event: ClaimedOutboxEvent): FoundationQueueEnvelope {
-  assertFoundationEventType(event.eventType, event.aggregateType);
-  return {
-    version: "v1",
-    eventId: event.eventId,
-    jobId: event.jobId,
-    scope: {
-      tenantId: event.tenantId,
-      workspaceId: event.workspaceId,
-      spaceId: event.spaceId
-    },
-    contextReference: event.signedContextReference,
-    requestId: event.requestId,
-    traceparent: event.traceparent,
-    ...(event.tracestate === undefined ? {} : { tracestate: event.tracestate })
-  };
+function staleClaimError(): Error {
+  return new Error("Relay claim is stale or outside the exact scope");
 }
 
 function assertFoundationEventType(eventType: string, aggregateType: string): void {

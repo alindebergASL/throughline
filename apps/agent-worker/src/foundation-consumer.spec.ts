@@ -47,6 +47,19 @@ class ManualScheduler {
     this.current = target;
     await flush();
   }
+
+  async runDelayedAt(target: number): Promise<void> {
+    if (target < this.current) throw new Error("manual scheduler cannot move backwards");
+    this.current = target;
+    const due = [...this.timers.entries()]
+      .filter(([, timer]) => !timer.cancelled && timer.at <= target)
+      .sort((left, right) => left[1].at - right[1].at || left[0] - right[0]);
+    for (const [id, timer] of due) {
+      this.timers.delete(id);
+      await timer.callback();
+      await flush();
+    }
+  }
 }
 
 type Deferred<T> = {
@@ -333,6 +346,20 @@ describe("Foundation SQS receipt lifecycle RED contract", () => {
     await scheduler.advanceTo(20_000);
     await expect(result).resolves.toEqual({ status: "undeleted", reasonCode: "deadline_exceeded" });
     expect(sqs.deleteMessage).not.toHaveBeenCalled();
+  });
+
+  it("delayed timer callbacks cannot move the absolute deadline or extend/delete after it", async () => {
+    const { options, scheduler, sqs } = harness({
+      rehydrate: vi.fn((_input, { signal }) => abortablePending<RehydratedJob>(signal))
+    });
+    const { result } = await start(options);
+
+    await scheduler.runDelayedAt(20_001);
+
+    await expect(result).resolves.toEqual({ status: "undeleted", reasonCode: "deadline_exceeded" });
+    expect(sqs.changeMessageVisibility).not.toHaveBeenCalled();
+    expect(sqs.deleteMessage).not.toHaveBeenCalled();
+    expect(scheduler.now()).toBe(20_001);
   });
 
   it("keeps the deadline active through transaction commit confirmation", async () => {

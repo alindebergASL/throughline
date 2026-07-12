@@ -13,7 +13,12 @@ import {
   type ReadableSpan
 } from "@opentelemetry/sdk-trace-base";
 import type { TransactionAwareAuthorizationService } from "@throughline/authorization";
-import type { ClaimedOutboxEvent, PgPool, PgPoolClient } from "@throughline/db";
+import type {
+  RelayClaimIdentity,
+  RelayPublicationRequest,
+  PgPool,
+  PgPoolClient
+} from "@throughline/db";
 import {
   createAsyncContextReferenceCodec,
   createDevSecurityContext,
@@ -136,10 +141,17 @@ describe("Foundation OpenTelemetry continuity", () => {
       expect(claimed.jobId).toBe(created.jobId);
 
       const repository = {
-        claimNext: vi.fn(async () => claimed),
-        markPublished: vi.fn(async () => undefined),
-        markRetry: vi.fn(),
-        markTerminal: vi.fn()
+        claimNext: vi.fn(async () => claimed.identity),
+        publishClaimed: vi.fn(async (_context, claim, publisher) => {
+          const acknowledgment = await publisher.publish(claimed.request);
+          return {
+            status: "published" as const,
+            eventId: claim.eventId,
+            messageId: acknowledgment.messageId
+          };
+        }),
+        recordRetry: vi.fn(),
+        recordTerminal: vi.fn()
       };
       const sqs = {
         send: vi.fn(async (command: { input: typeof queueInput }) => {
@@ -332,25 +344,43 @@ function createWorkerPool(jobId: string): PgPool {
   } as unknown as PgPool;
 }
 
-function claimedEvent(values: readonly unknown[]): ClaimedOutboxEvent {
+function claimedEvent(values: readonly unknown[]): {
+  identity: RelayClaimIdentity;
+  request: RelayPublicationRequest;
+  jobId: string;
+} {
+  const tenantId = String(values[1]);
+  const workspaceId = String(values[2]);
+  const spaceId = String(values[3]);
+  const eventId = String(values[0]);
+  const jobId = String(values[10]);
   return {
-    eventId: String(values[0]),
-    eventType: "foundation.proof.created.v1",
-    tenantId: String(values[1]),
-    workspaceId: String(values[2]),
-    spaceId: String(values[3]),
-    aggregateType: "foundation_test_aggregate",
-    aggregateId: String(values[4]),
-    aggregateVersion: Number(values[5]),
-    causationId: String(values[6]),
-    requestId: String(values[7]),
-    traceparent: String(values[8]),
-    ...(values[9] === null ? {} : { tracestate: String(values[9]) }),
-    jobId: String(values[10]),
-    contextReferenceId: String(values[12]),
-    signedContextReference: String(values[13]),
-    claimedBy: "relay-task8",
-    publicationAttempt: 1
+    jobId,
+    identity: {
+      eventId,
+      claimedBy: "relay-task8",
+      publicationAttempt: 1,
+      claimToken: Buffer.alloc(32, 2).toString("base64url")
+    } as RelayClaimIdentity,
+    request: {
+      eventType: "foundation.proof.created.v1",
+      aggregateType: "foundation_test_aggregate",
+      aggregateId: String(values[4]),
+      aggregateVersion: Number(values[5]),
+      causationId: String(values[6]),
+      contextReferenceId: String(values[12]),
+      routingKey: `tenant/${tenantId}/workspace/${workspaceId}/space/${spaceId}`,
+      envelope: {
+        version: "v1",
+        eventId,
+        jobId,
+        scope: { tenantId, workspaceId, spaceId },
+        contextReference: String(values[13]),
+        requestId: String(values[7]),
+        traceparent: String(values[8]),
+        ...(values[9] === null ? {} : { tracestate: String(values[9]) })
+      }
+    }
   };
 }
 

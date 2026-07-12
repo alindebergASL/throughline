@@ -38,6 +38,20 @@ function environment(overrides: Record<string, string | undefined> = {}) {
 }
 
 describe("Foundation worker executable verification-key rotation contract", () => {
+  it("treats the CI HMAC bytes as test-only and rejects them in production", () => {
+    const ciDummyKey = Buffer.alloc(32, 7).toString("base64");
+    const configured = environment({
+      FOUNDATION_CONTEXT_VERIFICATION_KEYS_JSON: JSON.stringify({ ci_test_key: ciDummyKey }),
+      FOUNDATION_CONTEXT_ACTIVE_KEY_ID: "ci_test_key"
+    });
+    expect(() =>
+      parseFoundationWorkerRuntimeEnvironment({ ...configured, NODE_ENV: "production" } as never)
+    ).toThrow("production context key configuration is invalid");
+    expect(() =>
+      parseFoundationWorkerRuntimeEnvironment({ ...configured, NODE_ENV: "test" } as never)
+    ).not.toThrow();
+  });
+
   it("uses only the same active-key plus strict verification-map variables as test:foundation", () => {
     const parsed = parseFoundationWorkerRuntimeEnvironment(environment()) as unknown as {
       contextKeys: { activeKeyId: string; verificationKeys: ReadonlyMap<string, Uint8Array> };

@@ -213,6 +213,7 @@ function logger() {
 function input(overrides: Partial<RehydrateInput> = {}): RehydrateInput {
   return {
     body: JSON.stringify(envelope()),
+    messageAttributes: routingAttributes(envelope()),
     codec: codec(),
     targetWorkerServicePrincipalId: ids.worker,
     targetPolicyVersionId: "default-v1",
@@ -220,6 +221,23 @@ function input(overrides: Partial<RehydrateInput> = {}): RehydrateInput {
     clock: () => instant,
     logger: logger(),
     ...overrides
+  };
+}
+
+function routingAttributes(message: ReturnType<typeof envelope>) {
+  return {
+    routingKey: {
+      DataType: "String",
+      StringValue: `tenant/${message.scope.tenantId}/workspace/${message.scope.workspaceId}/space/${message.scope.spaceId}`
+    },
+    tenantId: { DataType: "String", StringValue: message.scope.tenantId },
+    workspaceId: { DataType: "String", StringValue: message.scope.workspaceId },
+    spaceId: { DataType: "String", StringValue: message.scope.spaceId },
+    jobId: { DataType: "String", StringValue: message.jobId },
+    eventId: { DataType: "String", StringValue: message.eventId },
+    requestId: { DataType: "String", StringValue: message.requestId },
+    traceparent: { DataType: "String", StringValue: message.traceparent },
+    tracestate: { DataType: "String", StringValue: message.tracestate }
   };
 }
 
@@ -333,9 +351,14 @@ describe("Foundation worker context rehydration RED contract", () => {
     ["Space", { scope: { ...envelope().scope, spaceId: ids.otherSpace } }]
   ])("binds the signature to the exact envelope %s", async (_case, override) => {
     const bootstrapReference = vi.fn();
+    const message = envelope(issuedToken().token, override);
     await expect(
       rehydrate(
-        input({ body: JSON.stringify(envelope(issuedToken().token, override)), bootstrapReference })
+        input({
+          body: JSON.stringify(message),
+          messageAttributes: routingAttributes(message),
+          bootstrapReference
+        })
       )
     ).rejects.toMatchObject({ code: "context_reference_denied" });
     expect(bootstrapReference).not.toHaveBeenCalled();
@@ -421,6 +444,7 @@ describe("Foundation worker context rehydration RED contract", () => {
   });
 
   it.each([
+    ["routingKey", "tenant/wrong/workspace/wrong/space/wrong"],
     ["tenantId", ids.otherTenant],
     ["workspaceId", ids.otherWorkspace],
     ["spaceId", ids.otherSpace],
@@ -437,6 +461,7 @@ describe("Foundation worker context rehydration RED contract", () => {
         rehydrate(
           input({
             messageAttributes: {
+              ...routingAttributes(envelope()),
               [name]: { DataType: "String", StringValue: value }
             },
             bootstrapReference
@@ -453,6 +478,10 @@ describe("Foundation worker context rehydration RED contract", () => {
       rehydrate(
         input({
           messageAttributes: {
+            routingKey: {
+              DataType: "String",
+              StringValue: `tenant/${ids.tenant}/workspace/${ids.workspace}/space/${ids.space}`
+            },
             tenantId: { DataType: "String", StringValue: ids.tenant },
             workspaceId: { DataType: "String", StringValue: ids.workspace },
             spaceId: { DataType: "String", StringValue: ids.space },
@@ -468,6 +497,24 @@ describe("Foundation worker context rehydration RED contract", () => {
       )
     ).resolves.toBeDefined();
     expect(bootstrapReference).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    "routingKey",
+    "tenantId",
+    "workspaceId",
+    "spaceId",
+    "eventId",
+    "jobId",
+    "requestId",
+    "traceparent",
+    "tracestate"
+  ])("fails closed when mandatory duplicated SQS attribute %s is absent", async (name) => {
+    const attributes = routingAttributes(envelope()) as Record<string, unknown>;
+    delete attributes[name];
+    await expect(rehydrate(input({ messageAttributes: attributes }))).rejects.toMatchObject({
+      code: "invalid_envelope"
+    });
   });
 
   it("returns and logs only safe denial data without the raw token or SecurityContext", async () => {

@@ -6,7 +6,9 @@ import type { PgPool, PgPoolClient } from "./client.js";
 import {
   FOUNDATION_OUTBOX_AGGREGATE_TYPE,
   FOUNDATION_OUTBOX_EVENT_TYPE,
-  RelayOutboxRepository
+  RelayOutboxRepository,
+  type DeepReadonly,
+  type RelayPublicationRequest
 } from "./relay-transaction.js";
 
 const context = (): SecurityContext => ({
@@ -24,6 +26,9 @@ function fixturePool(options: { roleRows?: object[]; claimRows?: object[] } = {}
         return { rows: options.roleRows ?? [{ current_user: "throughline_relay" }] };
       }
       if (sql.includes("WITH eligible")) return { rows: options.claimRows ?? [] };
+      if (sql.includes("FROM ops.outbox_events") && sql.includes("FOR UPDATE")) {
+        return { rows: options.claimRows ?? [] };
+      }
       if (sql.includes("UPDATE ops.outbox_events")) return { rows: [{ id: values?.[0] }] };
       return { rows: [] };
     }),
@@ -77,6 +82,7 @@ function claimedRow(override: Record<string, unknown> = {}) {
     signed_context_reference: "tlctx.v1.hs256.test.opaque.signature",
     claimed_by: "relay-a",
     publication_attempt: 1,
+    claim_token: Buffer.alloc(32, 3).toString("base64url"),
     ...override
   };
 }
@@ -95,7 +101,7 @@ describe("RelayOutboxRepository fixed scoped surface", () => {
     expect(sqlTemplates.every((sql) => !sql?.includes("${"))).toBe(true);
   });
 
-  it("asserts the dedicated role before authorizing and claiming with SKIP LOCKED", async () => {
+  it("asserts the dedicated role and claims with SKIP LOCKED without treating scheduling as authorization", async () => {
     const { pool, queries } = fixturePool();
     const authorization = { canInTransaction: vi.fn(async () => allow()) };
     const repository = new RelayOutboxRepository(pool, authorization as never);
@@ -105,26 +111,22 @@ describe("RelayOutboxRepository fixed scoped surface", () => {
     expect(
       queries.findIndex(({ sql }) => sql === "SELECT current_user AS current_user")
     ).toBeLessThan(queries.findIndex(({ sql }) => sql.includes("WITH eligible")));
-    expect(authorization.canInTransaction).toHaveBeenCalledWith(
-      expect.anything(),
-      "foundation.relay.publish",
-      { type: "space", id: devFixtures.restrictedSpaceA },
-      expect.anything()
-    );
+    expect(authorization.canInTransaction).not.toHaveBeenCalled();
     expect(queries.some(({ sql }) => /FOR UPDATE SKIP LOCKED/.test(sql))).toBe(true);
     expect(queries.some(({ sql }) => /relay_service_principal_id = \$\d+/.test(sql))).toBe(true);
     const claimQuery = queries.find(({ sql }) => sql.includes("WITH eligible"));
     const claimSql = claimQuery?.sql ?? "";
     const [eligibilitySql, finalUpdateSql] = claimSql.split("UPDATE ops.outbox_events event");
     expect(claimSql).not.toContain("${");
-    expect(claimSql.match(/event_type = \$7/g)).toHaveLength(2);
-    expect(claimSql.match(/aggregate_type = \$8/g)).toHaveLength(2);
+    expect(claimSql.match(/event_type = \$8/g)).toHaveLength(2);
+    expect(claimSql.match(/aggregate_type = \$9/g)).toHaveLength(2);
     expect(claimQuery?.values).toEqual([
       devFixtures.tenantA,
       devFixtures.workspaceA,
       devFixtures.restrictedSpaceA,
       devFixtures.relayServicePrincipalA,
       "relay-a",
+      expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
       30,
       FOUNDATION_OUTBOX_EVENT_TYPE,
       FOUNDATION_OUTBOX_AGGREGATE_TYPE
@@ -133,15 +135,15 @@ describe("RelayOutboxRepository fixed scoped surface", () => {
     expect(eligibilitySql).toMatch(/workspace_id = \$2/);
     expect(eligibilitySql).toMatch(/space_id = \$3/);
     expect(eligibilitySql).toMatch(/relay_service_principal_id = \$4/);
-    expect(eligibilitySql).toMatch(/event_type = \$7/);
-    expect(eligibilitySql).toMatch(/aggregate_type = \$8/);
+    expect(eligibilitySql).toMatch(/event_type = \$8/);
+    expect(eligibilitySql).toMatch(/aggregate_type = \$9/);
     expect(finalUpdateSql).toMatch(/event\.id = eligible\.id/);
     expect(finalUpdateSql).toMatch(/event\.tenant_id = \$1/);
     expect(finalUpdateSql).toMatch(/event\.workspace_id = \$2/);
     expect(finalUpdateSql).toMatch(/event\.space_id = \$3/);
     expect(finalUpdateSql).toMatch(/event\.relay_service_principal_id = \$4/);
-    expect(finalUpdateSql).toMatch(/event\.event_type = \$7/);
-    expect(finalUpdateSql).toMatch(/event\.aggregate_type = \$8/);
+    expect(finalUpdateSql).toMatch(/event\.event_type = \$8/);
+    expect(finalUpdateSql).toMatch(/event\.aggregate_type = \$9/);
   });
 
   it.each([
@@ -191,16 +193,31 @@ describe("RelayOutboxRepository fixed scoped surface", () => {
   it.each([
     ["event type", { event_type: "foundation.other.created.v1" }],
     ["aggregate type", { aggregate_type: "other_aggregate" }]
-  ])("rejects a claimed row whose %s escaped the exact SQL predicate", async (_name, override) => {
-    const { pool } = fixturePool({ claimRows: [claimedRow(override)] });
-    const repository = new RelayOutboxRepository(pool, {
-      canInTransaction: vi.fn(async () => allow())
-    } as never);
+  ])(
+    "rejects a final locked row whose %s escaped the exact SQL predicate",
+    async (_name, override) => {
+      const row = claimedRow(override);
+      const { pool } = fixturePool({ claimRows: [row] });
+      const repository = new RelayOutboxRepository(pool, {
+        canInTransaction: vi.fn(async () => allow())
+      } as never);
+      const publisher = { publish: vi.fn() };
 
-    await expect(
-      repository.claimNext(context(), { claimedBy: "relay-a", leaseSeconds: 30 })
-    ).rejects.toThrow("Claimed outbox event is outside the exact Foundation relay type");
-  });
+      await expect(
+        repository.publishClaimed(
+          context(),
+          {
+            eventId: row.event_id,
+            claimedBy: row.claimed_by,
+            publicationAttempt: row.publication_attempt,
+            claimToken: row.claim_token
+          } as never,
+          publisher as never
+        )
+      ).rejects.toThrow("Claimed outbox event is outside the exact Foundation relay type");
+      expect(publisher.publish).not.toHaveBeenCalled();
+    }
+  );
 
   it("rejects incomplete and multiple-Space contexts before acquiring a connection", async () => {
     const { pool } = fixturePool();
@@ -220,77 +237,139 @@ describe("RelayOutboxRepository fixed scoped surface", () => {
     expect(pool.connect).not.toHaveBeenCalled();
   });
 
-  it("does not claim when centralized authorization denies", async () => {
+  it("claim acquisition remains scheduling-only even when live authorization would deny", async () => {
     const { pool, queries } = fixturePool();
     const repository = new RelayOutboxRepository(pool, {
       canInTransaction: vi.fn(async () => ({ ...allow(), allowed: false, reasonCode: "denied" }))
     } as never);
     await expect(
       repository.claimNext(context(), { claimedBy: "x", leaseSeconds: 30 })
-    ).rejects.toThrow("Relay publication is not authorized");
-    expect(queries.some(({ sql }) => sql.includes("WITH eligible"))).toBe(false);
+    ).resolves.toBeUndefined();
+    expect(queries.some(({ sql }) => sql.includes("WITH eligible"))).toBe(true);
+    expect(repository).toBeDefined();
   });
 
-  it("reauthorizes each result transaction before its fixed, exactly scoped guarded update", async () => {
-    const { pool, queries } = fixturePool();
+  it("locks the exact token-bound row, authorizes, publishes, and marks in one transaction", async () => {
+    const row = claimedRow();
+    const { pool, queries } = fixturePool({ claimRows: [row] });
     const authorization = { canInTransaction: vi.fn(async () => allow()) };
     const repository = new RelayOutboxRepository(pool, authorization as never);
-    const claim = { eventId: crypto.randomUUID(), claimedBy: "relay-a", publicationAttempt: 2 };
-    await repository.markPublished(context(), claim, "sqs-message");
-    await repository.markRetry(context(), claim, { code: "timeout", delaySeconds: 5 });
-    await repository.markTerminal(context(), claim, "invalid_message");
+    const claim = {
+      eventId: row.event_id,
+      claimedBy: row.claimed_by,
+      publicationAttempt: row.publication_attempt,
+      claimToken: row.claim_token,
+      envelope: { eventId: "caller-tampered-event" }
+    } as never;
+    const publisher = {
+      publish: vi.fn(async (request: DeepReadonly<RelayPublicationRequest>) => {
+        expect(request).toBeDefined();
+        return { messageId: "sqs-message" };
+      })
+    };
+    await repository.publishClaimed(context(), claim, publisher);
     const updates = queries.filter(({ sql }) => sql.includes("UPDATE ops.outbox_events"));
-    expect(updates).toHaveLength(3);
-    expect(new Set(updates.map(({ sql }) => sql)).size).toBe(3);
-    expect(authorization.canInTransaction).toHaveBeenCalledTimes(3);
-    expect(
-      updates.every(
-        ({ sql }) =>
-          !sql.includes("${") &&
-          /publication_attempts = \$\d+/.test(sql) &&
-          /claimed_by = \$\d+/.test(sql) &&
-          /claim_expires_at > clock_timestamp\(\)/.test(sql) &&
-          /tenant_id = \$\d+/.test(sql) &&
-          /workspace_id = \$\d+/.test(sql) &&
-          /space_id = \$\d+/.test(sql) &&
-          /relay_service_principal_id = \$\d+/.test(sql) &&
-          /event_type = \$\d+/.test(sql) &&
-          /aggregate_type = \$\d+/.test(sql)
-      )
-    ).toBe(true);
-    expect(updates.map(({ values }) => values?.slice(-2))).toEqual([
-      [FOUNDATION_OUTBOX_EVENT_TYPE, FOUNDATION_OUTBOX_AGGREGATE_TYPE],
-      [FOUNDATION_OUTBOX_EVENT_TYPE, FOUNDATION_OUTBOX_AGGREGATE_TYPE],
-      [FOUNDATION_OUTBOX_EVENT_TYPE, FOUNDATION_OUTBOX_AGGREGATE_TYPE]
-    ]);
-    expect(updates[0]?.sql).toMatch(/event_type = \$9\s+AND aggregate_type = \$10/);
-    expect(updates[1]?.sql).toMatch(/event_type = \$10\s+AND aggregate_type = \$11/);
-    expect(updates[2]?.sql).toMatch(/event_type = \$9\s+AND aggregate_type = \$10/);
+    expect(updates).toHaveLength(1);
+    expect(authorization.canInTransaction).toHaveBeenCalledOnce();
+    expect(publisher.publish).toHaveBeenCalledOnce();
+    expect(updates[0]?.sql).toMatch(/claim_token = \$10/);
     expect(updates[0]?.sql).toContain("published_message_id");
-    expect(updates[1]?.sql).toContain("last_retry_code");
-    expect(updates[2]?.sql).toContain("terminal_failure_code");
+    const publishedRequest = publisher.publish.mock.calls[0]?.[0];
+    expect(Object.isFrozen(publishedRequest)).toBe(true);
+    expect(Object.isFrozen(publishedRequest?.envelope)).toBe(true);
+    expect(publishedRequest?.envelope.eventId).toBe(row.event_id);
   });
 
-  it.each(["published", "retry", "terminal"] as const)(
-    "denial prevents the %s result update",
-    async (resultKind) => {
-      const { pool, queries } = fixturePool();
-      const authorization = {
-        canInTransaction: vi.fn(async () => ({ ...allow(), allowed: false, reasonCode: "denied" }))
-      };
-      const repository = new RelayOutboxRepository(pool, authorization as never);
-      const claim = { eventId: crypto.randomUUID(), claimedBy: "relay-a", publicationAttempt: 2 };
+  it.each([
+    ["ambiguous COMMIT confirmed by fresh database truth", true, "published"],
+    ["accepted send followed by marker failure remains unresolved", false, "unresolved"]
+  ] as const)("%s", async (_name, commitTruth, expectedStatus) => {
+    const row = claimedRow();
+    const claim = {
+      eventId: row.event_id,
+      claimedBy: row.claimed_by,
+      publicationAttempt: row.publication_attempt,
+      claimToken: row.claim_token
+    } as never;
+    let firstCommit = true;
+    const primary = {
+      query: vi.fn(async (sql: string, values?: unknown[]) => {
+        if (sql === "COMMIT" && firstCommit) {
+          firstCommit = false;
+          if (commitTruth) throw new Error("simulated ambiguous commit result");
+          return { rows: [] };
+        }
+        if (sql === "SELECT current_user AS current_user") {
+          return { rows: [{ current_user: "throughline_relay" }] };
+        }
+        if (sql.includes("FROM ops.outbox_events") && sql.includes("FOR UPDATE")) {
+          return { rows: [row] };
+        }
+        if (sql.includes("UPDATE ops.outbox_events")) {
+          if (!commitTruth) throw new Error("injected failure before mark");
+          return { rows: [{ id: values?.[0] }] };
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn()
+    } as unknown as PgPoolClient;
+    const verifier = {
+      query: vi.fn(async (sql: string) => {
+        if (sql === "SELECT current_user AS current_user") {
+          return { rows: [{ current_user: "throughline_relay" }] };
+        }
+        if (sql.includes("SELECT id") && sql.includes("published_message_id")) {
+          return { rows: commitTruth ? [{ id: row.event_id }] : [] };
+        }
+        return { rows: [] };
+      }),
+      release: vi.fn()
+    } as unknown as PgPoolClient;
+    const clients = [primary, verifier];
+    const pool = {
+      connect: vi.fn(async () => {
+        const client = clients.shift();
+        if (!client) throw new Error("unexpected connection");
+        return client;
+      })
+    } as unknown as PgPool;
+    const repository = new RelayOutboxRepository(pool, {
+      canInTransaction: vi.fn(async () => allow())
+    });
 
-      const operation =
-        resultKind === "published"
-          ? repository.markPublished(context(), claim, "sqs-message")
-          : resultKind === "retry"
-            ? repository.markRetry(context(), claim, { code: "timeout", delaySeconds: 5 })
-            : repository.markTerminal(context(), claim, "invalid_message");
+    await expect(
+      repository.publishClaimed(context(), claim, {
+        publish: async () => ({ messageId: "stable-message-id" })
+      })
+    ).resolves.toMatchObject({ status: expectedStatus, messageId: "stable-message-id" });
+    expect(verifier.query).toHaveBeenCalledWith(
+      expect.stringContaining("published_message_id = $11"),
+      expect.arrayContaining([row.event_id, "stable-message-id"])
+    );
+  });
 
-      await expect(operation).rejects.toThrow("Relay publication is not authorized");
-      expect(authorization.canInTransaction).toHaveBeenCalledOnce();
-      expect(queries.some(({ sql }) => sql.includes("UPDATE ops.outbox_events"))).toBe(false);
-    }
-  );
+  it("final authorization denial prevents publisher invocation and the marker", async () => {
+    const row = claimedRow();
+    const { pool, queries } = fixturePool({ claimRows: [row] });
+    const authorization = {
+      canInTransaction: vi.fn(async () => ({ ...allow(), allowed: false, reasonCode: "denied" }))
+    };
+    const repository = new RelayOutboxRepository(pool, authorization as never);
+    const publisher = { publish: vi.fn() };
+    await expect(
+      repository.publishClaimed(
+        context(),
+        {
+          eventId: row.event_id,
+          claimedBy: row.claimed_by,
+          publicationAttempt: row.publication_attempt,
+          claimToken: row.claim_token
+        } as never,
+        publisher as never
+      )
+    ).rejects.toThrow("Relay publication is not authorized");
+    expect(authorization.canInTransaction).toHaveBeenCalledOnce();
+    expect(publisher.publish).not.toHaveBeenCalled();
+    expect(queries.some(({ sql }) => sql.includes("UPDATE ops.outbox_events"))).toBe(false);
+  });
 });

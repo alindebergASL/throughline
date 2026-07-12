@@ -48,7 +48,7 @@ export async function composeRelayRuntime(
     environment.FOUNDATION_SQS_QUEUE_URL,
     commands
   );
-  return { relay, close: () => pool.end() };
+  return { relay, repository, close: () => pool.end() };
 }
 
 export function parseLocalSqsConfiguration(

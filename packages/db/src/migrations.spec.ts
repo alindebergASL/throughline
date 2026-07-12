@@ -155,6 +155,20 @@ describe("canonical Foundation closure migration", () => {
     expect(sql).toContain("REFERENCES access.spaces(tenant_id, workspace_id, id)");
   });
 
+  it("persists a mandatory random-format claim token and includes it in claim consistency", async () => {
+    const sql = await readFoundationMigration();
+    expect(sql).toMatch(
+      /claim_token text CHECK \(claim_token IS NULL OR claim_token ~ '\^\[A-Za-z0-9_-\]\{43\}\$'\)/
+    );
+    expect(sql).toMatch(/claimed_at IS NULL AND claimed_by IS NULL AND claim_token IS NULL/);
+    expect(sql).toMatch(
+      /claimed_at IS NOT NULL AND claimed_by IS NOT NULL AND claim_token IS NOT NULL/
+    );
+    expect(sql).toMatch(
+      /GRANT UPDATE \([\s\S]*?claim_token[\s\S]*?\) ON ops\.outbox_events TO throughline_relay/
+    );
+  });
+
   it("keeps relay and worker grants narrow and transaction-scope policies fail closed", async () => {
     const sql = await readFoundationMigration();
 
