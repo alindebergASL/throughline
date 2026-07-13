@@ -184,13 +184,25 @@ Tenant and Workspace. The trigger branches over the allowlisted table names; it 
 dynamic SQL from request data. Endpoint validation and authorization are repeated in trusted
 server code before the insert.
 
-Every relationship has one governing `space_id`:
+Every relationship has one governing `space_id`. `space`, `organization`, `initiative`, `activity`,
+and `content` are Space-bearing kinds; `person` is not:
 
-- if `context_type/context_id` is present, the context entity's Space is the governing Space;
-- otherwise the subject entity's Space is the governing Space;
+- if `context_type/context_id` is present, it must be Space-bearing and its Space is the governing
+  Space;
+- without a context, the subject's Space is governing when the subject is Space-bearing;
+- otherwise, the object must be Space-bearing and its Space is governing;
+- a relationship whose subject and object are both non-Space-bearing is rejected unless it has an
+  authorized Space-bearing context;
 - a Person endpoint has no independent Space and inherits no authority; and
-- a relationship is readable only when the caller can read its governing Space and every endpoint
-  that would be disclosed.
+- a relationship is readable only when the caller can read its governing Space, subject, object,
+  and explicit context without disclosing an inaccessible endpoint.
+
+Trusted server code derives `space_id`; the request never selects it. The fixed integrity trigger
+independently validates the same context → subject → object resolution, rejects a non-Space-bearing
+context or an unresolved governing Space, and rejects a persisted `space_id` that differs from the
+derived value. Thus `person --account_owner_for--> organization` without a context is governed by
+the Organization Space, while `person --> person` requires an explicit authorized Space-bearing
+context.
 
 If an endpoint is in a more restrictive or otherwise inaccessible Space, the API must not publish
 the relationship into a broader context. The request is denied or must select an authorized
@@ -328,7 +340,7 @@ The same migration adds:
 - explicit grants to the existing `throughline_app` role only;
 - no B1 product-table grants to `throughline_relay` or `throughline_worker`;
 - immutable-row triggers for Content revisions, SourceArtifacts, and SourceChunks;
-- fixed endpoint-integrity triggers for Relationships;
+- fixed endpoint-integrity and governing-Space triggers for Relationships;
 - source correction-chain constraints; and
 - indexes required by the manual workflow.
 
@@ -343,7 +355,7 @@ Every B1 row has explicit ownership:
 | Organizations/domains | required | required | Organization Space |
 | Initiatives and their joins | required | required | Initiative Space |
 | Activities and their joins | required | required | Activity Space |
-| Relationships | required | required | context/subject Space |
+| Relationships | required | required | context/subject/object fallback Space |
 | Content items/revisions | required | required | ContentItem Space |
 | Source artifacts/chunks | required | required | SourceArtifact Space |
 | Activity-source links | required | required | Activity Space |
@@ -605,7 +617,8 @@ The first implementation should remain conservative:
 - revising content requires contributor-or-higher authority and version precondition;
 - source correction requires contributor-or-higher authority and access to the predecessor;
 - tombstoning requires Workspace admin/owner plus a valid retention decision;
-- relationships require authority in the governing Space and readable endpoints;
+- relationships require authority in the mechanically derived governing Space and read access to
+  the subject, object, and explicit context;
 - service and agent principals remain default-denied for every B1 action unless a later approved
   plan adds one exact-purpose rule.
 
@@ -708,7 +721,9 @@ document the reason and security/maintenance impact before adding it.
 - organization/domain normalization and aggregate invariants;
 - Initiative primary-organization and profile key constraints;
 - Activity subtype/template/time validation;
-- Relationship direction, endpoint allowlist, validity, and no inverse duplication;
+- Relationship direction, endpoint allowlist, validity, governing-Space resolution, and no inverse
+  duplication, including object fallback for a Person subject and rejection when neither endpoint
+  nor context is Space-bearing;
 - Content revision optimistic concurrency;
 - normalization/chunking golden fixtures and hash reconstruction;
 - command schemas, request hashing, idempotent replay, and mismatched-key conflict;
@@ -726,6 +741,9 @@ document the reason and security/maintenance impact before adding it.
 - wrong Space insert/update fails `WITH CHECK`;
 - pooled `SET LOCAL` context does not leak;
 - cross-scope join and Relationship endpoints fail;
+- the Relationship trigger derives the Organization Space for a context-free
+  `person --account_owner_for--> organization`, rejects a forged `space_id`, rejects a Person
+  context, and rejects `person --> person` without a Space-bearing context;
 - immutable SourceArtifact/SourceChunk/ContentRevision update/delete attempts fail;
 - only the exact tombstone transition is allowed and cannot be reversed;
 - concurrent correction attempts produce one successor;
@@ -740,7 +758,13 @@ document the reason and security/maintenance impact before adding it.
   error, or timing-sensitive alternate response shape;
 - caller cannot forge scope, access class, profile version, owner authority, hashes, offsets, or
   tombstone fields;
-- Relationship endpoints are both authorized before disclosure;
+- a context-free `person --account_owner_for--> organization` requires relationship authority in
+  the Organization Space and readable Person and Organization endpoints;
+- `person --> person` is denied without a Space-bearing context, and with one is allowed only when
+  the actor can read both Persons and the context and has relationship authority in the context
+  Space;
+- a missing, inaccessible, cross-scope, or non-Space-bearing explicit context is denied without
+  leaking endpoint or context metadata;
 - route handlers contain no direct table mutation path;
 - source text remains untrusted data and is never treated as a command/instruction;
 - no source path exposes a write-capable tool or external action.
@@ -797,7 +821,9 @@ B1 is complete only when all of the following are evidenced from a clean databas
   without an integration;
 - Engagement is demonstrably an Activity subtype, not a parallel model;
 - every B1 row is Tenant/Workspace/Space bound with forced RLS and central authorization;
-- association and Relationship direction/endpoints are mechanically constrained;
+- association and Relationship direction/endpoints are mechanically constrained, including the
+  context → subject → object governing-Space rule and Person-only rejection without an authorized
+  Space-bearing context;
 - the AI Solutions profile validates at build/startup and exact Workspace pinning fails closed;
 - SourceArtifacts and SourceChunks are immutable outside the exact governed tombstone transition;
 - normalization, chunk logical identity, hashes, and Unicode-scalar offsets are deterministic;
