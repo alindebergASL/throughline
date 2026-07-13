@@ -64,6 +64,10 @@ async function setTransactionContext(
     ["app.trace_id", context.traceId],
     ["app.tenant_id", context.tenantId],
     ["app.workspace_id", context.workspaceId],
+    [
+      "app.space_id",
+      context.requestedSpaceIds.length === 1 ? context.requestedSpaceIds[0] : undefined
+    ],
     ["app.user_id", context.actorUserId],
     ["app.membership_id", context.actorMembershipId],
     ["app.service_principal_id", context.servicePrincipalId],

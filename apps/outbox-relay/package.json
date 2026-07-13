@@ -2,7 +2,7 @@
   "name": "@throughline/outbox-relay",
   "version": "0.0.0",
   "private": true,
-  "description": "Transactional outbox relay skeleton; publishing semantics are deferred.",
+  "description": "Tenant-scoped Foundation transactional outbox relay.",
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/main.ts",
@@ -12,6 +12,11 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@throughline/observability": "workspace:*"
+    "@aws-sdk/client-sqs": "^3.840.0",
+    "@throughline/authorization": "workspace:*",
+    "@throughline/core-types": "workspace:*",
+    "@throughline/db": "workspace:*",
+    "@throughline/observability": "workspace:*",
+    "@throughline/tenancy": "workspace:*"
   }
 }

@@ -179,3 +179,5 @@ export interface SkeletonModule {
   wave: "A1" | "A2";
   status: "placeholder" | "implemented";
 }
+
+export type { FoundationQueueEnvelope, FoundationScope } from "./async-foundation.js";

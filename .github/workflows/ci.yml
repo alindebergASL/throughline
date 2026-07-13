@@ -12,6 +12,10 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    env:
+      FOUNDATION_SOURCE_QUEUE_NAME: throughline-foundation-test-source-${{ github.run_id }}-${{ github.run_attempt }}
+      FOUNDATION_DLQ_NAME: throughline-foundation-test-dlq-${{ github.run_id }}-${{ github.run_attempt }}
+      FOUNDATION_BUCKET_NAME: throughline-foundation-test-bucket-${{ github.run_id }}-${{ github.run_attempt }}
     services:
       postgres:
         image: pgvector/pgvector:pg16
@@ -26,6 +30,17 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      localstack:
+        image: localstack/localstack:3.6
+        env:
+          SERVICES: sqs,s3
+        ports:
+          - 4566:4566
+        options: >-
+          --health-cmd "curl --fail http://localhost:4566/_localstack/health"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
 
     steps:
       - name: Check out repository
@@ -65,3 +80,58 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/throughline_test
           TEST_APP_DATABASE_URL: postgres://throughline_app@127.0.0.1:5432/throughline_test
+
+      - name: Provision isolated Foundation LocalStack resources
+        shell: bash
+        env:
+          FOUNDATION_SQS_ENDPOINT: http://127.0.0.1:4566
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: |
+          set -euo pipefail
+          account_id=000000000000
+          dlq_url="${FOUNDATION_SQS_ENDPOINT}/${account_id}/${FOUNDATION_DLQ_NAME}"
+          source_url="${FOUNDATION_SQS_ENDPOINT}/${account_id}/${FOUNDATION_SOURCE_QUEUE_NAME}"
+
+          aws --endpoint-url "$FOUNDATION_SQS_ENDPOINT" sqs create-queue \
+            --queue-name "$FOUNDATION_DLQ_NAME" >/dev/null
+          dlq_arn=$(aws --endpoint-url "$FOUNDATION_SQS_ENDPOINT" sqs get-queue-attributes \
+            --queue-url "$dlq_url" --attribute-names QueueArn \
+            --query 'Attributes.QueueArn' --output text)
+          redrive_policy=$(jq -cn \
+            --arg deadLetterTargetArn "$dlq_arn" \
+            '{deadLetterTargetArn: $deadLetterTargetArn, maxReceiveCount: "3"}')
+          queue_attributes=$(jq -cn \
+            --arg redrivePolicy "$redrive_policy" \
+            '{RedrivePolicy: $redrivePolicy}')
+          aws --endpoint-url "$FOUNDATION_SQS_ENDPOINT" sqs create-queue \
+            --queue-name "$FOUNDATION_SOURCE_QUEUE_NAME" >/dev/null
+          aws --endpoint-url "$FOUNDATION_SQS_ENDPOINT" sqs set-queue-attributes \
+            --queue-url "$source_url" \
+            --attributes "$queue_attributes"
+
+          configured_policy=$(aws --endpoint-url "$FOUNDATION_SQS_ENDPOINT" sqs get-queue-attributes \
+            --queue-url "$source_url" --attribute-names RedrivePolicy \
+            --query 'Attributes.RedrivePolicy' --output text)
+          test "$(jq -r '.maxReceiveCount' <<<"$configured_policy")" = "3"
+          test "$(jq -r '.deadLetterTargetArn' <<<"$configured_policy")" = "$dlq_arn"
+          aws --endpoint-url "$FOUNDATION_SQS_ENDPOINT" s3api create-bucket \
+            --bucket "$FOUNDATION_BUCKET_NAME" >/dev/null
+
+      - name: Run fail-closed Foundation PostgreSQL and LocalStack gate
+        run: pnpm test:foundation
+        env:
+          TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/throughline_test
+          TEST_APP_DATABASE_URL: postgres://throughline_app@127.0.0.1:5432/throughline_test
+          TEST_RELAY_DATABASE_URL: postgres://throughline_relay@127.0.0.1:5432/throughline_test
+          TEST_WORKER_DATABASE_URL: postgres://throughline_worker@127.0.0.1:5432/throughline_test
+          FOUNDATION_SQS_ENDPOINT: http://127.0.0.1:4566
+          FOUNDATION_SQS_QUEUE_URL: http://127.0.0.1:4566/000000000000/${{ env.FOUNDATION_SOURCE_QUEUE_NAME }}
+          FOUNDATION_SQS_DLQ_URL: http://127.0.0.1:4566/000000000000/${{ env.FOUNDATION_DLQ_NAME }}
+          FOUNDATION_S3_BUCKET: ${{ env.FOUNDATION_BUCKET_NAME }}
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+          FOUNDATION_CONTEXT_VERIFICATION_KEYS_JSON: '{"ci_test_key":"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="}'
+          FOUNDATION_CONTEXT_ACTIVE_KEY_ID: ci_test_key

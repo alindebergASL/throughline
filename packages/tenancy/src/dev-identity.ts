@@ -22,6 +22,7 @@ export const devFixtures = {
   restrictedChildSpaceA: "11111111-1111-4111-8111-111111111120",
   externalPersonA: "11111111-1111-4111-8111-111111111115",
   servicePrincipalA: "11111111-1111-4111-8111-111111111116",
+  relayServicePrincipalA: "11111111-1111-4111-8111-111111111121",
   agentPrincipalA: "11111111-1111-4111-8111-111111111117"
 } as const;
 
