@@ -1,24 +1,24 @@
 # Wave B1 Plan — Work Graph and Source Capture
 
-> **Plan only; implementation HOLD.** Do not implement Wave B1 until a separately approved
-> B3/runtime amendment defines the required typed product outbox/relay expansion and Andrew
-> explicitly lifts this HOLD. This artifact does not authorize that expansion, B1 command handlers
-> or migrations, B2 truth-ledger work, model extraction, ChangeSets, integrations, product UI,
-> deployment, or changes to canonical kickoff documents or accepted ADRs.
+> **Plan only; implementation HOLD.** Do not implement Wave B1 until a separately approved,
+> bounded **B1.0 canonical product-outbox prerequisite** is merged and Andrew explicitly lifts this
+> HOLD. This artifact defines but does not authorize B1.0, B1 command handlers or migrations, B2
+> truth-ledger work, B3 governed runtime work, model extraction, ChangeSets, integrations, product
+> UI, deployment, or changes to canonical kickoff documents or accepted ADRs.
 
-- **Date:** 2026-07-13
-- **Authorized correction base:** `adf1e37d8cb3d6dae9db77c986209ddd10d0a19a`
-- **Correction branch:** `throughline/impl/t_31535ea5-pr5-b1-plan-correction`
+- **Date:** 2026-07-14
+- **Authorized correction base:** `d870d4def9ee3be21b8dbf041cd63fb594e7e4c6`
+- **Correction branch:** `throughline/impl/t_eb4dee8d-pr5-b1-plan-review-hold-correction`
 - **Wave:** B1 — Work graph and source capture
 - **Planning verdict:** **HOLD** — ADR-019, Build Spec §14.1, and Implementation Kickoff ticket 9
   require every domain mutation to emit a transactional outbox event with aggregate version. The
-  merged Foundation outbox/relay is exact-purpose and cannot carry B1 events, while the proposed
-  app-only `ops.domain_events` ledger is not canonical outbox compliance. No B1 command handler or
-  migration may ship under this plan alone.
+  merged Foundation proof outbox/relay is exact-purpose and cannot carry B1 events. B1 therefore
+  requires the additive, isolated B1.0 canonical product-domain outbox below before any B1 command
+  handler or migration may ship.
 
 ## Proposed goal and gate after HOLD lift
 
-After the required amendment is separately approved and the HOLD is explicitly lifted, implement
+After B1.0 is separately approved and merged and the HOLD is explicitly lifted, implement
 the smallest manual Account Operations graph and evidence-capture path on top of the closed Wave A
 isolation foundation:
 
@@ -82,9 +82,9 @@ dependency, canonical document, or accepted ADR is changed by this plan.
 9. A minimal typed domain-command façade for the manual B1 mutations, as required by accepted
    ADR-019, without implementing the later governed ChangeSet runtime.
 10. Minimal REST endpoints and tests needed to prove the manual no-integration gate.
-11. Proposed reviewed SQL migrations, Drizzle mirrors, RLS/privilege tests,
-    audit/domain-event records, and observability for the new path, all blocked from implementation
-    until the required outbox/relay amendment is separately approved.
+11. Proposed reviewed SQL migrations, Drizzle mirrors, RLS/privilege tests, audit and canonical
+    product-outbox records, and observability for the new path, all blocked from implementation
+    until B1.0 is separately approved and merged.
 
 ### Explicit non-goals
 
@@ -139,20 +139,20 @@ The creation invariants are:
 
 ```text
 Organization command
-  = organization row + child Space + audit event + domain event + canonical outbox event
+  = organization row + child Space + audit event + canonical product-outbox notification
 
 Initiative command
-  = initiative row + child Space + primary organization link + audit event + domain event
-    + canonical outbox event
+  = initiative row + child Space + primary organization link + audit event
+    + canonical product-outbox notification
 
 Activity command
-  = activity row + normalized association rows + audit event + domain event
-    + canonical outbox event
+  = activity row + normalized association rows + audit event
+    + canonical product-outbox notification
 ```
 
-Once the required outbox expansion is separately approved, each group commits atomically. A
-partially created aggregate/Space pair or a mutation without its audit, domain-event, and canonical
-outbox records is invalid.
+Once B1.0 is separately approved and merged, each group commits atomically. A partially created
+aggregate/Space pair or a mutation without its audit and canonical product-outbox records is
+invalid.
 
 Organization and Initiative create idempotency is anchored to a stable, pre-existing reservation
 scope, never the child Space being created:
@@ -167,10 +167,10 @@ reservation Space, locks and authorizes that live parent, and attempts to insert
 reservation. Only the transaction that inserts the reservation may generate the UUIDv7 child
 Space ID and UUIDv7 aggregate ID. It generates each once, immediately persists both in the same
 transaction, completes the command record with those result references and a safe response, and
-commits aggregate, Space, audit, domain event, and canonical outbox event together. No child ID is
+commits aggregate, Space, audit, and canonical product-outbox records together. No child ID is
 accepted from the caller, generated before the reservation win, or regenerated on replay. This
-protocol remains proposed only until the separately approved outbox amendment supplies the typed
-outbox row and relay contract.
+protocol remains proposed only until B1.0 supplies the canonical typed row and domain-notification
+relay contract.
 
 The reservation has no durable abandoned state. `reserved` is an in-transaction state only; the
 create handler must either update it to `completed` before commit or throw so
@@ -188,16 +188,16 @@ Exact outcomes are mechanical:
 - a concurrent identical request waits on the unique-key conflict and then follows identical
   replay;
 - a concurrent mismatched request waits and then follows mismatch conflict;
-- any failure before commit rolls back reservation, Space, aggregate, audit, domain event, and
-  canonical outbox event together;
+- any failure before commit rolls back reservation, Space, aggregate, audit, and canonical
+  product-outbox records together;
   and
 - an abandoned open transaction is cancelled/rolled back and is behaviorally identical to any
   other rollback, not converted into a committed pending record.
 
-Database and concurrency tests count one command record, one child Space, one aggregate, one
-logical domain event, one audit event, and one canonical outbox event after retries; inject
-failures after reservation, after each UUID allocation, after each insert, and before commit; and
-prove no replay path can create a duplicate Space or aggregate.
+Database and concurrency tests count one command record, one child Space, one aggregate, one audit
+event, and one canonical product-outbox event after retries; inject failures after reservation, after
+each UUID allocation, after each insert, and before commit; and prove no replay path can create a
+duplicate Space, aggregate, audit event, or outbox event.
 
 ### 2. Normalized associations
 
@@ -298,7 +298,111 @@ editable note is itself immutable evidence.
 Do not rewrite or renumber migrations `0001` or `0002`. Add reviewed SQL migrations after the
 current journal head and mirror them in Drizzle schema definitions.
 
-### Migration 0003 — work graph
+### Migration 0003 — B1.0 canonical product-domain outbox prerequisite
+
+B1.0 is a bounded prerequisite PR, not B3 and not B1 implementation. It adds
+`ops.product_outbox_events` as the canonical transactional product-domain outbox. The table, its
+repository, relay, authorization, database role, service principal, envelope, and tests are wholly
+additive and isolated from the existing Foundation proof table and path.
+
+Each outbox row contains:
+
+- UUIDv7 `id`, which is also the stable `event_id` generated once by the winning domain-command
+  reservation and reused on retry;
+- exact non-null `tenant_id`, `workspace_id`, and governing `space_id` with composite scope foreign
+  keys;
+- the exact notification-only `relay_service_principal_id`, bound by a composite same-scope foreign
+  key and omitted from the public notification envelope;
+- a closed typed B1 `event_type` union and matching closed B1 `aggregate_type` union;
+- positive `event_schema_version`, positive `payload_schema_version`, aggregate UUIDv7 `aggregate_id`,
+  and positive committed `aggregate_version`;
+- non-null `causation_command_id` referencing the exact scoped `ops.domain_command_records` row once
+  B1 creates it;
+- a schema-validated safe JSON payload whose discriminant and payload schema version match
+  `event_type`, and which excludes raw source text, object keys, restricted Person fields,
+  credentials, and policy-erased hashes;
+- bounded `request_id`, `traceparent`, and optional `tracestate` metadata; and
+- publication state limited to attempt count, next-attempt time, bounded claim identity/expiry,
+  sanitized retry code, broker-accepted message ID/time, or terminal publication-failure code/time.
+
+The stable duplicate identity is both the event ID and a unique semantic key on
+`(tenant_id, workspace_id, space_id, causation_command_id, event_type, aggregate_type, aggregate_id,
+aggregate_version)`. Identical command replay returns the existing row and event ID only when the
+full trusted envelope payload is equal. Any mismatch is an invariant conflict and rolls back; relay
+retries always reuse the same event ID as the broker message/deduplication identity.
+
+The canonical TypeScript `DomainNotificationEnvelope` is a discriminated union containing exactly
+`eventId`, `eventType`, `eventSchemaVersion`, `payloadSchemaVersion`, Tenant/Workspace/Space scope,
+aggregate type/ID/version, causation command ID, safe payload, request ID, and trace carrier. It is a notification of
+an already-authorized committed fact, not authority to execute an effect. It contains and requires
+none of the following:
+
+- `jobId` or any worker-job identity;
+- a signed delegated-context reference;
+- worker execution authority;
+- an active consumer;
+- AgentRun, ChangeSet, or ExecutionReceipt state; or
+- consumer visibility, acknowledgement, redrive, or DLQ lifecycle.
+
+The mutation handler inserts aggregate state, `ops.audit_events`, and the canonical product-outbox
+row through repositories sharing the same `TenantDbTransaction`; the outbox repository cannot
+acquire a pool or accept a post-commit copy. A mutation without its audit and outbox row, or a later
+promotion/copy into the outbox, is invalid. B1.0 supplies the transaction-bound insert contract and
+rollback tests; B1 command handlers remain forbidden until B1.0 is merged and the HOLD is lifted.
+
+Publication uses a new least-privilege `throughline_product_relay` database role and a fixed
+notification-only product relay service principal per Workspace, authorized only for
+`product_outbox.relay.publish`. The application policy permits scoped insert/read only when
+Tenant/Workspace/Space settings match the row and the server-selected relay principal belongs to the
+same Workspace. The product-relay policy permits claim/read/publication-column update only when
+`relay_service_principal_id = ops.current_service_principal_id()`; it does not broaden by an
+untrusted Tenant/Workspace/Space request. A relay process sets only its server-owned principal,
+claims rows assigned to that principal, validates each row's exact scope, then builds a fresh
+service-principal `SecurityContext` for that Space and reauthorizes the fixed action immediately
+before every broker attempt. The row's relay principal is not serialized into
+`DomainNotificationEnvelope` and conveys no worker or consumer authority.
+
+Both roles are `NOBYPASSRLS`. The product relay receives no grants on B1 product/audit tables, cannot
+insert/delete outbox rows or update immutable envelope columns, and cannot use Foundation
+`throughline_relay`. RLS is enabled and forced, column grants/policies are exact, and claims use
+bounded leases.
+
+Publication attempts are bounded to the initial attempt plus retries after 1, 5, 30, 120, and 600
+seconds. Broker acceptance records `published_at` and the broker message ID. The sixth failed attempt
+records a sanitized terminal publication failure and stops automatic retry; B1.0 has no DLQ or
+consumer-failure state. An explicit separately authorized operator retry may clear only that
+publication terminal state without changing event identity or payload.
+
+If notification publication is enabled before a consumer exists, B1.0 publishes to a dedicated
+product-notification destination with no consumer, redrive, or no-op worker and an exact 24-hour
+message-retention TTL. Broker acceptance is the publication boundary; it does not claim consumption.
+The message expires after that TTL. Tests provision the destination without a consumer, publish once,
+prove the stable event/message identity and outbox `published` state, advance/assert expiry using the
+provider's bounded test seam, and prove there is no worker invocation or product write. A future
+consumer must establish its own current execution context and reauthorize every effect; the
+notification conveys no delegated authority.
+
+Before migration `0006` exists, the B1.0 publication/atomicity gate uses only disposable test-schema
+command, audit, and aggregate fixtures inside one transaction. The production B1 command feature is
+absent/disabled, the canonical product outbox must contain no non-test rows, and the harness cannot
+be invoked by an application route. This proves the B1.0 contract without creating an unbound
+production publication path or authorizing B1.
+
+B1.0 must prove the existing Foundation `ops.outbox_events` table, checks/FKs/indexes, constants,
+`FoundationQueueEnvelope`, `throughline_relay`/`throughline_worker` roles and grants, relay repository
+and authorization path, signed context-reference flow, queue resources, and end-to-end proof are
+byte/behavior unchanged. Product rows are unreachable from Foundation claim filters, and Foundation
+roles cannot select or mutate the product outbox. These isolation/non-regression tests run in the
+full Foundation gate and the B1.0 gate.
+
+Migration `0003` creates only this B1.0 table and its exact supporting role, policies, grants,
+constraints, indexes, and publication-state triggers in one transaction. The causation column is
+non-null and UUID-validated in `0003`; because the command table does not yet exist, migration `0006`
+must add its composite same-scope foreign key before any B1 insert path is enabled. B1.0 is itself
+separately reviewed and approved; this plan correction does not authorize its implementation or
+merge.
+
+### Migration 0004 — work graph
 
 Create schema `work` and these tables:
 
@@ -349,12 +453,12 @@ Important constraints:
 Organization and Initiative Space creation uses existing `access.spaces`; B1 does not create a
 parallel containment tree.
 
-Migration `0003` also installs, in this same transaction, RLS enablement/FORCE RLS, exact app-role
+Migration `0004` also installs, in this same transaction, RLS enablement/FORCE RLS, exact app-role
 grants, policies, composite scope foreign keys, and all work-table integrity triggers, including
 Relationship endpoint/governing-Space enforcement. A work table is never committed by the
 migration runner without its complete security boundary.
 
-### Migration 0004 — content, sources, and chunks
+### Migration 0005 — content, sources, and chunks
 
 Create schema `content` and:
 
@@ -410,12 +514,12 @@ normalized text, content hash, and inherited access class. A matching logical ke
 different field is an invariant violation that rolls back the command; it is never treated as a
 successful replay.
 
-Migration `0004` also installs, in this same transaction, RLS enablement/FORCE RLS, exact app-role
+Migration `0005` also installs, in this same transaction, RLS enablement/FORCE RLS, exact app-role
 grants, policies, composite scope foreign keys, access-class checks, immutable-row triggers, and
 the exact governed correction/tombstone transition triggers for every table it creates. There is
 no interval in which content/source tables exist without their complete security boundary.
 
-### Migration 0005 — B1 command idempotency, audit, and durable domain events
+### Migration 0006 — B1 command idempotency and audit
 
 Add `ops.domain_command_records` rather than overloading Foundation worker
 `ops.idempotency_records`. It contains exact Tenant/Workspace/reservation-Space scope, command kind,
@@ -423,16 +527,7 @@ caller-supplied idempotency key, canonical request hash, state, result reference
 snapshot, actor/delegation references, timestamps, and a unique key on
 `(tenant_id, workspace_id, reservation_space_id, command_kind, idempotency_key)`.
 
-The same migration creates append-only `ops.domain_events` for B1's durable but intentionally
-unpublished event record. Each row contains exact scope, an allowlisted B1 event type, aggregate
-type/ID/version, causation domain-command ID, request/trace IDs, an event-schema version, and a
-schema-validated safe JSON payload. It is an optional internal domain-event ledger and does not
-substitute for the canonical transactional outbox required by ADR-019. Raw source text, object
-keys, Person email/external refs, and hashes barred by a source's immutable
-`erase_on_tombstone` policy are forbidden. The table has no job, relay principal,
-context-reference token, claim/lease, retry, publication, or queue-message columns.
-
-Migration `0005` also proposes append-only `ops.audit_events`. Each audit row contains exact
+Migration `0006` also proposes append-only `ops.audit_events`. Each audit row contains exact
 Tenant/Workspace/Space scope; the domain-command ID as causation; the allowlisted action and typed
 resource type/ID; actor Membership and User; delegating Membership and User when present; agent
 principal when present; policy version; request and trace IDs; an audit-schema version; and
@@ -440,28 +535,39 @@ schema-validated safe detail. The actor and delegator references are composite s
 keys, the agent principal is a same-scope foreign key, and the policy version is the exact version
 used for authorization. Detail may contain only action-specific allowlisted keys and never raw
 source text, object keys, restricted Person fields, credentials, or hashes forbidden by
-`erase_on_tombstone`. `ops.audit_events` is immutable after insert: no application update or
-delete path exists, an append-only trigger rejects both, and forced RLS plus exact app-only
-`SELECT, INSERT` grants scope reads and inserts. `ops.domain_events` never substitutes for
-`ops.audit_events`.
+`erase_on_tombstone`. `ops.audit_events` is immutable after insert: no application update or delete
+path exists, an append-only trigger rejects both, and forced RLS plus exact app-only `SELECT, INSERT`
+grants scope reads and inserts.
 
-Migration `0005` installs RLS enablement/FORCE RLS, app-only grants, policies, append-only triggers,
-the no-committed-`reserved` constraint, composite scope foreign keys, and indexes for the three
-tables it creates in that same transaction. It may add reviewed cross-table constraints that only
-become possible after `0003` and `0004`, but it does not defer any earlier table's RLS, grants,
-policies, or required triggers. Migration `0005` remains proposed and must not ship until the
-separately approved amendment also defines canonical typed B1 outbox emission.
+Throughline is not event-sourced. B1 does not create a duplicate `ops.domain_events` ledger: the
+canonical `ops.product_outbox_events` notification plus `ops.audit_events` is the complete durable
+event/audit record. Migration `0006` adds a composite Tenant/Workspace causation foreign key from
+the B1.0 outbox table to `ops.domain_command_records` before any B1 handler may insert a
+product-outbox row. It intentionally does not include `space_id`: Organization/Initiative command
+records remain parent-reservation-scoped while their notifications are child-aggregate-scoped. A
+fixed deferred integrity trigger instead proves the command result references that exact child
+aggregate and that command, child, audit, and outbox row were written by the same transaction. No
+B1 handler may publish an outbox row before these constraints exist.
 
-Across the three migrations:
+Migration `0006` installs RLS enablement/FORCE RLS, app-only grants, policies, the audit append-only
+trigger, the no-committed-`reserved` constraint, composite scope foreign keys, and indexes for the two
+tables it creates in that same transaction. It may add the reviewed outbox-to-command causation
+constraint that becomes possible after `ops.domain_command_records` exists, but it does not defer
+any earlier table's RLS, grants, policies, or required triggers. Migration `0006` remains proposed
+and must not ship until B1.0 is separately approved and merged and Andrew lifts the B1 HOLD.
+
+Across the four migrations:
 
 - every table is secured in the same numbered migration that creates it;
-- explicit B1 grants go to the existing `throughline_app` role only;
-- no B1 product-table grants to `throughline_relay` or `throughline_worker`;
-- `ops.domain_events` and `ops.audit_events` grant `throughline_app` only `SELECT, INSERT`, with no
-  `UPDATE` or `DELETE` privilege;
-- `0003` owns work-table RLS/grants/policies/triggers;
-- `0004` owns content/source RLS/grants/policies/triggers; and
-- `0005` owns command/domain-event/audit-event RLS/grants/policies/triggers.
+- `0003` owns the isolated product-outbox RLS/grants/policies/publication-state triggers and the new
+  `throughline_product_relay` role;
+- explicit B1 product-table grants go to the existing `throughline_app` role only;
+- no B1 product/audit-table grants go to `throughline_product_relay`, `throughline_relay`, or
+  `throughline_worker`;
+- `ops.audit_events` grants `throughline_app` only `SELECT, INSERT`, with no `UPDATE` or `DELETE`;
+- `0004` owns work-table RLS/grants/policies/triggers;
+- `0005` owns content/source RLS/grants/policies/triggers; and
+- `0006` owns command/audit-event RLS/grants/policies/triggers and the outbox causation FK.
 
 Migration tests must inspect the catalog and exact privilege surface, not only match SQL strings.
 
@@ -479,7 +585,7 @@ Every B1 row has explicit ownership:
 | Source artifacts/chunks | required | required | SourceArtifact Space |
 | Activity-source links | required | required | Activity Space |
 | Domain command records | required | required | stable target/parent reservation Space |
-| Domain events | required | required | aggregate governing Space |
+| Product outbox events | required | required | aggregate governing Space |
 | Audit events | required | required | command resource governing Space |
 
 For each table:
@@ -491,14 +597,11 @@ For each table:
 4. RLS is both enabled and forced.
 5. `USING` restricts app-role visibility to current Tenant and Workspace.
 6. `WITH CHECK` additionally requires the command's exact transaction-local `app.space_id` for
-   inserts/updates. Every statement therefore has one exact Space. For Organization/Initiative
-   creation, trusted code begins with the stable existing reservation Space, authorizes and wins
-   the reservation there, then generates the child IDs and uses transaction-local `set_config`
-   statements to switch `app.space_id` to the child only for child Space/aggregate/event writes.
-   It switches back to the reservation Space to complete the command record. The transaction
-   wrapper still owns rollback, and the application role remains subject to RLS throughout; there
-   is no security-definer or arbitrary SQL bypass. The client cannot select either setting. Using
-   the not-yet-created child as idempotency or authorization scope is forbidden.
+   ordinary inserts/updates. Every statement therefore has one exact Space. Organization/Initiative
+   creation begins and ends in the stable authorized parent Space; only the fixed creation helper
+   below may enter the newly created child Space. Handlers and repositories never call raw
+   `set_config`, choose a replacement scope, or receive a generic scope-switch capability. Using the
+   not-yet-created child as idempotency or authorization scope is forbidden.
 7. Space-level read authorization remains the canonical centralized `can()` plus explicit
    permitted-Space repository predicate. RLS is the Tenant/Workspace backstop; it is not falsely
    presented as a replacement for recursive Space authorization.
@@ -508,6 +611,50 @@ For each table:
    mutation, following the existing Foundation pattern.
 10. Missing, empty, expired, cross-scope, archived-Space, suspended-Membership, or inactive-policy
     context fails closed before returning resource existence, title, count, or source text.
+
+### Creation-only Space context transition helper
+
+`packages/db/src/transaction.ts` owns one fixed `withCreatedChildSpaceScope` helper layered inside an
+already-open `withTenantTransaction`. It is not exported as a generic scope switch and is the only
+code allowed to change transaction-local `app.space_id` after transaction setup. Handlers and
+repositories receive neither the setting name nor raw configuration/query access for scope changes.
+
+The helper enforces this exact state machine and no other transition:
+
+```text
+locked + centrally authorized parent Space
+  → helper-generated and helper-inserted direct child Space in the same transaction
+  → restricted child-creation writes
+  → original parent Space
+```
+
+Before entering child scope, the helper requires the current setting to equal the expected parent,
+locks that live parent in the exact Tenant/Workspace, generates the UUIDv7 child ID internally after
+the command reservation win, inserts the child with `parent_id = expected_parent_id`, and verifies
+the inserted row through `RETURNING`. It rejects caller-supplied child IDs, a missing/archived parent,
+an existing child row, a non-direct child, a cross-scope row, a pre-existing unrelated Space, or any
+attempted parent → unrelated/pre-existing child transition.
+
+While child scope is active, the callback receives a restricted `ChildCreationDbTransaction`
+capability rather than `TenantDbTransaction`. It exposes only fixed statements/repositories for that
+new child Space's aggregate, required associations, audit row, and canonical product-outbox row. It
+cannot call `can()`, resolve/read unrelated resources, invoke arbitrary repositories/SQL, recurse,
+create another Space, or perform unrelated authorization or domain work. The command record remains
+parent-scoped and is completed only after the helper has restored the parent.
+
+A `finally` block restores the exact original parent and verifies the setting before returning. Any
+child write, callback, restore, or verification failure aborts the whole transaction. The outer
+transaction wrapper rolls back and, before pool release, verifies transaction-local Tenant,
+Workspace, Space, actor, and policy settings are cleared; a cleanup failure destroys rather than
+reuses the connection. No child/aggregate/audit/outbox residue may survive rollback.
+
+Adversarial tests cover forged caller child IDs, an existing unrelated Space ID, a child under a
+different parent, cross-Tenant/Workspace IDs, nested/reentrant switches, arbitrary query/repository
+attempts from the restricted callback, authorization attempts while switched, callback failure,
+restore failure, commit and rollback paths, and release/reacquire of the same pooled connection with
+no leaked context. Tests also prove the only observed sequence is parent → same-transaction direct
+child → parent and that every successful retry produces one child, aggregate, audit row, and outbox
+row.
 
 No request body or header supplies trusted Tenant, Workspace, Space, actor, access class, profile
 version, hash, chunk identity, or offsets. Trusted server code derives those fields from current
@@ -581,9 +728,8 @@ handler may atomically:
 4. clear `immutable_text` and `object_key` where policy requires erasure;
 5. for `erase_on_tombstone`, atomically null the artifact hashes; for `retain`, keep them;
 6. delete/cryptographically erase SourceChunks and stored objects;
-7. append audit, domain-event, and canonical outbox metadata with only policy-permitted
-   identifiers, conditionally allowlisted hashes, reason category, and policy reference, but no
-   erased content; and
+7. append audit and canonical product-outbox metadata with only policy-permitted identifiers,
+   conditionally allowlisted hashes, reason category, and policy reference, but no erased content; and
 8. record the domain-command result in that same transaction.
 
 A trigger rejects every other update and all physical deletion of the SourceArtifact row. A
@@ -659,11 +805,11 @@ Rules:
   evidence result. It never searches backward for a live predecessor. History/audit reads may
   expose authorized predecessors independently.
 
-Correction emits `source_artifact.corrected` with both IDs. For each referenced artifact, audit,
-domain-event, and canonical outbox metadata may include its hash only when that artifact's
-immutable policy is `retain`. If either artifact is `erase_on_tombstone`, no append-only
-audit/domain-event/canonical-outbox record copies that artifact's hashes during capture or
-correction. The correction does not revoke a Claim in B1 because claims do not yet exist.
+Correction emits `source_artifact.corrected` with both IDs through the canonical product outbox. For
+each referenced artifact, audit and product-outbox metadata may include its hash only when that
+artifact's immutable policy is `retain`. If either artifact is `erase_on_tombstone`, no append-only
+audit or product-outbox record copies that artifact's hashes during capture or correction. The
+correction does not revoke a Claim in B1 because claims do not yet exist.
 
 The mandatory regression is `A → B`, followed by `tombstone(B)`: current resolution returns B's
 tombstone/no current evidence, B's text/chunks are absent, and it never falls back to A. Authorized
@@ -682,8 +828,8 @@ B1 implements the source-side contract and no more:
   hashes, while an `erased` tombstone atomically nulls both. A check constraint permits only those
   policy/state combinations and forbids later changes;
 - the non-sensitive SourceArtifact tombstone, capture/correction linkage, timestamps, actor,
-  reason category, policy reference, audit event, durable domain event, and canonical outbox event
-  remain only where policy permits;
+  reason category, policy reference, audit event, and canonical product-outbox event remain only
+  where policy permits;
 - normal source reads return a non-leaking tombstone state and never return erased content;
 - ContentItem deletion is a separate command and does not imply evidence deletion;
 - source correction is not used as a substitute for lawful deletion.
@@ -697,11 +843,11 @@ the downstream reconciliation handler is installed and succeeds in the same gove
 
 Required retained metadata is Tenant/Workspace/Space, source ID, predecessor/successor IDs where
 applicable, deletion reason category, policy reference, causation/command ID, actor, and trace ID.
-For `retain`, append-only audit/domain-event/canonical-outbox metadata may include explicitly
-allowlisted hashes and the tombstone retains them. For `erase_on_tombstone`, no append-only
-audit/domain-event/canonical-outbox record may copy either hash at capture, correction, or
-tombstone time; the tombstone atomically nulls the live artifact columns, so erasure never pretends
-to rewrite append-only history, and those hashes never enter logs. Raw source text, chunks, and
+For `retain`, append-only audit/product-outbox metadata may include explicitly allowlisted hashes and
+the tombstone retains them. For `erase_on_tombstone`, no append-only audit or product-outbox record
+may copy either hash at capture, correction, or tombstone time; the tombstone atomically nulls the
+live artifact columns, so erasure never pretends to rewrite append-only history, and those hashes
+never enter logs. Raw source text, chunks, and
 erased object keys never enter event payloads, logs, or audit detail. Tests exercise both immutable
 policies, derived dispositions, nullable transitions, immutable post-tombstone state,
 capture/correction/tombstone metadata, and rejection of any caller-selected disposition.
@@ -751,9 +897,9 @@ it. `packages/account-operations` may consume its validated profile projection a
 
 ## Minimal Domain Command Bus seam
 
-Accepted ADR-019 applies now even though the full governed ChangeSet runtime is B3. Subject to the
-implementation HOLD and the required separately approved outbox/relay amendment, B1 would use a
-narrow typed `DomainCommandBus` façade and fixed handlers for human-originated B1 commands only:
+Accepted ADR-019 applies now even though the full governed ChangeSet runtime remains B3. Subject to
+the implementation HOLD and the separately approved/merged B1.0 prerequisite, B1 would use a narrow
+typed `DomainCommandBus` façade and fixed handlers for human-originated B1 commands only:
 
 - `organization.create`;
 - `initiative.create`;
@@ -766,32 +912,32 @@ narrow typed `DomainCommandBus` façade and fixed handlers for human-originated 
 - `source.correct`;
 - `source.tombstone`.
 
-This is not AgentRun, ChangeSet, approval, or a generic command framework. Once the outbox
-amendment is approved, each handler must:
+This is not AgentRun, ChangeSet, approval, or a generic command framework. Once B1.0 is merged and the
+HOLD is lifted, each handler must:
 
 1. parse a discriminated Zod payload;
 2. resolve trusted scope/profile/access values server-side;
 3. execute current `can()` in the same transaction immediately before mutation;
 4. check optimistic preconditions where updating mutable state;
 5. enforce a stable idempotency key and canonical request hash;
-6. write aggregate state, `ops.audit_events`, the optional `ops.domain_events` ledger record, and
-   the canonical typed outbox row atomically; and
+6. write aggregate state, `ops.audit_events`, and the canonical `ops.product_outbox_events` row
+   atomically; and
 7. return a typed result with no unrestricted repository or SQL callback.
 
 A reused idempotency key with an identical request returns the stored result. Reuse with a different
 request hash returns conflict. Human API handlers never write B1 tables directly. The stable-scope
-reservation protocol above is normative for Organization/Initiative creation. No listed handler
-may be implemented or shipped under this plan alone.
+reservation and fixed creation-only Space helper above are normative for Organization/Initiative
+creation. No listed handler may be implemented or shipped under this plan alone.
 
-### B1 event/relay boundary
+### B1.0 product notification and Foundation isolation boundary
 
 The merged Foundation `ops.outbox_events` is an exact proof-path table, not an existing generic
 product outbox. Its actual contract:
 
 - constrains `aggregate_type = 'foundation_test_aggregate'` and has a composite foreign key to
   `ops.foundation_test_aggregates`;
-- requires `job_id`, a system relay service principal, a durable security-context reference, and
-  its signed token;
+- requires `job_id`, a system relay service principal, a durable security-context reference, and its
+  signed token;
 - binds one context reference and one outbox row to the Foundation job/scope;
 - is claimed only when `event_type = 'foundation.proof.created.v1'` and
   `aggregate_type = 'foundation_test_aggregate'`;
@@ -799,45 +945,39 @@ product outbox. Its actual contract:
 - publishes the typed `FoundationQueueEnvelope`, whose required fields are Foundation event/job,
   exact scope, signed context reference, request ID, and trace carrier.
 
-B1 has no approved worker job, consumer, B1 context-reference lifecycle, generalized relay action,
-or typed B1 queue envelope. It therefore must not insert B1 rows into `ops.outbox_events`, loosen
-its checks/FKs/constants/query filters, fabricate jobs or context references, reuse
-`FoundationQueueEnvelope`, or grant the relay/worker access to B1 tables.
+B1 must not insert product rows into `ops.outbox_events`, loosen its checks/FKs/constants/query
+filters, fabricate jobs or context references, reuse `FoundationQueueEnvelope`, change Foundation
+roles/grants/queues, or route product notifications through the Foundation repository or relay.
+B1.0 instead supplies the additive `ops.product_outbox_events`, dedicated product relay role and
+principal, fixed `product_outbox.relay.publish` authorization, and typed
+`DomainNotificationEnvelope` defined above.
 
-Migration `0005` may propose durable-but-unpublished `ops.domain_events` as an internal ledger.
-Allowlisted event types are `organization.created`, `initiative.created`, `activity.created`,
+The B1 event union is exactly `organization.created`, `initiative.created`, `activity.created`,
 `activity.capture_added`, `relationship.created`, `relationship.ended`, `content.created`,
 `content.revised`, `source_artifact.captured`, `source_artifact.corrected`, and
-`source_artifact.tombstoned`. Each row stores the committed aggregate version and a minimal safe
-schema-validated payload. Because it has no publishable/claimable state and the Foundation relay
-cannot select it, `ops.domain_events` is not a transactional outbox and cannot satisfy ADR-019 or
-Build Spec §14.1.
+`source_artifact.tombstoned`. The matching aggregate union is exactly `organization`, `initiative`,
+`activity`, `relationship`, `content_item`, and `source_artifact`. Any event/aggregate pair not
+allowlisted by the discriminated schema is rejected before insert and again by database constraints.
 
-Aggregate type/event type pairs are a fixed discriminated union. Create events record version `1`;
-mutable commands lock the expected version, increment exactly once, and record that resulting
-version; source correction records the new successor at version `1`; source tombstone records the
-locked artifact's single increment. Payload versions are independent schema versions and never
-substitute for aggregate optimistic versions. Tests reject stale commands, wrong type/event pairs,
-zero/skipped versions, and event versions that do not equal the committed aggregate.
+Create notifications record aggregate version `1`; mutable commands lock the expected version,
+increment exactly once, and record that resulting version; source correction records the new
+successor at version `1`; source tombstone records the locked artifact's single increment. Event
+schema/payload versions are independent from aggregate optimistic versions and never substitute for
+them. Tests reject stale commands, wrong type/event pairs, zero/skipped versions, and event versions
+that do not equal the committed aggregate.
 
-Canonical outbox emission is required for every B1 domain mutation even if the manual gate does not
-yet exercise a worker consumer. Wave B1 implementation therefore remains **HOLD** until a
-separately approved B3/runtime amendment defines all of the following:
+Canonical product-outbox insertion is required for every B1 domain mutation even when no consumer
+exists. B1.0 has no job/context-reference, worker authority, active-consumer, execution receipt, or
+consumer/DLQ prerequisite. If publication precedes a consumer, the dedicated 24-hour-retention
+no-consumer disposition defined above is mandatory; a no-op worker is forbidden. Future consumers
+must establish their own execution context and reauthorize their effects.
 
-- typed, versioned B1 outbox rows and discriminated queue envelopes with aggregate version and
-  causation;
-- the B1 job and signed security-context-reference lifecycle without fabricated references;
-- exact event/aggregate allowlists and relay routing;
-- relay authorization, database grants, and RLS for the real B1 publication path;
-- consumer ordering, idempotency, retry, unresolved-publication, terminal-failure, and dead-letter
-  behavior; and
-- regression gates proving the Foundation table, constraints, constants, authorization, envelope,
-  filters, role isolation, and end-to-end proof remain unchanged.
-
-That amendment must require mutation, `ops.audit_events`, optional `ops.domain_events`, and the
-canonical outbox row to commit atomically. A later copy or promotion from `ops.domain_events` does
-not repair a mutation that committed without its canonical outbox row. This plan-safety correction
-does not authorize the amendment, new grants, relay behavior, migrations, or command handlers.
+Wave B1 implementation remains **HOLD** until the bounded B1.0 prerequisite is separately approved,
+merged, and evidenced with exact Foundation non-regression tests, and Andrew explicitly lifts this
+HOLD. Mutation, `ops.audit_events`, and the canonical product-outbox row must commit atomically. A
+later copy/promotion cannot repair a mutation committed without its canonical outbox row. This
+plan-safety correction does not authorize B1.0, new roles/grants/relay behavior, migrations, B1
+handlers, B3 work, merge, release, or deployment.
 
 ## Central authorization additions
 
@@ -945,9 +1085,9 @@ state, hash-retention policy/disposition, or audit fields.
 3. `POST /v1/initiatives` creates an AI Initiative under that Organization using the exact
    Workspace-pinned profile/type/stage.
 4. `POST /v1/activities` creates an Engagement Activity using an allowlisted activity template.
-5. `POST /v1/activities/:id/sources` captures a pasted note/transcript, creates its artifact,
-   chunks, activity link, command/audit record, optional domain-event ledger row, and canonical
-   outbox row in one transaction under the separately approved amendment.
+5. `POST /v1/activities/:id/sources` captures a pasted note/transcript and creates its artifact,
+   chunks, activity link, command/audit record, and canonical product-outbox row in one transaction
+   after B1.0 is merged and the HOLD is lifted.
 6. Authorized GETs reconstruct the Activity associations and return source metadata/chunks.
 7. A second user without the Initiative Space cannot learn the Activity/source existence, title,
    count, hashes, text, or chunks.
@@ -955,9 +1095,9 @@ state, hash-retention policy/disposition, or audit fields.
 
 ## Expected implementation locations after HOLD lift
 
-Only after the outbox/relay amendment is separately approved and Andrew explicitly lifts the HOLD,
-the implementation wave is expected to touch the existing modular-monolith seams plus the exact
-runtime seams authorized by that amendment, new tests, and a result artifact:
+Only after B1.0 is separately approved and merged and Andrew explicitly lifts the HOLD, the
+implementation wave is expected to touch the existing modular-monolith seams, use the already
+approved B1.0 product-outbox contracts, add tests, and produce a result artifact:
 
 - `packages/core-types/src/*` — B1 refs/DTOs and typed command/result contracts;
 - `packages/work-graph/src/*` — graph aggregates, invariants, and repositories;
@@ -977,32 +1117,34 @@ document the reason and security/maintenance impact before adding it.
 
 ## Implementation sequence after HOLD lift
 
-1. Verify the separately approved B3/runtime amendment is present and fully defines the typed B1
-   outbox/relay path; otherwise stop on HOLD. Freeze the approved plan/amendment SHAs and re-prove
-   clean migration/application-role baselines.
+1. Verify the separately approved B1.0 prerequisite is merged at an exact reviewed SHA and passes its
+   product-outbox/relay, no-consumer, and Foundation-isolation gates; otherwise stop on HOLD. Freeze
+   the approved plan/B1.0 SHAs and re-prove clean migration/application-role baselines.
 2. Add failing profile-schema and core dependency-boundary tests.
 3. Implement the strict profile loader/registry and exact Workspace pin resolution.
-4. Add migration `0003` work tables with their complete constraints, RLS, grants, policies,
+4. Add migration `0004` work tables with their complete constraints, RLS, grants, policies,
    triggers, and migration/security tests in the same migration.
 5. Add Work Graph TypeScript aggregates/repositories and invariant tests.
 6. Add failing normalization/chunking golden tests, including Unicode scalar offsets.
-7. Add migration `0004` content/source/chunk/activity-source tables with their complete RLS,
-   grants, policies, access-class checks, and immutability/correction/tombstone triggers in the
-   same migration.
+7. Add migration `0005` content/source/chunk/activity-source tables with their complete RLS,
+   grants, policies, access-class checks, and immutability/correction/tombstone triggers in the same
+   migration.
 8. Implement Content/Source deterministic helpers and repositories.
-9. Add migration `0005` command/domain-event/audit-event records with only their own complete
-   policies/grants/triggers and catalog tests; do not defer security for `0003`/`0004` tables, and
-   do not ship it without the amendment-defined canonical B1 outbox migration.
+9. Add migration `0006` command/audit records and the product-outbox causation FK with only their own
+   complete policies/grants/triggers and catalog tests; do not defer security for `0004`/`0005`
+   tables.
 10. Extend central authorization with B1 actions and negative matrices.
-11. Implement the minimal Domain Command Bus handlers and atomic
-    idempotency/audit/domain-event/canonical-outbox behavior.
-12. Add the minimal API routes through the command bus, with schema validation and non-leaking
+11. Add the fixed creation-only Space helper and its forged-ID, restricted-capability,
+    rollback/restore, and pooled-connection cleanup tests before any create handler.
+12. Implement the minimal Domain Command Bus handlers and atomic idempotency/audit/product-outbox
+    behavior without a duplicate domain-event ledger.
+13. Add the minimal API routes through the command bus, with schema validation and non-leaking
     errors.
-13. Add correction, concurrent-fork, tombstone, and deletion-reconciliation tests.
-14. Add the complete manual no-integration API walkthrough and restricted-Space denial proof.
-15. Run the full Foundation gate unchanged, the amendment-defined relay/consumer regressions, then
-    the new B1 gate, to prove no isolation regression.
-16. Write `WAVE_B1_RESULT.md`, obtain independent exact-head review, and stop before B2.
+14. Add correction, concurrent-fork, tombstone, and deletion-reconciliation tests.
+15. Add the complete manual no-integration API walkthrough and restricted-Space denial proof.
+16. Run the full Foundation gate unchanged, the B1.0 product publication/no-consumer/isolation gates,
+    then the new B1 gate, to prove no isolation regression.
+17. Write `WAVE_B1_RESULT.md`, obtain independent exact-head review, and stop before B2.
 
 ## Test plan
 
@@ -1024,23 +1166,27 @@ document the reason and security/maintenance impact before adding it.
   mismatched-key conflict, concurrency, rollback, and abandoned-transaction recovery;
 - Source correction/tombstone state transitions, including `A → B → tombstone(B)` with no fallback
   to A; both immutable hash-retention policies; mechanically derived dispositions; and hash-free
-  audit/domain-event/canonical-outbox metadata at capture, correction, and tombstone time for
+  audit/product-outbox metadata at capture, correction, and tombstone time for
   `erase_on_tombstone`.
 
 ### Migration and database tests
 
-- clean `0001 → 0002 → 0003 → 0004 → 0005` plus the separately approved canonical B1 outbox
-  expansion apply and deterministic repeat;
+- clean `0001 → 0002 → 0003 → 0004 → 0005 → 0006` apply and deterministic repeat, with `0003`
+  independently proving the bounded B1.0 prerequisite before any B1 handler is enabled;
 - after each individual migration commit, every table created by that migration already has FORCE
-  RLS, exact grants/policies, and its required integrity/immutability triggers;
+  RLS, exact grants/policies, and its required integrity/immutability/publication-state triggers;
 - true migration SHA-256 journal checks and rollback-on-journal-failure behavior;
-- exact B1 table catalog, constraints, indexes, triggers, and composite foreign keys;
-- RLS enabled/forced on every B1 table;
-- app/relay/worker roles remain `NOBYPASSRLS` with exact grants;
+- exact B1/B1.0 table catalog, constraints, indexes, triggers, and composite foreign keys;
+- RLS enabled/forced on every B1/B1.0 table;
+- app, product-relay, Foundation-relay, and worker roles remain `NOBYPASSRLS` with exact disjoint
+  grants;
 - no context sees no rows and cannot write;
 - cross-Tenant and cross-Workspace reads/writes fail;
 - wrong Space insert/update fails `WITH CHECK`;
-- pooled `SET LOCAL` context does not leak;
+- the creation-only Space helper rejects forged/pre-existing/unrelated child IDs, exposes no generic
+  query/authorization capability while switched, restores parent scope in `finally`, rolls back all
+  child writes on failure, and leaks no context after pooled release/reacquire;
+- pooled transaction-local context does not leak;
 - cross-scope join and Relationship endpoints fail;
 - the Relationship trigger derives the Organization Space for a context-free
   `person --account_owner_for--> organization`, rejects a forged `space_id`, rejects a Person
@@ -1053,17 +1199,20 @@ document the reason and security/maintenance impact before adding it.
 - source/chunk hashes, normalization/chunking versions, deterministic logical keys, and exact
   full-payload equality are enforced;
 - Organization/Initiative retry/failure matrices persist exactly one reservation, child Space,
-  aggregate, audit record, logical domain event, and canonical outbox event, with no committed
-  `reserved` record;
+  aggregate, audit record, and canonical product-outbox event, with no committed `reserved` record;
 - `ops.audit_events` contains exact command/causation, action/resource, actor/delegator/agent,
   policy-version, request/trace, and schema-versioned safe-detail fields; it is append-only,
   immutable, forced-RLS, and app-only;
-- `ops.domain_events` is append-only/app-only and cannot be selected or claimed by Foundation relay
-  or worker roles, and tests prove it cannot substitute for an amendment-defined canonical outbox
-  row; and
-- the amendment-defined B1 outbox path passes ordering/idempotency/failure tests while Foundation
-  `ops.outbox_events` checks/FKs/grants, constants, filters, envelope, and role isolation remain
-  exact and unchanged.
+- no `ops.domain_events` ledger exists; tests prove the canonical product outbox plus audit records
+  are the only durable event/audit seams and that Throughline does not claim event sourcing;
+- `ops.product_outbox_events` enforces typed event/aggregate unions, scope, event/schema and
+  aggregate identity/version, command causation, safe payload, request/trace, stable duplicate
+  identity, atomic rollback, fixed relay authorization/RLS/grants, bounded retry/terminal failure,
+  and exact full-envelope equality on replay;
+- the 24-hour no-consumer destination test proves broker acceptance, stable event/message identity,
+  eventual expiry, and zero worker/product side effects without a no-op worker or DLQ; and
+- Foundation `ops.outbox_events` checks/FKs/grants, constants, filters, envelope, roles, relay path,
+  signed context flow, queue resources, and end-to-end proof remain exact and unchanged.
 
 ### Authorization and API security tests
 
@@ -1094,22 +1243,21 @@ document the reason and security/maintenance impact before adding it.
 ### Integration and gate tests
 
 - exact manual Organization → Initiative → Engagement → Source workflow with no integration;
-- atomic Space/aggregate/audit/domain-event/canonical-outbox creation rollback on every injected
+- atomic Space/aggregate/audit/product-outbox creation rollback on every injected failure;
+- atomic SourceArtifact/chunks/activity link/command/audit/product-outbox rollback on every injected
   failure;
-- atomic SourceArtifact/chunks/activity link/command/audit/domain-event/canonical-outbox rollback
-  on every injected failure;
-- idempotent retry returns one aggregate/source, one audit event, one logical domain event, and one
-  canonical outbox event; Organization and Initiative create retries cannot duplicate child Spaces
-  or aggregates;
+- idempotent retry returns one aggregate/source, one audit event, and one canonical product-outbox
+  event; Organization and Initiative create retries cannot duplicate child Spaces or aggregates;
+- the observed creation-scope sequence is only authorized parent → helper-created direct child →
+  parent, forged/unrelated IDs and unrelated work while switched fail, and pooled context is clean;
 - API/repository responses reconstruct normalized associations correctly;
 - correction resolves the terminal leaf but preserves separately authorized history;
 - tombstoning the B leaf of `A → B` returns tombstone/no current evidence and never A;
 - tombstone removes text/chunks and writes policy-conditional safe invalidation metadata, proving
   `retain` may preserve allowlisted hashes while `erase_on_tombstone` never copied hashes into
-  append-only audit/domain-event/canonical-outbox history and atomically nulls the live artifact
-  hashes;
-- existing `pnpm test:foundation` remains passing with zero authoritative skips, along with the
-  amendment-defined Foundation-isolation regressions;
+  append-only audit/product-outbox history and atomically nulls the live artifact hashes;
+- existing `pnpm test:foundation` remains passing with zero authoritative skips, along with the B1.0
+  Foundation-isolation and no-consumer publication regressions;
 - core dependency test continues preventing Core imports from Account Operations, profiles, and
   adapters.
 
@@ -1162,20 +1310,21 @@ B1 is complete only when all of the following are evidenced from a clean databas
 - correction chains cannot fork/cycle and retain authorized history;
 - terminal-leaf resolution never falls back through a tombstone;
 - tombstoning removes source content/chunks and records only policy-permitted reconciliation/audit
-  evidence; immutable `retain` preserves allowlisted hashes, while `erase_on_tombstone` never
-  copies them to append-only audit/domain-event/canonical-outbox history and atomically nulls the
-  live row hashes;
+  evidence; immutable `retain` preserves allowlisted hashes, while `erase_on_tombstone` never copies
+  them to append-only audit/product-outbox history and atomically nulls the live row hashes;
 - source and Relationship visibility obey ADR-018 and `dataClassCeiling` at direct, link, list, and
   count surfaces;
 - Person projections require centralized `person.read`, are field-safe, non-enumerable across
   inaccessible scope, and never convert Person ownership into authority;
 - User B cannot infer restricted source existence or content;
 - manual API writes use typed authorized commands and stable-scope idempotency, and atomically write
-  immutable `ops.audit_events`, optional `ops.domain_events`, and amendment-defined canonical typed
-  outbox rows; no B1 event enters or weakens the Foundation proof path;
+  immutable `ops.audit_events` plus B1.0 canonical product-outbox rows; no duplicate
+  `ops.domain_events` ledger exists and no B1 event enters or weakens the Foundation proof path;
+- the fixed creation helper admits only authorized parent → same-transaction direct child → parent,
+  exposes no unrelated activity while switched, and proves rollback and pooled-context cleanup;
 - no Claim, AcceptedFact, DerivedView, ChangeSet, model, integration, or production UI is added;
-- the full Foundation gate, amendment-defined relay/consumer isolation regressions, and B1 security
-  gate pass without authoritative skips;
+- the full Foundation gate, B1.0 publication/no-consumer/isolation regressions, and B1 security gate
+  pass without authoritative skips;
 - an independent exact-head reviewer returns PASS.
 
 ## Canonical boundaries and unresolved implementation gate
@@ -1192,13 +1341,15 @@ Three implementation ambiguities are intentionally closed narrowly:
    fixed handlers needed for its own manual writes. ChangeSets, approvals, receipts, compensation,
    and agent operation unions remain B3, and no façade/handler ships while this HOLD remains.
 3. ADR-019, Build Spec §14.1, and Implementation Kickoff ticket 9 require canonical transactional
-   outbox emission with aggregate version; an app-only `ops.domain_events` ledger is not a
-   substitute. The merged Foundation proof relay is too exact-purpose to reuse safely. This is an
-   unresolved implementation gate requiring the separately approved B3/runtime amendment listed
-   above, not permission to loosen or fabricate inputs for the Foundation path.
+   outbox emission with aggregate version. The merged Foundation proof relay is too exact-purpose to
+   reuse safely. The bounded B1.0 prerequisite above resolves that seam additively without beginning
+   B3, inventing job/delegated-context/worker semantics, or adding a duplicate event ledger. It is a
+   separate approval/merge prerequisite, not permission to loosen or fabricate inputs for the
+   Foundation path.
 
 The first two boundaries require no canonical-document or accepted-ADR change. The third keeps B1
-implementation on HOLD until the compatible runtime seam is separately designed and approved.
+implementation on HOLD until B1.0 is separately approved and merged and Andrew explicitly lifts the
+HOLD.
 
 ## Stop conditions
 
@@ -1227,17 +1378,24 @@ Stop and return **HOLD** before implementation or further mutation if any of the
     integration/UI work.
 12. The implementation worktree is not based on the exact approved SHA or contains unrelated user
     changes that cannot be preserved safely.
-13. The separately approved B3/runtime amendment is absent or does not fully define typed B1
-    outbox rows/envelopes, job/context lifecycle, relay authorization/grants/RLS, consumer
-    ordering/idempotency/failure behavior, and Foundation-isolation regressions.
-14. Any proposed expansion fabricates a job/context reference, reuses `FoundationQueueEnvelope`,
-    changes Foundation outbox checks/FKs/constants/filters/envelope, weakens Foundation role
-    isolation, or grants relay/worker access beyond the amendment's exact B1 path.
+13. The separately approved B1.0 prerequisite is absent or does not fully define the additive
+    product-domain outbox/table/envelope, typed event/aggregate unions, scope/version/causation/safe
+    payload/trace/duplicate identity, atomic audit+mutation insertion, fixed relay
+    authorization/grants/RLS/retries/failure behavior, bounded no-consumer disposition, and exact
+    Foundation-isolation regressions.
+14. Any proposal fabricates a job/context reference, adds worker execution authority or a no-op
+    worker, requires consumer/DLQ lifecycle, reuses `FoundationQueueEnvelope`, changes Foundation
+    outbox checks/FKs/constants/filters/envelope/roles/relay path, weakens Foundation role isolation,
+    or grants any Foundation relay/worker access to the product outbox or B1 tables.
+15. Any handler/repository issues a raw Space-context change, the helper accepts a caller or existing
+    unrelated child ID, unrelated authorization/repository work can execute while switched, the
+    parent is not restored in `finally`, or rollback/pool reuse can leak child scope.
 
 ## Approval requested
 
 No B1 implementation approval is requested while this plan is on HOLD. Andrew must separately
-approve the typed B3/runtime outbox/relay amendment and then explicitly lift this HOLD before any
-B1 command handler or migration may ship. Approval of this plan-safety correction alone does not
-authorize that expansion, B1 implementation, B2, deployment, canonical-document edits,
-accepted-ADR changes, integrations, model work, production UI, merge, or release.
+approve and merge the bounded B1.0 canonical product-outbox prerequisite and then explicitly lift
+this HOLD before any B1 command handler or migration may ship. Approval of this plan-safety
+correction alone does not authorize B1.0, B1 implementation, B2, B3, deployment,
+canonical-document edits, accepted-ADR changes, integrations, model work, production UI, merge, or
+release.
