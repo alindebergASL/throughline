@@ -175,6 +175,33 @@ const invalidVectors: ProductAuditDetailTestVector[] = [
     valid: false
   },
   {
+    name: "rejects calendar-overflow relationship timestamps",
+    action: "relationship.end",
+    resourceType: "relationship",
+    resourceId: ids.relationship,
+    auditSchemaVersion: 1,
+    safeDetail: { relationshipId: ids.relationship, validTo: "2026-02-30T12:00:00Z" },
+    valid: false
+  },
+  {
+    name: "rejects out-of-range relationship timestamp offsets",
+    action: "relationship.end",
+    resourceType: "relationship",
+    resourceId: ids.relationship,
+    auditSchemaVersion: 1,
+    safeDetail: { relationshipId: ids.relationship, validTo: "2026-01-01T12:00:00+16:00" },
+    valid: false
+  },
+  {
+    name: "rejects relationship timestamp leap seconds",
+    action: "relationship.end",
+    resourceType: "relationship",
+    resourceId: ids.relationship,
+    auditSchemaVersion: 1,
+    safeDetail: { relationshipId: ids.relationship, validTo: "2026-01-01T12:00:60Z" },
+    valid: false
+  },
+  {
     name: "rejects non-integer revisions",
     action: "content.revise",
     resourceType: "content_item",

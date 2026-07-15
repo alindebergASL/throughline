@@ -134,7 +134,7 @@ BEGIN
         '76c9b68fa18aa9092a631a8bc459b831'),
       ('product_event_payload_valid', 'text, integer, uuid, jsonb', 'boolean', 'plpgsql', 'i', true, false,
         ARRAY['throughline_app:false', 'throughline_product_relay:false']::text[],
-        '9fdbd2105e31af3b8e28ea50d1002704'),
+        '6756e09445b552fa1d2ef1282277a6c3'),
       ('product_audit_detail_valid', 'text, text, integer, uuid, jsonb', 'boolean', 'plpgsql', 'i', true, false,
         ARRAY['throughline_app:false']::text[], 'f8fbf1cb0a8d13ea14ad64c3fee68cfe'),
       ('enforce_domain_command_transition', '', 'trigger', 'plpgsql', 'v', false, false,
@@ -588,6 +588,20 @@ BEGIN
           AND payload_value->>'validTo' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$',
         false
       ) THEN
+        RETURN false;
+      END IF;
+      IF substring(payload_value->>'validTo' FROM 1 FOR 4)::integer < 1
+        OR substring(payload_value->>'validTo' FROM 12 FOR 2)::integer > 23
+        OR substring(payload_value->>'validTo' FROM 15 FOR 2)::integer > 59
+        OR substring(payload_value->>'validTo' FROM 18 FOR 2)::integer > 59
+        OR (
+          right(payload_value->>'validTo', 1) <> 'Z'
+          AND (
+            substring(payload_value->>'validTo' FROM char_length(payload_value->>'validTo') - 4 FOR 2)::integer > 15
+            OR right(payload_value->>'validTo', 2)::integer > 59
+          )
+        )
+      THEN
         RETURN false;
       END IF;
       BEGIN
