@@ -166,6 +166,15 @@ const invalidVectors: ProductAuditDetailTestVector[] = [
     valid: false
   },
   {
+    name: "rejects semantically invalid relationship timestamps",
+    action: "relationship.end",
+    resourceType: "relationship",
+    resourceId: ids.relationship,
+    auditSchemaVersion: 1,
+    safeDetail: { relationshipId: ids.relationship, validTo: "2026-01-01T25:00:00Z" },
+    valid: false
+  },
+  {
     name: "rejects non-integer revisions",
     action: "content.revise",
     resourceType: "content_item",

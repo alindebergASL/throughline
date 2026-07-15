@@ -220,7 +220,11 @@ function requireEnum<const Values extends readonly string[]>(
 }
 
 function isIsoTimestamp(value: unknown): value is string {
-  return typeof value === "string" && ISO_TIMESTAMP_PATTERN.test(value);
+  return (
+    typeof value === "string" &&
+    ISO_TIMESTAMP_PATTERN.test(value) &&
+    Number.isFinite(Date.parse(value))
+  );
 }
 
 function fail(): never {

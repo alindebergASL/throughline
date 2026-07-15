@@ -134,7 +134,7 @@ BEGIN
         '76c9b68fa18aa9092a631a8bc459b831'),
       ('product_event_payload_valid', 'text, integer, uuid, jsonb', 'boolean', 'plpgsql', 'i', true, false,
         ARRAY['throughline_app:false', 'throughline_product_relay:false']::text[],
-        '642100b0d5f3ccae25bb1d72928ed1ba'),
+        '9fdbd2105e31af3b8e28ea50d1002704'),
       ('product_audit_detail_valid', 'text, text, integer, uuid, jsonb', 'boolean', 'plpgsql', 'i', true, false,
         ARRAY['throughline_app:false']::text[], 'f8fbf1cb0a8d13ea14ad64c3fee68cfe'),
       ('enforce_domain_command_transition', '', 'trigger', 'plpgsql', 'v', false, false,
@@ -582,12 +582,20 @@ BEGIN
         false
       );
     WHEN 'relationship.ended' THEN
-      RETURN COALESCE(
+      IF NOT COALESCE(
         payload_keys = ARRAY['relationshipId', 'validTo']
           AND lower(payload_value->>'relationshipId') = aggregate_id_value::text
           AND payload_value->>'validTo' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$',
         false
-      );
+      ) THEN
+        RETURN false;
+      END IF;
+      BEGIN
+        PERFORM (payload_value->>'validTo')::timestamptz;
+      EXCEPTION WHEN OTHERS THEN
+        RETURN false;
+      END;
+      RETURN true;
     WHEN 'content.revised' THEN
       RETURN COALESCE(
         payload_keys = ARRAY['contentItemId', 'revisionNumber']
