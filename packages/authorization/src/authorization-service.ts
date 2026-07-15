@@ -87,6 +87,9 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
     if (action === "foundation.worker.consume") {
       return foundationWorkerConsumeDecision(tx, context, resource, options);
     }
+    if (action === "product_outbox.relay.publish") {
+      return productOutboxRelayPublishDecision(tx, context, resource, options);
+    }
 
     const hasActivePolicyVersion = await loadActivePolicyVersion(tx, context);
     if (!hasActivePolicyVersion) {
@@ -215,6 +218,133 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
 
     return deny(context.policyVersion, "unsupported_action", "Action is not implemented in A2");
   }
+}
+
+async function productOutboxRelayPublishDecision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  resource: ResourceRef,
+  options: { explain?: boolean }
+): Promise<AuthorizationDecision> {
+  if (
+    !context.servicePrincipalId ||
+    context.actorUserId ||
+    context.actorMembershipId ||
+    context.agentPrincipalId ||
+    context.delegatedByUserId ||
+    context.delegatedByMembershipId
+  ) {
+    return deny(
+      context.policyVersion,
+      "product_relay_service_principal_required",
+      "Product notification publication requires one non-delegated service principal"
+    );
+  }
+  if (
+    resource.type !== "space" ||
+    context.requestedSpaceIds.length !== 1 ||
+    context.requestedSpaceIds[0] !== resource.id
+  ) {
+    return deny(
+      context.policyVersion,
+      "product_relay_space_scope_mismatch",
+      "Product notification publication is bound to one exact Space"
+    );
+  }
+
+  const tenant = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.tenants
+     WHERE id = $1 AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [context.tenantId]
+  );
+  if (tenant.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "tenant_not_active", "Tenant is not active");
+  }
+
+  const workspace = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.workspaces
+     WHERE tenant_id = $1 AND id = $2 AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [context.tenantId, context.workspaceId]
+  );
+  if (workspace.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "workspace_not_active", "Workspace is not active");
+  }
+
+  const policy = await tx.query<{ status: string }>(
+    `SELECT status FROM identity.policy_versions
+     WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [context.tenantId, context.workspaceId, context.policyVersion]
+  );
+  if (policy.rows[0]?.status !== "active") {
+    return deny(context.policyVersion, "policy_version_not_active", "Policy version is not active");
+  }
+
+  const principal = await tx.query<{ purpose: string; status: string }>(
+    `SELECT purpose, status FROM identity.service_principals
+     WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
+       AND purpose = 'product_notification_relay' AND status = 'active'
+     LIMIT 1
+     FOR UPDATE`,
+    [context.tenantId, context.workspaceId, context.servicePrincipalId]
+  );
+  if (principal.rows[0]?.status !== "active") {
+    return deny(
+      context.policyVersion,
+      "product_relay_principal_not_active",
+      "Product notification relay principal is not active in the exact scope"
+    );
+  }
+  if (principal.rows[0]?.purpose !== "product_notification_relay") {
+    return deny(
+      context.policyVersion,
+      "product_relay_principal_wrong_purpose",
+      "Service principal is not the notification-only product relay"
+    );
+  }
+
+  const space = await tx.query<{ id: string }>(
+    `SELECT id FROM access.spaces
+     WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND archived_at IS NULL
+     LIMIT 1
+     FOR UPDATE`,
+    [context.tenantId, context.workspaceId, resource.id]
+  );
+  if (space.rows.length !== 1) {
+    return deny(context.policyVersion, "space_not_found", "Space is not active in the exact scope");
+  }
+
+  const grant = await tx.query<{ id: string }>(
+    `SELECT id FROM access.access_relationships
+     WHERE tenant_id = $1 AND workspace_id = $2
+       AND subject_type = 'service_principal' AND subject_id = $3
+       AND relation = 'manager' AND resource_type = 'space' AND resource_id = $4
+       AND source = 'direct'
+     LIMIT 1
+     FOR UPDATE`,
+    [context.tenantId, context.workspaceId, context.servicePrincipalId, resource.id]
+  );
+  if (grant.rows.length !== 1) {
+    return deny(
+      context.policyVersion,
+      "product_relay_direct_manager_required",
+      "Product relay requires one live direct manager grant on the exact Space"
+    );
+  }
+
+  return allow(
+    context.policyVersion,
+    "product_relay_direct_manager",
+    options.explain
+      ? "The notification-only product relay has a locked direct manager grant on the exact Space"
+      : undefined,
+    ["product_relay_direct_manager"]
+  );
 }
 
 async function foundationWorkerConsumeDecision(

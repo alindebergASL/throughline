@@ -21,7 +21,8 @@ const maybeDescribe =
 
 const migrationIds = [
   "0001_wave_a2_identity_access_rls.sql",
-  "0002_foundation_closure_async_isolation.sql"
+  "0002_foundation_closure_async_isolation.sql",
+  "0003_b1_0_canonical_product_outbox.sql"
 ];
 
 const ids = {
@@ -117,7 +118,7 @@ maybeDescribe("Foundation operational schema security", () => {
     await ownerPool.end();
   });
 
-  it("applies 0001 then 0002, repeats unchanged migrations, and records true checksums", async () => {
+  it("applies all ordered migrations, repeats unchanged migrations, and records true checksums", async () => {
     const journal = await ownerPool.query<{ id: string; checksum: string }>(
       "SELECT id, checksum FROM throughline_migrations.journal ORDER BY id"
     );
