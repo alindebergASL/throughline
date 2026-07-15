@@ -1,7 +1,7 @@
 # Wave B1.0 Result — Canonical Product Outbox Correction
 
 - **Date:** 2026-07-15
-- **Status:** corrected implementation and post-review timeout-observer fix verified locally; final result-bearing regate, exact-head reviews, push, and CI pending
+- **Status:** corrected implementation plus timeout-observer and semantic audit-timestamp review fixes verified locally; final result-bearing regate, exact-head reviews, push, and CI pending
 - **PR:** `alindebergASL/throughline#6`
 - **Authorized base:** `b454ae8c865c77639adbf82daf8963db67922ad6`
 - **Correction parent:** `7d385391d08e0fdd2605a628960ee920fe75c7ca`
@@ -9,8 +9,10 @@
 - **Tested pre-result implementation tree:** `8152155cfc3970cc8e3fd2b633ac38d1faad2bc3`
 - **Post-review fix head:** `cd8a2d9c6f237937254bbe5d5f4b316364ea7fde`
 - **Post-review fix tree:** `7ebf1d18ff69e6442cf2bbc69b6a574868773499`
+- **Semantic timestamp fix head:** `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e`
+- **Semantic timestamp fix tree:** `a280fd2c10ceb078aea3576cc29572145a35e51f`
 - **Branch:** `b1-0-canonical-product-outbox`
-- **Local commits:** `e10fffd1abe264ae8e553ea2b8a8f17675c6988b`, `d82d4dc43b8ed452669dd2b492bc952fc97177eb`, `cd8a2d9c6f237937254bbe5d5f4b316364ea7fde`
+- **Local commits:** `e10fffd1abe264ae8e553ea2b8a8f17675c6988b`, `d82d4dc43b8ed452669dd2b492bc952fc97177eb`, `cd8a2d9c6f237937254bbe5d5f4b316364ea7fde`, `2ea00def3fa375f8da2a6b365d57f418dc8133d6`, `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e`
 
 ## Scope and outcome
 
@@ -39,7 +41,7 @@ One minimal shared migration-runner change sets transaction-local `throughline.m
 - `0002_foundation_closure_async_isolation.sql`:
   `4264f0f760a74026bc0e0a6a38b98760e6061c76c9885848cf4236f13cda3ee2`
 - `0003_b1_0_canonical_product_outbox.sql`:
-  `01ac2dd3993911aff3b7104623f007f2147e5f3d9c72fd394ea87666861b4da7`
+  `fb6b11de9b2583e4053d01d9301612e83832de2154d7da66eb5bf26a5ec26539`
 
 Migrations `0001` and `0002` are byte-identical to the correction parent. No migration after `0003` exists.
 
@@ -63,11 +65,11 @@ Artifacts include a temporary index, binary patch, source archive, changed-path 
 
 ## Fresh authoritative local gate
 
-A fresh disposable PostgreSQL database and LocalStack generation reran the complete gate after the detached-verifier timeout-observer fix on tree `7ebf1d18ff69e6442cf2bbc69b6a574868773499` with `CI=1` and `TURBO_FORCE=true`.
+A fresh disposable PostgreSQL database and LocalStack generation reran the complete gate after both review fixes on tree `a280fd2c10ceb078aea3576cc29572145a35e51f` with `CI=1` and `TURBO_FORCE=true`.
 
 Run directory:
 
-`/home/ubuntu/.hermes/rollouts/throughline-pr6-correction-20260715/authoritative-gate-20260715T195307Z-114676`
+`/home/ubuntu/.hermes/rollouts/throughline-pr6-correction-20260715/authoritative-gate-20260715T204717Z-183777`
 
 | Command | Result | Evidence |
 | --- | ---: | --- |
@@ -75,18 +77,18 @@ Run directory:
 | `pnpm format:check` | PASS | zero formatting errors |
 | `pnpm lint` | PASS | zero lint errors |
 | `pnpm typecheck` | PASS | zero type errors |
-| ordinary `pnpm test` with integration variables unset | PASS | 542 passed; 233 expected environment-gated skips |
+| ordinary `pnpm test` with integration variables unset | PASS | 543 passed; 233 expected environment-gated skips |
 | `pnpm build` | PASS | all build tasks passed |
 | `pnpm test:security` | PASS | 96 passed; zero skips |
 | `pnpm test:foundation` | PASS | 451 passed; zero skips |
-| `pnpm test:b1-0` | PASS | 688 passed; zero skips |
+| `pnpm test:b1-0` | PASS | 689 passed; zero skips |
 | `git diff --check` | PASS | zero whitespace errors |
 
 The B1.0 authoritative total includes its nested Foundation and security execution. Its direct B1.0 portions were:
 
 - combined preflight and architecture: 22 passed;
 - canonical notification envelope: 3 passed;
-- migration, audit, repositories, and real PostgreSQL behavior: 105 passed;
+- migration, audit, repositories, and real PostgreSQL behavior: 106 passed;
 - direct authorization: 78 passed;
 - product relay unit and PostgreSQL/LocalStack integration: 29 passed.
 
@@ -96,13 +98,13 @@ The gate recorded identical start and end trees, an exact migration journal, zer
 
 Evidence hashes:
 
-- summary: `5197d70ace9fa9f750e2a247907fe7ae42f7c2d9d1db34bb672f8c574c72a6c2`
-- cleanup: `65afa5f12ab4fe803bfd57e5b936768d9a692694a3dbff4d1e54dffc9bd99586`
-- ordinary test log: `c13e39c21c2aba9e9ff647efe1d6ad364c7b0617b4ebe5d67f9a598c6aa3d81c`
-- security log: `e2aec7c193f85a366aa6852aabd5d91e27426448596b1ba75ffc4296bb661fa5`
-- Foundation log: `fc48a92d26e6fdadaeb63d0c9eb527a11589a68147b275bd16040cf44a050836`
-- B1.0 log: `7f3611f258550b3133f2f101c828ae02c9a3cb36ec22f8a3709c4e603a062f3b`
-- migration journal: `6481f717fde9d0bd8cf8569be4964ed9c556cfb55e273dbe7a8e302b8d92c466`
+- summary: `5c9c6d36db8a18d981e345f4e8fecd9a8d4828acb6062c57a93dabac0f7e09b9`
+- cleanup: `ef850b41d6c00d0634c1c992a2fc17e63f288ef8e39dc1ecf45583d5c65ca716`
+- ordinary test log: `5bfea158f0af3872d5b0b590d4fb9be63b97a3080db6aaf89c0cab456da00327`
+- security log: `d7f1f7b9c3b500c703a00ac64099c93fb78596ae57d84a44dd531ae0b3aa8fa6`
+- Foundation log: `0bed09c3d619596ccf7a2150c253a6816294d8c57ac5a34e5e25cd97c5eccc30`
+- B1.0 log: `6e32f7d85c5719d670e6ddc1e6ec8f5770f963275682a9922586e361b596350e`
+- migration journal: `00886d1eee3a4dba7f3ffb07427d1e26a0d9346e19215ee671ed05d86d9fc079`
 
 ## Cleanup
 
@@ -134,15 +136,18 @@ Earlier fresh runs were retained as failed evidence rather than presented as pas
 
 The first detached exact-head gate on `d82d4dc43b8ed452669dd2b492bc952fc97177eb` then found one timing-dependent Vitest unhandled rejection in the never-settling-send regression. The expected publication timeout could occur while the test was deliberately waiting for lock contenders but before the test attached its rejection assertion. Production deadline handling and lock release were correct, but the test-authority failure was a blocker. Commit `cd8a2d9c6f237937254bbe5d5f4b316364ea7fde` attaches an immediate rejection observer while retaining the later exact `TimeoutError` assertion. The focused B1.0 gate and the complete authoritative gate then passed with zero unhandled errors.
 
+A fresh direct read-only review of `2ea00def3fa375f8da2a6b365d57f418dc8133d6` then found that the TypeScript and PostgreSQL audit validators accepted timestamp-shaped but semantically invalid `relationship.end` values such as hour 25, even though the canonical notification parser rejects them. Commit `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e` adds the semantic check to TypeScript and PostgreSQL and an exact shared rejection vector. The focused 106-test database gate and the complete authoritative gate passed afterward.
+
 After the last implementation byte changed, the complete authoritative gate was rerun from frozen install and passed.
 
 ## Review and publication state
 
 At the time this result was updated:
 
-- three bounded local correction commits existed through `cd8a2d9c6f237937254bbe5d5f4b316364ea7fde`;
+- five bounded local correction/evidence commits existed through `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e`;
 - the first detached gate on `d82d4dc43b8ed452669dd2b492bc952fc97177eb` returned HOLD on the unhandled-rejection blocker;
 - a direct read-only review of `d82d4dc43b8ed452669dd2b492bc952fc97177eb` found no source-level blocker before that timing-dependent test-authority failure was observed;
+- the detached full gate on `2ea00def3fa375f8da2a6b365d57f418dc8133d6` passed, but its concurrent direct review found the semantic timestamp blocker described above;
 - fresh detached and direct read-only reviews of the final result-bearing head remained pending;
 - no correction commit had been pushed;
 - no exact-head GitHub Actions result existed for the correction; and
