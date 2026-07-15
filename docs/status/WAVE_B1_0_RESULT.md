@@ -1,7 +1,7 @@
 # Wave B1.0 Result — Canonical Product Outbox Correction
 
 - **Date:** 2026-07-15
-- **Status:** corrected implementation plus timeout-observer and semantic audit-timestamp review fixes verified locally; final result-bearing regate, exact-head reviews, push, and CI pending
+- **Status:** corrected implementation plus timeout-observer and strict semantic audit-timestamp review fixes verified locally; final result-bearing regate, exact-head reviews, push, and CI pending
 - **PR:** `alindebergASL/throughline#6`
 - **Authorized base:** `b454ae8c865c77639adbf82daf8963db67922ad6`
 - **Correction parent:** `7d385391d08e0fdd2605a628960ee920fe75c7ca`
@@ -11,8 +11,10 @@
 - **Post-review fix tree:** `7ebf1d18ff69e6442cf2bbc69b6a574868773499`
 - **Semantic timestamp fix head:** `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e`
 - **Semantic timestamp fix tree:** `a280fd2c10ceb078aea3576cc29572145a35e51f`
+- **Strict calendar fix head:** `b5ba93cc1d58d2073527a827702c914040f491da`
+- **Strict calendar fix tree:** `0e540423877e2aee2e84e6886c0502d2b149e2a7`
 - **Branch:** `b1-0-canonical-product-outbox`
-- **Local commits:** `e10fffd1abe264ae8e553ea2b8a8f17675c6988b`, `d82d4dc43b8ed452669dd2b492bc952fc97177eb`, `cd8a2d9c6f237937254bbe5d5f4b316364ea7fde`, `2ea00def3fa375f8da2a6b365d57f418dc8133d6`, `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e`
+- **Local commits:** `e10fffd1abe264ae8e553ea2b8a8f17675c6988b`, `d82d4dc43b8ed452669dd2b492bc952fc97177eb`, `cd8a2d9c6f237937254bbe5d5f4b316364ea7fde`, `2ea00def3fa375f8da2a6b365d57f418dc8133d6`, `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e`, `e21a3d57629e8dd15c96590815a87cfd749c7e7a`, `b5ba93cc1d58d2073527a827702c914040f491da`
 
 ## Scope and outcome
 
@@ -41,7 +43,7 @@ One minimal shared migration-runner change sets transaction-local `throughline.m
 - `0002_foundation_closure_async_isolation.sql`:
   `4264f0f760a74026bc0e0a6a38b98760e6061c76c9885848cf4236f13cda3ee2`
 - `0003_b1_0_canonical_product_outbox.sql`:
-  `fb6b11de9b2583e4053d01d9301612e83832de2154d7da66eb5bf26a5ec26539`
+  `094303adaafbdc744c3c29fb1643ee3342d1e50bd7493491e96f84bd428fcc63`
 
 Migrations `0001` and `0002` are byte-identical to the correction parent. No migration after `0003` exists.
 
@@ -65,11 +67,11 @@ Artifacts include a temporary index, binary patch, source archive, changed-path 
 
 ## Fresh authoritative local gate
 
-A fresh disposable PostgreSQL database and LocalStack generation reran the complete gate after both review fixes on tree `a280fd2c10ceb078aea3576cc29572145a35e51f` with `CI=1` and `TURBO_FORCE=true`.
+A fresh disposable PostgreSQL database and LocalStack generation reran the complete gate after all review fixes on tree `0e540423877e2aee2e84e6886c0502d2b149e2a7` with `CI=1` and `TURBO_FORCE=true`.
 
 Run directory:
 
-`/home/ubuntu/.hermes/rollouts/throughline-pr6-correction-20260715/authoritative-gate-20260715T204717Z-183777`
+`/home/ubuntu/.hermes/rollouts/throughline-pr6-correction-20260715/authoritative-gate-20260715T213541Z-242587`
 
 | Command | Result | Evidence |
 | --- | ---: | --- |
@@ -77,18 +79,18 @@ Run directory:
 | `pnpm format:check` | PASS | zero formatting errors |
 | `pnpm lint` | PASS | zero lint errors |
 | `pnpm typecheck` | PASS | zero type errors |
-| ordinary `pnpm test` with integration variables unset | PASS | 543 passed; 233 expected environment-gated skips |
+| ordinary `pnpm test` with integration variables unset | PASS | 546 passed; 233 expected environment-gated skips |
 | `pnpm build` | PASS | all build tasks passed |
 | `pnpm test:security` | PASS | 96 passed; zero skips |
 | `pnpm test:foundation` | PASS | 451 passed; zero skips |
-| `pnpm test:b1-0` | PASS | 689 passed; zero skips |
+| `pnpm test:b1-0` | PASS | 692 passed; zero skips |
 | `git diff --check` | PASS | zero whitespace errors |
 
 The B1.0 authoritative total includes its nested Foundation and security execution. Its direct B1.0 portions were:
 
 - combined preflight and architecture: 22 passed;
 - canonical notification envelope: 3 passed;
-- migration, audit, repositories, and real PostgreSQL behavior: 106 passed;
+- migration, audit, repositories, and real PostgreSQL behavior: 109 passed;
 - direct authorization: 78 passed;
 - product relay unit and PostgreSQL/LocalStack integration: 29 passed.
 
@@ -98,13 +100,13 @@ The gate recorded identical start and end trees, an exact migration journal, zer
 
 Evidence hashes:
 
-- summary: `5c9c6d36db8a18d981e345f4e8fecd9a8d4828acb6062c57a93dabac0f7e09b9`
-- cleanup: `ef850b41d6c00d0634c1c992a2fc17e63f288ef8e39dc1ecf45583d5c65ca716`
-- ordinary test log: `5bfea158f0af3872d5b0b590d4fb9be63b97a3080db6aaf89c0cab456da00327`
-- security log: `d7f1f7b9c3b500c703a00ac64099c93fb78596ae57d84a44dd531ae0b3aa8fa6`
-- Foundation log: `0bed09c3d619596ccf7a2150c253a6816294d8c57ac5a34e5e25cd97c5eccc30`
-- B1.0 log: `6e32f7d85c5719d670e6ddc1e6ec8f5770f963275682a9922586e361b596350e`
-- migration journal: `00886d1eee3a4dba7f3ffb07427d1e26a0d9346e19215ee671ed05d86d9fc079`
+- summary: `990805c3f6075961cd380a7b3cd16c04c7e10ccc5001b8b6ec845e09776d31d9`
+- cleanup: `3a10c3dc4a6a4cca906b1329ef09bda0c057906ebcc2b3f74e300258a8d4ceb6`
+- ordinary test log: `5a15ffe5747eac6fb437e117ea701decdaf77963fcd3ce9770e59b6c611b3cb8`
+- security log: `ae8a250dde390ddf9c22fdb7134d0feec29868aa3a609bffef56f46b451e6c1f`
+- Foundation log: `6d27612f23d28fd8586af014b73043f282a5d3abb032915abd06685ec32066b9`
+- B1.0 log: `d16f749f24eb107cefe084413911cfa83fec896af8ab0d6c40208e2fe3b611d8`
+- migration journal: `478ace56c08a6ea10d79e15aea1758fcf6a6349e39d02969237486fc7ab4bc43`
 
 ## Cleanup
 
@@ -138,13 +140,15 @@ The first detached exact-head gate on `d82d4dc43b8ed452669dd2b492bc952fc97177eb`
 
 A fresh direct read-only review of `2ea00def3fa375f8da2a6b365d57f418dc8133d6` then found that the TypeScript and PostgreSQL audit validators accepted timestamp-shaped but semantically invalid `relationship.end` values such as hour 25, even though the canonical notification parser rejects them. Commit `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e` adds the semantic check to TypeScript and PostgreSQL and an exact shared rejection vector. The focused 106-test database gate and the complete authoritative gate passed afterward.
 
+The next direct read-only review found one remaining language mismatch: JavaScript `Date.parse` normalizes calendar overflow such as February 30 while PostgreSQL rejects the original timestamp. Commit `b5ba93cc1d58d2073527a827702c914040f491da` makes the TypeScript and PostgreSQL validators both enforce valid calendar dates, hour/minute/second ranges, and the PostgreSQL-compatible maximum numeric offset, with shared rejection vectors for calendar overflow, hour overflow, leap seconds, and offset overflow. The focused 109-test database gate and the complete authoritative gate passed afterward.
+
 After the last implementation byte changed, the complete authoritative gate was rerun from frozen install and passed.
 
 ## Review and publication state
 
 At the time this result was updated:
 
-- five bounded local correction/evidence commits existed through `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e`;
+- seven bounded local correction/evidence commits existed through `b5ba93cc1d58d2073527a827702c914040f491da`;
 - the first detached gate on `d82d4dc43b8ed452669dd2b492bc952fc97177eb` returned HOLD on the unhandled-rejection blocker;
 - a direct read-only review of `d82d4dc43b8ed452669dd2b492bc952fc97177eb` found no source-level blocker before that timing-dependent test-authority failure was observed;
 - the detached full gate on `2ea00def3fa375f8da2a6b365d57f418dc8133d6` passed, but its concurrent direct review found the semantic timestamp blocker described above;
