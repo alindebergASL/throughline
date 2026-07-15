@@ -529,6 +529,9 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     );
 
     const publish = repository.publishClaimed(handle, timeoutPublisher);
+    // Attach a rejection observer before deliberately waiting on competing locks so the
+    // expected timeout cannot be reported as an unhandled rejection on slower runners.
+    void publish.catch(() => undefined);
     await sendStarted.promise;
     await Promise.all(started.map(({ promise }) => promise));
     await new Promise((resolve) => setTimeout(resolve, 25));
