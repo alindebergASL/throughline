@@ -5,6 +5,10 @@ import {
   type DomainNotificationEnvelope
 } from "@throughline/core-types";
 import { createHash } from "node:crypto";
+import {
+  parseProductAuditSafeDetail,
+  type ProductAuditSafeDetailInput
+} from "./audit-safe-detail.js";
 import type { TenantDbTransaction } from "./transaction.js";
 
 export class ProductDomainInvariantError extends Error {
@@ -159,6 +163,9 @@ export class DomainCommandRepository {
   }
 
   async complete(input: CompleteDomainCommandInput): Promise<CompletedDomainCommand> {
+    if ((input.resultResourceType === undefined) !== (input.resultResourceId === undefined)) {
+      throw new ProductDomainInvariantError();
+    }
     const safeResponse =
       input.safeResponse === undefined
         ? null
@@ -209,32 +216,12 @@ export class DomainCommandRepository {
   }
 }
 
-export interface AuditEventInsert {
+interface AuditEventMetadata {
   id: string;
   tenantId: string;
   workspaceId: string;
   spaceId: string;
   causationCommandId: string;
-  action:
-    | "organization.create"
-    | "initiative.create"
-    | "activity.create"
-    | "activity.capture_add"
-    | "relationship.create"
-    | "relationship.end"
-    | "content.create"
-    | "content.revise"
-    | "source_artifact.capture"
-    | "source_artifact.correct"
-    | "source_artifact.tombstone";
-  resourceType:
-    | "organization"
-    | "initiative"
-    | "activity"
-    | "relationship"
-    | "content_item"
-    | "source_artifact";
-  resourceId: string;
   actorUserId: string;
   actorMembershipId: string;
   delegatingUserId?: string;
@@ -244,15 +231,23 @@ export interface AuditEventInsert {
   requestId: string;
   traceparent: string;
   tracestate?: string;
-  auditSchemaVersion: number;
-  safeDetail: unknown;
 }
+
+export type AuditEventInsert = AuditEventMetadata & ProductAuditSafeDetailInput;
 
 export class AuditEventRepository {
   constructor(private readonly tx: TenantDbTransaction) {}
 
   async insert(input: AuditEventInsert): Promise<void> {
-    const safeDetail = canonicalJsonStringify(input.safeDetail);
+    const safeDetail = canonicalJsonStringify(
+      parseProductAuditSafeDetail(
+        input.action,
+        input.resourceType,
+        input.resourceId,
+        input.auditSchemaVersion,
+        input.safeDetail
+      )
+    );
     const result = await this.tx.query<{ id: string }>(
       `INSERT INTO ops.audit_events (
          id, tenant_id, workspace_id, space_id, causation_command_id,

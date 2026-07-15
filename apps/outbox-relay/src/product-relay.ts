@@ -42,6 +42,7 @@ export interface ProductSqsClient {
     readonly MessageId?: string;
     readonly Attributes?: Record<string, string | undefined>;
   }>;
+  destroy(): void;
 }
 
 export interface ProductSqsCommandFactory {
@@ -53,22 +54,17 @@ export type ProductRelayPublishResult =
   | { status: "idle" }
   | { status: "published"; eventId: string; messageId: string };
 
-export class ProductOutboxRelay {
-  private readonly publisher: ProductSqsPublisher;
+const verifiedProductPublisherBrand: unique symbol = Symbol("verifiedProductPublisher");
 
+export interface VerifiedProductPublicationPublisher extends ProductPublicationPublisher {
+  readonly [verifiedProductPublisherBrand]: true;
+}
+
+export class ProductOutboxRelay {
   constructor(
     private readonly repository: ProductOutboxRepository,
-    sqs: ProductSqsClient,
-    queueUrl: string,
-    commands: ProductSqsCommandFactory,
-    sendTimeoutMs = 10_000
-  ) {
-    this.publisher = new ProductSqsPublisher(sqs, queueUrl, commands, sendTimeoutMs);
-  }
-
-  verifyQueueContract(): Promise<void> {
-    return this.publisher.verifyQueueContract();
-  }
+    private readonly publisher: VerifiedProductPublicationPublisher
+  ) {}
 
   async publishNext(
     scope: ProductRelayClaimScope,
@@ -107,42 +103,57 @@ export class ProductOutboxRelay {
   }
 }
 
-export class ProductSqsPublisher implements ProductPublicationPublisher {
-  constructor(
+export class ProductSqsPublisher implements VerifiedProductPublicationPublisher {
+  readonly [verifiedProductPublisherBrand] = true as const;
+  private verified = false;
+
+  private constructor(
     private readonly sqs: ProductSqsClient,
     private readonly queueUrl: string,
     private readonly commands: ProductSqsCommandFactory,
-    private readonly sendTimeoutMs: number
+    private readonly sendTimeoutMs: number,
+    private readonly verificationTimeoutMs: number
   ) {
     if (!queueUrl) throw new Error("Product notification queue configuration is invalid");
     if (!Number.isInteger(sendTimeoutMs) || sendTimeoutMs < 1 || sendTimeoutMs > 60_000) {
       throw new Error("Product notification send deadline is invalid");
     }
+    if (
+      !Number.isInteger(verificationTimeoutMs) ||
+      verificationTimeoutMs < 1 ||
+      verificationTimeoutMs > 60_000
+    ) {
+      throw new Error("Product notification verification deadline is invalid");
+    }
   }
 
-  async verifyQueueContract(): Promise<void> {
-    const response = await this.sqs.send(
-      this.commands.getQueueAttributes({
-        QueueUrl: this.queueUrl,
-        AttributeNames: ["MessageRetentionPeriod", "RedrivePolicy", "FifoQueue"]
-      })
+  static async createVerified(
+    sqs: ProductSqsClient,
+    queueUrl: string,
+    commands: ProductSqsCommandFactory,
+    sendTimeoutMs = 10_000,
+    verificationTimeoutMs = 10_000
+  ): Promise<ProductSqsPublisher> {
+    const publisher = new ProductSqsPublisher(
+      sqs,
+      queueUrl,
+      commands,
+      sendTimeoutMs,
+      verificationTimeoutMs
     );
-    const attributes = response.Attributes;
-    if (
-      !attributes ||
-      attributes.MessageRetentionPeriod !== String(PRODUCT_NOTIFICATION_RETENTION_SECONDS) ||
-      attributes.RedrivePolicy !== undefined ||
-      (attributes.FifoQueue !== undefined && attributes.FifoQueue !== "false")
-    ) {
-      throw new Error(
-        "Product notification queue does not satisfy the Standard no-redrive contract"
-      );
+    try {
+      await publisher.verifyQueueContract();
+    } catch {
+      throw new ProductQueueContractError();
     }
+    publisher.verified = true;
+    return publisher;
   }
 
   publish(
     envelope: ProductDeepReadonly<DomainNotificationEnvelope>
   ): Promise<{ readonly messageId: string }> {
+    if (!this.verified) throw new ProductQueueContractError();
     return withPropagatedSpan(
       {
         name: "product_outbox.relay.publish",
@@ -165,44 +176,80 @@ export class ProductSqsPublisher implements ProductPublicationPublisher {
     envelope: ProductDeepReadonly<DomainNotificationEnvelope>
   ): Promise<{ readonly messageId: string }> {
     const input = createProductSendMessageInput(this.queueUrl, envelope);
+    const acknowledgment = await this.sendWithDeadline(
+      this.commands.sendMessage(input),
+      this.sendTimeoutMs
+    );
+    const messageId = acknowledgment.MessageId;
+    if (
+      typeof messageId !== "string" ||
+      messageId.length < 1 ||
+      messageId.length > 200 ||
+      hasControlCharacters(messageId)
+    ) {
+      throw Object.assign(new Error("Product SQS acknowledgment is ambiguous"), {
+        name: "MissingMessageId"
+      });
+    }
+    return { messageId };
+  }
+
+  private async verifyQueueContract(): Promise<void> {
+    const response = await this.sendWithDeadline(
+      this.commands.getQueueAttributes({
+        QueueUrl: this.queueUrl,
+        AttributeNames: ["MessageRetentionPeriod", "RedrivePolicy", "FifoQueue"]
+      }),
+      this.verificationTimeoutMs
+    );
+    const attributes = response.Attributes;
+    const allowedAttributes = new Set(["MessageRetentionPeriod", "RedrivePolicy", "FifoQueue"]);
+    if (
+      !attributes ||
+      attributes.MessageRetentionPeriod !== String(PRODUCT_NOTIFICATION_RETENTION_SECONDS) ||
+      "RedrivePolicy" in attributes ||
+      (attributes.FifoQueue !== undefined && attributes.FifoQueue !== "false") ||
+      Object.keys(attributes).some((key) => !allowedAttributes.has(key))
+    ) {
+      throw new ProductQueueContractError();
+    }
+  }
+
+  private async sendWithDeadline(
+    command: unknown,
+    deadlineMs: number
+  ): Promise<{
+    readonly MessageId?: string;
+    readonly Attributes?: Record<string, string | undefined>;
+  }> {
     const abortController = new AbortController();
-    const sendPromise = this.sqs.send(this.commands.sendMessage(input), {
-      abortSignal: abortController.signal
-    });
+    const transportPromise = Promise.resolve().then(() =>
+      this.sqs.send(command, { abortSignal: abortController.signal })
+    );
+    void transportPromise.catch(() => undefined);
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
+    const deadline = new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(() => {
         abortController.abort();
-        resolve("timeout");
-      }, this.sendTimeoutMs);
+        reject(
+          Object.assign(new Error("Product SQS request deadline exceeded"), {
+            name: "TimeoutError"
+          })
+        );
+      }, deadlineMs);
     });
-
     try {
-      const outcome = await Promise.race([
-        sendPromise.then((acknowledgment) => ({ kind: "settled" as const, acknowledgment })),
-        timeout.then(() => ({ kind: "timeout" as const }))
-      ]);
-      if (outcome.kind === "timeout") {
-        await sendPromise.catch(() => undefined);
-        throw Object.assign(new Error("Product SQS send outcome is ambiguous"), {
-          name: "TimeoutError"
-        });
-      }
-      const messageId = outcome.acknowledgment.MessageId;
-      if (
-        typeof messageId !== "string" ||
-        messageId.length < 1 ||
-        messageId.length > 200 ||
-        hasControlCharacters(messageId)
-      ) {
-        throw Object.assign(new Error("Product SQS acknowledgment is ambiguous"), {
-          name: "MissingMessageId"
-        });
-      }
-      return { messageId };
+      return await Promise.race([transportPromise, deadline]);
     } finally {
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
     }
+  }
+}
+
+export class ProductQueueContractError extends Error {
+  constructor() {
+    super("Product notification queue contract verification failed");
+    this.name = "ProductQueueContractError";
   }
 }
 

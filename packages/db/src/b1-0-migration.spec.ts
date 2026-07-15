@@ -83,7 +83,7 @@ describe("B1.0 canonical product outbox migration", () => {
     expect(sql).toContain("audit_events_append_only_guard");
     expect(sql).toContain("product_outbox_events_transition_guard");
     const assertions = sql.indexOf("DO $assertions$");
-    const appGrant = sql.indexOf("GRANT SELECT, INSERT ON ops.domain_command_records");
+    const appGrant = sql.indexOf("GRANT INSERT (\n  id, tenant_id", assertions);
     const relayGrant = sql.indexOf("GRANT SELECT (\n  id, tenant_id", assertions);
     expect(assertions).toBeGreaterThan(0);
     expect(appGrant).toBeGreaterThan(assertions);
@@ -98,13 +98,22 @@ describe("B1.0 canonical product outbox migration", () => {
     expect(sql).toContain("DO $assert_table_adoption$");
     expect(sql).toContain("DO $adopt_triggers$");
     expect(sql).toContain("DO $adopt_policies$");
+    expect(sql).toContain("index_record.indoption::smallint[]");
+    expect(sql).toContain("index_record.indclass::oid[]");
+    expect(sql).toContain("index_record.indcollation::oid[]");
+    expect(sql).toContain("AS uses_default_key_semantics");
     expect(sql.match(/CREATE TABLE IF NOT EXISTS ops\./g)).toHaveLength(3);
     expect(sql.match(/CREATE (?:UNIQUE )?INDEX IF NOT EXISTS/g)).toHaveLength(6);
     expect(sql.match(/DROP TRIGGER IF EXISTS/g)).toHaveLength(5);
-    expect(sql.match(/DROP POLICY IF EXISTS/g)).toHaveLength(27);
+    expect(sql.match(/DROP POLICY IF EXISTS/g)).toHaveLength(28);
     expect(sql).toContain("does not match the B1.0 definition");
     expect(sql).toContain("columns do not match the B1.0 definition");
     expect(sql).toContain("constraints do not match the B1.0 definition");
+    expect(sql).toContain("Unexpected RLS policy is applicable to a B1.0 protected role");
+    expect(sql).toContain("Unexpected trigger is applicable to the B1.0 catalog");
+    expect(sql).toContain("Unexpected rewrite rule is applicable to the B1.0 catalog");
+    expect(sql).toContain("Existing grants do not match the exact B1.0 privilege catalog");
+    expect(sql).toContain("Unexpected B1.0 runtime or integrity role membership path");
   });
 
   it("uses and removes a transactional regular schema for exact FK contract comparison", async () => {
@@ -207,27 +216,95 @@ describe("B1.0 canonical product outbox migration", () => {
 
   it("keeps function adoption fingerprints bound to the exact installed bodies", async () => {
     const sql = await migration();
-    expect(sql).toContain("volatility_code, is_strict, source_md5");
+    expect(sql).toContain("volatility_code, is_strict, security_definer, execute_acl, source_md5");
     expect(sql).toContain("procedure_record.proisstrict AS is_strict");
     expect(sql).toContain("installed_function.is_strict");
     expect(sql).toContain("expected_function.is_strict");
+    expect(sql).toContain("acl_record.is_grantable");
     expect(sql).not.toMatch(/(?:\.strict\b|\bAS strict\b)/);
-    const bodies = [
+    const definitions = [
       ...sql.matchAll(
-        /CREATE OR REPLACE FUNCTION ops\.[a-z_]+[\s\S]*?AS \$function\$([\s\S]*?)\$function\$;/g
+        /CREATE OR REPLACE FUNCTION ops\.[a-z_0-9]+[\s\S]*?AS \$function\$([\s\S]*?)\$function\$;/g
       )
-    ].map((match) => match[1] ?? "");
-    expect(bodies).toHaveLength(8);
-    for (const body of bodies) {
+    ];
+    expect(definitions).toHaveLength(9);
+    for (const definition of definitions) {
+      expect(definition[0]).toContain("SET search_path = pg_catalog");
+      const body = definition[1] ?? "";
       expect(sql).toContain(createHash("md5").update(body).digest("hex"));
     }
+    expect(sql.match(/SECURITY DEFINER/g)).toHaveLength(1);
+    expect(sql).toContain(
+      "ALTER FUNCTION ops.reject_committed_reserved_command() OWNER TO throughline_b1_0_integrity"
+    );
   });
 
-  it("gives the app only completion columns and the product relay only id locks/publication columns", async () => {
+  it("gives the app exact reservation/replay columns and keeps all lifecycle authority sealed", async () => {
     const sql = await migration();
+    const commandInsert = grantColumns(sql, "INSERT", "ops.domain_command_records");
+    const appOutboxSelect = grantColumns(sql, "SELECT", "ops.product_outbox_events");
+    const appOutboxInsert = grantColumns(sql, "INSERT", "ops.product_outbox_events");
+    const immutableOutboxColumns = [
+      "id",
+      "tenant_id",
+      "workspace_id",
+      "space_id",
+      "relay_service_principal_id",
+      "policy_version_id",
+      "event_type",
+      "event_schema_version",
+      "payload_schema_version",
+      "aggregate_type",
+      "aggregate_id",
+      "aggregate_version",
+      "causation_command_id",
+      "payload",
+      "request_id",
+      "traceparent",
+      "tracestate"
+    ];
+    expect(commandInsert).toEqual([
+      "id",
+      "tenant_id",
+      "workspace_id",
+      "reservation_space_id",
+      "command_kind",
+      "command_schema_version",
+      "idempotency_key",
+      "canonical_request_hash",
+      "actor_user_id",
+      "actor_membership_id",
+      "delegating_user_id",
+      "delegating_membership_id",
+      "agent_principal_id",
+      "policy_version_id",
+      "request_id",
+      "traceparent",
+      "tracestate"
+    ]);
+    expect(appOutboxSelect).toEqual(immutableOutboxColumns);
+    expect(appOutboxInsert).toEqual(immutableOutboxColumns);
     expect(sql).toMatch(
       /GRANT UPDATE \(\s*state, result_resource_type, result_resource_id, safe_response, completed_at, updated_at\s*\) ON ops\.domain_command_records TO throughline_app;/
     );
+    expect(sql).not.toMatch(/GRANT (?:SELECT, )?INSERT ON ops\.domain_command_records/);
+    expect(sql).not.toMatch(/GRANT (?:SELECT|INSERT|SELECT, INSERT) ON ops\.product_outbox_events/);
+    for (const lifecycleColumn of [
+      "publication_state",
+      "publication_attempt",
+      "next_attempt_at",
+      "claimed_at",
+      "claimed_by",
+      "claim_token",
+      "claim_expires_at",
+      "last_outcome_code",
+      "published_at",
+      "published_message_id",
+      "terminal_at"
+    ]) {
+      expect(appOutboxSelect).not.toContain(lifecycleColumn);
+      expect(appOutboxInsert).not.toContain(lifecycleColumn);
+    }
     expect(sql).not.toMatch(
       /GRANT (?:ALL|DELETE).*ops\.(?:domain_command_records|audit_events|product_outbox_events)/i
     );
@@ -287,3 +364,25 @@ describe("B1.0 canonical product outbox migration", () => {
     );
   });
 });
+
+function grantColumns(sql: string, privilege: "INSERT" | "SELECT", table: string): string[] {
+  const grantStart = `GRANT ${privilege} (`;
+  const grantEnd = `) ON ${table} TO throughline_app;`;
+  let start = sql.indexOf(grantStart);
+  let end = -1;
+  while (start >= 0) {
+    const candidateEnd = sql.indexOf(grantEnd, start);
+    const nextGrant = sql.indexOf("\nGRANT ", start + grantStart.length);
+    if (candidateEnd >= 0 && (nextGrant < 0 || candidateEnd < nextGrant)) {
+      end = candidateEnd;
+      break;
+    }
+    start = sql.indexOf(grantStart, start + grantStart.length);
+  }
+  if (start < 0 || end < 0) throw new Error(`Missing ${privilege} column grant for ${table}`);
+  const body = sql.slice(start + grantStart.length, end);
+  return body
+    .split(",")
+    .map((column) => column.trim())
+    .filter(Boolean);
+}

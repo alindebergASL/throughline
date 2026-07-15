@@ -1,4 +1,6 @@
 import {
+  CreateQueueCommand,
+  DeleteQueueCommand,
   GetQueueAttributesCommand,
   ReceiveMessageCommand,
   SQSClient,
@@ -26,6 +28,12 @@ import {
 } from "@throughline/db";
 import { createDevSecurityContext, devFixtures, DEV_POLICY_VERSION } from "@throughline/tenancy";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  composeProductRelayRuntime,
+  type ProductAwsSqsModule,
+  type ProductRelayRuntimeEnvironment,
+  type ProductSqsSdkConfiguration
+} from "./product-main.js";
 import {
   ProductSqsPublisher,
   createProductSendMessageInput,
@@ -95,7 +103,12 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     productRelayPrincipalId = provisioned.principalId;
     authorization = new PostgresAuthorizationService(productRelayPool);
     repository = new ProductOutboxRepository(productRelayPool, authorization);
-    publisher = new ProductSqsPublisher(sqs as ProductSqsClient, queueUrl, commands, 2_000);
+    publisher = await ProductSqsPublisher.createVerified(
+      sqs as ProductSqsClient,
+      queueUrl,
+      commands,
+      2_000
+    );
   });
 
   afterAll(async () => {
@@ -106,7 +119,6 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
   });
 
   it("observes the exact Standard queue retention and absence of redrive/FIFO configuration", async () => {
-    await expect(publisher.verifyQueueContract()).resolves.toBeUndefined();
     const attributes = await sqs.send(
       new GetQueueAttributesCommand({
         QueueUrl: queueUrl,
@@ -115,7 +127,118 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     );
     expect(attributes.Attributes?.MessageRetentionPeriod).toBe("86400");
     expect(attributes.Attributes).not.toHaveProperty("RedrivePolicy");
-    expect(attributes.Attributes?.FifoQueue).not.toBe("true");
+    expect(attributes.Attributes).not.toHaveProperty("FifoQueue");
+  });
+
+  it("publishes only through a runtime composed after exact queue verification", async () => {
+    const event = await createPendingEvent(0);
+    const runtime = await composeProductRelayRuntime(runtimeEnvironment(queueUrl));
+    try {
+      await expect(
+        runtime.relay.publishNext(scope(), { claimedBy: "composed-relay", leaseSeconds: 5 })
+      ).resolves.toMatchObject({ status: "published", eventId: event.eventId });
+    } finally {
+      await runtime.close();
+    }
+
+    const messages = await observeTestMessages(4);
+    expect(
+      messages.some((message) => message.MessageAttributes?.event_id?.StringValue === event.eventId)
+    ).toBe(true);
+  });
+
+  it("fails closed on a real wrong queue with zero claims/sends and disposes both resources", async () => {
+    const event = await createPendingEvent(90);
+    const queueName = `throughline-b1-test-wrong-retention-${Date.now()}`;
+    await sqs.send(
+      new CreateQueueCommand({
+        QueueName: queueName,
+        Attributes: { MessageRetentionPeriod: "60" }
+      })
+    );
+    const wrongQueue = new URL(queueUrl);
+    const queuePath = wrongQueue.pathname.split("/").filter(Boolean);
+    wrongQueue.pathname = `/${queuePath[0]}/${queueName}`;
+    const wrongQueueUrl = wrongQueue.href;
+
+    const disposablePool = createPgPool(process.env.TEST_PRODUCT_RELAY_DATABASE_URL!);
+    const poolConnect = vi.spyOn(disposablePool, "connect");
+    const poolEnd = vi.spyOn(disposablePool, "end");
+    const sendMessage = vi.fn();
+    const destroy = vi.fn();
+
+    class TrackingSqsClient implements ProductSqsClient {
+      private readonly client: SQSClient;
+
+      constructor(configuration: ProductSqsSdkConfiguration) {
+        this.client = new SQSClient(configuration);
+      }
+
+      send(command: unknown, options?: { readonly abortSignal?: AbortSignal }) {
+        if (command instanceof SendMessageCommand) sendMessage();
+        const send = this.client.send.bind(this.client) as (
+          input: unknown,
+          sendOptions?: { readonly abortSignal?: AbortSignal }
+        ) => ReturnType<ProductSqsClient["send"]>;
+        return send(command, options);
+      }
+
+      destroy(): void {
+        destroy();
+        this.client.destroy();
+      }
+    }
+
+    const sdk = {
+      SQSClient: TrackingSqsClient,
+      SendMessageCommand,
+      GetQueueAttributesCommand
+    } as unknown as ProductAwsSqsModule;
+
+    try {
+      await expect(
+        composeProductRelayRuntime(runtimeEnvironment(wrongQueueUrl, queueName), {
+          loadSdk: async () => sdk,
+          createPool: () => disposablePool,
+          verificationTimeoutMs: 2_000
+        })
+      ).rejects.toMatchObject({
+        message: "Product notification queue contract verification failed"
+      });
+      expect(poolConnect).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(poolEnd).toHaveBeenCalledTimes(1);
+      expect(destroy).toHaveBeenCalledTimes(1);
+
+      const unchanged = await ownerPool.query<{
+        publication_attempt: number;
+        publication_state: string;
+      }>(
+        `SELECT publication_state, publication_attempt
+         FROM ops.product_outbox_events WHERE id = $1`,
+        [event.eventId]
+      );
+      expect(unchanged.rows[0]).toEqual({
+        publication_state: "pending",
+        publication_attempt: 0
+      });
+      const messages = await sqs.send(
+        new ReceiveMessageCommand({
+          QueueUrl: wrongQueueUrl,
+          MaxNumberOfMessages: 1,
+          WaitTimeSeconds: 0,
+          MessageAttributeNames: ["All"]
+        })
+      );
+      expect(messages.Messages ?? []).toEqual([]);
+
+      const cleanupHandle = await claim(event);
+      await repository.publishClaimed(cleanupHandle, {
+        publish: async () => ({ messageId: "wrong-queue-fixture-cleanup" })
+      });
+    } finally {
+      await sqs.send(new DeleteQueueCommand({ QueueUrl: wrongQueueUrl }));
+    }
   });
 
   it("round-trips fresh millisecond claim bindings through publish and failure recording", async () => {
@@ -336,28 +459,112 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     await restoreDirectManagerGrant();
   });
 
-  it("releases relay and authority locks on timeout/rollback", async () => {
+  it("abandons a never-settling send and promptly releases the row plus all authority locks", async () => {
     const event = await createPendingEvent(31);
     const handle = await claim(event);
-    let revocationSettled = false;
-    let revocation: Promise<unknown> | undefined;
-    const abortingClient: ProductSqsClient = {
-      send: (_command, options) => {
-        revocation = deleteDirectManagerGrant().finally(() => {
-          revocationSettled = true;
-        });
-        return new Promise((_, reject) => {
-          options?.abortSignal?.addEventListener("abort", () =>
-            reject(Object.assign(new Error("sanitized timeout"), { name: "AbortError" }))
+    const started = Array.from({ length: 7 }, () => deferred<void>());
+    const settled = Array.from({ length: 7 }, () => false);
+    let lockPromises: Array<Promise<unknown>> = [];
+    const sendStarted = deferred<void>();
+    const timeoutPublisher = await ProductSqsPublisher.createVerified(
+      {
+        send: (command) => {
+          if (command instanceof GetQueueAttributesCommand) {
+            return Promise.resolve({
+              Attributes: { MessageRetentionPeriod: "86400", FifoQueue: "false" }
+            });
+          }
+          const contenders: Array<[string, readonly unknown[]]> = [
+            ["SELECT id FROM ops.product_outbox_events WHERE id = $1 FOR UPDATE", [event.eventId]],
+            [
+              "UPDATE identity.tenants SET status = 'suspended' WHERE id = $1",
+              [devFixtures.tenantA]
+            ],
+            [
+              "UPDATE identity.workspaces SET status = 'archived' WHERE tenant_id = $1 AND id = $2",
+              [devFixtures.tenantA, devFixtures.workspaceA]
+            ],
+            [
+              "UPDATE identity.policy_versions SET status = 'retired' WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3",
+              [devFixtures.tenantA, devFixtures.workspaceA, DEV_POLICY_VERSION]
+            ],
+            [
+              "UPDATE identity.service_principals SET status = 'disabled' WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3",
+              [devFixtures.tenantA, devFixtures.workspaceA, productRelayPrincipalId]
+            ],
+            [
+              "UPDATE access.spaces SET archived_at = clock_timestamp() WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3",
+              [devFixtures.tenantA, devFixtures.workspaceA, devFixtures.restrictedSpaceA]
+            ],
+            [
+              `DELETE FROM access.access_relationships
+               WHERE tenant_id = $1 AND workspace_id = $2
+                 AND subject_type = 'service_principal' AND subject_id = $3
+                 AND relation = 'manager' AND resource_type = 'space' AND resource_id = $4
+                 AND source = 'direct'`,
+              [
+                devFixtures.tenantA,
+                devFixtures.workspaceA,
+                productRelayPrincipalId,
+                devFixtures.restrictedSpaceA
+              ]
+            ]
+          ];
+          lockPromises = contenders.map(([sql, values], index) =>
+            executeContender(ownerPool, sql, values, () => started[index]!.resolve()).finally(
+              () => {
+                settled[index] = true;
+              }
+            )
           );
-        });
-      }
-    };
-    const timeoutPublisher = new ProductSqsPublisher(abortingClient, queueUrl, commands, 50);
-    await expect(repository.publishClaimed(handle, timeoutPublisher)).rejects.toBeDefined();
-    await revocation;
-    expect(revocationSettled).toBe(true);
-    await restoreDirectManagerGrant();
+          sendStarted.resolve();
+          return new Promise<never>(() => undefined);
+        },
+        destroy: vi.fn()
+      },
+      queueUrl,
+      commands,
+      75,
+      2_000
+    );
+
+    const publish = repository.publishClaimed(handle, timeoutPublisher);
+    await sendStarted.promise;
+    await Promise.all(started.map(({ promise }) => promise));
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    expect(settled).toEqual(Array.from({ length: 7 }, () => false));
+
+    const deadlineStartedAt = Date.now();
+    try {
+      await expect(withDeadline(publish, 1_000)).rejects.toMatchObject({ name: "TimeoutError" });
+      await expect(withDeadline(Promise.all(lockPromises), 1_000)).resolves.toHaveLength(7);
+      expect(Date.now() - deadlineStartedAt).toBeLessThan(1_000);
+      expect(settled).toEqual(Array.from({ length: 7 }, () => true));
+    } finally {
+      await Promise.all([
+        ownerPool.query("UPDATE identity.tenants SET status = 'active' WHERE id = $1", [
+          devFixtures.tenantA
+        ]),
+        ownerPool.query(
+          "UPDATE identity.workspaces SET status = 'active' WHERE tenant_id = $1 AND id = $2",
+          [devFixtures.tenantA, devFixtures.workspaceA]
+        ),
+        ownerPool.query(
+          "UPDATE identity.policy_versions SET status = 'active' WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3",
+          [devFixtures.tenantA, devFixtures.workspaceA, DEV_POLICY_VERSION]
+        ),
+        ownerPool.query(
+          "UPDATE identity.service_principals SET status = 'active' WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3",
+          [devFixtures.tenantA, devFixtures.workspaceA, productRelayPrincipalId]
+        ),
+        ownerPool.query(
+          "UPDATE access.spaces SET archived_at = NULL WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3",
+          [devFixtures.tenantA, devFixtures.workspaceA, devFixtures.restrictedSpaceA]
+        )
+      ]);
+      await restoreDirectManagerGrant();
+    }
+
     await expect(
       repository.recordFailure(handle, { kind: "ambiguous", code: "timeout_error" })
     ).resolves.toBe("retry_wait");
@@ -543,38 +750,27 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
   }
 
   async function createAttemptFiveEvent(sequence: number) {
-    const fixture = fixtureFor(sequence);
-    await withTenantTransaction({ pool: appPool, context: appContext() }, async (tx) => {
-      const repositories = new ProductDomainTransactionRepositories(tx);
-      await repositories.commands.reserve(fixture.reservation);
-      await repositories.audit.insert(fixture.audit);
-      await repositories.commands.complete(fixture.completion);
+    const fixture = await createPendingEvent(sequence);
+    await withOwnerTransaction(ownerPool, async (tx) => {
       await tx.query(
-        `INSERT INTO ops.product_outbox_events (
-             id, tenant_id, workspace_id, space_id, relay_service_principal_id, policy_version_id,
-             event_type, event_schema_version, payload_schema_version, aggregate_type, aggregate_id,
-             aggregate_version, causation_command_id, payload, request_id, traceparent,
-             publication_state, publication_attempt, next_attempt_at, last_outcome_code
-           ) VALUES (
-             $1, $2, $3, $4, $5, $6,
-             'organization.created', 1, 1, 'organization', $7,
-             1, $8, $9::jsonb, $10, $11,
-             'retry_wait', 5, clock_timestamp() - interval '1 second', 'prior_retry'
-           )`,
-        [
-          fixture.eventId,
-          devFixtures.tenantA,
-          devFixtures.workspaceA,
-          devFixtures.restrictedSpaceA,
-          productRelayPrincipalId,
-          DEV_POLICY_VERSION,
-          fixture.aggregateId,
-          fixture.commandId,
-          JSON.stringify(fixture.envelope.payload),
-          fixture.envelope.requestId,
-          traceparent
-        ]
+        "ALTER TABLE ops.product_outbox_events DISABLE TRIGGER product_outbox_events_transition_guard"
       );
+      try {
+        const updated = await tx.query<{ id: string }>(
+          `UPDATE ops.product_outbox_events
+           SET publication_state = 'retry_wait', publication_attempt = 5,
+               next_attempt_at = clock_timestamp() - interval '1 second',
+               last_outcome_code = 'prior_retry'
+           WHERE id = $1 AND publication_state = 'pending' AND publication_attempt = 0
+           RETURNING id`,
+          [fixture.eventId]
+        );
+        expect(updated.rows).toEqual([{ id: fixture.eventId }]);
+      } finally {
+        await tx.query(
+          "ALTER TABLE ops.product_outbox_events ENABLE TRIGGER product_outbox_events_transition_guard"
+        );
+      }
     });
     return fixture;
   }
@@ -669,7 +865,7 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
         policyVersionId: DEV_POLICY_VERSION,
         requestId: envelope.requestId,
         traceparent,
-        auditSchemaVersion: 1,
+        auditSchemaVersion: 1 as const,
         safeDetail: { organizationId: aggregateId }
       },
       completion: {
@@ -754,6 +950,52 @@ function uuid7(decimalSuffix: string): string {
 
 function cryptoRandomSuffix(): string {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function runtimeEnvironment(
+  sqsQueueUrl: string,
+  sqsQueueName = process.env.PRODUCT_SQS_QUEUE_NAME!
+): ProductRelayRuntimeEnvironment {
+  return {
+    TEST_PRODUCT_RELAY_DATABASE_URL: process.env.TEST_PRODUCT_RELAY_DATABASE_URL!,
+    PRODUCT_SQS_ENDPOINT: process.env.PRODUCT_SQS_ENDPOINT!,
+    PRODUCT_SQS_QUEUE_URL: sqsQueueUrl,
+    PRODUCT_SQS_QUEUE_NAME: sqsQueueName,
+    AWS_REGION: process.env.AWS_REGION!,
+    AWS_ACCESS_KEY_ID: process.env.AWS_ACCESS_KEY_ID!,
+    AWS_SECRET_ACCESS_KEY: process.env.AWS_SECRET_ACCESS_KEY!
+  };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+async function executeContender(
+  pool: PgPool,
+  sql: string,
+  values: readonly unknown[],
+  onStarted: () => void
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    onStarted();
+    await client.query(sql, [...values]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
 }
 
 async function withDeadline<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {

@@ -1,4 +1,5 @@
 export * from "./client.js";
+export * from "./audit-safe-detail.js";
 export * from "./async-context-repository.js";
 export * from "./foundation-proof-repository.js";
 export * from "./migrations.js";

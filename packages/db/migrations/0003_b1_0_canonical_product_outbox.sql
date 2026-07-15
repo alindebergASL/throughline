@@ -2,27 +2,62 @@ SET LOCAL search_path TO pg_catalog;
 
 DO $role$
 DECLARE
-  granted_role text;
+  protected_role_oid oid;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'throughline_product_relay') THEN
     CREATE ROLE throughline_product_relay
       NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
   END IF;
 
-  FOR granted_role IN
-    SELECT granted.rolname
-    FROM pg_auth_members AS membership
-    JOIN pg_roles AS granted ON granted.oid = membership.roleid
-    JOIN pg_roles AS member ON member.oid = membership.member
-    WHERE member.rolname = 'throughline_product_relay'
+  IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'throughline_b1_0_integrity') THEN
+    CREATE ROLE throughline_b1_0_integrity
+      NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS;
+  END IF;
+
+  FOR protected_role_oid IN
+    SELECT oid FROM pg_roles
+    WHERE rolname IN (
+      'throughline_app', 'throughline_product_relay', 'throughline_b1_0_integrity'
+    )
   LOOP
-    EXECUTE format('REVOKE %I FROM throughline_product_relay', granted_role);
+    IF EXISTS (
+      SELECT 1 FROM pg_auth_members
+      WHERE roleid = protected_role_oid OR member = protected_role_oid
+    ) THEN
+      RAISE EXCEPTION 'Unexpected B1.0 runtime or integrity role membership path';
+    END IF;
   END LOOP;
 
   ALTER ROLE throughline_product_relay
     NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD NULL;
+  ALTER ROLE throughline_b1_0_integrity
+    NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD NULL;
 END
 $role$;
+
+DO $adoption_mode$
+DECLARE
+  existing_table_count integer;
+BEGIN
+  SELECT count(*)::integer INTO existing_table_count
+  FROM pg_class AS relation_record
+  JOIN pg_namespace AS namespace_record ON namespace_record.oid = relation_record.relnamespace
+  WHERE namespace_record.nspname = 'ops'
+    AND relation_record.relname IN (
+      'domain_command_records', 'audit_events', 'product_outbox_events'
+    );
+
+  IF existing_table_count NOT IN (0, 3) THEN
+    RAISE EXCEPTION 'Partial B1.0 catalog cannot be adopted';
+  END IF;
+
+  PERFORM set_config(
+    'throughline.b1_0_adoption',
+    CASE WHEN existing_table_count = 3 THEN 'on' ELSE 'off' END,
+    true
+  );
+END
+$adoption_mode$;
 
 DO $prepare_contract_schema$
 BEGIN
@@ -75,23 +110,57 @@ DO $adopt_functions$
 DECLARE
   expected_function record;
   installed_function record;
+  compatible_execute_acl text[];
+  predecessors_replayed boolean;
 BEGIN
+  predecessors_replayed := COALESCE(
+    string_to_array(
+      current_setting('throughline.migration_batch_applied', true), ','
+    ) && ARRAY[
+      '0001_wave_a2_identity_access_rls.sql',
+      '0002_foundation_closure_async_isolation.sql'
+    ]::text[],
+    false
+  );
+
   FOR expected_function IN
     SELECT *
     FROM (VALUES
-      ('is_uuid_v7', 'uuid', 'boolean', 'sql', 'i', true, 'b898da6973f850c9ea0050413fccfbf6'),
-      ('product_safe_json', 'jsonb', 'boolean', 'plpgsql', 'i', true, '76c9b68fa18aa9092a631a8bc459b831'),
-      ('product_event_payload_valid', 'text, integer, uuid, jsonb', 'boolean', 'plpgsql', 'i', true, '7051124c6fdef53ea1ab1d3e84c133f1'),
-      ('enforce_domain_command_transition', '', 'trigger', 'plpgsql', 'v', false, '8559d04ff4138c55d9a36c98a6661e9d'),
-      ('reject_committed_reserved_command', '', 'trigger', 'plpgsql', 'v', false, '443e0136eb3745677d174bfaad1be7c1'),
-      ('reject_audit_event_mutation', '', 'trigger', 'plpgsql', 'v', false, '4ed19d7809b95466646e5674aef11d5e'),
-      ('enforce_product_outbox_transition', '', 'trigger', 'plpgsql', 'v', false, '0f84372b13204352ba3b93e406fd3fa7'),
-      ('validate_product_outbox_relay_binding', '', 'trigger', 'plpgsql', 'v', false, 'fa6fc5ad8aee30d6d74165ea0407675f')
+      ('is_uuid_v7', 'uuid', 'boolean', 'sql', 'i', true, false,
+        ARRAY['throughline_app:false', 'throughline_product_relay:false']::text[],
+        'b898da6973f850c9ea0050413fccfbf6'),
+      ('product_safe_json', 'jsonb', 'boolean', 'plpgsql', 'i', true, false,
+        ARRAY['throughline_app:false', 'throughline_product_relay:false']::text[],
+        '76c9b68fa18aa9092a631a8bc459b831'),
+      ('product_event_payload_valid', 'text, integer, uuid, jsonb', 'boolean', 'plpgsql', 'i', true, false,
+        ARRAY['throughline_app:false', 'throughline_product_relay:false']::text[],
+        '642100b0d5f3ccae25bb1d72928ed1ba'),
+      ('product_audit_detail_valid', 'text, text, integer, uuid, jsonb', 'boolean', 'plpgsql', 'i', true, false,
+        ARRAY['throughline_app:false']::text[], 'f8fbf1cb0a8d13ea14ad64c3fee68cfe'),
+      ('enforce_domain_command_transition', '', 'trigger', 'plpgsql', 'v', false, false,
+        ARRAY[]::text[], '3d31c436f7deaa92a19cf235fe9fae71'),
+      ('reject_committed_reserved_command', '', 'trigger', 'plpgsql', 'v', false, true,
+        ARRAY[]::text[], '443e0136eb3745677d174bfaad1be7c1'),
+      ('reject_audit_event_mutation', '', 'trigger', 'plpgsql', 'v', false, false,
+        ARRAY[]::text[], '4ed19d7809b95466646e5674aef11d5e'),
+      ('enforce_product_outbox_transition', '', 'trigger', 'plpgsql', 'v', false, false,
+        ARRAY[]::text[], '82883d9649a163ee9c0baf0ec5850773'),
+      ('validate_product_outbox_relay_binding', '', 'trigger', 'plpgsql', 'v', false, false,
+        ARRAY[]::text[], 'fa6fc5ad8aee30d6d74165ea0407675f')
     ) AS expected(
       function_name, identity_arguments, result_type, language_name,
-      volatility_code, is_strict, source_md5
+      volatility_code, is_strict, security_definer, execute_acl, source_md5
     )
   LOOP
+    compatible_execute_acl := CASE
+      WHEN predecessors_replayed AND expected_function.function_name IN (
+        'enforce_domain_command_transition', 'reject_committed_reserved_command',
+        'reject_audit_event_mutation', 'enforce_product_outbox_transition',
+        'validate_product_outbox_relay_binding'
+      ) THEN ARRAY['throughline_app:false']::text[]
+      ELSE expected_function.execute_acl
+    END;
+
     SELECT
       oidvectortypes(procedure_record.proargtypes) AS identity_arguments,
       pg_get_function_result(procedure_record.oid) AS result_type,
@@ -100,6 +169,25 @@ BEGIN
       procedure_record.proisstrict AS is_strict,
       procedure_record.prosecdef AS security_definer,
       procedure_record.prokind::text AS function_kind,
+      pg_get_userbyid(procedure_record.proowner) AS owner_name,
+      procedure_record.proconfig AS configuration,
+      ARRAY(
+        SELECT format(
+          '%s:%s',
+          CASE
+            WHEN acl_record.grantee = 0 THEN 'PUBLIC'
+            ELSE pg_get_userbyid(acl_record.grantee)
+          END,
+          CASE WHEN acl_record.is_grantable THEN 'true' ELSE 'false' END
+        )::text
+        FROM aclexplode(COALESCE(
+          procedure_record.proacl,
+          acldefault('f', procedure_record.proowner)
+        )) AS acl_record
+        WHERE acl_record.privilege_type = 'EXECUTE'
+          AND acl_record.grantee <> procedure_record.proowner
+        ORDER BY 1
+      ) AS execute_acl,
       md5(procedure_record.prosrc) AS source_md5
     INTO installed_function
     FROM pg_proc AS procedure_record
@@ -111,26 +199,41 @@ BEGIN
       AND procedure_record.proname = expected_function.function_name
       AND oidvectortypes(procedure_record.proargtypes) = expected_function.identity_arguments;
 
-    IF FOUND AND ROW(
-      installed_function.identity_arguments,
-      installed_function.result_type,
-      installed_function.language_name,
-      installed_function.volatility_code,
-      installed_function.is_strict,
-      installed_function.security_definer,
-      installed_function.function_kind,
-      installed_function.source_md5
-    ) IS DISTINCT FROM ROW(
-      expected_function.identity_arguments,
-      expected_function.result_type,
-      expected_function.language_name,
-      expected_function.volatility_code,
-      expected_function.is_strict,
-      false,
-      'f',
-      expected_function.source_md5
+    IF FOUND AND (
+      ROW(
+        installed_function.identity_arguments,
+        installed_function.result_type,
+        installed_function.language_name,
+        installed_function.volatility_code,
+        installed_function.is_strict,
+        installed_function.security_definer,
+        installed_function.function_kind,
+        installed_function.owner_name,
+        installed_function.configuration,
+        installed_function.source_md5
+      ) IS DISTINCT FROM ROW(
+        expected_function.identity_arguments,
+        expected_function.result_type,
+        expected_function.language_name,
+        expected_function.volatility_code,
+        expected_function.is_strict,
+        expected_function.security_definer,
+        'f',
+        'throughline_b1_0_integrity',
+        ARRAY['search_path=pg_catalog']::text[],
+        expected_function.source_md5
+      )
+      OR (
+        installed_function.execute_acl IS DISTINCT FROM expected_function.execute_acl
+        AND installed_function.execute_acl IS DISTINCT FROM compatible_execute_acl
+      )
     ) THEN
       RAISE EXCEPTION 'Existing function ops.%(%) does not match the B1.0 definition',
+        expected_function.function_name, expected_function.identity_arguments;
+    END IF;
+
+    IF current_setting('throughline.b1_0_adoption') = 'on' AND NOT FOUND THEN
+      RAISE EXCEPTION 'Expected function ops.%(%) is missing during B1.0 adoption',
         expected_function.function_name, expected_function.identity_arguments;
     END IF;
   END LOOP;
@@ -143,6 +246,7 @@ BEGIN
     WHERE namespace_record.nspname = 'ops'
       AND procedure_record.proname IN (
         'is_uuid_v7', 'product_safe_json', 'product_event_payload_valid',
+        'product_audit_detail_valid',
         'enforce_domain_command_transition', 'reject_committed_reserved_command',
         'reject_audit_event_mutation', 'enforce_product_outbox_transition',
         'validate_product_outbox_relay_binding'
@@ -151,6 +255,7 @@ BEGIN
         ('is_uuid_v7', 'uuid'),
         ('product_safe_json', 'jsonb'),
         ('product_event_payload_valid', 'text, integer, uuid, jsonb'),
+        ('product_audit_detail_valid', 'text, text, integer, uuid, jsonb'),
         ('enforce_domain_command_transition', ''),
         ('reject_committed_reserved_command', ''),
         ('reject_audit_event_mutation', ''),
@@ -173,7 +278,9 @@ DO $adopt_indexes$
 DECLARE
   expected_index record;
   installed_index record;
+  installed_index_found boolean;
   normalized_predicate text;
+  expected_predicate_literals text[];
 BEGIN
   FOR expected_index IN
     SELECT *
@@ -214,6 +321,7 @@ BEGIN
       table_namespace.nspname AS table_schema,
       table_relation.relname AS table_name,
       access_method.amname AS access_method,
+      pg_get_userbyid(index_relation.relowner) AS owner_name,
       index_record.indisunique AS is_unique,
       index_record.indisprimary AS is_primary,
       index_record.indisexclusion AS is_exclusion,
@@ -224,6 +332,31 @@ BEGIN
       index_record.indnullsnotdistinct AS nulls_not_distinct,
       index_record.indnatts AS attribute_count,
       index_record.indnkeyatts AS key_attribute_count,
+      index_record.indexprs IS NULL AS has_no_expressions,
+      NOT EXISTS (
+        SELECT 1
+        FROM unnest(
+          index_record.indkey::smallint[],
+          index_record.indclass::oid[],
+          index_record.indcollation::oid[],
+          index_record.indoption::smallint[]
+        ) WITH ORDINALITY AS key_semantic(
+          attnum, operator_class_oid, collation_oid, option_bits, ordinal
+        )
+        JOIN pg_attribute AS semantic_attribute
+          ON semantic_attribute.attrelid = index_record.indrelid
+         AND semantic_attribute.attnum = key_semantic.attnum
+        JOIN pg_opclass AS operator_class
+          ON operator_class.oid = key_semantic.operator_class_oid
+        WHERE key_semantic.ordinal <= index_record.indnkeyatts
+          AND (
+            key_semantic.option_bits <> 0
+            OR key_semantic.collation_oid <> semantic_attribute.attcollation
+            OR operator_class.opcmethod <> access_method.oid
+            OR NOT operator_class.opcdefault
+            OR operator_class.opcintype <> semantic_attribute.atttypid
+          )
+      ) AS uses_default_key_semantics,
       ARRAY(
         SELECT attribute_record.attname::text
         FROM unnest(index_record.indkey::smallint[]) WITH ORDINALITY AS key_record(attnum, ordinal)
@@ -233,10 +366,18 @@ BEGIN
         WHERE key_record.ordinal <= index_record.indnkeyatts
         ORDER BY key_record.ordinal
       ) AS key_columns,
-      lower(regexp_replace(regexp_replace(
+      lower(regexp_replace(regexp_replace(regexp_replace(
         COALESCE(pg_get_expr(index_record.indpred, index_record.indrelid), ''),
-        '::text', '', 'g'
-      ), '[()[:space:]]', '', 'g')) AS predicate_expression
+        $regex$'([^']|'')*'$regex$, $replacement$'<literal>'$replacement$, 'g'
+      ), '::text', '', 'g'), '[()[:space:]]', '', 'g')) AS predicate_expression,
+      ARRAY(
+        SELECT match_record.captures[1]
+        FROM regexp_matches(
+          COALESCE(pg_get_expr(index_record.indpred, index_record.indrelid), ''),
+          $regex$('([^']|'')*')$regex$,
+          'g'
+        ) AS match_record(captures)
+      ) AS predicate_literals
     INTO installed_index
     FROM pg_class AS index_relation
     JOIN pg_namespace AS index_namespace
@@ -247,15 +388,26 @@ BEGIN
     JOIN pg_am AS access_method ON access_method.oid = index_relation.relam
     WHERE index_namespace.nspname = expected_index.schema_name
       AND index_relation.relname = expected_index.index_name;
+    installed_index_found := FOUND;
 
-    normalized_predicate := lower(regexp_replace(regexp_replace(
-      expected_index.predicate_expression, '::text', '', 'g'
-    ), '[()[:space:]]', '', 'g'));
+    normalized_predicate := lower(regexp_replace(regexp_replace(regexp_replace(
+      expected_index.predicate_expression,
+      $regex$'([^']|'')*'$regex$, $replacement$'<literal>'$replacement$, 'g'
+    ), '::text', '', 'g'), '[()[:space:]]', '', 'g'));
+    SELECT ARRAY(
+      SELECT match_record.captures[1]
+      FROM regexp_matches(
+        expected_index.predicate_expression,
+        $regex$('([^']|'')*')$regex$,
+        'g'
+      ) AS match_record(captures)
+    ) INTO expected_predicate_literals;
 
-    IF FOUND AND ROW(
+    IF installed_index_found AND ROW(
       installed_index.table_schema,
       installed_index.table_name,
       installed_index.access_method,
+      installed_index.owner_name,
       installed_index.is_unique,
       installed_index.is_primary,
       installed_index.is_exclusion,
@@ -266,12 +418,16 @@ BEGIN
       installed_index.nulls_not_distinct,
       installed_index.attribute_count,
       installed_index.key_attribute_count,
+      installed_index.has_no_expressions,
+      installed_index.uses_default_key_semantics,
       installed_index.key_columns,
-      installed_index.predicate_expression
+      installed_index.predicate_expression,
+      installed_index.predicate_literals
     ) IS DISTINCT FROM ROW(
       expected_index.schema_name,
       expected_index.table_name,
       'btree',
+      current_user,
       expected_index.is_unique,
       false,
       false,
@@ -282,18 +438,26 @@ BEGIN
       false,
       cardinality(expected_index.key_columns),
       cardinality(expected_index.key_columns),
+      true,
+      true,
       expected_index.key_columns,
-      normalized_predicate
+      normalized_predicate,
+      expected_predicate_literals
     ) THEN
       RAISE EXCEPTION 'Existing index %.% does not match the B1.0 definition',
         expected_index.schema_name, expected_index.index_name;
     END IF;
 
-    IF NOT FOUND AND EXISTS (
+    IF NOT installed_index_found AND EXISTS (
       SELECT 1 FROM pg_class WHERE relname = expected_index.index_name
     ) THEN
       RAISE EXCEPTION 'Existing index % is installed in the wrong schema',
         expected_index.index_name;
+    END IF;
+
+    IF current_setting('throughline.b1_0_adoption') = 'on' AND NOT installed_index_found THEN
+      RAISE EXCEPTION 'Expected index %.% is missing during B1.0 adoption',
+        expected_index.schema_name, expected_index.index_name;
     END IF;
   END LOOP;
 END
@@ -308,6 +472,8 @@ RETURNS boolean
 LANGUAGE sql
 IMMUTABLE
 STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog
 AS $function$
   SELECT substring(value::text FROM 15 FOR 1) = '7'
     AND substring(value::text FROM 20 FOR 1) IN ('8', '9', 'a', 'b')
@@ -318,6 +484,8 @@ RETURNS boolean
 LANGUAGE plpgsql
 IMMUTABLE
 STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog
 AS $function$
 DECLARE
   item_key text;
@@ -369,6 +537,8 @@ RETURNS boolean
 LANGUAGE plpgsql
 IMMUTABLE
 STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog
 AS $function$
 DECLARE
   payload_keys text[];
@@ -381,7 +551,9 @@ BEGIN
     RETURN false;
   END IF;
 
-  SELECT array_agg(key ORDER BY key) INTO payload_keys FROM jsonb_object_keys(payload_value) AS key;
+  SELECT COALESCE(array_agg(key ORDER BY key), ARRAY[]::text[])
+  INTO payload_keys
+  FROM jsonb_object_keys(payload_value) AS key;
 
   aggregate_key := CASE event_type_value
     WHEN 'organization.created' THEN 'organizationId'
@@ -394,45 +566,170 @@ BEGIN
   END;
 
   IF aggregate_key IS NOT NULL THEN
-    RETURN payload_keys = ARRAY[aggregate_key]
-      AND payload_value->>aggregate_key = aggregate_id_value::text;
+    RETURN COALESCE(
+      payload_keys = ARRAY[aggregate_key]
+        AND lower(payload_value->>aggregate_key) = aggregate_id_value::text,
+      false
+    );
   END IF;
 
   CASE event_type_value
     WHEN 'activity.capture_added' THEN
-      RETURN payload_keys = ARRAY['activityId', 'sourceArtifactId']
-        AND payload_value->>'activityId' = aggregate_id_value::text
-        AND payload_value->>'sourceArtifactId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$';
+      RETURN COALESCE(
+        payload_keys = ARRAY['activityId', 'sourceArtifactId']
+          AND lower(payload_value->>'activityId') = aggregate_id_value::text
+          AND payload_value->>'sourceArtifactId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$',
+        false
+      );
     WHEN 'relationship.ended' THEN
-      RETURN payload_keys = ARRAY['relationshipId', 'validTo']
-        AND payload_value->>'relationshipId' = aggregate_id_value::text
-        AND payload_value->>'validTo' ~ '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$';
+      RETURN COALESCE(
+        payload_keys = ARRAY['relationshipId', 'validTo']
+          AND lower(payload_value->>'relationshipId') = aggregate_id_value::text
+          AND payload_value->>'validTo' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?(Z|[+-][0-9]{2}:[0-9]{2})$',
+        false
+      );
     WHEN 'content.revised' THEN
-      RETURN payload_keys = ARRAY['contentItemId', 'revisionNumber']
-        AND payload_value->>'contentItemId' = aggregate_id_value::text
-        AND jsonb_typeof(payload_value->'revisionNumber') = 'number'
-        AND payload_value->>'revisionNumber' ~ '^[1-9][0-9]*$';
+      RETURN COALESCE(
+        payload_keys = ARRAY['contentItemId', 'revisionNumber']
+          AND lower(payload_value->>'contentItemId') = aggregate_id_value::text
+          AND CASE WHEN jsonb_typeof(payload_value->'revisionNumber') = 'number' THEN
+            (payload_value->>'revisionNumber')::numeric >= 1
+            AND (payload_value->>'revisionNumber')::numeric <= 9007199254740991
+            AND trunc((payload_value->>'revisionNumber')::numeric) =
+              (payload_value->>'revisionNumber')::numeric
+          ELSE false END,
+        false
+      );
     WHEN 'source_artifact.corrected' THEN
-      RETURN payload_keys = ARRAY['previousSourceArtifactId', 'sourceArtifactId']
-        AND payload_value->>'sourceArtifactId' = aggregate_id_value::text
-        AND payload_value->>'previousSourceArtifactId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
-        AND payload_value->>'previousSourceArtifactId' <> aggregate_id_value::text;
+      RETURN COALESCE(
+        payload_keys = ARRAY['previousSourceArtifactId', 'sourceArtifactId']
+          AND lower(payload_value->>'sourceArtifactId') = aggregate_id_value::text
+          AND payload_value->>'previousSourceArtifactId' ~* '^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'
+          AND lower(payload_value->>'previousSourceArtifactId') <> aggregate_id_value::text,
+        false
+      );
     WHEN 'source_artifact.tombstoned' THEN
-      RETURN payload_keys = ARRAY['deletionPolicyRef', 'deletionReasonCategory', 'hashDisposition', 'sourceArtifactId']
-        AND payload_value->>'sourceArtifactId' = aggregate_id_value::text
-        AND payload_value->>'deletionPolicyRef' ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$'
-        AND payload_value->>'deletionReasonCategory' ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$'
-        AND payload_value->>'hashDisposition' IN ('retained', 'erased');
+      RETURN COALESCE(
+        payload_keys = ARRAY['deletionPolicyRef', 'deletionReasonCategory', 'hashDisposition', 'sourceArtifactId']
+          AND lower(payload_value->>'sourceArtifactId') = aggregate_id_value::text
+          AND jsonb_typeof(payload_value->'deletionPolicyRef') = 'string'
+          AND payload_value->>'deletionPolicyRef' ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$'
+          AND jsonb_typeof(payload_value->'deletionReasonCategory') = 'string'
+          AND payload_value->>'deletionReasonCategory' ~ '^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$'
+          AND payload_value->>'hashDisposition' IN ('retained', 'erased'),
+        false
+      );
     ELSE
       RETURN false;
   END CASE;
 END
 $function$;
 
+CREATE OR REPLACE FUNCTION ops.product_audit_detail_valid(
+  action_value text,
+  resource_type_value text,
+  audit_schema_version_value integer,
+  resource_id_value uuid,
+  safe_detail_value jsonb
+)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+STRICT
+SECURITY INVOKER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+  event_type_value text;
+BEGIN
+  IF audit_schema_version_value <> 1 THEN
+    RETURN false;
+  END IF;
+
+  IF NOT ops.is_uuid_v7(resource_id_value) THEN
+    RETURN false;
+  END IF;
+
+  event_type_value := CASE
+    WHEN action_value = 'organization.create' AND resource_type_value = 'organization'
+      THEN 'organization.created'
+    WHEN action_value = 'initiative.create' AND resource_type_value = 'initiative'
+      THEN 'initiative.created'
+    WHEN action_value = 'activity.create' AND resource_type_value = 'activity'
+      THEN 'activity.created'
+    WHEN action_value = 'activity.capture_add' AND resource_type_value = 'activity'
+      THEN 'activity.capture_added'
+    WHEN action_value = 'relationship.create' AND resource_type_value = 'relationship'
+      THEN 'relationship.created'
+    WHEN action_value = 'relationship.end' AND resource_type_value = 'relationship'
+      THEN 'relationship.ended'
+    WHEN action_value = 'content.create' AND resource_type_value = 'content_item'
+      THEN 'content.created'
+    WHEN action_value = 'content.revise' AND resource_type_value = 'content_item'
+      THEN 'content.revised'
+    WHEN action_value = 'source_artifact.capture' AND resource_type_value = 'source_artifact'
+      THEN 'source_artifact.captured'
+    WHEN action_value = 'source_artifact.correct' AND resource_type_value = 'source_artifact'
+      THEN 'source_artifact.corrected'
+    WHEN action_value = 'source_artifact.tombstone' AND resource_type_value = 'source_artifact'
+      THEN 'source_artifact.tombstoned'
+    ELSE NULL
+  END;
+
+  RETURN COALESCE(
+    event_type_value IS NOT NULL
+      AND ops.product_event_payload_valid(
+        event_type_value, audit_schema_version_value, resource_id_value, safe_detail_value
+      ),
+    false
+  );
+END
+$function$;
+
+ALTER FUNCTION ops.is_uuid_v7(uuid) OWNER TO throughline_b1_0_integrity;
+ALTER FUNCTION ops.product_safe_json(jsonb) OWNER TO throughline_b1_0_integrity;
+ALTER FUNCTION ops.product_event_payload_valid(text, integer, uuid, jsonb)
+  OWNER TO throughline_b1_0_integrity;
+ALTER FUNCTION ops.product_audit_detail_valid(text, text, integer, uuid, jsonb)
+  OWNER TO throughline_b1_0_integrity;
+
 DO $adopt_tables$
 DECLARE
   table_name text;
 BEGIN
+  IF current_setting('throughline.b1_0_adoption') = 'on' AND EXISTS (
+    SELECT 1
+    FROM pg_namespace AS namespace_record
+    WHERE namespace_record.nspname IN ('identity', 'access', 'ops')
+      AND pg_get_userbyid(namespace_record.nspowner) <> current_user
+  ) THEN
+    RAISE EXCEPTION 'Existing protected schema ownership does not match B1.0';
+  END IF;
+
+  IF current_setting('throughline.b1_0_adoption') = 'on' AND EXISTS (
+    SELECT 1
+    FROM pg_class AS relation_record
+    JOIN pg_namespace AS namespace_record ON namespace_record.oid = relation_record.relnamespace
+    WHERE (namespace_record.nspname, relation_record.relname) IN (
+      ('identity', 'tenants'),
+      ('identity', 'workspaces'),
+      ('identity', 'policy_versions'),
+      ('identity', 'service_principals'),
+      ('access', 'spaces'),
+      ('access', 'access_relationships')
+    )
+      AND (
+        relation_record.relkind <> 'r'
+        OR relation_record.relpersistence <> 'p'
+        OR relation_record.relispartition
+        OR NOT relation_record.relrowsecurity
+        OR NOT relation_record.relforcerowsecurity
+        OR pg_get_userbyid(relation_record.relowner) <> current_user
+      )
+  ) THEN
+    RAISE EXCEPTION 'Existing protected authority table security shape does not match B1.0';
+  END IF;
+
   FOREACH table_name IN ARRAY ARRAY[
     'domain_command_records', 'audit_events', 'product_outbox_events'
   ] LOOP
@@ -447,6 +744,7 @@ BEGIN
         AND relation_record.relrowsecurity
         AND relation_record.relforcerowsecurity
         AND NOT relation_record.relispartition
+        AND pg_get_userbyid(relation_record.relowner) = current_user
     ) THEN
       RAISE EXCEPTION 'Existing table ops.% does not have the required table security shape',
         table_name;
@@ -517,7 +815,8 @@ CREATE TABLE IF NOT EXISTS ops.domain_command_records (
   CONSTRAINT domain_command_records_result_check CHECK (
     (result_resource_type IS NULL AND result_resource_id IS NULL)
     OR (
-      result_resource_type ~ '^[a-z][a-z0-9_]{0,63}$'
+      result_resource_type IS NOT NULL
+      AND result_resource_type ~ '^[a-z][a-z0-9_]{0,63}$'
       AND result_resource_id IS NOT NULL
       AND ops.is_uuid_v7(result_resource_id)
     )
@@ -613,9 +912,11 @@ CREATE TABLE IF NOT EXISTS ops.audit_events (
   CONSTRAINT audit_events_delegation_check CHECK (
     (delegating_user_id IS NULL) = (delegating_membership_id IS NULL)
   ),
-  CONSTRAINT audit_events_schema_version_check CHECK (audit_schema_version > 0),
+  CONSTRAINT audit_events_schema_version_check CHECK (audit_schema_version = 1),
   CONSTRAINT audit_events_detail_check CHECK (
-    jsonb_typeof(safe_detail) = 'object' AND ops.product_safe_json(safe_detail)
+    ops.product_audit_detail_valid(
+      action, resource_type, audit_schema_version, resource_id, safe_detail
+    )
   ),
   CONSTRAINT audit_events_request_check CHECK (
     length(request_id) BETWEEN 1 AND 200 AND request_id !~ '[[:cntrl:]]'
@@ -727,7 +1028,9 @@ CREATE TABLE IF NOT EXISTS ops.product_outbox_events (
       AND claimed_by IS NOT NULL
       AND length(claimed_by) BETWEEN 1 AND 128
       AND claimed_by !~ '[[:cntrl:]]'
+      AND claim_token IS NOT NULL
       AND claim_token ~ '^[A-Za-z0-9_-]{43}$'
+      AND claim_expires_at IS NOT NULL
       AND claim_expires_at > claimed_at
     )
     OR (
@@ -798,7 +1101,8 @@ ALTER TABLE throughline_b1_0_migration_contract.b1_0_expected_domain_command_rec
   ADD CONSTRAINT domain_command_records_result_check CHECK (
     (result_resource_type IS NULL AND result_resource_id IS NULL)
     OR (
-      result_resource_type ~ '^[a-z][a-z0-9_]{0,63}$'
+      result_resource_type IS NOT NULL
+      AND result_resource_type ~ '^[a-z][a-z0-9_]{0,63}$'
       AND result_resource_id IS NOT NULL
       AND ops.is_uuid_v7(result_resource_id)
     )
@@ -877,9 +1181,11 @@ ALTER TABLE throughline_b1_0_migration_contract.b1_0_expected_audit_events
   ADD CONSTRAINT audit_events_delegation_check CHECK (
     (delegating_user_id IS NULL) = (delegating_membership_id IS NULL)
   ),
-  ADD CONSTRAINT audit_events_schema_version_check CHECK (audit_schema_version > 0),
+  ADD CONSTRAINT audit_events_schema_version_check CHECK (audit_schema_version = 1),
   ADD CONSTRAINT audit_events_detail_check CHECK (
-    jsonb_typeof(safe_detail) = 'object' AND ops.product_safe_json(safe_detail)
+    ops.product_audit_detail_valid(
+      action, resource_type, audit_schema_version, resource_id, safe_detail
+    )
   ),
   ADD CONSTRAINT audit_events_request_check CHECK (
     length(request_id) BETWEEN 1 AND 200 AND request_id !~ '[[:cntrl:]]'
@@ -968,7 +1274,9 @@ ALTER TABLE throughline_b1_0_migration_contract.b1_0_expected_product_outbox_eve
       AND claimed_by IS NOT NULL
       AND length(claimed_by) BETWEEN 1 AND 128
       AND claimed_by !~ '[[:cntrl:]]'
+      AND claim_token IS NOT NULL
       AND claim_token ~ '^[A-Za-z0-9_-]{43}$'
+      AND claim_expires_at IS NOT NULL
       AND claim_expires_at > claimed_at
     )
     OR (
@@ -1201,8 +1509,21 @@ CREATE INDEX IF NOT EXISTS product_outbox_events_scope_created_idx
 CREATE OR REPLACE FUNCTION ops.enforce_domain_command_transition()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
 AS $function$
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.state <> 'reserved'
+      OR NEW.result_resource_type IS NOT NULL OR NEW.result_resource_id IS NOT NULL
+      OR NEW.safe_response IS NOT NULL OR NEW.completed_at IS NOT NULL
+    THEN
+      RAISE EXCEPTION 'domain command records must be inserted in reserved state';
+    END IF;
+    NEW.updated_at := NEW.created_at;
+    RETURN NEW;
+  END IF;
+
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'domain command records cannot be deleted';
   END IF;
@@ -1242,7 +1563,7 @@ BEGIN
     FROM (VALUES
       (
         'domain_command_records', 'domain_command_records_transition_guard',
-        'enforce_domain_command_transition', 27, false, false, false
+        'enforce_domain_command_transition', 31, false, false, false
       ),
       (
         'domain_command_records', 'domain_command_records_no_committed_reserved',
@@ -1254,7 +1575,7 @@ BEGIN
       ),
       (
         'product_outbox_events', 'product_outbox_events_transition_guard',
-        'enforce_product_outbox_transition', 27, false, false, false
+        'enforce_product_outbox_transition', 31, false, false, false
       ),
       (
         'product_outbox_events', 'product_outbox_events_relay_binding_guard',
@@ -1320,18 +1641,69 @@ BEGIN
       RAISE EXCEPTION 'Existing trigger % on ops.% does not match the B1.0 definition',
         expected_trigger.trigger_name, expected_trigger.table_name;
     END IF;
+
+    IF current_setting('throughline.b1_0_adoption') = 'on' AND NOT FOUND THEN
+      RAISE EXCEPTION 'Expected trigger % on ops.% is missing during B1.0 adoption',
+        expected_trigger.trigger_name, expected_trigger.table_name;
+    END IF;
   END LOOP;
+
+  IF current_setting('throughline.b1_0_adoption') = 'on' AND EXISTS (
+    SELECT 1
+    FROM pg_trigger AS trigger_record
+    WHERE trigger_record.tgrelid IN (
+      'identity.tenants'::regclass,
+      'identity.workspaces'::regclass,
+      'identity.policy_versions'::regclass,
+      'identity.service_principals'::regclass,
+      'access.spaces'::regclass,
+      'access.access_relationships'::regclass,
+      'ops.domain_command_records'::regclass,
+      'ops.audit_events'::regclass,
+      'ops.product_outbox_events'::regclass
+    )
+      AND NOT trigger_record.tgisinternal
+      AND (trigger_record.tgrelid, trigger_record.tgname) NOT IN (
+        ('ops.domain_command_records'::regclass, 'domain_command_records_transition_guard'),
+        ('ops.domain_command_records'::regclass, 'domain_command_records_no_committed_reserved'),
+        ('ops.audit_events'::regclass, 'audit_events_append_only_guard'),
+        ('ops.product_outbox_events'::regclass, 'product_outbox_events_transition_guard'),
+        ('ops.product_outbox_events'::regclass, 'product_outbox_events_relay_binding_guard')
+      )
+  ) THEN
+    RAISE EXCEPTION 'Unexpected trigger is applicable to the B1.0 catalog';
+  END IF;
+
+  IF current_setting('throughline.b1_0_adoption') = 'on' AND EXISTS (
+    SELECT 1
+    FROM pg_rewrite AS rewrite_record
+    WHERE rewrite_record.ev_class IN (
+      'identity.tenants'::regclass,
+      'identity.workspaces'::regclass,
+      'identity.policy_versions'::regclass,
+      'identity.service_principals'::regclass,
+      'access.spaces'::regclass,
+      'access.access_relationships'::regclass,
+      'ops.domain_command_records'::regclass,
+      'ops.audit_events'::regclass,
+      'ops.product_outbox_events'::regclass
+    )
+  ) THEN
+    RAISE EXCEPTION 'Unexpected rewrite rule is applicable to the B1.0 catalog';
+  END IF;
 END
 $adopt_triggers$;
 
 DROP TRIGGER IF EXISTS domain_command_records_transition_guard ON ops.domain_command_records;
 CREATE TRIGGER domain_command_records_transition_guard
-BEFORE UPDATE OR DELETE ON ops.domain_command_records
+BEFORE INSERT OR UPDATE OR DELETE ON ops.domain_command_records
 FOR EACH ROW EXECUTE FUNCTION ops.enforce_domain_command_transition();
 
 CREATE OR REPLACE FUNCTION ops.reject_committed_reserved_command()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF EXISTS (
@@ -1345,6 +1717,9 @@ BEGIN
 END
 $function$;
 
+ALTER FUNCTION ops.enforce_domain_command_transition() OWNER TO throughline_b1_0_integrity;
+ALTER FUNCTION ops.reject_committed_reserved_command() OWNER TO throughline_b1_0_integrity;
+
 DROP TRIGGER IF EXISTS domain_command_records_no_committed_reserved ON ops.domain_command_records;
 CREATE CONSTRAINT TRIGGER domain_command_records_no_committed_reserved
 AFTER INSERT OR UPDATE ON ops.domain_command_records
@@ -1354,11 +1729,15 @@ FOR EACH ROW EXECUTE FUNCTION ops.reject_committed_reserved_command();
 CREATE OR REPLACE FUNCTION ops.reject_audit_event_mutation()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   RAISE EXCEPTION 'audit events are append-only';
 END
 $function$;
+
+ALTER FUNCTION ops.reject_audit_event_mutation() OWNER TO throughline_b1_0_integrity;
 
 DROP TRIGGER IF EXISTS audit_events_append_only_guard ON ops.audit_events;
 CREATE TRIGGER audit_events_append_only_guard
@@ -1368,8 +1747,25 @@ FOR EACH ROW EXECUTE FUNCTION ops.reject_audit_event_mutation();
 CREATE OR REPLACE FUNCTION ops.enforce_product_outbox_transition()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
 AS $function$
 BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.publication_state <> 'pending'
+      OR NEW.publication_attempt <> 0
+      OR NEW.claimed_at IS NOT NULL OR NEW.claimed_by IS NOT NULL
+      OR NEW.claim_token IS NOT NULL OR NEW.claim_expires_at IS NOT NULL
+      OR NEW.last_outcome_code IS NOT NULL
+      OR NEW.published_at IS NOT NULL OR NEW.published_message_id IS NOT NULL
+      OR NEW.terminal_at IS NOT NULL
+    THEN
+      RAISE EXCEPTION 'product outbox events must be inserted in pending state';
+    END IF;
+    NEW.next_attempt_at := NEW.created_at;
+    RETURN NEW;
+  END IF;
+
   IF TG_OP = 'DELETE' THEN
     RAISE EXCEPTION 'product outbox events cannot be deleted';
   END IF;
@@ -1394,6 +1790,9 @@ BEGIN
     IF OLD.publication_state NOT IN ('pending', 'retry_wait', 'claimed')
       OR NEW.publication_attempt <> OLD.publication_attempt + 1
       OR (OLD.publication_state = 'claimed' AND OLD.claim_expires_at > clock_timestamp())
+      OR NEW.claimed_at IS NULL OR NEW.claimed_by IS NULL
+      OR NEW.claim_token IS NULL OR NEW.claim_expires_at IS NULL
+      OR NEW.claim_expires_at <= NEW.claimed_at
       OR NEW.last_outcome_code IS NOT NULL
       OR NEW.published_at IS NOT NULL OR NEW.published_message_id IS NOT NULL
       OR NEW.terminal_at IS NOT NULL
@@ -1434,14 +1833,18 @@ BEGIN
 END
 $function$;
 
+ALTER FUNCTION ops.enforce_product_outbox_transition() OWNER TO throughline_b1_0_integrity;
+
 DROP TRIGGER IF EXISTS product_outbox_events_transition_guard ON ops.product_outbox_events;
 CREATE TRIGGER product_outbox_events_transition_guard
-BEFORE UPDATE OR DELETE ON ops.product_outbox_events
+BEFORE INSERT OR UPDATE OR DELETE ON ops.product_outbox_events
 FOR EACH ROW EXECUTE FUNCTION ops.enforce_product_outbox_transition();
 
 CREATE OR REPLACE FUNCTION ops.validate_product_outbox_relay_binding()
 RETURNS trigger
 LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = pg_catalog
 AS $function$
 BEGIN
   IF NOT EXISTS (
@@ -1457,6 +1860,8 @@ BEGIN
   RETURN NEW;
 END
 $function$;
+
+ALTER FUNCTION ops.validate_product_outbox_relay_binding() OWNER TO throughline_b1_0_integrity;
 
 DROP TRIGGER IF EXISTS product_outbox_events_relay_binding_guard ON ops.product_outbox_events;
 CREATE TRIGGER product_outbox_events_relay_binding_guard
@@ -1474,12 +1879,60 @@ DO $adopt_policies$
 DECLARE
   expected_policy record;
   installed_policy record;
-  expected_using text;
-  expected_check text;
+  expected_using_tree text;
+  expected_check_tree text;
+  policy_contract_name constant text := 'throughline_b1_0_expected_policy_contract';
+  expected_policy_keys text[] := ARRAY[]::text[];
 BEGIN
   FOR expected_policy IN
     SELECT *
     FROM (VALUES
+      (
+        'identity', 'tenants', 'tenants_current_tenant',
+        '*', true, 'throughline_app',
+        $expression$id = ops.current_tenant_id()$expression$,
+        $expression$id = ops.current_tenant_id()$expression$
+      ),
+      (
+        'identity', 'workspaces', 'workspaces_current_workspace',
+        '*', true, 'throughline_app',
+        $expression$tenant_id = ops.current_tenant_id()
+          AND id = ops.current_workspace_id()$expression$,
+        $expression$tenant_id = ops.current_tenant_id()
+          AND id = ops.current_workspace_id()$expression$
+      ),
+      (
+        'identity', 'service_principals', 'service_principals_current_workspace',
+        '*', true, 'throughline_app',
+        $expression$tenant_id = ops.current_tenant_id()
+          AND workspace_id = ops.current_workspace_id()$expression$,
+        $expression$tenant_id = ops.current_tenant_id()
+          AND workspace_id = ops.current_workspace_id()$expression$
+      ),
+      (
+        'identity', 'policy_versions', 'policy_versions_current_workspace',
+        '*', true, 'throughline_app',
+        $expression$tenant_id = ops.current_tenant_id()
+          AND workspace_id = ops.current_workspace_id()$expression$,
+        $expression$tenant_id = ops.current_tenant_id()
+          AND workspace_id = ops.current_workspace_id()$expression$
+      ),
+      (
+        'access', 'spaces', 'spaces_current_workspace',
+        '*', true, 'throughline_app',
+        $expression$tenant_id = ops.current_tenant_id()
+          AND workspace_id = ops.current_workspace_id()$expression$,
+        $expression$tenant_id = ops.current_tenant_id()
+          AND workspace_id = ops.current_workspace_id()$expression$
+      ),
+      (
+        'access', 'access_relationships', 'access_relationships_current_workspace',
+        '*', true, 'throughline_app',
+        $expression$tenant_id = ops.current_tenant_id()
+          AND workspace_id = ops.current_workspace_id()$expression$,
+        $expression$tenant_id = ops.current_tenant_id()
+          AND workspace_id = ops.current_workspace_id()$expression$
+      ),
       (
         'ops', 'domain_command_records', 'domain_command_records_app_select',
         'r', true, 'throughline_app',
@@ -1489,6 +1942,10 @@ BEGIN
         NULL::text
       ),
       (
+        'ops', 'domain_command_records', 'domain_command_records_integrity_select',
+        'r', true, 'throughline_b1_0_integrity', 'true', NULL::text
+      ),
+      (
         'ops', 'domain_command_records', 'domain_command_records_app_insert',
         'a', true, 'throughline_app', NULL::text,
         $expression$tenant_id = ops.current_tenant_id()
@@ -1496,7 +1953,11 @@ BEGIN
           AND reservation_space_id = ops.current_space_id()
           AND actor_user_id = ops.current_user_id()
           AND actor_membership_id = ops.current_membership_id()
-          AND policy_version_id = ops.current_policy_version()$expression$
+          AND policy_version_id = ops.current_policy_version()
+          AND state = 'reserved'
+          AND result_resource_type IS NULL AND result_resource_id IS NULL
+          AND safe_response IS NULL AND completed_at IS NULL
+          AND updated_at = created_at$expression$
       ),
       (
         'ops', 'domain_command_records', 'domain_command_records_app_complete',
@@ -1553,7 +2014,14 @@ BEGIN
               AND principal.id = product_outbox_events.relay_service_principal_id
               AND principal.purpose = 'product_notification_relay'
               AND principal.status = 'active'
-          )$expression$
+          )
+          AND publication_state = 'pending' AND publication_attempt = 0
+          AND next_attempt_at = created_at
+          AND claimed_at IS NULL AND claimed_by IS NULL
+          AND claim_token IS NULL AND claim_expires_at IS NULL
+          AND last_outcome_code IS NULL
+          AND published_at IS NULL AND published_message_id IS NULL
+          AND terminal_at IS NULL$expression$
       ),
       (
         'ops', 'product_outbox_events', 'product_outbox_events_product_relay_select',
@@ -1720,6 +2188,52 @@ BEGIN
       role_name, using_expression, check_expression
     )
   LOOP
+    expected_policy_keys := array_append(
+      expected_policy_keys,
+      format(
+        '%I.%I.%I',
+        expected_policy.schema_name,
+        expected_policy.table_name,
+        expected_policy.policy_name
+      )
+    );
+
+    EXECUTE format(
+      'CREATE POLICY %I ON %I.%I AS %s FOR %s TO %I%s%s',
+      policy_contract_name,
+      expected_policy.schema_name,
+      expected_policy.table_name,
+      CASE WHEN expected_policy.is_permissive THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END,
+      CASE expected_policy.policy_command
+        WHEN '*' THEN 'ALL'
+        WHEN 'r' THEN 'SELECT'
+        WHEN 'a' THEN 'INSERT'
+        WHEN 'w' THEN 'UPDATE'
+        WHEN 'd' THEN 'DELETE'
+      END,
+      expected_policy.role_name,
+      CASE WHEN expected_policy.using_expression IS NULL THEN ''
+        ELSE format(' USING (%s)', expected_policy.using_expression)
+      END,
+      CASE WHEN expected_policy.check_expression IS NULL THEN ''
+        ELSE format(' WITH CHECK (%s)', expected_policy.check_expression)
+      END
+    );
+
+    SELECT
+      pg_get_expr(policy_record.polqual, policy_record.polrelid, false),
+      pg_get_expr(policy_record.polwithcheck, policy_record.polrelid, false)
+    INTO expected_using_tree, expected_check_tree
+    FROM pg_policy AS policy_record
+    WHERE policy_record.polrelid =
+      format('%I.%I', expected_policy.schema_name, expected_policy.table_name)::regclass
+      AND policy_record.polname = policy_contract_name;
+
+    EXECUTE format(
+      'DROP POLICY %I ON %I.%I',
+      policy_contract_name, expected_policy.schema_name, expected_policy.table_name
+    );
+
     SELECT
       policy_record.polcmd::text AS policy_command,
       policy_record.polpermissive AS is_permissive,
@@ -1728,44 +2242,83 @@ BEGIN
         FROM unnest(policy_record.polroles) AS role_oid
         ORDER BY 1
       ) AS role_names,
-      lower(regexp_replace(regexp_replace(
-        COALESCE(pg_get_expr(policy_record.polqual, policy_record.polrelid), ''),
-        '::(text|name)', '', 'g'
-      ), '[()[:space:]]', '', 'g')) AS using_expression,
-      lower(regexp_replace(regexp_replace(
-        COALESCE(pg_get_expr(policy_record.polwithcheck, policy_record.polrelid), ''),
-        '::(text|name)', '', 'g'
-      ), '[()[:space:]]', '', 'g')) AS check_expression
+      pg_get_expr(policy_record.polqual, policy_record.polrelid, false) AS using_tree,
+      pg_get_expr(policy_record.polwithcheck, policy_record.polrelid, false) AS check_tree
     INTO installed_policy
     FROM pg_policy AS policy_record
     WHERE policy_record.polrelid =
       format('%I.%I', expected_policy.schema_name, expected_policy.table_name)::regclass
       AND policy_record.polname = expected_policy.policy_name;
 
-    expected_using := lower(regexp_replace(regexp_replace(
-      COALESCE(expected_policy.using_expression, ''), '::(text|name)', '', 'g'
-    ), '[()[:space:]]', '', 'g'));
-    expected_check := lower(regexp_replace(regexp_replace(
-      COALESCE(expected_policy.check_expression, ''), '::(text|name)', '', 'g'
-    ), '[()[:space:]]', '', 'g'));
-
     IF FOUND AND ROW(
       installed_policy.policy_command,
       installed_policy.is_permissive,
       installed_policy.role_names,
-      installed_policy.using_expression,
-      installed_policy.check_expression
+      installed_policy.using_tree,
+      installed_policy.check_tree
     ) IS DISTINCT FROM ROW(
       expected_policy.policy_command,
       expected_policy.is_permissive,
       ARRAY[expected_policy.role_name]::text[],
-      expected_using,
-      expected_check
+      expected_using_tree,
+      expected_check_tree
     ) THEN
       RAISE EXCEPTION 'Existing policy % on %.% does not match the B1.0 definition',
         expected_policy.policy_name, expected_policy.schema_name, expected_policy.table_name;
     END IF;
+
+    IF current_setting('throughline.b1_0_adoption') = 'on' AND NOT FOUND THEN
+      RAISE EXCEPTION 'Expected policy % on %.% is missing during B1.0 adoption',
+        expected_policy.policy_name, expected_policy.schema_name, expected_policy.table_name;
+    END IF;
   END LOOP;
+
+  IF current_setting('throughline.b1_0_adoption') = 'on' AND EXISTS (
+    WITH RECURSIVE applicable_role(role_oid) AS (
+      SELECT seed.role_oid
+      FROM (
+        SELECT 0::oid AS role_oid
+        UNION ALL
+        SELECT oid FROM pg_roles
+        WHERE rolname IN (
+          'throughline_app', 'throughline_product_relay', 'throughline_b1_0_integrity'
+        )
+      ) AS seed
+      UNION
+      SELECT membership.roleid
+      FROM pg_auth_members AS membership
+      JOIN applicable_role AS member_role ON member_role.role_oid = membership.member
+    )
+    SELECT 1
+    FROM pg_policy AS policy_record
+    JOIN pg_class AS relation_record ON relation_record.oid = policy_record.polrelid
+    JOIN pg_namespace AS namespace_record ON namespace_record.oid = relation_record.relnamespace
+    WHERE (namespace_record.nspname, relation_record.relname) IN (
+      ('identity', 'tenants'),
+      ('identity', 'workspaces'),
+      ('identity', 'policy_versions'),
+      ('identity', 'service_principals'),
+      ('access', 'spaces'),
+      ('access', 'access_relationships'),
+      ('ops', 'domain_command_records'),
+      ('ops', 'audit_events'),
+      ('ops', 'product_outbox_events')
+    )
+      AND (
+        (
+          namespace_record.nspname = 'ops'
+          AND relation_record.relname IN (
+            'domain_command_records', 'audit_events', 'product_outbox_events'
+          )
+        )
+        OR policy_record.polroles && ARRAY(SELECT role_oid FROM applicable_role)
+      )
+      AND NOT format(
+        '%I.%I.%I', namespace_record.nspname, relation_record.relname, policy_record.polname
+      ) = ANY(expected_policy_keys)
+  ) THEN
+    RAISE EXCEPTION 'Unexpected RLS policy is applicable to a B1.0 protected role';
+  END IF;
 END
 $adopt_policies$;
 
@@ -1776,6 +2329,10 @@ CREATE POLICY domain_command_records_app_select ON ops.domain_command_records
     tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id()
     AND reservation_space_id = ops.current_space_id()
   );
+DROP POLICY IF EXISTS domain_command_records_integrity_select ON ops.domain_command_records;
+CREATE POLICY domain_command_records_integrity_select ON ops.domain_command_records
+  FOR SELECT TO throughline_b1_0_integrity
+  USING (true);
 DROP POLICY IF EXISTS domain_command_records_app_insert ON ops.domain_command_records;
 CREATE POLICY domain_command_records_app_insert ON ops.domain_command_records
   FOR INSERT TO throughline_app
@@ -1785,6 +2342,10 @@ CREATE POLICY domain_command_records_app_insert ON ops.domain_command_records
     AND actor_user_id = ops.current_user_id()
     AND actor_membership_id = ops.current_membership_id()
     AND policy_version_id = ops.current_policy_version()
+    AND state = 'reserved'
+    AND result_resource_type IS NULL AND result_resource_id IS NULL
+    AND safe_response IS NULL AND completed_at IS NULL
+    AND updated_at = created_at
   );
 DROP POLICY IF EXISTS domain_command_records_app_complete ON ops.domain_command_records;
 CREATE POLICY domain_command_records_app_complete ON ops.domain_command_records
@@ -1844,6 +2405,13 @@ CREATE POLICY product_outbox_events_app_insert ON ops.product_outbox_events
         AND principal.purpose = 'product_notification_relay'
         AND principal.status = 'active'
     )
+    AND publication_state = 'pending' AND publication_attempt = 0
+    AND next_attempt_at = created_at
+    AND claimed_at IS NULL AND claimed_by IS NULL
+    AND claim_token IS NULL AND claim_expires_at IS NULL
+    AND last_outcome_code IS NULL
+    AND published_at IS NULL AND published_message_id IS NULL
+    AND terminal_at IS NULL
   );
 
 DROP POLICY IF EXISTS product_outbox_events_product_relay_select ON ops.product_outbox_events;
@@ -1990,14 +2558,257 @@ DROP POLICY IF EXISTS access_relationships_product_relay_no_write ON access.acce
 CREATE POLICY access_relationships_product_relay_no_write ON access.access_relationships
   AS RESTRICTIVE FOR UPDATE TO throughline_product_relay USING (true) WITH CHECK (false);
 
+DO $adopt_privileges$
+BEGIN
+  IF current_setting('throughline.b1_0_adoption') = 'on' AND EXISTS (
+    WITH RECURSIVE applicable_role(role_oid) AS (
+      SELECT seed.role_oid
+      FROM (
+        SELECT 0::oid AS role_oid
+        UNION ALL
+        SELECT oid FROM pg_roles
+        WHERE rolname IN (
+          'throughline_app', 'throughline_product_relay', 'throughline_b1_0_integrity'
+        )
+      ) AS seed
+      UNION
+      SELECT membership.roleid
+      FROM pg_auth_members AS membership
+      JOIN applicable_role AS member_role ON member_role.role_oid = membership.member
+    ),
+    actual_privilege AS (
+      SELECT
+        namespace_record.nspname::text AS schema_name,
+        relation_record.relname::text AS table_name,
+        NULL::text AS column_name,
+        CASE
+          WHEN acl_record.grantee = 0 THEN 'PUBLIC'
+          ELSE pg_get_userbyid(acl_record.grantee)
+        END::text AS grantee,
+        acl_record.privilege_type::text,
+        acl_record.is_grantable
+      FROM pg_class AS relation_record
+      JOIN pg_namespace AS namespace_record
+        ON namespace_record.oid = relation_record.relnamespace
+      CROSS JOIN LATERAL aclexplode(relation_record.relacl) AS acl_record
+      WHERE (namespace_record.nspname, relation_record.relname) IN (
+        ('identity', 'tenants'),
+        ('identity', 'workspaces'),
+        ('identity', 'policy_versions'),
+        ('identity', 'service_principals'),
+        ('access', 'spaces'),
+        ('access', 'access_relationships'),
+        ('ops', 'domain_command_records'),
+        ('ops', 'audit_events'),
+        ('ops', 'product_outbox_events')
+      )
+        AND acl_record.grantee <> relation_record.relowner
+        AND (
+          (
+            namespace_record.nspname = 'ops'
+            AND relation_record.relname IN (
+              'domain_command_records', 'audit_events', 'product_outbox_events'
+            )
+          )
+          OR acl_record.grantee IN (SELECT role_oid FROM applicable_role)
+        )
+      UNION ALL
+      SELECT
+        namespace_record.nspname::text AS schema_name,
+        relation_record.relname::text AS table_name,
+        attribute_record.attname::text AS column_name,
+        CASE
+          WHEN acl_record.grantee = 0 THEN 'PUBLIC'
+          ELSE pg_get_userbyid(acl_record.grantee)
+        END::text AS grantee,
+        acl_record.privilege_type::text,
+        acl_record.is_grantable
+      FROM pg_attribute AS attribute_record
+      JOIN pg_class AS relation_record ON relation_record.oid = attribute_record.attrelid
+      JOIN pg_namespace AS namespace_record
+        ON namespace_record.oid = relation_record.relnamespace
+      CROSS JOIN LATERAL aclexplode(attribute_record.attacl) AS acl_record
+      WHERE attribute_record.attnum > 0 AND NOT attribute_record.attisdropped
+        AND (namespace_record.nspname, relation_record.relname) IN (
+          ('identity', 'tenants'),
+          ('identity', 'workspaces'),
+          ('identity', 'policy_versions'),
+          ('identity', 'service_principals'),
+          ('access', 'spaces'),
+          ('access', 'access_relationships'),
+          ('ops', 'domain_command_records'),
+          ('ops', 'audit_events'),
+          ('ops', 'product_outbox_events')
+        )
+        AND acl_record.grantee <> relation_record.relowner
+        AND (
+          (
+            namespace_record.nspname = 'ops'
+            AND relation_record.relname IN (
+              'domain_command_records', 'audit_events', 'product_outbox_events'
+            )
+          )
+          OR acl_record.grantee IN (SELECT role_oid FROM applicable_role)
+        )
+    ),
+    expected_table_source(schema_name, table_name, grantee, privileges) AS (
+      VALUES
+        ('identity', 'tenants', 'throughline_app',
+          ARRAY['DELETE', 'INSERT', 'SELECT', 'UPDATE']::text[]),
+        ('identity', 'workspaces', 'throughline_app',
+          ARRAY['DELETE', 'INSERT', 'SELECT', 'UPDATE']::text[]),
+        ('identity', 'policy_versions', 'throughline_app',
+          ARRAY['DELETE', 'INSERT', 'SELECT', 'UPDATE']::text[]),
+        ('identity', 'service_principals', 'throughline_app',
+          ARRAY['DELETE', 'INSERT', 'SELECT', 'UPDATE']::text[]),
+        ('access', 'spaces', 'throughline_app',
+          ARRAY['DELETE', 'INSERT', 'SELECT', 'UPDATE']::text[]),
+        ('access', 'access_relationships', 'throughline_app',
+          ARRAY['DELETE', 'INSERT', 'SELECT', 'UPDATE']::text[]),
+        ('ops', 'domain_command_records', 'throughline_app', ARRAY['SELECT']::text[]),
+        ('ops', 'audit_events', 'throughline_app', ARRAY['INSERT', 'SELECT']::text[])
+    ),
+    expected_column_source(schema_name, table_name, columns, grantee, privileges) AS (
+      VALUES
+        ('identity', 'tenants', ARRAY['id', 'status']::text[],
+          'throughline_product_relay', ARRAY['SELECT']::text[]),
+        ('identity', 'tenants', ARRAY['id']::text[],
+          'throughline_product_relay', ARRAY['UPDATE']::text[]),
+        ('identity', 'workspaces', ARRAY['id', 'tenant_id', 'status']::text[],
+          'throughline_product_relay', ARRAY['SELECT']::text[]),
+        ('identity', 'workspaces', ARRAY['id']::text[],
+          'throughline_product_relay', ARRAY['UPDATE']::text[]),
+        ('identity', 'policy_versions', ARRAY['id', 'tenant_id', 'workspace_id', 'status']::text[],
+          'throughline_product_relay', ARRAY['SELECT']::text[]),
+        ('identity', 'policy_versions', ARRAY['id']::text[],
+          'throughline_product_relay', ARRAY['UPDATE']::text[]),
+        ('identity', 'service_principals',
+          ARRAY['id', 'tenant_id', 'workspace_id', 'purpose', 'status']::text[],
+          'throughline_product_relay', ARRAY['SELECT']::text[]),
+        ('identity', 'service_principals', ARRAY['id']::text[],
+          'throughline_product_relay', ARRAY['UPDATE']::text[]),
+        ('access', 'spaces', ARRAY['id', 'tenant_id', 'workspace_id', 'archived_at']::text[],
+          'throughline_product_relay', ARRAY['SELECT']::text[]),
+        ('access', 'spaces', ARRAY['id']::text[],
+          'throughline_product_relay', ARRAY['UPDATE']::text[]),
+        ('access', 'access_relationships', ARRAY[
+          'id', 'tenant_id', 'workspace_id', 'subject_type', 'subject_id',
+          'relation', 'resource_type', 'resource_id', 'source'
+        ]::text[], 'throughline_product_relay', ARRAY['SELECT']::text[]),
+        ('access', 'access_relationships', ARRAY['id']::text[],
+          'throughline_product_relay', ARRAY['UPDATE']::text[]),
+        ('ops', 'domain_command_records', ARRAY[
+          'id', 'tenant_id', 'workspace_id', 'reservation_space_id', 'command_kind',
+          'command_schema_version', 'idempotency_key', 'canonical_request_hash',
+          'actor_user_id', 'actor_membership_id', 'delegating_user_id',
+          'delegating_membership_id', 'agent_principal_id', 'policy_version_id',
+          'request_id', 'traceparent', 'tracestate'
+        ]::text[], 'throughline_app', ARRAY['INSERT']::text[]),
+        ('ops', 'domain_command_records', ARRAY[
+          'state', 'result_resource_type', 'result_resource_id',
+          'safe_response', 'completed_at', 'updated_at'
+        ]::text[], 'throughline_app', ARRAY['UPDATE']::text[]),
+        ('ops', 'domain_command_records', ARRAY['id', 'tenant_id', 'workspace_id', 'state']::text[],
+          'throughline_b1_0_integrity', ARRAY['SELECT']::text[]),
+        ('ops', 'product_outbox_events', ARRAY[
+          'id', 'tenant_id', 'workspace_id', 'space_id', 'relay_service_principal_id',
+          'policy_version_id', 'event_type', 'event_schema_version', 'payload_schema_version',
+          'aggregate_type', 'aggregate_id', 'aggregate_version', 'causation_command_id',
+          'payload', 'request_id', 'traceparent', 'tracestate'
+        ]::text[], 'throughline_app', ARRAY['INSERT', 'SELECT']::text[]),
+        ('ops', 'product_outbox_events', ARRAY[
+          'id', 'tenant_id', 'workspace_id', 'space_id', 'relay_service_principal_id',
+          'policy_version_id', 'event_type', 'event_schema_version', 'payload_schema_version',
+          'aggregate_type', 'aggregate_id', 'aggregate_version', 'causation_command_id',
+          'payload', 'request_id', 'traceparent', 'tracestate', 'created_at',
+          'publication_state', 'publication_attempt', 'next_attempt_at', 'claimed_at',
+          'claimed_by', 'claim_token', 'claim_expires_at', 'last_outcome_code',
+          'published_at', 'published_message_id', 'terminal_at'
+        ]::text[], 'throughline_product_relay', ARRAY['SELECT']::text[]),
+        ('ops', 'product_outbox_events', ARRAY[
+          'publication_state', 'publication_attempt', 'next_attempt_at', 'claimed_at',
+          'claimed_by', 'claim_token', 'claim_expires_at', 'last_outcome_code',
+          'published_at', 'published_message_id', 'terminal_at'
+        ]::text[], 'throughline_product_relay', ARRAY['UPDATE']::text[])
+    ),
+    expected_privilege AS (
+      SELECT schema_name, table_name, NULL::text AS column_name, grantee,
+        privilege_type::text, false AS is_grantable
+      FROM expected_table_source
+      CROSS JOIN LATERAL unnest(privileges) AS privilege_record(privilege_type)
+      UNION ALL
+      SELECT schema_name, table_name, column_name, grantee, privilege_type, false
+      FROM expected_column_source
+      CROSS JOIN LATERAL unnest(columns) AS column_record(column_name)
+      CROSS JOIN LATERAL unnest(privileges) AS privilege_record(privilege_type)
+    ),
+    difference AS (
+      (SELECT * FROM actual_privilege EXCEPT SELECT * FROM expected_privilege)
+      UNION ALL
+      (SELECT * FROM expected_privilege EXCEPT SELECT * FROM actual_privilege)
+    )
+    SELECT 1 FROM difference
+  ) THEN
+    RAISE EXCEPTION 'Existing grants do not match the exact B1.0 privilege catalog';
+  END IF;
+
+  IF current_setting('throughline.b1_0_adoption') = 'on' AND EXISTS (
+    WITH actual_schema_privilege AS (
+      SELECT
+        namespace_record.nspname::text AS schema_name,
+        CASE
+          WHEN acl_record.grantee = 0 THEN 'PUBLIC'
+          ELSE pg_get_userbyid(acl_record.grantee)
+        END::text AS grantee,
+        acl_record.privilege_type::text,
+        acl_record.is_grantable
+      FROM pg_namespace AS namespace_record
+      CROSS JOIN LATERAL aclexplode(namespace_record.nspacl) AS acl_record
+      WHERE namespace_record.nspname IN ('identity', 'access', 'ops')
+        AND acl_record.grantee <> namespace_record.nspowner
+        AND (
+          acl_record.grantee = 0 OR pg_get_userbyid(acl_record.grantee) IN (
+            'throughline_app', 'throughline_product_relay', 'throughline_b1_0_integrity'
+          )
+        )
+    ),
+    expected_schema_privilege(schema_name, grantee, privilege_type, is_grantable) AS (
+      VALUES
+        ('identity', 'throughline_app', 'USAGE', false),
+        ('access', 'throughline_app', 'USAGE', false),
+        ('ops', 'throughline_app', 'USAGE', false),
+        ('identity', 'throughline_product_relay', 'USAGE', false),
+        ('access', 'throughline_product_relay', 'USAGE', false),
+        ('ops', 'throughline_product_relay', 'USAGE', false),
+        ('ops', 'throughline_b1_0_integrity', 'USAGE', false)
+    ),
+    difference AS (
+      (SELECT * FROM actual_schema_privilege EXCEPT SELECT * FROM expected_schema_privilege)
+      UNION ALL
+      (SELECT * FROM expected_schema_privilege EXCEPT SELECT * FROM actual_schema_privilege)
+    )
+    SELECT 1 FROM difference
+  ) THEN
+    RAISE EXCEPTION 'Existing schema grants do not match the exact B1.0 privilege catalog';
+  END IF;
+END
+$adopt_privileges$;
+
 REVOKE ALL PRIVILEGES ON SCHEMA identity, access, ops FROM throughline_product_relay;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA identity FROM throughline_product_relay;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA access FROM throughline_product_relay;
 REVOKE ALL PRIVILEGES ON ALL TABLES IN SCHEMA ops FROM throughline_product_relay;
 REVOKE ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA ops FROM throughline_product_relay;
+REVOKE ALL PRIVILEGES ON SCHEMA ops FROM throughline_b1_0_integrity;
 REVOKE ALL PRIVILEGES ON ops.domain_command_records FROM throughline_app;
 REVOKE ALL PRIVILEGES ON ops.audit_events FROM throughline_app;
 REVOKE ALL PRIVILEGES ON ops.product_outbox_events FROM throughline_app;
+REVOKE ALL PRIVILEGES ON ops.domain_command_records FROM throughline_b1_0_integrity;
+REVOKE ALL PRIVILEGES ON ops.audit_events FROM throughline_b1_0_integrity;
+REVOKE ALL PRIVILEGES ON ops.product_outbox_events FROM throughline_b1_0_integrity;
+REVOKE ALL PRIVILEGES ON
+  ops.domain_command_records, ops.audit_events, ops.product_outbox_events
+FROM PUBLIC;
 
 DO $clear_b1_0_column_grants$
 DECLARE
@@ -2010,7 +2821,7 @@ BEGIN
       grantee = 'throughline_product_relay'
       AND table_schema IN ('identity', 'access', 'ops')
     ) OR (
-      grantee = 'throughline_app'
+      grantee IN ('throughline_app', 'throughline_b1_0_integrity')
       AND table_schema = 'ops'
       AND table_name IN ('domain_command_records', 'audit_events', 'product_outbox_events')
     )
@@ -2030,10 +2841,16 @@ $clear_b1_0_column_grants$;
 REVOKE EXECUTE ON FUNCTION
   ops.is_uuid_v7(uuid), ops.product_safe_json(jsonb),
   ops.product_event_payload_valid(text, integer, uuid, jsonb),
+  ops.product_audit_detail_valid(text, text, integer, uuid, jsonb),
   ops.enforce_domain_command_transition(), ops.reject_committed_reserved_command(),
   ops.reject_audit_event_mutation(), ops.enforce_product_outbox_transition(),
   ops.validate_product_outbox_relay_binding()
 FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION
+  ops.enforce_domain_command_transition(), ops.reject_committed_reserved_command(),
+  ops.reject_audit_event_mutation(), ops.enforce_product_outbox_transition(),
+  ops.validate_product_outbox_relay_binding()
+FROM throughline_app, throughline_product_relay;
 
 DO $assertions$
 DECLARE
@@ -2105,7 +2922,8 @@ BEGIN
 
   FOREACH policy_name IN ARRAY ARRAY[
     'domain_command_records_app_select', 'domain_command_records_app_insert',
-    'domain_command_records_app_complete', 'audit_events_app_select', 'audit_events_app_insert',
+    'domain_command_records_integrity_select', 'domain_command_records_app_complete',
+    'audit_events_app_select', 'audit_events_app_insert',
     'product_outbox_events_app_select', 'product_outbox_events_app_insert',
     'product_outbox_events_product_relay_select', 'product_outbox_events_product_relay_update',
     'tenants_product_relay_select',
@@ -2155,6 +2973,7 @@ END
 $assertions$;
 
 GRANT USAGE ON SCHEMA identity, access, ops TO throughline_product_relay;
+GRANT USAGE ON SCHEMA ops TO throughline_b1_0_integrity;
 GRANT EXECUTE ON FUNCTION
   ops.current_tenant_id(), ops.current_workspace_id(), ops.current_space_id(),
   ops.current_service_principal_id(), ops.current_policy_version()
@@ -2165,7 +2984,8 @@ GRANT EXECUTE ON FUNCTION
 TO throughline_product_relay;
 GRANT EXECUTE ON FUNCTION
   ops.is_uuid_v7(uuid), ops.product_safe_json(jsonb),
-  ops.product_event_payload_valid(text, integer, uuid, jsonb)
+  ops.product_event_payload_valid(text, integer, uuid, jsonb),
+  ops.product_audit_detail_valid(text, text, integer, uuid, jsonb)
 TO throughline_app;
 
 GRANT SELECT (id, status) ON identity.tenants TO throughline_product_relay;
@@ -2187,12 +3007,29 @@ GRANT UPDATE (id) ON identity.service_principals TO throughline_product_relay;
 GRANT UPDATE (id) ON access.spaces TO throughline_product_relay;
 GRANT UPDATE (id) ON access.access_relationships TO throughline_product_relay;
 
-GRANT SELECT, INSERT ON ops.domain_command_records TO throughline_app;
+GRANT SELECT ON ops.domain_command_records TO throughline_app;
+GRANT INSERT (
+  id, tenant_id, workspace_id, reservation_space_id, command_kind,
+  command_schema_version, idempotency_key, canonical_request_hash,
+  actor_user_id, actor_membership_id, delegating_user_id, delegating_membership_id,
+  agent_principal_id, policy_version_id, request_id, traceparent, tracestate
+) ON ops.domain_command_records TO throughline_app;
 GRANT UPDATE (
   state, result_resource_type, result_resource_id, safe_response, completed_at, updated_at
 ) ON ops.domain_command_records TO throughline_app;
+GRANT SELECT (id, tenant_id, workspace_id, state)
+  ON ops.domain_command_records TO throughline_b1_0_integrity;
 GRANT SELECT, INSERT ON ops.audit_events TO throughline_app;
-GRANT SELECT, INSERT ON ops.product_outbox_events TO throughline_app;
+GRANT SELECT (
+  id, tenant_id, workspace_id, space_id, relay_service_principal_id, policy_version_id,
+  event_type, event_schema_version, payload_schema_version, aggregate_type, aggregate_id,
+  aggregate_version, causation_command_id, payload, request_id, traceparent, tracestate
+) ON ops.product_outbox_events TO throughline_app;
+GRANT INSERT (
+  id, tenant_id, workspace_id, space_id, relay_service_principal_id, policy_version_id,
+  event_type, event_schema_version, payload_schema_version, aggregate_type, aggregate_id,
+  aggregate_version, causation_command_id, payload, request_id, traceparent, tracestate
+) ON ops.product_outbox_events TO throughline_app;
 
 GRANT SELECT (
   id, tenant_id, workspace_id, space_id, relay_service_principal_id, policy_version_id,

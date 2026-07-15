@@ -62,6 +62,9 @@ export async function applyMigrations(
 
       await client.query("BEGIN");
       try {
+        await client.query("SELECT set_config('throughline.migration_batch_applied', $1, true)", [
+          result.applied.join(",")
+        ]);
         await client.query(sql);
         await client.query(
           `

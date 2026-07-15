@@ -1,6 +1,7 @@
 import type { DomainNotificationEnvelope } from "@throughline/core-types";
 import { describe, expect, it, vi } from "vitest";
 import {
+  AuditEventRepository,
   DomainCommandRepository,
   ProductDomainInvariantError,
   ProductDomainOutboxWriter,
@@ -138,6 +139,48 @@ describe("transaction-bound product domain repositories", () => {
     expect(sql).toContain("state = 'completed'");
     expect(sql).toContain("state = 'reserved'");
     expect(sql).not.toMatch(/tenant_id\s*=\s*\$\d+,/);
+  });
+
+  it("rejects a partial command result identity before issuing SQL", async () => {
+    const { tx, query } = txWithRows();
+    await expect(
+      new DomainCommandRepository(tx).complete({
+        commandId: ids.command,
+        tenantId: ids.tenant,
+        workspaceId: ids.workspace,
+        reservationSpaceId: ids.space,
+        commandKind: "b1_0.fixture.v1",
+        idempotencyKey: "fixture-command-1",
+        canonicalRequestHash: requestHash,
+        resultResourceId: ids.aggregate
+      })
+    ).rejects.toBeInstanceOf(ProductDomainInvariantError);
+    expect(query).not.toHaveBeenCalled();
+  });
+
+  it("rejects unsafe audit detail before issuing SQL", async () => {
+    const { tx, query } = txWithRows();
+    const repository = new AuditEventRepository(tx);
+    await expect(
+      repository.insert({
+        id: "70000000-0000-7000-8000-000000000010",
+        tenantId: ids.tenant,
+        workspaceId: ids.workspace,
+        spaceId: ids.space,
+        causationCommandId: ids.command,
+        action: "organization.create",
+        resourceType: "organization",
+        resourceId: ids.aggregate,
+        actorUserId: ids.user,
+        actorMembershipId: ids.membership,
+        policyVersionId: "dev-policy-v1",
+        requestId: "request-1",
+        traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        auditSchemaVersion: 1,
+        safeDetail: { organizationId: ids.aggregate, transcript: "restricted" }
+      } as never)
+    ).rejects.toThrow(/audit safe detail is invalid/);
+    expect(query).not.toHaveBeenCalled();
   });
 
   it("inserts or replays only a byte-equivalent trusted envelope and binding", async () => {

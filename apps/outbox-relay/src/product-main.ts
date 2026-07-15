@@ -1,7 +1,8 @@
 import { PostgresAuthorizationService } from "@throughline/authorization";
-import { createPgPool, ProductOutboxRepository } from "@throughline/db";
+import { createPgPool, ProductOutboxRepository, type PgPool } from "@throughline/db";
 import {
   ProductOutboxRelay,
+  ProductSqsPublisher,
   type ProductGetQueueAttributesInput,
   type ProductSendMessageInput,
   type ProductSqsClient,
@@ -20,7 +21,7 @@ export interface ProductRelayRuntimeEnvironment {
   AWS_SECRET_ACCESS_KEY: string;
 }
 
-interface AwsSqsModule {
+export interface ProductAwsSqsModule {
   SQSClient: new (configuration: ProductSqsSdkConfiguration) => ProductSqsClient;
   SendMessageCommand: new (input: ProductSendMessageInput) => unknown;
   GetQueueAttributesCommand: new (input: ProductGetQueueAttributesInput) => unknown;
@@ -32,22 +33,49 @@ export interface ProductSqsSdkConfiguration {
   credentials: { accessKeyId: string; secretAccessKey: string };
 }
 
+export interface ProductRelayRuntimeDependencies {
+  loadSdk?: () => Promise<ProductAwsSqsModule>;
+  createPool?: (connectionString: string) => PgPool;
+  sendTimeoutMs?: number;
+  verificationTimeoutMs?: number;
+}
+
 export async function composeProductRelayRuntime(
   environment: ProductRelayRuntimeEnvironment,
-  loadSdk: () => Promise<AwsSqsModule> = loadAwsSqsModule
-) {
+  dependencies: ProductRelayRuntimeDependencies = {}
+): Promise<{ relay: ProductOutboxRelay; close: () => Promise<void> }> {
   const configuration = parseProductRelayRuntimeEnvironment(environment);
-  const sdk = await loadSdk();
+  const sdk = await (dependencies.loadSdk ?? loadAwsSqsModule)();
   const sqs = new sdk.SQSClient(configuration.sqs);
   const commands: ProductSqsCommandFactory = {
     sendMessage: (input) => new sdk.SendMessageCommand(input),
     getQueueAttributes: (input) => new sdk.GetQueueAttributesCommand(input)
   };
-  const pool = createPgPool(configuration.databaseUrl);
-  const authorization = new PostgresAuthorizationService(pool);
-  const repository = new ProductOutboxRepository(pool, authorization);
-  const relay = new ProductOutboxRelay(repository, sqs, configuration.queueUrl, commands);
-  return { relay, repository, close: () => pool.end() };
+  let pool: PgPool | undefined;
+  try {
+    pool = (dependencies.createPool ?? createPgPool)(configuration.databaseUrl);
+    const publisher = await ProductSqsPublisher.createVerified(
+      sqs,
+      configuration.queueUrl,
+      commands,
+      dependencies.sendTimeoutMs,
+      dependencies.verificationTimeoutMs
+    );
+    const authorization = new PostgresAuthorizationService(pool);
+    const repository = new ProductOutboxRepository(pool, authorization);
+    const relay = new ProductOutboxRelay(repository, publisher);
+    let closePromise: Promise<void> | undefined;
+    return {
+      relay,
+      close: () => {
+        closePromise ??= disposeProductRelayResources(pool!, sqs, false);
+        return closePromise;
+      }
+    };
+  } catch (error) {
+    await disposeProductRelayResources(pool, sqs, true);
+    throw error;
+  }
 }
 
 export function parseProductRelayRuntimeEnvironment(environment: ProductRelayRuntimeEnvironment): {
@@ -123,7 +151,21 @@ function configurationError(): Error {
   return new Error("Product relay runtime configuration is invalid");
 }
 
-async function loadAwsSqsModule(): Promise<AwsSqsModule> {
+async function loadAwsSqsModule(): Promise<ProductAwsSqsModule> {
   const moduleName = "@aws-sdk/client-sqs";
-  return import(moduleName) as Promise<AwsSqsModule>;
+  return import(moduleName) as Promise<ProductAwsSqsModule>;
+}
+
+async function disposeProductRelayResources(
+  pool: PgPool | undefined,
+  sqs: ProductSqsClient,
+  suppressFailure: boolean
+): Promise<void> {
+  const results = await Promise.allSettled([
+    pool ? pool.end() : Promise.resolve(),
+    Promise.resolve().then(() => sqs.destroy())
+  ]);
+  if (!suppressFailure && results.some((result) => result.status === "rejected")) {
+    throw new Error("Product relay runtime resource disposal failed");
+  }
 }

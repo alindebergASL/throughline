@@ -7,6 +7,7 @@ import {
   PRODUCT_NOTIFICATION_RETENTION_SECONDS,
   ProductOutboxRelay,
   ProductPublicationFailedError,
+  ProductQueueContractError,
   ProductSqsPublisher,
   classifyProductSqsError,
   createProductSendMessageInput,
@@ -57,17 +58,19 @@ describe("dedicated Standard product-notification SQS contract", () => {
     expect(first.MessageBody).not.toMatch(/jobId|contextReference|worker|consumer/i);
   });
 
-  it("checks provider-managed eventual retention only through exact supported queue attributes", async () => {
-    const send = vi.fn(async () => ({
-      Attributes: { MessageRetentionPeriod: "86400", FifoQueue: "false" }
-    }));
-    const publisher = new ProductSqsPublisher(
-      { send },
+  it("verifies the exact Standard queue before returning a publish-capable object", async () => {
+    const send = vi.fn(async (command: unknown) =>
+      (command as { kind?: string }).kind === "attributes"
+        ? { Attributes: { MessageRetentionPeriod: "86400", FifoQueue: "false" } }
+        : { MessageId: "verified-publish" }
+    );
+    const publisher = await ProductSqsPublisher.createVerified(
+      { send, destroy: vi.fn() },
       "http://localhost:4566/000/test-product",
       commands,
       100
     );
-    await expect(publisher.verifyQueueContract()).resolves.toBeUndefined();
+    await expect(publisher.publish(envelope)).resolves.toBeDefined();
     expect(PRODUCT_NOTIFICATION_RETENTION_SECONDS).toBe(86_400);
     expect(PRODUCT_NOTIFICATION_DELIVERY).toEqual({
       ordering: "potentially_unordered",
@@ -86,16 +89,149 @@ describe("dedicated Standard product-notification SQS contract", () => {
     for (const Attributes of [
       { MessageRetentionPeriod: "345600", FifoQueue: "false" },
       { MessageRetentionPeriod: "86400", RedrivePolicy: "{}", FifoQueue: "false" },
-      { MessageRetentionPeriod: "86400", FifoQueue: "true" }
+      { MessageRetentionPeriod: "86400", RedrivePolicy: undefined, FifoQueue: "false" },
+      { MessageRetentionPeriod: "86400", FifoQueue: "true" },
+      { MessageRetentionPeriod: "86400", FifoQueue: "unexpected" },
+      { MessageRetentionPeriod: "86400", FifoQueue: "false", VisibilityTimeout: "30" },
+      {},
+      undefined
     ]) {
-      const invalid = new ProductSqsPublisher(
-        { send: vi.fn(async () => ({ Attributes })) },
+      await expect(
+        ProductSqsPublisher.createVerified(
+          {
+            send: vi.fn(async () =>
+              Attributes === undefined
+                ? {}
+                : { Attributes: Attributes as Record<string, string | undefined> }
+            ),
+            destroy: vi.fn()
+          },
+          "http://localhost:4566/000/test-product",
+          commands,
+          100
+        )
+      ).rejects.toBeInstanceOf(ProductQueueContractError);
+    }
+    await expect(
+      ProductSqsPublisher.createVerified(
+        {
+          send: vi.fn(async () => {
+            throw new Error("provider credential=must-not-leak");
+          }),
+          destroy: vi.fn()
+        },
         "http://localhost:4566/000/test-product",
         commands,
         100
-      );
-      await expect(invalid.verifyQueueContract()).rejects.toThrow(/Standard no-redrive/);
+      )
+    ).rejects.toMatchObject({ message: "Product notification queue contract verification failed" });
+  });
+
+  it("abandons a never-settling SQS request at the fixed deadline", async () => {
+    const send = vi.fn((command: unknown) => {
+      if ((command as { kind?: string }).kind === "attributes") {
+        return Promise.resolve({
+          Attributes: { MessageRetentionPeriod: "86400", FifoQueue: "false" }
+        });
+      }
+      return new Promise<never>(() => undefined);
+    });
+    const publisher = await ProductSqsPublisher.createVerified(
+      { send, destroy: vi.fn() },
+      "http://localhost:4566/000/test-product",
+      commands,
+      25,
+      100
+    );
+    const startedAt = Date.now();
+    await expect(withDeadline(publisher.publish(envelope), 250)).rejects.toMatchObject({
+      name: "TimeoutError"
+    });
+    expect(Date.now() - startedAt).toBeLessThan(250);
+  });
+
+  it("sinks a detached transport rejection after the deadline", async () => {
+    let rejectTransport!: (error: Error) => void;
+    const send = vi.fn((command: unknown) => {
+      if ((command as { kind?: string }).kind === "attributes") {
+        return Promise.resolve({
+          Attributes: { MessageRetentionPeriod: "86400", FifoQueue: "false" }
+        });
+      }
+      return new Promise<never>((_resolve, reject) => {
+        rejectTransport = reject;
+      });
+    });
+    const publisher = await ProductSqsPublisher.createVerified(
+      { send, destroy: vi.fn() },
+      "http://localhost:4566/000/test-product",
+      commands,
+      20,
+      100
+    );
+    const unhandled = vi.fn();
+    process.on("unhandledRejection", unhandled);
+    try {
+      await expect(publisher.publish(envelope)).rejects.toMatchObject({ name: "TimeoutError" });
+      rejectTransport(new Error("late provider body and credential"));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).not.toHaveBeenCalled();
+    } finally {
+      process.off("unhandledRejection", unhandled);
     }
+  });
+
+  it("keeps a late transport success ambiguous and unable to mark publication", async () => {
+    let resolveTransport!: (result: { MessageId: string }) => void;
+    const publisher = await ProductSqsPublisher.createVerified(
+      {
+        send: vi.fn((command: unknown) =>
+          (command as { kind?: string }).kind === "attributes"
+            ? Promise.resolve({
+                Attributes: { MessageRetentionPeriod: "86400", FifoQueue: "false" }
+              })
+            : new Promise<{ MessageId: string }>((resolve) => {
+                resolveTransport = resolve;
+              })
+        ),
+        destroy: vi.fn()
+      },
+      "http://localhost:4566/000/test-product",
+      commands,
+      20,
+      100
+    );
+    const marked = vi.fn();
+    const repository = {
+      claimNext: vi.fn(async () => handle),
+      publishClaimed: vi.fn(
+        async (_handle: ProductOutboxClaimHandle, transport: ProductSqsPublisher) => {
+          const acknowledgment = await transport.publish(envelope);
+          marked(acknowledgment);
+          return {
+            status: "published" as const,
+            eventId: envelope.eventId,
+            messageId: acknowledgment.messageId
+          };
+        }
+      ),
+      recordFailure: vi.fn(async () => "retry_wait" as const)
+    };
+    const relay = new ProductOutboxRelay(repository as never, publisher);
+
+    await expect(withDeadline(relay.publishClaimed(handle), 250)).rejects.toMatchObject({
+      kind: "ambiguous",
+      code: "timeout_error"
+    });
+    resolveTransport({ MessageId: "late-accepted-message" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(marked).not.toHaveBeenCalled();
+    expect(repository.recordFailure).toHaveBeenCalledTimes(1);
+    expect(repository.recordFailure).toHaveBeenCalledWith(handle, {
+      kind: "ambiguous",
+      code: "timeout_error"
+    });
   });
 
   it("classifies only definite broker rejections as deterministic and sanitizes codes", () => {
@@ -124,12 +260,7 @@ describe("dedicated Standard product-notification SQS contract", () => {
       })),
       recordFailure: vi.fn(async () => "retry_wait" as const)
     };
-    const relay = new ProductOutboxRelay(
-      repository as never,
-      { send: vi.fn() },
-      "http://localhost:4566/000/test-product",
-      commands
-    );
+    const relay = new ProductOutboxRelay(repository as never, await verifiedPublisher());
     await expect(relay.publishClaimed(handle)).rejects.toThrow(/unresolved/);
     expect(repository.recordFailure).toHaveBeenCalledWith(handle, {
       kind: "ambiguous",
@@ -150,12 +281,7 @@ describe("dedicated Standard product-notification SQS contract", () => {
       }),
       recordFailure: vi.fn(async () => "retry_wait" as const)
     };
-    const relay = new ProductOutboxRelay(
-      repository as never,
-      { send: vi.fn() },
-      "http://localhost:4566/000/test-product",
-      commands
-    );
+    const relay = new ProductOutboxRelay(repository as never, await verifiedPublisher());
     let failure: unknown;
     try {
       await relay.publishClaimed(handle);
@@ -165,6 +291,42 @@ describe("dedicated Standard product-notification SQS contract", () => {
     expect(failure).toBeInstanceOf(ProductPublicationFailedError);
     expect(failure).toMatchObject({ kind: "ambiguous", code: "service_unavailable" });
     expect(String(failure)).not.toMatch(/credential|secret|payload|raw source/i);
+  });
+
+  it("records a transport deadline as ambiguous without waiting for settlement", async () => {
+    const publisher = await ProductSqsPublisher.createVerified(
+      {
+        send: vi.fn((command: unknown) =>
+          (command as { kind?: string }).kind === "attributes"
+            ? Promise.resolve({
+                Attributes: { MessageRetentionPeriod: "86400", FifoQueue: "false" }
+              })
+            : new Promise<never>(() => undefined)
+        ),
+        destroy: vi.fn()
+      },
+      "http://localhost:4566/000/test-product",
+      commands,
+      20,
+      100
+    );
+    const repository = {
+      claimNext: vi.fn(async () => handle),
+      publishClaimed: vi.fn(
+        async (_handle: ProductOutboxClaimHandle, transport: ProductSqsPublisher) =>
+          transport.publish(envelope)
+      ),
+      recordFailure: vi.fn(async () => "retry_wait" as const)
+    };
+    const relay = new ProductOutboxRelay(repository as never, publisher);
+    await expect(withDeadline(relay.publishClaimed(handle), 250)).rejects.toMatchObject({
+      kind: "ambiguous",
+      code: "timeout_error"
+    });
+    expect(repository.recordFailure).toHaveBeenCalledWith(handle, {
+      kind: "ambiguous",
+      code: "timeout_error"
+    });
   });
 
   it("fails runtime configuration closed without exposing DSNs or dummy credentials", () => {
@@ -192,3 +354,33 @@ describe("dedicated Standard product-notification SQS contract", () => {
     expect((failure as Error).message).not.toContain("test-password");
   });
 });
+
+async function verifiedPublisher(): Promise<ProductSqsPublisher> {
+  return ProductSqsPublisher.createVerified(
+    {
+      send: vi.fn(async (command: unknown) =>
+        (command as { kind?: string }).kind === "attributes"
+          ? { Attributes: { MessageRetentionPeriod: "86400", FifoQueue: "false" } }
+          : { MessageId: "verified-test-message" }
+      ),
+      destroy: vi.fn()
+    },
+    "http://localhost:4566/000/test-product",
+    commands,
+    100
+  );
+}
+
+async function withDeadline<T>(promise: Promise<T>, deadlineMs: number): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error("unit deadline exceeded")), deadlineMs);
+      })
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
+}
