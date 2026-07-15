@@ -189,7 +189,7 @@ export function parseDomainNotificationEnvelope(input: unknown): DomainNotificat
     case "relationship.ended": {
       const payload = requireExactObject(envelope.payload, ["relationshipId", "validTo"]);
       const relationshipId = requireUuidV7(payload.relationshipId);
-      if (relationshipId !== aggregateId || !isIsoTimestamp(payload.validTo)) fail();
+      if (relationshipId !== aggregateId || !isDomainNotificationTimestamp(payload.validTo)) fail();
       return {
         ...base,
         eventType,
@@ -376,12 +376,37 @@ function requireTraceparent(value: unknown): string {
   return value;
 }
 
-function isIsoTimestamp(value: unknown): value is string {
+export function isDomainNotificationTimestamp(value: unknown): value is string {
+  if (typeof value !== "string" || !ISO_TIMESTAMP_PATTERN.test(value)) return false;
+  const year = Number(value.slice(0, 4));
+  const month = Number(value.slice(5, 7));
+  const day = Number(value.slice(8, 10));
+  const hour = Number(value.slice(11, 13));
+  const minute = Number(value.slice(14, 16));
+  const second = Number(value.slice(17, 19));
+  const offsetHour = value.endsWith("Z") ? 0 : Number(value.slice(-5, -3));
+  const offsetMinute = value.endsWith("Z") ? 0 : Number(value.slice(-2));
   return (
-    typeof value === "string" &&
-    ISO_TIMESTAMP_PATTERN.test(value) &&
+    year >= 1 &&
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= daysInMonth(year, month) &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59 &&
+    offsetHour <= 15 &&
+    offsetMinute <= 59 &&
     Number.isFinite(Date.parse(value))
   );
+}
+
+function daysInMonth(year: number, month: number): number {
+  if (month === 2) {
+    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    return leapYear ? 29 : 28;
+  }
+  return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
 function fail(): never {

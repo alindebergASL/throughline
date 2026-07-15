@@ -1,3 +1,5 @@
+import { isDomainNotificationTimestamp } from "@throughline/core-types";
+
 export const PRODUCT_AUDIT_SCHEMA_VERSION = 1 as const;
 
 export interface ProductAuditDetailMap {
@@ -68,8 +70,6 @@ export type ProductAuditSafeDetail = ProductAuditSafeDetailInput["safeDetail"];
 
 const UUID_V7_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const SAFE_REFERENCE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/;
-const ISO_TIMESTAMP_PATTERN =
-  /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$/;
 
 export class ProductAuditDetailValidationError extends Error {
   constructor() {
@@ -112,7 +112,7 @@ export function parseProductAuditSafeDetail(
       requireResourceType(resourceType, "relationship");
       const detail = requireExactObject(safeDetail, ["relationshipId", "validTo"]);
       const relationshipId = requireUuidV7(detail.relationshipId);
-      if (relationshipId !== resourceId || !isIsoTimestamp(detail.validTo)) fail();
+      if (relationshipId !== resourceId || !isDomainNotificationTimestamp(detail.validTo)) fail();
       return { relationshipId, validTo: detail.validTo };
     }
     case "content.create":
@@ -217,39 +217,6 @@ function requireEnum<const Values extends readonly string[]>(
 ): Values[number] {
   if (typeof value !== "string" || !values.includes(value)) fail();
   return value as Values[number];
-}
-
-function isIsoTimestamp(value: unknown): value is string {
-  if (typeof value !== "string" || !ISO_TIMESTAMP_PATTERN.test(value)) return false;
-  const year = Number(value.slice(0, 4));
-  const month = Number(value.slice(5, 7));
-  const day = Number(value.slice(8, 10));
-  const hour = Number(value.slice(11, 13));
-  const minute = Number(value.slice(14, 16));
-  const second = Number(value.slice(17, 19));
-  const offsetHour = value.endsWith("Z") ? 0 : Number(value.slice(-5, -3));
-  const offsetMinute = value.endsWith("Z") ? 0 : Number(value.slice(-2));
-  return (
-    year >= 1 &&
-    month >= 1 &&
-    month <= 12 &&
-    day >= 1 &&
-    day <= daysInMonth(year, month) &&
-    hour <= 23 &&
-    minute <= 59 &&
-    second <= 59 &&
-    offsetHour <= 15 &&
-    offsetMinute <= 59 &&
-    Number.isFinite(Date.parse(value))
-  );
-}
-
-function daysInMonth(year: number, month: number): number {
-  if (month === 2) {
-    const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
-    return leapYear ? 29 : 28;
-  }
-  return [4, 6, 9, 11].includes(month) ? 30 : 31;
 }
 
 function fail(): never {

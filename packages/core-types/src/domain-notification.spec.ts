@@ -132,6 +132,23 @@ describe("DomainNotificationEnvelope", () => {
     ).toThrow("Domain notification envelope is invalid");
   });
 
+  it("rejects relationship timestamps outside the shared PostgreSQL calendar and range contract", () => {
+    const base = envelope("relationship.ended");
+    for (const validTo of [
+      "2026-02-30T12:00:00Z",
+      "2026-01-01T24:00:00Z",
+      "2026-01-01T12:00:60Z",
+      "2026-01-01T12:00:00+16:00"
+    ]) {
+      expect(() =>
+        parseDomainNotificationEnvelope({
+          ...base,
+          payload: { relationshipId: ids.aggregate, validTo }
+        })
+      ).toThrow("Domain notification envelope is invalid");
+    }
+  });
+
   it("serializes canonically without erasing trusted differences", () => {
     const first = envelope("content.revised");
     const reordered = Object.fromEntries(Object.entries(first).reverse());
