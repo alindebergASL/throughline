@@ -371,3 +371,165 @@ export const idempotencyRecords = ops.table(
     )
   ]
 );
+
+export const domainCommandRecords = ops.table(
+  "domain_command_records",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    reservationSpaceId: uuid("reservation_space_id").notNull(),
+    commandKind: text("command_kind").notNull(),
+    commandSchemaVersion: integer("command_schema_version").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    canonicalRequestHash: text("canonical_request_hash").notNull(),
+    state: text("state").notNull().default("reserved"),
+    resultResourceType: text("result_resource_type"),
+    resultResourceId: uuid("result_resource_id"),
+    safeResponse: jsonb("safe_response"),
+    actorUserId: uuid("actor_user_id").notNull(),
+    actorMembershipId: uuid("actor_membership_id").notNull(),
+    delegatingUserId: uuid("delegating_user_id"),
+    delegatingMembershipId: uuid("delegating_membership_id"),
+    agentPrincipalId: uuid("agent_principal_id"),
+    policyVersionId: text("policy_version_id").notNull(),
+    requestId: text("request_id").notNull(),
+    traceparent: text("traceparent").notNull(),
+    tracestate: text("tracestate"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+    completedAt: timestamp("completed_at", { withTimezone: true })
+  },
+  (table) => [
+    unique("domain_command_records_scope_id_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.id
+    ),
+    unique("domain_command_records_idempotency_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.reservationSpaceId,
+      table.commandKind,
+      table.idempotencyKey
+    ),
+    index("domain_command_records_scope_created_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.reservationSpaceId,
+      table.createdAt
+    )
+  ]
+);
+
+export const auditEvents = ops.table(
+  "audit_events",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    causationCommandId: uuid("causation_command_id").notNull(),
+    action: text("action").notNull(),
+    resourceType: text("resource_type").notNull(),
+    resourceId: uuid("resource_id").notNull(),
+    actorUserId: uuid("actor_user_id").notNull(),
+    actorMembershipId: uuid("actor_membership_id").notNull(),
+    delegatingUserId: uuid("delegating_user_id"),
+    delegatingMembershipId: uuid("delegating_membership_id"),
+    agentPrincipalId: uuid("agent_principal_id"),
+    policyVersionId: text("policy_version_id").notNull(),
+    requestId: text("request_id").notNull(),
+    traceparent: text("traceparent").notNull(),
+    tracestate: text("tracestate"),
+    auditSchemaVersion: integer("audit_schema_version").notNull(),
+    safeDetail: jsonb("safe_detail").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    unique("audit_events_scope_id_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.id
+    ),
+    index("audit_events_resource_created_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.resourceType,
+      table.resourceId,
+      table.createdAt
+    ),
+    index("audit_events_command_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.causationCommandId
+    )
+  ]
+);
+
+export const productOutboxEvents = ops.table(
+  "product_outbox_events",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    relayServicePrincipalId: uuid("relay_service_principal_id").notNull(),
+    policyVersionId: text("policy_version_id").notNull(),
+    eventType: text("event_type").notNull(),
+    eventSchemaVersion: integer("event_schema_version").notNull(),
+    payloadSchemaVersion: integer("payload_schema_version").notNull(),
+    aggregateType: text("aggregate_type").notNull(),
+    aggregateId: uuid("aggregate_id").notNull(),
+    aggregateVersion: integer("aggregate_version").notNull(),
+    causationCommandId: uuid("causation_command_id").notNull(),
+    payload: jsonb("payload").notNull(),
+    requestId: text("request_id").notNull(),
+    traceparent: text("traceparent").notNull(),
+    tracestate: text("tracestate"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    publicationState: text("publication_state").notNull().default("pending"),
+    publicationAttempt: integer("publication_attempt").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+    claimedAt: timestamp("claimed_at", { withTimezone: true }),
+    claimedBy: text("claimed_by"),
+    claimToken: text("claim_token"),
+    claimExpiresAt: timestamp("claim_expires_at", { withTimezone: true }),
+    lastOutcomeCode: text("last_outcome_code"),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    publishedMessageId: text("published_message_id"),
+    terminalAt: timestamp("terminal_at", { withTimezone: true })
+  },
+  (table) => [
+    unique("product_outbox_events_scope_id_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.id
+    ),
+    unique("product_outbox_events_semantic_unique").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.causationCommandId,
+      table.eventType,
+      table.aggregateType,
+      table.aggregateId,
+      table.aggregateVersion
+    ),
+    index("product_outbox_events_publishable_idx").on(
+      table.nextAttemptAt,
+      table.createdAt,
+      table.id
+    ),
+    index("product_outbox_events_scope_created_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.createdAt,
+      table.id
+    )
+  ]
+);

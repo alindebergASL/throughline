@@ -12,7 +12,8 @@ export type AuthorizationAction =
   | "membership.read"
   | "foundation.proof.create"
   | "foundation.relay.publish"
-  | "foundation.worker.consume";
+  | "foundation.worker.consume"
+  | "product_outbox.relay.publish";
 
 export interface WorkerAuthorizationBinding {
   referenceId: string;

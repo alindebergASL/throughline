@@ -12,7 +12,11 @@ const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
 const maybeDescribe = ownerUrl && appUrl ? describe.sequential : describe.skip;
 const migrationId = "0001_wave_a2_identity_access_rls.sql";
-const migrationIds = [migrationId, "0002_foundation_closure_async_isolation.sql"];
+const migrationIds = [
+  migrationId,
+  "0002_foundation_closure_async_isolation.sql",
+  "0003_b1_0_canonical_product_outbox.sql"
+];
 const migrationUrl = new URL("../migrations/0001_wave_a2_identity_access_rls.sql", import.meta.url);
 
 interface AppRoleState {
@@ -147,7 +151,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
       `
     );
 
-    expect(journal.rows).toHaveLength(2);
+    expect(journal.rows).toHaveLength(migrationIds.length);
     expect(journal.rows[0]).toMatchObject({ id: migrationId, checksum: expectedChecksum });
     expect(journal.rows.every(({ applied_at }) => applied_at !== null)).toBe(true);
   });
@@ -189,7 +193,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
 
       expect(adopted).toEqual({ applied: migrationIds, skipped: [] });
       expect(repeated).toEqual({ applied: [], skipped: migrationIds });
-      expect(journal.rows[0]?.count).toBe("2");
+      expect(journal.rows[0]?.count).toBe(String(migrationIds.length));
       expect(hardenedRole).toMatchObject({
         rolcanlogin: false,
         rolbypassrls: false,

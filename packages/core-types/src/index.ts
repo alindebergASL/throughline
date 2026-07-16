@@ -1,5 +1,7 @@
 export type AccessClass = "public" | "workspace" | "restricted" | "confidential";
 
+export * from "./domain-notification.js";
+
 export type Confidence = "confirmed" | "strong" | "weak" | "unknown";
 
 export type EntityKind =

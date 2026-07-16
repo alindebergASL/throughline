@@ -3,6 +3,7 @@ import type { PgPool, PgPoolClient } from "./client.js";
 const testAppRole = "throughline_app";
 const testRelayRole = "throughline_relay";
 const testWorkerRole = "throughline_worker";
+const testProductRelayRole = "throughline_product_relay";
 
 export async function provisionTestAppRole(
   ownerPool: PgPool,
@@ -62,6 +63,28 @@ export async function provisionTestFoundationRoles(
     await client.query("BEGIN");
     await provisionDisposableLogin(client, testRelayRole, relayUrl.password);
     await provisionDisposableLogin(client, testWorkerRole, workerUrl.password);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function provisionTestProductRelayRole(
+  ownerPool: PgPool,
+  testProductRelayDatabaseUrl: string
+): Promise<void> {
+  if (process.env.NODE_ENV !== "test") {
+    throw new Error("Test product relay role provisioning is only available when NODE_ENV=test");
+  }
+
+  const relayUrl = parseTestRoleDatabaseUrl(testProductRelayDatabaseUrl, testProductRelayRole);
+  const client = await ownerPool.connect();
+  try {
+    await client.query("BEGIN");
+    await provisionDisposableLogin(client, testProductRelayRole, relayUrl.password);
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");

@@ -333,6 +333,120 @@ describe("foundation.relay.publish exact authorization", () => {
   });
 });
 
+describe("product_outbox.relay.publish exact authorization", () => {
+  const productPrincipalId = "70000000-0000-7000-8000-000000000061";
+  const context = (overrides: Partial<SecurityContext> = {}): SecurityContext => ({
+    ...createDevSecurityContext("tenant-a-service"),
+    servicePrincipalId: productPrincipalId,
+    requestedSpaceIds: [devFixtures.restrictedSpaceA],
+    ...overrides
+  });
+
+  function executor(deniedTable?: string) {
+    const queries: string[] = [];
+    const tx = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        const table = sql.match(/FROM\s+((?:identity|access)\.[a-z_]+)/)?.[1];
+        if (table === deniedTable) return { rows: [] };
+        if (table === "identity.tenants") return { rows: [{ status: "active" }] };
+        if (table === "identity.workspaces") return { rows: [{ status: "active" }] };
+        if (table === "identity.policy_versions") return { rows: [{ status: "active" }] };
+        if (table === "identity.service_principals") {
+          return { rows: [{ purpose: "product_notification_relay", status: "active" }] };
+        }
+        if (table === "access.spaces") return { rows: [{ id: devFixtures.restrictedSpaceA }] };
+        if (table === "access.access_relationships") return { rows: [{ id: "direct-manager" }] };
+        throw new Error(`Unexpected product relay authorization query: ${sql}`);
+      })
+    } as unknown as TenantQueryExecutor;
+    return { queries, tx };
+  }
+
+  it("locks every live authority input in the exact required order", async () => {
+    const { queries, tx } = executor();
+    const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      context(),
+      "product_outbox.relay.publish",
+      { type: "space", id: devFixtures.restrictedSpaceA },
+      tx as never
+    );
+    expect(decision).toMatchObject({
+      allowed: true,
+      reasonCode: "product_relay_direct_manager"
+    });
+    expect(queries.map((sql) => sql.match(/FROM\s+((?:identity|access)\.[a-z_]+)/)?.[1])).toEqual([
+      "identity.tenants",
+      "identity.workspaces",
+      "identity.policy_versions",
+      "identity.service_principals",
+      "access.spaces",
+      "access.access_relationships"
+    ]);
+    expect(queries.every((sql) => /FOR UPDATE/.test(sql))).toBe(true);
+    expect(queries[3]).toMatch(/purpose = 'product_notification_relay'/);
+    expect(queries[5]).toMatch(
+      /subject_type = 'service_principal'[\s\S]*relation = 'manager'[\s\S]*source = 'direct'/
+    );
+  });
+
+  it.each([
+    ["tenant", "identity.tenants", "tenant_not_active"],
+    ["workspace", "identity.workspaces", "workspace_not_active"],
+    ["policy", "identity.policy_versions", "policy_version_not_active"],
+    ["principal", "identity.service_principals", "product_relay_principal_not_active"],
+    ["Space", "access.spaces", "space_not_found"],
+    ["direct manager", "access.access_relationships", "product_relay_direct_manager_required"]
+  ] as const)("denies a missing or revoked %s before send", async (_name, table, reasonCode) => {
+    const { tx } = executor(table);
+    await expect(
+      new PostgresAuthorizationService({} as PgPool).canInTransaction(
+        context(),
+        "product_outbox.relay.publish",
+        { type: "space", id: devFixtures.restrictedSpaceA },
+        tx as never
+      )
+    ).resolves.toMatchObject({ allowed: false, reasonCode });
+  });
+
+  it("denies human, agent, delegated, and wrong-Space principal confusion before any lock", async () => {
+    for (const overrides of [
+      {
+        servicePrincipalId: undefined,
+        actorUserId: devFixtures.userA,
+        actorMembershipId: devFixtures.membershipAOwner
+      },
+      { servicePrincipalId: undefined, agentPrincipalId: devFixtures.agentPrincipalA },
+      {
+        delegatedByUserId: devFixtures.userA,
+        delegatedByMembershipId: devFixtures.membershipAOwner
+      }
+    ] as Array<Partial<SecurityContext>>) {
+      const { queries, tx } = executor();
+      const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+        context(overrides),
+        "product_outbox.relay.publish",
+        { type: "space", id: devFixtures.restrictedSpaceA },
+        tx as never
+      );
+      expect(decision.allowed).toBe(false);
+      expect(queries).toEqual([]);
+    }
+    const { queries, tx } = executor();
+    const wrongSpace = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      context(),
+      "product_outbox.relay.publish",
+      { type: "space", id: devFixtures.rootSpaceA },
+      tx as never
+    );
+    expect(wrongSpace).toMatchObject({
+      allowed: false,
+      reasonCode: "product_relay_space_scope_mismatch"
+    });
+    expect(queries).toEqual([]);
+  });
+});
+
 describe("foundation.worker.consume exact authorization", () => {
   const workerId = "70000000-0000-7000-8000-000000000051";
   const referenceId = "70000000-0000-7000-8000-000000000031";
