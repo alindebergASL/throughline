@@ -22,12 +22,15 @@ describe("withTenantTransaction", () => {
       ...createDevSecurityContext("tenant-a-owner"),
       requestedSpaceIds
     };
-    const query = vi.fn().mockResolvedValue({
-      command: "",
-      rowCount: 0,
-      oid: 0,
-      fields: [],
-      rows: []
+    const query = vi.fn(async (sql: string, values?: unknown[]) => {
+      void values;
+      return {
+        command: "",
+        rowCount: sql.includes("AS settings_cleared") ? 1 : 0,
+        oid: 0,
+        fields: [],
+        rows: sql.includes("AS settings_cleared") ? [{ settings_cleared: true }] : []
+      };
     });
     const client = {
       query,
@@ -80,5 +83,22 @@ describe("withTenantTransaction", () => {
     });
     expect.soft(connect).not.toHaveBeenCalled();
     expect(callback).not.toHaveBeenCalled();
+  });
+
+  it("destroys a pooled connection when transaction-local context cleanup cannot be proved", async () => {
+    const context = createDevSecurityContext("tenant-a-owner");
+    const release = vi.fn();
+    const client = {
+      query: vi.fn(async (sql: string) => ({
+        rows: sql.includes("AS settings_cleared") ? [{ settings_cleared: false }] : []
+      })),
+      release
+    } as unknown as PgPoolClient;
+    const pool = { connect: vi.fn(async () => client) } as unknown as PgPool;
+
+    await expect(withTenantTransaction({ pool, context }, async () => undefined)).rejects.toThrow(
+      "Transaction-local security context was not cleared"
+    );
+    expect(release).toHaveBeenCalledWith(true);
   });
 });

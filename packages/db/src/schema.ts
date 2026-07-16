@@ -3,6 +3,7 @@ import {
   index,
   integer,
   jsonb,
+  numeric,
   pgSchema,
   primaryKey,
   text,
@@ -14,6 +15,8 @@ import {
 export const identity = pgSchema("identity");
 export const access = pgSchema("access");
 export const ops = pgSchema("ops");
+export const work = pgSchema("work");
+export const content = pgSchema("content");
 
 const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -531,5 +534,341 @@ export const productOutboxEvents = ops.table(
       table.createdAt,
       table.id
     )
+  ]
+);
+
+export const organizations = work.table(
+  "organizations",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    name: text("name").notNull(),
+    normalizedName: text("normalized_name").notNull(),
+    status: text("status").notNull(),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id)
+  ]
+);
+
+export const organizationDomains = work.table(
+  "organization_domains",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    organizationId: uuid("organization_id").notNull(),
+    domain: text("domain").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.workspaceId, table.organizationId, table.domain] })
+  ]
+);
+
+export const initiatives = work.table(
+  "initiatives",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    title: text("title").notNull(),
+    typeKey: text("type_key").notNull(),
+    stageKey: text("stage_key").notNull(),
+    health: text("health").notNull(),
+    ownerPersonId: uuid("owner_person_id").notNull(),
+    profileId: text("profile_id").notNull(),
+    profileVersion: text("profile_version").notNull(),
+    evidenceScore: numeric("evidence_score"),
+    evidenceChallenge: text("evidence_challenge"),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id)
+  ]
+);
+
+export const initiativeOrganizations = work.table(
+  "initiative_organizations",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    initiativeId: uuid("initiative_id").notNull(),
+    organizationId: uuid("organization_id").notNull(),
+    associationRole: text("association_role").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    endedAt: timestamp("ended_at", { withTimezone: true })
+  },
+  (table) => [
+    primaryKey({
+      columns: [
+        table.tenantId,
+        table.workspaceId,
+        table.initiativeId,
+        table.organizationId,
+        table.createdAt
+      ]
+    })
+  ]
+);
+
+export const initiativePeople = work.table(
+  "initiative_people",
+  {
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    initiativeId: uuid("initiative_id").notNull(),
+    personId: uuid("person_id").notNull(),
+    role: text("role").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    endedAt: timestamp("ended_at", { withTimezone: true })
+  },
+  (table) => [
+    primaryKey({
+      columns: [
+        table.tenantId,
+        table.workspaceId,
+        table.initiativeId,
+        table.personId,
+        table.createdAt
+      ]
+    })
+  ]
+);
+
+export const activities = work.table(
+  "activities",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    subtype: text("subtype").notNull(),
+    profileTemplateKey: text("profile_template_key").notNull(),
+    title: text("title").notNull(),
+    status: text("status").notNull(),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }),
+    startsAt: timestamp("starts_at", { withTimezone: true }),
+    endsAt: timestamp("ends_at", { withTimezone: true }),
+    ownerPersonId: uuid("owner_person_id").notNull(),
+    governingInitiativeId: uuid("governing_initiative_id"),
+    governingOrganizationId: uuid("governing_organization_id"),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id)
+  ]
+);
+
+function activityAssociationColumns(name: string) {
+  return {
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    activityId: uuid("activity_id").notNull(),
+    relatedId: uuid(name).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  };
+}
+
+export const activityOrganizations = work.table(
+  "activity_organizations",
+  activityAssociationColumns("organization_id"),
+  (table) => [
+    primaryKey({
+      columns: [table.tenantId, table.workspaceId, table.activityId, table.relatedId]
+    })
+  ]
+);
+export const activityInitiatives = work.table(
+  "activity_initiatives",
+  activityAssociationColumns("initiative_id"),
+  (table) => [
+    primaryKey({
+      columns: [table.tenantId, table.workspaceId, table.activityId, table.relatedId]
+    })
+  ]
+);
+export const activityAttendees = work.table(
+  "activity_attendees",
+  activityAssociationColumns("person_id"),
+  (table) => [
+    primaryKey({
+      columns: [table.tenantId, table.workspaceId, table.activityId, table.relatedId]
+    })
+  ]
+);
+
+export const relationships = work.table(
+  "relationships",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    subjectType: text("subject_type").notNull(),
+    subjectId: uuid("subject_id").notNull(),
+    predicate: text("predicate").notNull(),
+    objectType: text("object_type").notNull(),
+    objectId: uuid("object_id").notNull(),
+    contextType: text("context_type"),
+    contextId: uuid("context_id"),
+    supportingFactId: uuid("supporting_fact_id"),
+    validFrom: timestamp("valid_from", { withTimezone: true }),
+    validTo: timestamp("valid_to", { withTimezone: true }),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id)
+  ]
+);
+
+export const contentItems = content.table(
+  "content_items",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    type: text("type").notNull(),
+    title: text("title").notNull(),
+    ownerPersonId: uuid("owner_person_id").notNull(),
+    accessClass: text("access_class").notNull(),
+    metadata: jsonb("metadata").notNull().default({}),
+    currentRevision: integer("current_revision").notNull().default(1),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id)
+  ]
+);
+
+export const contentRevisions = content.table(
+  "content_revisions",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    contentItemId: uuid("content_item_id").notNull(),
+    revisionNumber: integer("revision_number").notNull(),
+    title: text("title").notNull(),
+    body: text("body").notNull(),
+    metadata: jsonb("metadata").notNull().default({}),
+    accessClass: text("access_class").notNull(),
+    createdByUserId: uuid("created_by_user_id").notNull(),
+    createdByMembershipId: uuid("created_by_membership_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.contentItemId, table.revisionNumber),
+    unique().on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.contentItemId,
+      table.revisionNumber
+    )
+  ]
+);
+
+export const sourceArtifacts = content.table(
+  "source_artifacts",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    sourceType: text("source_type").notNull(),
+    trustClass: text("trust_class").notNull(),
+    title: text("title"),
+    immutableText: text("immutable_text"),
+    objectKey: text("object_key"),
+    contentHash: text("content_hash"),
+    sourceUri: text("source_uri"),
+    externalRef: jsonb("external_ref"),
+    providerId: text("provider_id"),
+    providerVersion: text("provider_version"),
+    adapterVersion: text("adapter_version"),
+    normalizationVersion: text("normalization_version").notNull(),
+    chunkingVersion: text("chunking_version").notNull(),
+    normalizedContentHash: text("normalized_content_hash"),
+    hashRetentionPolicy: text("hash_retention_policy").notNull(),
+    originContentItemId: uuid("origin_content_item_id"),
+    originContentRevision: integer("origin_content_revision"),
+    supersedesSourceId: uuid("supersedes_source_id"),
+    capturedByUserId: uuid("captured_by_user_id").notNull(),
+    capturedByMembershipId: uuid("captured_by_membership_id").notNull(),
+    retrievedAt: timestamp("retrieved_at", { withTimezone: true }),
+    occurredAt: timestamp("occurred_at", { withTimezone: true }),
+    accessClass: text("access_class").notNull(),
+    sourceSnapshotPolicy: text("source_snapshot_policy").notNull(),
+    retentionPolicyId: text("retention_policy_id"),
+    deletedAt: timestamp("deleted_at", { withTimezone: true }),
+    deletionReason: text("deletion_reason"),
+    deletionPolicyRef: text("deletion_policy_ref"),
+    hashDisposition: text("hash_disposition"),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.supersedesSourceId)
+  ]
+);
+
+export const sourceChunks = content.table(
+  "source_chunks",
+  {
+    id: uuid("id").primaryKey(),
+    tenantId: uuid("tenant_id").notNull(),
+    workspaceId: uuid("workspace_id").notNull(),
+    spaceId: uuid("space_id").notNull(),
+    sourceArtifactId: uuid("source_artifact_id").notNull(),
+    normalizationVersion: text("normalization_version").notNull(),
+    chunkingVersion: text("chunking_version").notNull(),
+    chunkIndex: integer("chunk_index").notNull(),
+    startOffset: integer("start_offset").notNull(),
+    endOffset: integer("end_offset").notNull(),
+    normalizedText: text("normalized_text").notNull(),
+    contentHash: text("content_hash").notNull(),
+    accessClass: text("access_class").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id),
+    unique().on(
+      table.tenantId,
+      table.workspaceId,
+      table.sourceArtifactId,
+      table.normalizationVersion,
+      table.chunkingVersion,
+      table.chunkIndex
+    )
+  ]
+);
+
+export const activitySources = work.table(
+  "activity_sources",
+  activityAssociationColumns("source_artifact_id"),
+  (table) => [
+    primaryKey({
+      columns: [table.tenantId, table.workspaceId, table.activityId, table.relatedId]
+    }),
+    unique().on(table.tenantId, table.workspaceId, table.relatedId)
   ]
 );

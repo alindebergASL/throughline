@@ -13,7 +13,24 @@ export type AuthorizationAction =
   | "foundation.proof.create"
   | "foundation.relay.publish"
   | "foundation.worker.consume"
-  | "product_outbox.relay.publish";
+  | "product_outbox.relay.publish"
+  | "organization.create"
+  | "organization.read"
+  | "initiative.create"
+  | "initiative.read"
+  | "activity.create"
+  | "activity.read"
+  | "person.read"
+  | "relationship.create"
+  | "relationship.end"
+  | "relationship.read"
+  | "content.create"
+  | "content.revise"
+  | "content.read"
+  | "source.capture"
+  | "source.correct"
+  | "source.tombstone"
+  | "source.read";
 
 export interface WorkerAuthorizationBinding {
   referenceId: string;
@@ -29,6 +46,7 @@ export interface WorkerAuthorizationBinding {
 
 export interface AuthorizationDecisionOptions {
   explain?: boolean;
+  personUseSite?: ResourceRef;
 }
 
 export interface TransactionAuthorizationDecisionOptions extends AuthorizationDecisionOptions {

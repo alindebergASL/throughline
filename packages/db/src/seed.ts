@@ -18,8 +18,8 @@ export async function seedWaveA2DeterministicData(pool: PgPool): Promise<void> {
     INSERT INTO identity.workspaces
       (id, tenant_id, slug, name, status, profile_id, profile_version, default_access_class)
     VALUES
-      ($1, $2, 'workspace-a', 'Workspace A', 'active', 'ai-solutions', 'v1', 'workspace'),
-      ($3, $4, 'workspace-b', 'Workspace B', 'active', 'ai-solutions', 'v1', 'workspace')
+      ($1, $2, 'workspace-a', 'Workspace A', 'active', 'ai-solutions', '1.0.0', 'workspace'),
+      ($3, $4, 'workspace-b', 'Workspace B', 'active', 'ai-solutions', '1.0.0', 'workspace')
     ON CONFLICT (id) DO NOTHING
     `,
     [devFixtures.workspaceA, devFixtures.tenantA, devFixtures.workspaceB, devFixtures.tenantB]

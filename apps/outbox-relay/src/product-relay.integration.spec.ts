@@ -717,21 +717,21 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     expect(marker.rows[0]?.published_at).toBeInstanceOf(Date);
     expect(marker.rows[0]?.published_message_id).not.toBe(event.eventId);
     const effects = await ownerPool.query<{
-      organizations: string | null;
-      activities: string | null;
-      content_items: string | null;
+      organizations: string;
+      activities: string;
+      content_items: string;
       domain_events: string | null;
     }>(`
       SELECT
-        to_regclass('work.organizations')::text AS organizations,
-        to_regclass('work.activities')::text AS activities,
-        to_regclass('content.content_items')::text AS content_items,
+        (SELECT count(*)::text FROM work.organizations) AS organizations,
+        (SELECT count(*)::text FROM work.activities) AS activities,
+        (SELECT count(*)::text FROM content.content_items) AS content_items,
         to_regclass('ops.domain_events')::text AS domain_events
     `);
     expect(effects.rows[0]).toEqual({
-      organizations: null,
-      activities: null,
-      content_items: null,
+      organizations: "0",
+      activities: "0",
+      content_items: "0",
       domain_events: null
     });
   }, 15_000);

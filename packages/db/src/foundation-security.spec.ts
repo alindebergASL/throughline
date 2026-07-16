@@ -7,7 +7,7 @@ import {
 } from "@throughline/tenancy";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { applyMigrations } from "./migrations.js";
+import { applyMigrations as applyRepositoryMigrations } from "./migrations.js";
 import { seedWaveA2DeterministicData } from "./seed.js";
 import { provisionTestAppRole, provisionTestFoundationRoles } from "./test-database.js";
 import { bootstrapWorkerContextReference } from "./worker-bootstrap.js";
@@ -23,7 +23,11 @@ const migrationIds = [
   "0001_wave_a2_identity_access_rls.sql",
   "0002_foundation_closure_async_isolation.sql",
   "0003_b1_0_canonical_product_outbox.sql"
-];
+] as const;
+
+function applyMigrations(pool: pg.Pool, options: { reset?: boolean } = {}) {
+  return applyRepositoryMigrations(pool, { ...options, through: migrationIds[2] });
+}
 
 const ids = {
   aggregateA: "70000000-0000-7000-8000-000000000001",

@@ -17,6 +17,9 @@ const context = createDevSecurityContext("tenant-a-owner", { now });
 function buildService(roleRows: unknown[], roleFailure?: Error) {
   const order: string[] = [];
   const query = vi.fn(async (sql: string) => {
+    if (sql.includes("AS settings_cleared")) {
+      return { rows: [{ settings_cleared: true }], rowCount: 1 };
+    }
     if (sql === 'SELECT current_user AS "currentUser"') {
       order.push("role");
       if (roleFailure) throw roleFailure;
@@ -79,7 +82,7 @@ describe("FoundationProofService database role boundary", () => {
     ) as unknown as [string, unknown];
     expect(roleCall).toEqual(['SELECT current_user AS "currentUser"', undefined]);
     expect(authorization.canInTransaction).toHaveBeenCalledOnce();
-    expect(query.mock.calls.at(-1)?.[0]).toBe("COMMIT");
+    expect(query.mock.calls.some(([sql]) => sql === "COMMIT")).toBe(true);
     expect(client.release).toHaveBeenCalledOnce();
   });
 
@@ -110,7 +113,7 @@ describe("FoundationProofService database role boundary", () => {
     expect(rendered).not.toContain("secret-proof-key");
     expect(order).toEqual(["role"]);
     expect(authorization.canInTransaction).not.toHaveBeenCalled();
-    expect(query.mock.calls.at(-1)?.[0]).toBe("ROLLBACK");
+    expect(query.mock.calls.some(([sql]) => sql === "ROLLBACK")).toBe(true);
     expect(client.release).toHaveBeenCalledOnce();
   });
 

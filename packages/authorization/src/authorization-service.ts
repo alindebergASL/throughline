@@ -125,6 +125,10 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
       );
     }
 
+    if (isB1Action(action)) {
+      return b1Decision(tx, context, membership.role, action, resource, options);
+    }
+
     if (action === "tenant.read") {
       if (resource.type !== "tenant" || resource.id !== context.tenantId) {
         return deny(
@@ -218,6 +222,263 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
 
     return deny(context.policyVersion, "unsupported_action", "Action is not implemented in A2");
   }
+}
+
+const b1Actions = new Set<AuthorizationAction>([
+  "organization.create",
+  "organization.read",
+  "initiative.create",
+  "initiative.read",
+  "activity.create",
+  "activity.read",
+  "person.read",
+  "relationship.create",
+  "relationship.end",
+  "relationship.read",
+  "content.create",
+  "content.revise",
+  "content.read",
+  "source.capture",
+  "source.correct",
+  "source.tombstone",
+  "source.read"
+]);
+
+function isB1Action(action: AuthorizationAction): boolean {
+  return b1Actions.has(action);
+}
+
+async function b1Decision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  role: MembershipRole,
+  action: AuthorizationAction,
+  resource: ResourceRef,
+  options: AuthorizationDecisionOptions
+): Promise<AuthorizationDecision> {
+  if (action === "person.read") {
+    return personReadDecision(tx, context, role, resource, options.personUseSite);
+  }
+
+  const createActions = new Set<AuthorizationAction>([
+    "organization.create",
+    "initiative.create",
+    "activity.create",
+    "relationship.create",
+    "content.create",
+    "source.capture"
+  ]);
+  let spaceId: string | undefined;
+  let accessClass: "public" | "workspace" | "restricted" | "confidential" | undefined;
+  if (createActions.has(action)) {
+    if (resource.type !== "space") return nonLeakingB1Deny(context.policyVersion);
+    spaceId = resource.id;
+    const space = await tx.query<{ access_class: typeof accessClass }>(
+      `SELECT access_class FROM access.spaces
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND archived_at IS NULL LIMIT 1`,
+      [context.tenantId, context.workspaceId, spaceId]
+    );
+    accessClass = space.rows[0]?.access_class;
+  } else {
+    const loaded = await loadB1ResourceScope(tx, context, action, resource);
+    spaceId = loaded?.spaceId;
+    accessClass = loaded?.accessClass;
+  }
+  if (!spaceId || !accessClass || !canReadDataClass(context.dataClassCeiling, accessClass)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const readable = await canReadSpaceResource(tx, context, spaceId, role);
+  if (!readable.allowed) return nonLeakingB1Deny(context.policyVersion);
+
+  const readActions = new Set<AuthorizationAction>([
+    "organization.read",
+    "initiative.read",
+    "activity.read",
+    "relationship.read",
+    "content.read",
+    "source.read"
+  ]);
+  if (readActions.has(action)) {
+    return allow(
+      context.policyVersion,
+      "b1_resource_read",
+      options.explain ? "Current Space and data-class access allow this projection" : undefined,
+      [readable.reasonCode]
+    );
+  }
+  if (action === "source.tombstone" || action === "organization.create") {
+    return ownerOrAdminDecision(context.policyVersion, role, "b1_workspace_authority");
+  }
+  const contributor = await hasContributorAuthority(tx, context, spaceId, role);
+  return contributor
+    ? allow(context.policyVersion, "b1_contributor_authority", undefined, [readable.reasonCode])
+    : deny(context.policyVersion, "b1_resource_not_available");
+}
+
+async function loadB1ResourceScope(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  action: AuthorizationAction,
+  resource: ResourceRef
+): Promise<
+  | {
+      spaceId: string;
+      accessClass: "public" | "workspace" | "restricted" | "confidential";
+    }
+  | undefined
+> {
+  let table: string;
+  let expectedType: ResourceRef["type"];
+  if (action.startsWith("organization."))
+    [table, expectedType] = ["work.organizations", "organization"];
+  else if (action.startsWith("initiative."))
+    [table, expectedType] = ["work.initiatives", "initiative"];
+  else if (action.startsWith("activity.")) [table, expectedType] = ["work.activities", "activity"];
+  else if (action.startsWith("relationship."))
+    [table, expectedType] = ["work.relationships", "relationship"];
+  else if (action.startsWith("content."))
+    [table, expectedType] = ["content.content_items", "content_item"];
+  else if (action.startsWith("source."))
+    [table, expectedType] = ["content.source_artifacts", "source"];
+  else return undefined;
+  if (resource.type !== expectedType) return undefined;
+  const result = await tx.query<{
+    space_id: string;
+    access_class: "public" | "workspace" | "restricted" | "confidential";
+  }>(
+    table === "content.source_artifacts"
+      ? `SELECT source.space_id,
+           CASE GREATEST(
+             CASE space.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
+             CASE source.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END
+           ) WHEN 0 THEN 'public' WHEN 1 THEN 'workspace' WHEN 2 THEN 'restricted' ELSE 'confidential' END AS access_class
+         FROM content.source_artifacts source
+         JOIN access.spaces space ON space.tenant_id = source.tenant_id
+           AND space.workspace_id = source.workspace_id AND space.id = source.space_id
+         WHERE source.tenant_id = $1 AND source.workspace_id = $2 AND source.id = $3 LIMIT 1`
+      : `SELECT resource.space_id, space.access_class
+         FROM ${table} resource
+         JOIN access.spaces space ON space.tenant_id = resource.tenant_id
+           AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id
+         WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3 LIMIT 1`,
+    [context.tenantId, context.workspaceId, resource.id]
+  );
+  const row = result.rows[0];
+  return row ? { spaceId: row.space_id, accessClass: row.access_class } : undefined;
+}
+
+async function personReadDecision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  role: MembershipRole,
+  resource: ResourceRef,
+  useSite: ResourceRef | undefined
+): Promise<AuthorizationDecision> {
+  if (resource.type !== "person" || !useSite) return nonLeakingB1Deny(context.policyVersion);
+  let associationQuery: string;
+  let table: string;
+  if (useSite.type === "activity") {
+    table = "work.activities";
+    associationQuery = `resource.owner_person_id = $4 OR EXISTS (
+      SELECT 1 FROM work.activity_attendees attendee
+      WHERE attendee.tenant_id = resource.tenant_id AND attendee.workspace_id = resource.workspace_id
+        AND attendee.activity_id = resource.id AND attendee.person_id = $4)`;
+  } else if (useSite.type === "initiative") {
+    table = "work.initiatives";
+    associationQuery = `resource.owner_person_id = $4 OR EXISTS (
+      SELECT 1 FROM work.initiative_people contributor
+      WHERE contributor.tenant_id = resource.tenant_id AND contributor.workspace_id = resource.workspace_id
+        AND contributor.initiative_id = resource.id AND contributor.person_id = $4
+        AND contributor.ended_at IS NULL)`;
+  } else if (useSite.type === "relationship") {
+    table = "work.relationships";
+    associationQuery = `
+      (resource.subject_type = 'person' AND resource.subject_id = $4)
+      OR (resource.object_type = 'person' AND resource.object_id = $4)
+      OR (resource.context_type = 'person' AND resource.context_id = $4)`;
+  } else if (useSite.type === "organization") {
+    table = "work.organizations";
+    associationQuery = "true";
+  } else if (useSite.type === "content_item") {
+    table = "content.content_items";
+    associationQuery = "true";
+  } else if (useSite.type === "space") {
+    const result = await tx.query<{
+      space_id: string;
+      access_class: "public" | "workspace" | "restricted" | "confidential";
+    }>(
+      `SELECT space.id AS space_id, space.access_class
+       FROM access.spaces space
+       JOIN identity.people person ON person.tenant_id = space.tenant_id
+         AND person.workspace_id = space.workspace_id AND person.id = $4
+       WHERE space.tenant_id = $1 AND space.workspace_id = $2 AND space.id = $3
+         AND space.archived_at IS NULL LIMIT 1`,
+      [context.tenantId, context.workspaceId, useSite.id, resource.id]
+    );
+    const row = result.rows[0];
+    if (!row || !canReadDataClass(context.dataClassCeiling, row.access_class)) {
+      return nonLeakingB1Deny(context.policyVersion);
+    }
+    const readable = await canReadSpaceResource(tx, context, row.space_id, role);
+    return readable.allowed
+      ? allow(context.policyVersion, "person_use_site_read", undefined, [readable.reasonCode])
+      : nonLeakingB1Deny(context.policyVersion);
+  } else return nonLeakingB1Deny(context.policyVersion);
+  const result = await tx.query<{
+    space_id: string;
+    access_class: "public" | "workspace" | "restricted" | "confidential";
+  }>(
+    `SELECT resource.space_id, space.access_class
+     FROM ${table} resource
+     JOIN access.spaces space ON space.tenant_id = resource.tenant_id
+       AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id
+     JOIN identity.people person ON person.tenant_id = resource.tenant_id
+       AND person.workspace_id = resource.workspace_id AND person.id = $4
+     WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3
+       AND (${associationQuery}) LIMIT 1`,
+    [context.tenantId, context.workspaceId, useSite.id, resource.id]
+  );
+  const row = result.rows[0];
+  if (!row || !canReadDataClass(context.dataClassCeiling, row.access_class)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const readable = await canReadSpaceResource(tx, context, row.space_id, role);
+  return readable.allowed
+    ? allow(context.policyVersion, "person_use_site_read", undefined, [readable.reasonCode])
+    : nonLeakingB1Deny(context.policyVersion);
+}
+
+async function hasContributorAuthority(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  spaceId: string,
+  role: MembershipRole
+): Promise<boolean> {
+  if (role === "owner" || role === "admin") return true;
+  const result = await tx.query<{ allowed: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM access.access_relationships grant_record
+       WHERE grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
+         AND grant_record.resource_type = 'space' AND grant_record.resource_id = $3
+         AND grant_record.relation IN ('owner','manager','contributor')
+         AND ((grant_record.subject_type = 'membership' AND grant_record.subject_id = $4)
+           OR (grant_record.subject_type = 'user' AND grant_record.subject_id = $5))
+     ) AS allowed`,
+    [context.tenantId, context.workspaceId, spaceId, context.actorMembershipId, context.actorUserId]
+  );
+  return result.rows[0]?.allowed === true;
+}
+
+function canReadDataClass(
+  ceiling: "public" | "workspace" | "restricted" | "confidential",
+  resource: "public" | "workspace" | "restricted" | "confidential"
+): boolean {
+  const rank = { public: 0, workspace: 1, restricted: 2, confidential: 3 } as const;
+  return rank[resource] <= rank[ceiling];
+}
+
+function nonLeakingB1Deny(policyVersion: string): AuthorizationDecision {
+  return deny(policyVersion, "b1_resource_not_available");
 }
 
 async function productOutboxRelayPublishDecision(

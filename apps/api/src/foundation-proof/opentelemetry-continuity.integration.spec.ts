@@ -79,6 +79,9 @@ describe("Foundation OpenTelemetry continuity", () => {
     });
     const writes = new Map<string, readonly unknown[]>();
     const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      if (sql.includes("AS settings_cleared")) {
+        return { rows: [{ settings_cleared: true }], rowCount: 1 };
+      }
       if (sql === 'SELECT current_user AS "currentUser"') {
         return { rows: [{ currentUser: "throughline_app" }], rowCount: 1 };
       }

@@ -83,21 +83,33 @@ importers:
       '@nestjs/platform-fastify':
         specifier: ^11.1.5
         version: 11.1.27(@nestjs/common@11.1.27(reflect-metadata@0.2.2)(rxjs@7.8.2))(@nestjs/core@11.1.27(@nestjs/common@11.1.27(reflect-metadata@0.2.2)(rxjs@7.8.2))(reflect-metadata@0.2.2)(rxjs@7.8.2))
+      '@throughline/account-operations':
+        specifier: workspace:*
+        version: link:../../packages/account-operations
       '@throughline/authorization':
         specifier: workspace:*
         version: link:../../packages/authorization
+      '@throughline/content':
+        specifier: workspace:*
+        version: link:../../packages/content
       '@throughline/core-types':
         specifier: workspace:*
         version: link:../../packages/core-types
       '@throughline/db':
         specifier: workspace:*
         version: link:../../packages/db
+      '@throughline/domain-profiles':
+        specifier: workspace:*
+        version: link:../../packages/domain-profiles
       '@throughline/observability':
         specifier: workspace:*
         version: link:../../packages/observability
       '@throughline/tenancy':
         specifier: workspace:*
         version: link:../../packages/tenancy
+      '@throughline/work-graph':
+        specifier: workspace:*
+        version: link:../../packages/work-graph
       reflect-metadata:
         specifier: ^0.2.2
         version: 0.2.2
@@ -169,12 +181,27 @@ importers:
 
   packages/account-operations:
     dependencies:
+      '@throughline/authorization':
+        specifier: workspace:*
+        version: link:../authorization
+      '@throughline/content':
+        specifier: workspace:*
+        version: link:../content
       '@throughline/core-types':
         specifier: workspace:*
         version: link:../core-types
+      '@throughline/db':
+        specifier: workspace:*
+        version: link:../db
+      '@throughline/domain-profiles':
+        specifier: workspace:*
+        version: link:../domain-profiles
       '@throughline/work-graph':
         specifier: workspace:*
         version: link:../work-graph
+      zod:
+        specifier: ^4.0.14
+        version: 4.4.3
 
   packages/agent-runtime:
     dependencies:
@@ -205,6 +232,9 @@ importers:
       '@throughline/core-types':
         specifier: workspace:*
         version: link:../core-types
+      '@throughline/db':
+        specifier: workspace:*
+        version: link:../db
 
   packages/core-types: {}
 
@@ -291,6 +321,9 @@ importers:
       '@throughline/core-types':
         specifier: workspace:*
         version: link:../core-types
+      '@throughline/db':
+        specifier: workspace:*
+        version: link:../db
 
 packages:
 

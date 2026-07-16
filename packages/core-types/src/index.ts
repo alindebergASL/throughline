@@ -1,6 +1,7 @@
 export type AccessClass = "public" | "workspace" | "restricted" | "confidential";
 
 export * from "./domain-notification.js";
+export * from "./b1.js";
 
 export type Confidence = "confirmed" | "strong" | "weak" | "unknown";
 
@@ -30,7 +31,11 @@ export interface ResourceRef {
     | "user"
     | "membership"
     | "service_principal"
-    | "agent_principal";
+    | "agent_principal"
+    | "relationship"
+    | "content_item"
+    | "source"
+    | "source_chunk";
   id: string;
   spaceId?: string;
 }
@@ -131,7 +136,7 @@ export interface ServicePrincipal {
   tenantId: string;
   workspaceId: string;
   name: string;
-  purpose: "worker" | "connector" | "system";
+  purpose: "worker" | "connector" | "system" | "product_notification_relay";
   status: "active" | "disabled";
   createdAt: string;
   updatedAt: string;

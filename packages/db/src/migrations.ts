@@ -15,7 +15,7 @@ export interface MigrationRunResult {
 
 export async function applyMigrations(
   pool: PgPool,
-  options: { reset?: boolean } = {}
+  options: { reset?: boolean; through?: string } = {}
 ): Promise<MigrationRunResult> {
   const client = await pool.connect();
   const result: MigrationRunResult = { applied: [], skipped: [] };
@@ -28,6 +28,8 @@ export async function applyMigrations(
     if (options.reset) {
       await client.query("BEGIN");
       try {
+        await client.query("DROP SCHEMA IF EXISTS content CASCADE");
+        await client.query("DROP SCHEMA IF EXISTS work CASCADE");
         await client.query("DROP SCHEMA IF EXISTS access CASCADE");
         await client.query("DROP SCHEMA IF EXISTS identity CASCADE");
         await client.query("DROP SCHEMA IF EXISTS ops CASCADE");
@@ -41,7 +43,9 @@ export async function applyMigrations(
 
     await ensureMigrationJournal(client);
 
-    const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
+    const files = (await readdir(migrationsDir))
+      .filter((file) => file.endsWith(".sql") && (!options.through || file <= options.through))
+      .sort();
 
     for (const file of files) {
       const sql = await readFile(join(migrationsDir, file), "utf8");
