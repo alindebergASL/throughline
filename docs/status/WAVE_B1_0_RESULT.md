@@ -1,7 +1,7 @@
 # Wave B1.0 Result — Canonical Product Outbox Correction
 
 - **Date:** 2026-07-15
-- **Status:** corrected implementation plus timeout-observer and shared strict timestamp review fixes verified locally; final result-bearing regate, exact-head reviews, push, and CI pending
+- **Status:** reviewed implementation checkpoint passed the authoritative gate, detached verification, direct review, publication, and exact-head CI; PR remains open and unmerged on HOLD
 - **PR:** `alindebergASL/throughline#6`
 - **Authorized base:** `b454ae8c865c77639adbf82daf8963db67922ad6`
 - **Correction parent:** `7d385391d08e0fdd2605a628960ee920fe75c7ca`
@@ -15,8 +15,9 @@
 - **Strict calendar fix tree:** `0e540423877e2aee2e84e6886c0502d2b149e2a7`
 - **Canonical timestamp fix head:** `a82c5253552e9c1a672e5c14e7a583bcbeb40cd9`
 - **Canonical timestamp fix tree:** `babb7ecd2564facfe476cdf290efd094bd03327a`
+- **Reviewed implementation checkpoint:** `5ef2781c2c7acbcf01881fb4b2ce5d765699e878`
+- **Reviewed implementation tree:** `0b8689a9c5644f55573468ede5f3b2bc389addc8`
 - **Branch:** `b1-0-canonical-product-outbox`
-- **Local commits:** `e10fffd1abe264ae8e553ea2b8a8f17675c6988b`, `d82d4dc43b8ed452669dd2b492bc952fc97177eb`, `cd8a2d9c6f237937254bbe5d5f4b316364ea7fde`, `2ea00def3fa375f8da2a6b365d57f418dc8133d6`, `0630ccac7cc1ea8921e9856e2877fd02a7ca9d7e`, `e21a3d57629e8dd15c96590815a87cfd749c7e7a`, `b5ba93cc1d58d2073527a827702c914040f491da`, `a88e8cdaa17314bf111f3f86885d801c72cccaed`, `a82c5253552e9c1a672e5c14e7a583bcbeb40cd9`
 
 ## Scope and outcome
 
@@ -69,11 +70,11 @@ Artifacts include a temporary index, binary patch, source archive, changed-path 
 
 ## Fresh authoritative local gate
 
-A fresh disposable PostgreSQL database and LocalStack generation reran the complete gate after all review fixes on tree `babb7ecd2564facfe476cdf290efd094bd03327a` with `CI=1` and `TURBO_FORCE=true`.
+A fresh disposable PostgreSQL database and LocalStack generation reran the complete gate after all implementation and result-artifact bytes were finalized on tree `0b8689a9c5644f55573468ede5f3b2bc389addc8` with `CI=1` and `TURBO_FORCE=true`. That tree became reviewed implementation checkpoint `5ef2781c2c7acbcf01881fb4b2ce5d765699e878` without further byte changes.
 
 Run directory:
 
-`/home/ubuntu/.hermes/rollouts/throughline-pr6-correction-20260715/authoritative-gate-20260715T222742Z-296857`
+`/home/ubuntu/.hermes/rollouts/throughline-pr6-correction-20260715/authoritative-gate-20260715T224542Z-314660`
 
 | Command | Result | Evidence |
 | --- | ---: | --- |
@@ -102,12 +103,12 @@ The gate recorded identical start and end trees, an exact migration journal, zer
 
 Evidence hashes:
 
-- summary: `d0a6bbeacde68bded98a672e3f10d64e3216aa1b88f4fd28d5c3818fea3978ee`
-- cleanup: `f026296a24d52f8bb84993b75e51fb357eefa95ac7ae9a9e065ea5a7de731251`
-- ordinary test log: `09aa4e8c4e8ca58913d73f30bc28e160a8ce7d9206a15333bef8ea48b088c982`
-- security log: `554fa780de9eeec1e641b27118bd808b8bf8f7a781481c61dd1fd645da80417e`
-- Foundation log: `60b5bbf5cf4562d88fdc5f0b37ccd4e09e453996e20a314dbdc8383e26bc1330`
-- B1.0 log: `c8fda1913e3a5e4a5c7fb7aa90518b36e57bc4cfc2b2492c29f772f77669e905`
+- summary: `9d5a643b7c50845b20ea28c62e7ebe712f91c179ae6416619efb3c76e63605ad`
+- cleanup: `743e6766e0f207c4507197b28202476fb3c3355d9a7c7fef3cb9ca3f1f7ea372`
+- ordinary test log: `43ee535246e96a4986ae76286dfd20da10f52f766155078a75eede7a57b3beec`
+- security log: `e20aef71699b4155895b792a44c1a8890ed81cf8dcd845ca35f194bc15dd486e`
+- Foundation log: `c504a0cb2fb86e1293056340f927ff4697016eb0982927810ef36c7b8014def1`
+- B1.0 log: `87cb8efe3b88b878fd3faa0a95d0b600aa804caddd0e0021f00dfa0125536b9f`
 - migration journal: `478ace56c08a6ea10d79e15aea1758fcf6a6349e39d02969237486fc7ab4bc43`
 
 ## Cleanup
@@ -150,15 +151,14 @@ After the last implementation byte changed, the complete authoritative gate was 
 
 ## Review and publication state
 
-At the time this result was updated:
+Reviewed implementation checkpoint `5ef2781c2c7acbcf01881fb4b2ce5d765699e878` completed every authorized publication gate:
 
-- nine bounded local correction/evidence commits existed through `a82c5253552e9c1a672e5c14e7a583bcbeb40cd9`;
-- the first detached gate on `d82d4dc43b8ed452669dd2b492bc952fc97177eb` returned HOLD on the unhandled-rejection blocker;
-- a direct read-only review of `d82d4dc43b8ed452669dd2b492bc952fc97177eb` found no source-level blocker before that timing-dependent test-authority failure was observed;
-- the detached full gate on `2ea00def3fa375f8da2a6b365d57f418dc8133d6` passed, but its concurrent direct review found the semantic timestamp blocker described above;
-- fresh detached and direct read-only reviews of the final result-bearing head remained pending;
-- no correction commit had been pushed;
-- no exact-head GitHub Actions result existed for the correction; and
-- no merge, deployment, B1 start, Kanban enablement, AWS access, or runtime-host access occurred.
+- the complete authoritative PostgreSQL/LocalStack gate passed on exact tree `0b8689a9c5644f55573468ede5f3b2bc389addc8` with zero authoritative skips and zero unhandled errors;
+- the detached exact-head authoritative verifier passed on the same head and tree; its summary SHA-256 is `7a25a000ca9ef1439a896d1d7fad624daadc30bd9d89660f1883629690bdb760` and cleanup SHA-256 is `40a083fb7f237afb06842842f813807f8f2073d2f812b42f1bb5e8a8d88a3df2`;
+- the direct read-only exact-head reviewer returned PASS with no actionable regressions or correctness issues; report SHA-256: `345bb08eaebe18d591437d2c190dbea21ef8d47077c88684854d2ec81c6a823e`;
+- the branch was pushed normally and PR #6 advanced to that exact head; and
+- GitHub Actions run `29458169560` completed successfully on that exact head (`verify`, job `87495840518`).
 
-PR #6 remains on HOLD until the result-bearing tree passes the complete gate, bounded commits are created, both exact-head reviews return PASS, the branch is pushed normally, and GitHub Actions succeeds on that exact head. The required stop point remains before merge.
+The historical failed and intermediate review attempts above remain evidence of the correction path; none is substituted for the final exact-head passes.
+
+PR #6 is open, cleanly mergeable, and unmerged. Publication gates are complete for reviewed implementation checkpoint `5ef2781c2c7acbcf01881fb4b2ce5d765699e878`, but merge, deployment, release, B1 implementation, real Kanban dispatch, AWS/runtime access, canonical-document changes, and accepted-ADR changes remain explicitly on HOLD. This docs-only child correction intentionally does not name its own commit; its exact SHA and tree must be bound through the PR description and durable checkpoint only after exact-new-head CI succeeds.
