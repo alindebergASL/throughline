@@ -36,6 +36,11 @@ export interface SourceChunkProjection extends DeterministicSourceChunk {
   accessClass: AccessClass;
 }
 
+export interface SourceArtifactScope {
+  id: string;
+  spaceId: string;
+}
+
 interface SourceArtifactRow {
   id: string;
   space_id: string;
@@ -85,6 +90,23 @@ export class ContentInvariantError extends Error {
 
 export class ContentRepository {
   constructor(private readonly tx: TenantDbTransaction) {}
+
+  async getSourceScope(
+    tenantId: string,
+    workspaceId: string,
+    sourceArtifactId: string
+  ): Promise<SourceArtifactScope> {
+    const result = await this.tx.query<{ id: string; space_id: string }>(
+      `SELECT id, space_id
+       FROM content.source_artifacts
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
+       LIMIT 1`,
+      [tenantId, workspaceId, sourceArtifactId]
+    );
+    const row = result.rows[0];
+    if (!row) throw new ContentInvariantError("Source is unavailable");
+    return { id: row.id, spaceId: row.space_id };
+  }
 
   async getContentItemScope(
     tenantId: string,

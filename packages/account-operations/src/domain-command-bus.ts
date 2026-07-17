@@ -158,20 +158,18 @@ export class AccountOperationsDomainCommandBus {
           ).spaceId;
         case "source.correct":
           return (
-            await new ContentRepository(tx).getSource(
+            await new ContentRepository(tx).getSourceScope(
               context.tenantId,
               context.workspaceId,
-              command.payload.predecessorSourceArtifactId,
-              false
+              command.payload.predecessorSourceArtifactId
             )
           ).spaceId;
         case "source.tombstone":
           return (
-            await new ContentRepository(tx).getSource(
+            await new ContentRepository(tx).getSourceScope(
               context.tenantId,
               context.workspaceId,
-              command.payload.sourceArtifactId,
-              false
+              command.payload.sourceArtifactId
             )
           ).spaceId;
       }
@@ -966,6 +964,16 @@ export class AccountOperationsDomainCommandBus {
         return result;
       }
       case "source.correct": {
+        const predecessorResource = {
+          type: "source" as const,
+          id: command.payload.predecessorSourceArtifactId
+        };
+        await this.authorize(tx, context, "source.read", predecessorResource, {
+          lockAuthority: true
+        });
+        await this.authorize(tx, context, "source.correct", predecessorResource, {
+          lockAuthority: true
+        });
         const initialActivityLink = await content.resolveSourceActivityLinkForCorrection(
           context.tenantId,
           context.workspaceId,
@@ -985,10 +993,6 @@ export class AccountOperationsDomainCommandBus {
           activityId
         );
         if (activity.spaceId !== reservationSpaceId) throw new B1CommandInvariantError();
-        await this.authorize(tx, context, "source.correct", {
-          type: "source",
-          id: command.payload.predecessorSourceArtifactId
-        });
         const reservation = await reserveCommand(
           domain.commands,
           command,
@@ -1004,6 +1008,12 @@ export class AccountOperationsDomainCommandBus {
           reservationSpaceId,
           command.payload.predecessorSourceArtifactId
         );
+        if (
+          predecessor.id !== command.payload.predecessorSourceArtifactId ||
+          predecessor.spaceId !== reservationSpaceId
+        ) {
+          throw new B1CommandInvariantError();
+        }
         await content.revalidateSourceActivityLinkForCorrection({
           tenantId: context.tenantId,
           workspaceId: context.workspaceId,
@@ -1011,7 +1021,13 @@ export class AccountOperationsDomainCommandBus {
           activityId,
           sourceArtifactId: predecessor.id
         });
-        await this.authorize(tx, context, "source.correct", { type: "source", id: predecessor.id });
+        const currentPredecessorResource = { type: "source" as const, id: predecessor.id };
+        await this.authorize(tx, context, "source.read", currentPredecessorResource, {
+          lockAuthority: true
+        });
+        await this.authorize(tx, context, "source.correct", currentPredecessorResource, {
+          lockAuthority: true
+        });
         const space = await graph.getSpace(
           context.tenantId,
           context.workspaceId,
@@ -1093,13 +1109,34 @@ export class AccountOperationsDomainCommandBus {
         return result;
       }
       case "source.tombstone": {
+        const sourceResource = {
+          type: "source" as const,
+          id: command.payload.sourceArtifactId
+        };
+        await this.authorize(tx, context, "source.read", sourceResource, {
+          lockAuthority: true
+        });
+        await this.authorize(tx, context, "source.tombstone", sourceResource, {
+          lockAuthority: true
+        });
         const source = await content.lockSource(
           context.tenantId,
           context.workspaceId,
           command.payload.sourceArtifactId
         );
-        if (source.spaceId !== reservationSpaceId) throw new B1CommandInvariantError();
-        await this.authorize(tx, context, "source.tombstone", { type: "source", id: source.id });
+        if (
+          source.id !== command.payload.sourceArtifactId ||
+          source.spaceId !== reservationSpaceId
+        ) {
+          throw new B1CommandInvariantError();
+        }
+        const currentSourceResource = { type: "source" as const, id: source.id };
+        await this.authorize(tx, context, "source.read", currentSourceResource, {
+          lockAuthority: true
+        });
+        await this.authorize(tx, context, "source.tombstone", currentSourceResource, {
+          lockAuthority: true
+        });
         const reservation = await reserveCommand(
           domain.commands,
           command,
