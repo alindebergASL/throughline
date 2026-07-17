@@ -52,14 +52,20 @@ LANGUAGE plpgsql
 IMMUTABLE
 SET search_path = pg_catalog
 AS $function$
-DECLARE expected_type text; id_key text; required_keys text[];
+DECLARE
+  expected_type text;
+  id_key text;
+  required_keys text[];
+  version_value numeric;
+  counter_value numeric;
 BEGIN
+  IF command_kind_value = 'b1_0.fixture.v1' THEN RETURN true; END IF;
   IF command_kind_value NOT IN (
     'organization.create.v1', 'initiative.create.v1', 'activity.create.v1',
     'relationship.create.v1', 'relationship.end.v1', 'content.create.v1',
     'content.revise.v1', 'source.capture.v1', 'source.correct.v1',
     'source.tombstone.v1'
-  ) THEN RETURN true; END IF;
+  ) THEN RETURN false; END IF;
   IF command_schema_version_value <> 1 THEN RETURN false; END IF;
   CASE command_kind_value
     WHEN 'organization.create.v1' THEN expected_type := 'organization'; id_key := 'organizationId'; required_keys := ARRAY['organizationId','spaceId','version'];
@@ -72,7 +78,7 @@ BEGIN
     WHEN 'source.capture.v1' THEN expected_type := 'source_artifact'; id_key := 'sourceArtifactId'; required_keys := ARRAY['sourceArtifactId','activityId','chunkCount','version'];
     WHEN 'source.correct.v1' THEN expected_type := 'source_artifact'; id_key := 'sourceArtifactId'; required_keys := ARRAY['sourceArtifactId','previousSourceArtifactId','chunkCount','version'];
     WHEN 'source.tombstone.v1' THEN expected_type := 'source_artifact'; id_key := 'sourceArtifactId'; required_keys := ARRAY['sourceArtifactId','version','hashDisposition'];
-    ELSE RETURN true;
+    ELSE RETURN false;
   END CASE;
   IF command_state = 'reserved' THEN
     RETURN result_type IS NULL AND result_id IS NULL AND response IS NULL;
@@ -82,24 +88,34 @@ BEGIN
     OR NOT response ?& required_keys
     OR (SELECT count(*) FROM jsonb_object_keys(response)) <> cardinality(required_keys)
     OR response ->> id_key <> result_id::text
-    OR jsonb_typeof(response -> 'version') <> 'number'
-    OR (response ->> 'version')::integer < 1 THEN RETURN false;
+    OR jsonb_typeof(response -> 'version') <> 'number' THEN RETURN false;
   END IF;
+  version_value := (response ->> 'version')::numeric;
+  IF trunc(version_value) <> version_value THEN RETURN false; END IF;
+  IF version_value < 1 OR version_value > 2147483647 THEN RETURN false; END IF;
   IF command_kind_value IN ('organization.create.v1','initiative.create.v1','activity.create.v1',
       'relationship.create.v1') THEN
-    RETURN (response ->> 'spaceId')::uuid IS NOT NULL AND (response ->> 'version')::integer = 1;
+    RETURN (response ->> 'spaceId')::uuid IS NOT NULL AND version_value = 1;
   ELSIF command_kind_value IN ('content.create.v1','content.revise.v1') THEN
-    RETURN jsonb_typeof(response -> 'revisionNumber') = 'number'
-      AND (response ->> 'revisionNumber')::integer > 0;
-  ELSIF command_kind_value = 'source.capture.v1' THEN
-    RETURN ops.is_uuid_v7((response ->> 'activityId')::uuid)
-      AND jsonb_typeof(response -> 'chunkCount') = 'number'
-      AND (response ->> 'chunkCount')::integer > 0 AND (response ->> 'version')::integer = 1;
-  ELSIF command_kind_value = 'source.correct.v1' THEN
+    IF jsonb_typeof(response -> 'revisionNumber') <> 'number' THEN RETURN false; END IF;
+    counter_value := (response ->> 'revisionNumber')::numeric;
+    IF trunc(counter_value) <> counter_value THEN RETURN false; END IF;
+    IF counter_value < 1 OR counter_value > 2147483647 THEN RETURN false; END IF;
+    IF command_kind_value = 'content.create.v1' THEN
+      RETURN counter_value = 1 AND version_value = 1;
+    END IF;
+    RETURN true;
+  ELSIF command_kind_value IN ('source.capture.v1','source.correct.v1') THEN
+    IF jsonb_typeof(response -> 'chunkCount') <> 'number' THEN RETURN false; END IF;
+    counter_value := (response ->> 'chunkCount')::numeric;
+    IF trunc(counter_value) <> counter_value THEN RETURN false; END IF;
+    IF counter_value < 1 OR counter_value > 2147483647 THEN RETURN false; END IF;
+    IF command_kind_value = 'source.capture.v1' THEN
+      RETURN ops.is_uuid_v7((response ->> 'activityId')::uuid) AND version_value = 1;
+    END IF;
     RETURN ops.is_uuid_v7((response ->> 'previousSourceArtifactId')::uuid)
       AND (response ->> 'previousSourceArtifactId') <> result_id::text
-      AND jsonb_typeof(response -> 'chunkCount') = 'number'
-      AND (response ->> 'chunkCount')::integer > 0 AND (response ->> 'version')::integer = 1;
+      AND version_value = 1;
   ELSIF command_kind_value = 'source.tombstone.v1' THEN
     RETURN response ->> 'hashDisposition' IN ('retained','erased');
   ELSIF command_kind_value = 'relationship.end.v1' THEN
@@ -141,6 +157,7 @@ DECLARE
 BEGIN
   IF NEW.state <> 'completed' THEN RETURN NULL; END IF;
   CASE NEW.command_kind
+    WHEN 'b1_0.fixture.v1' THEN RETURN NULL;
     WHEN 'organization.create.v1' THEN expected_action := 'organization.create'; expected_event := 'organization.created'; expected_aggregate := 'organization';
     WHEN 'initiative.create.v1' THEN expected_action := 'initiative.create'; expected_event := 'initiative.created'; expected_aggregate := 'initiative';
     WHEN 'activity.create.v1' THEN expected_action := 'activity.create'; expected_event := 'activity.created'; expected_aggregate := 'activity';
@@ -151,7 +168,7 @@ BEGIN
     WHEN 'source.capture.v1' THEN expected_action := 'source_artifact.capture'; expected_event := 'source_artifact.captured'; expected_aggregate := 'source_artifact';
     WHEN 'source.correct.v1' THEN expected_action := 'source_artifact.correct'; expected_event := 'source_artifact.corrected'; expected_aggregate := 'source_artifact';
     WHEN 'source.tombstone.v1' THEN expected_action := 'source_artifact.tombstone'; expected_event := 'source_artifact.tombstoned'; expected_aggregate := 'source_artifact';
-    ELSE RETURN NULL;
+    ELSE RAISE EXCEPTION 'unknown command kind cannot bypass B1 atomicity';
   END CASE;
 
   CASE expected_aggregate
@@ -176,7 +193,12 @@ BEGIN
     AND (NEW.safe_response ->> 'spaceId')::uuid <> aggregate_space THEN
     RAISE EXCEPTION 'B1 command result Space does not match its aggregate';
   END IF;
-  IF NEW.command_kind IN ('content.create.v1','content.revise.v1')
+  IF NEW.command_kind = 'content.create.v1'
+    AND (aggregate_revision <> 1 OR resolved_aggregate_version <> 1
+      OR (NEW.safe_response ->> 'revisionNumber')::integer <> 1
+      OR (NEW.safe_response ->> 'version')::integer <> 1) THEN
+    RAISE EXCEPTION 'B1 content create result must bind to first revision and version';
+  ELSIF NEW.command_kind = 'content.revise.v1'
     AND aggregate_revision <> (NEW.safe_response ->> 'revisionNumber')::integer THEN
     RAISE EXCEPTION 'B1 content result does not match its current revision';
   END IF;

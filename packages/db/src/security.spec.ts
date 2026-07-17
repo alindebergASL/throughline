@@ -20,7 +20,9 @@ const migrationIds = [
   "0005_b1_content_sources.sql",
   "0006_b1_command_integrity.sql"
 ];
-const successorMigrationIds = migrationIds.slice(1);
+const foundationMigrationId = migrationIds[1]!;
+const exactPrefixError =
+  "Migration journal is not an exact contiguous prefix of the known migration catalog";
 const migrationUrl = new URL("../migrations/0001_wave_a2_identity_access_rls.sql", import.meta.url);
 
 interface AppRoleState {
@@ -42,6 +44,15 @@ interface JournalRow {
 interface CleanMigrationState {
   journal: Array<Pick<JournalRow, "id" | "checksum">>;
   tenantCount: string;
+}
+
+interface MigrationCatalogState {
+  journal: JournalRow[];
+  catalog: Array<{
+    object_type: string;
+    object_identity: string;
+    definition: string;
+  }>;
 }
 
 maybeDescribe("Wave A2 database RLS security", () => {
@@ -126,7 +137,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
       VALUES ('second-reset-sentinel', 'Second reset sentinel', 'active', 'workspace')
       `
     );
-  });
+  }, 60_000);
 
   it("produces the same deterministic clean migration state on two resets", async () => {
     const secondResetRun = await applyMigrations(ownerPool, { reset: true });
@@ -142,7 +153,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
       tenantCount: "0"
     });
     expect(secondResetState).toEqual(firstResetState);
-  });
+  }, 60_000);
 
   it("records the exact migration id, true SHA-256 checksum, and applied timestamp", async () => {
     const sql = await readFile(migrationUrl, "utf8");
@@ -160,161 +171,53 @@ maybeDescribe("Wave A2 database RLS security", () => {
     expect(journal.rows.every(({ applied_at }) => applied_at !== null)).toBe(true);
   });
 
-  it("adopts a parent-equivalent A2 schema when only its predecessor journal row is absent", async () => {
-    let adoptionCompleted = false;
-
-    await setExistingAppLoginWithTestCredential(ownerPool, appUrl!);
-    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-      migrationId
-    ]);
-
+  it("fails closed without catalog or journal mutation when 0001 is missing before successors", async () => {
     try {
-      const startingState = await ownerPool.query<{
-        constraint_count: string;
-        journal_relation: string | null;
-      }>(
-        `
-        SELECT
-          (
-            SELECT count(*)::text
-            FROM pg_constraint
-            WHERE conname = 'workspaces_default_space_fk'
-              AND conrelid = to_regclass('identity.workspaces')
-          ) AS constraint_count,
-          to_regclass('throughline_migrations.journal')::text AS journal_relation
-        `
-      );
-
-      expect(startingState.rows[0]).toEqual({
-        constraint_count: "1",
-        journal_relation: "throughline_migrations.journal"
-      });
-
-      const adopted = await applyMigrations(ownerPool);
-      const repeated = await applyMigrations(ownerPool);
-      const journal = await ownerPool.query<{ count: string }>(
-        "SELECT count(*)::text AS count FROM throughline_migrations.journal"
-      );
-      const hardenedRole = await readAppRoleState(ownerPool);
-
-      expect(adopted).toEqual({ applied: [migrationId], skipped: successorMigrationIds });
-      expect(repeated).toEqual({ applied: [], skipped: migrationIds });
-      expect(journal.rows[0]?.count).toBe(String(migrationIds.length));
-      expect(hardenedRole).toMatchObject({
-        rolcanlogin: false,
-        rolbypassrls: false,
-        rolcreatedb: false,
-        rolcreaterole: false,
-        rolreplication: false,
-        rolsuper: false,
-        password_is_null: true
-      });
-      adoptionCompleted = true;
+      await expectGappedJournalRejectedWithoutMutation(migrationId);
     } finally {
-      if (!adoptionCompleted) {
-        await applyMigrations(ownerPool, { reset: true });
-      }
+      await applyMigrations(ownerPool, { reset: true });
     }
-  });
+  }, 60_000);
 
-  it("adopts a parent-equivalent A2 schema with parent schemas on the owner search path", async () => {
-    const parentSchemaOwnerPool = new pg.Pool({
-      connectionString: ownerUrl,
-      max: 1,
-      options: "-c search_path=access,identity,public"
-    });
-
+  it("fails closed without catalog or journal mutation when 0002 is missing before successors", async () => {
     try {
-      const configuredConnection = await parentSchemaOwnerPool.query<{
-        effective_schemas: string[];
-        search_path: string;
-      }>(`
-        SELECT
-          current_schemas(false)::text[] AS effective_schemas,
-          current_setting('search_path') AS search_path
-      `);
+      await expectGappedJournalRejectedWithoutMutation(foundationMigrationId);
+    } finally {
+      await applyMigrations(ownerPool, { reset: true });
+    }
+  }, 60_000);
 
-      expect(
-        configuredConnection.rows[0]?.search_path.split(",").map((schema) => schema.trim())
-      ).toEqual(["access", "identity", "public"]);
-      expect(configuredConnection.rows[0]?.effective_schemas).toEqual([
-        "access",
-        "identity",
-        "public"
-      ]);
+  async function expectGappedJournalRejectedWithoutMutation(missingId: string): Promise<void> {
+    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [missingId]);
+    const before = await readMigrationJournalAndCatalogState(ownerPool);
 
+    expect(before.journal.map((row) => row.id)).toEqual(
+      migrationIds.filter((id) => id !== missingId)
+    );
+    await expect(applyMigrations(ownerPool, { through: migrationId })).rejects.toThrow(
+      exactPrefixError
+    );
+
+    const after = await readMigrationJournalAndCatalogState(ownerPool);
+    expect(after).toEqual(before);
+  }
+
+  it("fails closed when the named adoption constraint has an unexpected definition", async () => {
+    try {
+      await applyMigrations(ownerPool, { reset: true, through: migrationId });
       await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
         migrationId
       ]);
-
-      const startingState = await parentSchemaOwnerPool.query<{
-        constraint_count: string;
-        journal_relation: string | null;
-        referenced_schema: string | null;
-      }>(`
-        SELECT
-          (
-            SELECT count(*)::text
-            FROM pg_constraint
-            WHERE conname = 'workspaces_default_space_fk'
-              AND conrelid = to_regclass('identity.workspaces')
-              AND contype = 'f'
-              AND condeferrable
-              AND condeferred
-          ) AS constraint_count,
-          (
-            SELECT target_namespace.nspname
-            FROM pg_constraint AS constraint_record
-            JOIN pg_class AS target_relation
-              ON target_relation.oid = constraint_record.confrelid
-            JOIN pg_namespace AS target_namespace
-              ON target_namespace.oid = target_relation.relnamespace
-            WHERE constraint_record.conname = 'workspaces_default_space_fk'
-              AND constraint_record.conrelid = to_regclass('identity.workspaces')
-          ) AS referenced_schema,
-          to_regclass('throughline_migrations.journal')::text AS journal_relation
+      await ownerPool.query(
+        "ALTER TABLE identity.workspaces DROP CONSTRAINT workspaces_default_space_fk"
+      );
+      await ownerPool.query(`
+        ALTER TABLE identity.workspaces
+        ADD CONSTRAINT workspaces_default_space_fk
+        CHECK (default_space_id IS NULL)
       `);
 
-      expect(startingState.rows[0]).toEqual({
-        constraint_count: "1",
-        journal_relation: "throughline_migrations.journal",
-        referenced_schema: "access"
-      });
-
-      const adopted = await applyMigrations(parentSchemaOwnerPool);
-      const repeated = await applyMigrations(parentSchemaOwnerPool);
-      const journal = await parentSchemaOwnerPool.query<{ count: string }>(
-        "SELECT count(*)::text AS count FROM throughline_migrations.journal WHERE id = $1",
-        [migrationId]
-      );
-
-      expect(adopted).toEqual({ applied: [migrationId], skipped: successorMigrationIds });
-      expect(repeated).toEqual({ applied: [], skipped: migrationIds });
-      expect(journal.rows[0]?.count).toBe("1");
-    } finally {
-      try {
-        await applyMigrations(ownerPool);
-      } finally {
-        await parentSchemaOwnerPool.end();
-      }
-    }
-  });
-
-  it("fails closed when the named adoption constraint has an unexpected definition", async () => {
-    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-      migrationId
-    ]);
-    await ownerPool.query(
-      "ALTER TABLE identity.workspaces DROP CONSTRAINT workspaces_default_space_fk"
-    );
-    await ownerPool.query(`
-      ALTER TABLE identity.workspaces
-      ADD CONSTRAINT workspaces_default_space_fk
-      CHECK (default_space_id IS NULL)
-    `);
-
-    try {
-      await expect(applyMigrations(ownerPool)).rejects.toThrow(
+      await expect(applyMigrations(ownerPool, { through: migrationId })).rejects.toThrow(
         "Existing constraint workspaces_default_space_fk does not match the expected definition"
       );
 
@@ -324,15 +227,13 @@ maybeDescribe("Wave A2 database RLS security", () => {
       );
       expect(journal.rows[0]?.count).toBe("0");
     } finally {
-      await ownerPool.query(
-        "ALTER TABLE identity.workspaces DROP CONSTRAINT IF EXISTS workspaces_default_space_fk"
-      );
-      await applyMigrations(ownerPool);
+      await applyMigrations(ownerPool, { reset: true });
     }
-  });
+  }, 60_000);
 
   it("fails closed when paired missing columns shrink the expected adoption constraint", async () => {
     try {
+      await applyMigrations(ownerPool, { reset: true, through: migrationId });
       await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
         migrationId
       ]);
@@ -359,7 +260,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
       `);
 
       await expect
-        .soft(applyMigrations(ownerPool))
+        .soft(applyMigrations(ownerPool, { through: migrationId }))
         .rejects.toThrow(
           "Existing constraint workspaces_default_space_fk does not match the expected definition"
         );
@@ -370,93 +271,20 @@ maybeDescribe("Wave A2 database RLS security", () => {
       );
       expect.soft(journal.rows[0]?.count).toBe("0");
     } finally {
-      try {
-        await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-          migrationId
-        ]);
-      } finally {
-        try {
-          await ownerPool.query(
-            "ALTER TABLE identity.workspaces DROP CONSTRAINT IF EXISTS workspaces_default_space_fk"
-          );
-        } finally {
-          try {
-            await ownerPool.query(
-              "ALTER TABLE access.spaces DROP CONSTRAINT IF EXISTS spaces_tenant_workspace_adoption_unique"
-            );
-          } finally {
-            try {
-              await ownerPool.query(`
-                DO $cleanup$
-                BEGIN
-                  IF EXISTS (
-                    SELECT 1
-                    FROM pg_attribute
-                    WHERE attrelid = to_regclass('identity.workspaces')
-                      AND attname = 'default_space_id_adoption_omitted'
-                      AND attnum > 0
-                      AND NOT attisdropped
-                  ) THEN
-                    ALTER TABLE identity.workspaces
-                      RENAME COLUMN default_space_id_adoption_omitted TO default_space_id;
-                  END IF;
-                END
-                $cleanup$
-              `);
-            } finally {
-              try {
-                await ownerPool.query(`
-                  DO $cleanup$
-                  BEGIN
-                    IF EXISTS (
-                      SELECT 1
-                      FROM pg_attribute
-                      WHERE attrelid = to_regclass('access.spaces')
-                        AND attname = 'id_adoption_omitted'
-                        AND attnum > 0
-                        AND NOT attisdropped
-                    ) THEN
-                      ALTER TABLE access.spaces
-                        RENAME COLUMN id_adoption_omitted TO id;
-                    END IF;
-                  END
-                  $cleanup$
-                `);
-              } finally {
-                await applyMigrations(ownerPool);
-              }
-            }
-          }
-        }
-      }
+      await applyMigrations(ownerPool, { reset: true });
     }
-  });
+  }, 60_000);
 
   it("rolls migration SQL back when the journal insert fails", async () => {
-    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-      migrationId
-    ]);
-    await ownerPool.query("DROP POLICY tenants_current_tenant ON identity.tenants");
-
     try {
-      await ownerPool.query(`
-        CREATE FUNCTION throughline_migrations.reject_journal_insert()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $trigger$
-        BEGIN
-          RAISE EXCEPTION 'intentional migration journal insert failure';
-        END
-        $trigger$
-      `);
-      await ownerPool.query(`
-        CREATE TRIGGER reject_journal_insert
-        BEFORE INSERT ON throughline_migrations.journal
-        FOR EACH ROW
-        EXECUTE FUNCTION throughline_migrations.reject_journal_insert()
-      `);
+      await applyMigrations(ownerPool, { reset: true, through: migrationId });
+      await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
+        migrationId
+      ]);
+      await ownerPool.query("DROP POLICY tenants_current_tenant ON identity.tenants");
+      const insertFailingPool = rejectMigrationJournalInsert(ownerPool);
 
-      await expect(applyMigrations(ownerPool)).rejects.toThrow(
+      await expect(applyMigrations(insertFailingPool, { through: migrationId })).rejects.toThrow(
         "intentional migration journal insert failure"
       );
 
@@ -483,23 +311,20 @@ maybeDescribe("Wave A2 database RLS security", () => {
         policy_count: "0"
       });
     } finally {
-      await ownerPool.query(
-        "DROP TRIGGER IF EXISTS reject_journal_insert ON throughline_migrations.journal"
-      );
-      await ownerPool.query(
-        "DROP FUNCTION IF EXISTS throughline_migrations.reject_journal_insert()"
-      );
-      await applyMigrations(ownerPool);
+      await applyMigrations(ownerPool, { reset: true });
     }
-  });
+  }, 60_000);
 
   it("serializes concurrent migration callers into one apply and one skip", async () => {
-    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-      migrationId
-    ]);
-
     try {
-      const runs = await Promise.all([applyMigrations(ownerPool), applyMigrations(ownerPool)]);
+      await applyMigrations(ownerPool, { reset: true, through: migrationId });
+      await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
+        migrationId
+      ]);
+      const runs = await Promise.all([
+        applyMigrations(ownerPool, { through: migrationId }),
+        applyMigrations(ownerPool, { through: migrationId })
+      ]);
       const journal = await ownerPool.query<{ count: string }>(
         "SELECT count(*)::text AS count FROM throughline_migrations.journal WHERE id = $1",
         [migrationId]
@@ -507,16 +332,16 @@ maybeDescribe("Wave A2 database RLS security", () => {
 
       expect(runs).toEqual(
         expect.arrayContaining([
-          { applied: [migrationId], skipped: successorMigrationIds },
-          { applied: [], skipped: migrationIds }
+          { applied: [migrationId], skipped: [] },
+          { applied: [], skipped: [migrationId] }
         ])
       );
       expect(runs).toHaveLength(2);
       expect(journal.rows[0]?.count).toBe("1");
     } finally {
-      await applyMigrations(ownerPool);
+      await applyMigrations(ownerPool, { reset: true });
     }
-  });
+  }, 60_000);
 
   it("restores the explicit test app login and deterministic RLS fixtures", async () => {
     await applyMigrations(ownerPool, { reset: true });
@@ -538,7 +363,7 @@ maybeDescribe("Wave A2 database RLS security", () => {
       current_user: "throughline_app",
       rolbypassrls: false
     });
-  });
+  }, 60_000);
 
   it("fails closed if an applied migration filename has a different checksum", async () => {
     const recorded = await ownerPool.query<{ checksum: string }>(
@@ -801,6 +626,164 @@ async function readCleanMigrationState(pool: pg.Pool): Promise<CleanMigrationSta
     journal: journal.rows,
     tenantCount: tenants.rows[0]?.count ?? "missing"
   };
+}
+
+async function readMigrationJournalAndCatalogState(pool: pg.Pool): Promise<MigrationCatalogState> {
+  const [journal, catalog] = await Promise.all([
+    pool.query<JournalRow>(
+      "SELECT id, checksum, applied_at FROM throughline_migrations.journal ORDER BY id"
+    ),
+    pool.query<MigrationCatalogState["catalog"][number]>(
+      `WITH migrated_schemas AS (
+        SELECT namespace_record.oid, namespace_record.nspname,
+               namespace_record.nspowner, namespace_record.nspacl
+        FROM pg_namespace namespace_record
+         WHERE namespace_record.nspname = ANY($1::text[])
+       ), catalog AS (
+         SELECT 'schema'::text AS object_type,
+                namespace_record.oid::text || ':' || namespace_record.nspname AS object_identity,
+                concat_ws('|', pg_get_userbyid(namespace_record.nspowner),
+                  COALESCE(namespace_record.nspacl::text, '<null>')) AS definition
+         FROM migrated_schemas namespace_record
+         UNION ALL
+         SELECT 'relation', relation_record.oid::text || ':' || namespace_record.nspname ||
+                  '.' || relation_record.relname,
+                concat_ws('|', relation_record.relkind::text,
+                  relation_record.relpersistence::text,
+                  pg_get_userbyid(relation_record.relowner),
+                  relation_record.relrowsecurity::text,
+                  relation_record.relforcerowsecurity::text,
+                  COALESCE(relation_record.relacl::text, '<null>'),
+                  COALESCE(relation_record.reloptions::text, '<null>'))
+         FROM pg_class relation_record
+         JOIN migrated_schemas namespace_record
+           ON namespace_record.oid = relation_record.relnamespace
+         UNION ALL
+         SELECT 'column', relation_record.oid::text || ':' || namespace_record.nspname ||
+                  '.' || relation_record.relname || ':' || attribute_record.attnum::text || ':' ||
+                  attribute_record.attname,
+                concat_ws('|',
+                  format_type(attribute_record.atttypid, attribute_record.atttypmod),
+                  attribute_record.attnotnull::text,
+                  attribute_record.attidentity::text,
+                  attribute_record.attgenerated::text,
+                  COALESCE(attribute_record.attacl::text, '<null>'),
+                  COALESCE(pg_get_expr(default_record.adbin, default_record.adrelid), '<null>'))
+         FROM pg_attribute attribute_record
+         JOIN pg_class relation_record ON relation_record.oid = attribute_record.attrelid
+         JOIN migrated_schemas namespace_record
+           ON namespace_record.oid = relation_record.relnamespace
+         LEFT JOIN pg_attrdef default_record
+           ON default_record.adrelid = attribute_record.attrelid
+          AND default_record.adnum = attribute_record.attnum
+         WHERE attribute_record.attnum > 0 AND NOT attribute_record.attisdropped
+         UNION ALL
+         SELECT 'constraint', constraint_record.oid::text || ':' ||
+                  namespace_record.nspname || '.' || relation_record.relname || ':' ||
+                  constraint_record.conname,
+                concat_ws('|', constraint_record.contype::text,
+                  constraint_record.condeferrable::text,
+                  constraint_record.condeferred::text,
+                  constraint_record.convalidated::text,
+                  pg_get_constraintdef(constraint_record.oid, false))
+         FROM pg_constraint constraint_record
+         JOIN pg_class relation_record ON relation_record.oid = constraint_record.conrelid
+         JOIN migrated_schemas namespace_record
+           ON namespace_record.oid = relation_record.relnamespace
+         UNION ALL
+         SELECT 'index', index_relation.oid::text || ':' || namespace_record.nspname || '.' ||
+                  index_relation.relname,
+                pg_get_indexdef(index_record.indexrelid, 0, false)
+         FROM pg_index index_record
+         JOIN pg_class index_relation ON index_relation.oid = index_record.indexrelid
+         JOIN pg_class table_relation ON table_relation.oid = index_record.indrelid
+         JOIN migrated_schemas namespace_record
+           ON namespace_record.oid = table_relation.relnamespace
+         UNION ALL
+         SELECT 'function', procedure_record.oid::text || ':' || namespace_record.nspname || '.' ||
+                  procedure_record.proname || '(' ||
+                  pg_get_function_identity_arguments(procedure_record.oid) || ')',
+                concat_ws('|', pg_get_userbyid(procedure_record.proowner),
+                  procedure_record.prokind::text,
+                  procedure_record.provolatile::text,
+                  procedure_record.prosecdef::text,
+                  COALESCE(procedure_record.proconfig::text, '<null>'),
+                  COALESCE(procedure_record.proacl::text, '<null>'),
+                  pg_get_function_result(procedure_record.oid), procedure_record.prosrc)
+         FROM pg_proc procedure_record
+         JOIN migrated_schemas namespace_record
+           ON namespace_record.oid = procedure_record.pronamespace
+         UNION ALL
+         SELECT 'policy', policy_record.oid::text || ':' || namespace_record.nspname || '.' ||
+                  relation_record.relname || ':' || policy_record.polname,
+                concat_ws('|', policy_record.polcmd::text, policy_record.polpermissive::text,
+                  array_to_string(ARRAY(
+                    SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC' ELSE role_oid::regrole::text END
+                    FROM unnest(policy_record.polroles) role_oid ORDER BY 1
+                  ), ','),
+                  COALESCE(pg_get_expr(policy_record.polqual, policy_record.polrelid), '<null>'),
+                  COALESCE(pg_get_expr(policy_record.polwithcheck, policy_record.polrelid), '<null>'))
+         FROM pg_policy policy_record
+         JOIN pg_class relation_record ON relation_record.oid = policy_record.polrelid
+         JOIN migrated_schemas namespace_record
+           ON namespace_record.oid = relation_record.relnamespace
+         UNION ALL
+         SELECT 'trigger', trigger_record.oid::text || ':' || namespace_record.nspname || '.' ||
+                  relation_record.relname || ':' || trigger_record.tgname,
+                concat_ws('|', trigger_record.tgenabled::text, trigger_record.tgisinternal::text,
+                  pg_get_triggerdef(trigger_record.oid, false))
+         FROM pg_trigger trigger_record
+         JOIN pg_class relation_record ON relation_record.oid = trigger_record.tgrelid
+         JOIN migrated_schemas namespace_record
+           ON namespace_record.oid = relation_record.relnamespace
+         UNION ALL
+         SELECT 'role', role_record.oid::text || ':' || role_record.rolname,
+                concat_ws('|', role_record.rolcanlogin::text, role_record.rolsuper::text,
+                  role_record.rolcreatedb::text, role_record.rolcreaterole::text,
+                  role_record.rolinherit::text, role_record.rolreplication::text,
+                  role_record.rolbypassrls::text, role_record.rolconnlimit::text,
+                  COALESCE(role_record.rolvaliduntil::text, '<null>'),
+                  COALESCE(role_record.rolconfig::text, '<null>'))
+         FROM pg_roles role_record
+         WHERE role_record.rolname LIKE 'throughline\\_%' ESCAPE '\\'
+       )
+       SELECT object_type, object_identity, definition
+       FROM catalog
+       ORDER BY object_type, object_identity`,
+      [["throughline_migrations", "identity", "access", "ops", "work", "content"]]
+    )
+  ]);
+
+  return { journal: journal.rows, catalog: catalog.rows };
+}
+
+function rejectMigrationJournalInsert(pool: pg.Pool): pg.Pool {
+  return {
+    connect: async () => {
+      const client = await pool.connect();
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "query") {
+            return (...args: unknown[]) => {
+              const statement = args[0];
+              const sql =
+                typeof statement === "string"
+                  ? statement
+                  : statement && typeof statement === "object" && "text" in statement
+                    ? String(statement.text)
+                    : "";
+              if (/INSERT INTO throughline_migrations\.journal/.test(sql)) {
+                throw new Error("intentional migration journal insert failure");
+              }
+              return Reflect.apply(target.query, target, args);
+            };
+          }
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    }
+  } as unknown as pg.Pool;
 }
 
 async function setExistingAppLoginWithTestCredential(

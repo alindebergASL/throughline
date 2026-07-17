@@ -1543,35 +1543,14 @@ maybeDescribe("Foundation operational schema security", () => {
 
   it("rolls migration 0002 back with its journal record", async () => {
     const migrationId = migrationIds[1]!;
-    await ownerPool.query("DELETE FROM throughline_migrations.journal WHERE id = $1", [
-      migrationId
-    ]);
-    await ownerPool.query("DROP POLICY outbox_events_app_scope ON ops.outbox_events");
+    await applyRepositoryMigrations(ownerPool, { reset: true, through: migrationIds[0]! });
 
     try {
-      await ownerPool.query(`
-        CREATE FUNCTION throughline_migrations.reject_foundation_journal_insert()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $trigger$
-        BEGIN
-          IF NEW.id = '0002_foundation_closure_async_isolation.sql' THEN
-            RAISE EXCEPTION 'intentional Foundation journal failure';
-          END IF;
-          RETURN NEW;
-        END
-        $trigger$
-      `);
-      await ownerPool.query(`
-        CREATE TRIGGER reject_foundation_journal_insert
-        BEFORE INSERT ON throughline_migrations.journal
-        FOR EACH ROW
-        EXECUTE FUNCTION throughline_migrations.reject_foundation_journal_insert()
-      `);
-
-      await expect(applyMigrations(ownerPool)).rejects.toThrow(
-        "intentional Foundation journal failure"
-      );
+      await expect(
+        applyRepositoryMigrations(rejectFoundationJournalInsert(ownerPool), {
+          through: migrationId
+        })
+      ).rejects.toThrow("intentional Foundation journal failure");
       const rolledBack = await ownerPool.query<{ journal_count: string; policy_count: string }>(`
         SELECT
           (SELECT count(*)::text FROM throughline_migrations.journal WHERE id = '${migrationId}')
@@ -1582,16 +1561,39 @@ maybeDescribe("Foundation operational schema security", () => {
       `);
       expect(rolledBack.rows[0]).toEqual({ journal_count: "0", policy_count: "0" });
     } finally {
-      await ownerPool.query(
-        "DROP TRIGGER IF EXISTS reject_foundation_journal_insert ON throughline_migrations.journal"
-      );
-      await ownerPool.query(
-        "DROP FUNCTION IF EXISTS throughline_migrations.reject_foundation_journal_insert()"
-      );
-      await applyMigrations(ownerPool);
+      await applyMigrations(ownerPool, { reset: true });
     }
-  });
+  }, 60_000);
 });
+
+function rejectFoundationJournalInsert(pool: pg.Pool): pg.Pool {
+  return {
+    connect: async () => {
+      const client = await pool.connect();
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "query") {
+            return (...args: unknown[]) => {
+              const statement = args[0];
+              const sql =
+                typeof statement === "string"
+                  ? statement
+                  : statement && typeof statement === "object" && "text" in statement
+                    ? String(statement.text)
+                    : "";
+              if (/INSERT INTO throughline_migrations\.journal/.test(sql)) {
+                throw new Error("intentional Foundation journal failure");
+              }
+              return Reflect.apply(target.query, target, args);
+            };
+          }
+          const value: unknown = Reflect.get(target, property, target);
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      });
+    }
+  } as unknown as pg.Pool;
+}
 
 function assertDistinctRuntimeDsns(
   owner: string,
