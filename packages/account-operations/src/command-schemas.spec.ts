@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { canonicalizeB1Payload, parseB1Command } from "./command-schemas.js";
+import { sourceTextMatchesRevisionBody } from "./domain-command-bus.js";
+import { canonicalizeB1Payload, parseB1Command, parseStoredB1Result } from "./command-schemas.js";
 
 describe("B1 command schemas", () => {
   it("accepts only manual source types and rejects trusted-field forgery", () => {
@@ -54,5 +55,26 @@ describe("B1 command schemas", () => {
         initiativeIds: ["b", "a"]
       })
     ).toMatchObject({ organizationIds: ["a", "z"], initiativeIds: ["a", "b"] });
+  });
+
+  it("accepts only exact integer ones for stored content-create counters", () => {
+    const contentItemId = "70000000-0000-7000-8000-000000000001";
+    const valid = { contentItemId, revisionNumber: 1, version: 1 };
+    expect(parseStoredB1Result("content.create", valid)).toEqual(valid);
+
+    for (const field of ["revisionNumber", "version"] as const) {
+      for (const invalid of [0, 2, -1, 1.1, 1.5, 1.9, "1", null, 2_147_483_648]) {
+        expect(() =>
+          parseStoredB1Result("content.create", { ...valid, [field]: invalid })
+        ).toThrow();
+      }
+    }
+  });
+
+  it("byte-compares origin revision text without Unicode normalization", () => {
+    const exact = "Résumé 👩🏽‍💻\r\nΔοκιμή";
+    expect(sourceTextMatchesRevisionBody(exact, exact)).toBe(true);
+    expect(sourceTextMatchesRevisionBody("Resume\u0301 👩🏽‍💻\r\nΔοκιμή", exact)).toBe(false);
+    expect(sourceTextMatchesRevisionBody(exact.replace("\r\n", "\n"), exact)).toBe(false);
   });
 });

@@ -111,16 +111,38 @@ export class B1AccountOperationsRuntime implements OnModuleDestroy {
           tx
         )
       );
-      const activity = await graph.getActivity(context.tenantId, context.workspaceId, activityId);
+      const candidates = await graph.getActivityAssociationCandidates(
+        context.tenantId,
+        context.workspaceId,
+        activityId
+      );
+      const organizationIds = await permittedResourceIds(candidates.organizationIds, (id) =>
+        authorization.canInTransaction(
+          context,
+          "organization.read",
+          { type: "organization", id },
+          tx
+        )
+      );
+      const initiativeIds = await permittedResourceIds(candidates.initiativeIds, (id) =>
+        authorization.canInTransaction(context, "initiative.read", { type: "initiative", id }, tx)
+      );
+      const personIds = await permittedResourceIds(candidates.personIds, (id) =>
+        authorization.canInTransaction(context, "person.read", { type: "person", id }, tx, {
+          personUseSite: { type: "activity", id: activityId }
+        })
+      );
+      const activity = await graph.getActivity(context.tenantId, context.workspaceId, activityId, {
+        organizationIds,
+        initiativeIds,
+        personIds
+      });
       return {
         ...activity,
-        people: await this.safePeopleForUseSite(
-          tx,
-          graph,
-          authorization,
-          context,
-          uniqueDefined([activity.ownerPersonId, ...activity.attendeePersonIds]),
-          { type: "activity", id: activity.id }
+        people: await graph.getSafePeople(
+          context.tenantId,
+          context.workspaceId,
+          uniqueDefined([activity.ownerPersonId, ...activity.attendeePersonIds])
         )
       };
     });
@@ -136,7 +158,11 @@ export class B1AccountOperationsRuntime implements OnModuleDestroy {
           tx
         )
       );
-      const activity = await graph.getActivity(context.tenantId, context.workspaceId, activityId);
+      const activity = await graph.getActivityScope(
+        context.tenantId,
+        context.workspaceId,
+        activityId
+      );
       const sources = await new ContentRepository(tx).listActivitySources({
         tenantId: context.tenantId,
         workspaceId: context.workspaceId,
@@ -161,21 +187,13 @@ export class B1AccountOperationsRuntime implements OnModuleDestroy {
 
   getSource(context: SecurityContext, sourceArtifactId: string) {
     return this.read(context, async (tx, _graph, authorization) => {
-      const content = new ContentRepository(tx);
-      const current = await content.resolveCurrentSource(
-        context.tenantId,
-        context.workspaceId,
+      return readAuthorizedSource({
+        content: new ContentRepository(tx),
+        authorization,
+        tx,
+        context,
         sourceArtifactId
-      );
-      await requireAllowed(
-        authorization.canInTransaction(
-          context,
-          "source.read",
-          { type: "source", id: current.id },
-          tx
-        )
-      );
-      return current;
+      });
     });
   }
 
@@ -236,6 +254,42 @@ export class B1AccountOperationsRuntime implements OnModuleDestroy {
   }
 }
 
+export async function readAuthorizedSource(input: {
+  content: ContentRepository;
+  authorization: PostgresAuthorizationService;
+  tx: Parameters<Parameters<typeof withTenantTransaction>[1]>[0];
+  context: SecurityContext;
+  sourceArtifactId: string;
+}) {
+  await requireAllowed(
+    input.authorization.canInTransaction(
+      input.context,
+      "source.read",
+      { type: "source", id: input.sourceArtifactId },
+      input.tx
+    )
+  );
+  const currentId = await input.content.resolveCurrentSourceId(
+    input.context.tenantId,
+    input.context.workspaceId,
+    input.sourceArtifactId
+  );
+  await requireAllowed(
+    input.authorization.canInTransaction(
+      input.context,
+      "source.read",
+      { type: "source", id: currentId },
+      input.tx
+    )
+  );
+  return input.content.getSource(
+    input.context.tenantId,
+    input.context.workspaceId,
+    currentId,
+    true
+  );
+}
+
 async function requireAllowed(
   decision: ReturnType<PostgresAuthorizationService["canInTransaction"]>
 ) {
@@ -244,6 +298,17 @@ async function requireAllowed(
 
 function uniqueDefined(values: readonly (string | undefined)[]): string[] {
   return [...new Set(values.filter((value): value is string => value !== undefined))].sort();
+}
+
+async function permittedResourceIds(
+  ids: readonly string[],
+  decide: (id: string) => ReturnType<PostgresAuthorizationService["canInTransaction"]>
+): Promise<string[]> {
+  const permitted: string[] = [];
+  for (const id of [...new Set(ids)].sort()) {
+    if ((await decide(id)).allowed) permitted.push(id);
+  }
+  return permitted;
 }
 
 async function assertAppRole(

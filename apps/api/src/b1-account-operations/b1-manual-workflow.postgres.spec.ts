@@ -320,6 +320,114 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
     expect(noContext.rows[0]).toEqual({ organizations: "0", sources: "0" });
   });
 
+  it("accepts only the predecessor fixture and the closed ten B1 v1 command shapes", async () => {
+    const resultId = "70000000-0000-7000-8000-000000000001";
+    const validations = await ownerPool.query<{
+      fixture: boolean;
+      source_v2: boolean;
+      typo: boolean;
+      unknown: boolean;
+      create_one: boolean;
+      create_later_revision: boolean;
+      create_later_version: boolean;
+      revise_later: boolean;
+    }>(
+      `SELECT
+        ops.b1_command_record_valid(
+          'b1_0.fixture.v1', 1, 'completed', 'fixture', $1, '{}'::jsonb
+        ) AS fixture,
+        ops.b1_command_record_valid(
+          'source.capture.v2', 2, 'reserved', NULL, NULL, NULL
+        ) AS source_v2,
+        ops.b1_command_record_valid(
+          'source.captuer.v1', 1, 'reserved', NULL, NULL, NULL
+        ) AS typo,
+        ops.b1_command_record_valid(
+          'unknown.command.v1', 1, 'reserved', NULL, NULL, NULL
+        ) AS unknown,
+        ops.b1_command_record_valid(
+          'content.create.v1', 1, 'completed', 'content_item', $1,
+          jsonb_build_object('contentItemId',$1::text,'revisionNumber',1,'version',1)
+        ) AS create_one,
+        ops.b1_command_record_valid(
+          'content.create.v1', 1, 'completed', 'content_item', $1,
+          jsonb_build_object('contentItemId',$1::text,'revisionNumber',2,'version',1)
+        ) AS create_later_revision,
+        ops.b1_command_record_valid(
+          'content.create.v1', 1, 'completed', 'content_item', $1,
+          jsonb_build_object('contentItemId',$1::text,'revisionNumber',1,'version',2)
+        ) AS create_later_version,
+        ops.b1_command_record_valid(
+          'content.revise.v1', 1, 'completed', 'content_item', $1,
+          jsonb_build_object('contentItemId',$1::text,'revisionNumber',2,'version',2)
+        ) AS revise_later`,
+      [resultId]
+    );
+    expect(validations.rows[0]).toEqual({
+      fixture: true,
+      source_v2: false,
+      typo: false,
+      unknown: false,
+      create_one: true,
+      create_later_revision: false,
+      create_later_version: false,
+      revise_later: true
+    });
+  });
+
+  it("rejects forged non-integer-one content-create counters at the PostgreSQL boundary", async () => {
+    const resultId = "70000000-0000-7000-8000-000000000001";
+    const valid = await ownerPool.query<{ valid: boolean }>(
+      `SELECT ops.b1_command_record_valid(
+         'content.create.v1', 1, 'completed', 'content_item', $1::uuid,
+         jsonb_build_object('contentItemId',$1::uuid::text,'revisionNumber',1,'version',1)
+       ) AS valid`,
+      [resultId]
+    );
+    expect(valid.rows[0]).toEqual({ valid: true });
+
+    const forged = await ownerPool.query<{
+      field_name: string;
+      case_name: string;
+      valid: boolean;
+    }>(
+      `WITH adversarial(field_name, case_name, candidate) AS (
+         VALUES
+           ('revisionNumber','zero','0'::jsonb),
+           ('revisionNumber','two','2'::jsonb),
+           ('revisionNumber','negative','-1'::jsonb),
+           ('revisionNumber','fractional_1_1','1.1'::jsonb),
+           ('revisionNumber','fractional_1_5','1.5'::jsonb),
+           ('revisionNumber','fractional_1_9','1.9'::jsonb),
+           ('revisionNumber','string',to_jsonb('1'::text)),
+           ('revisionNumber','null','null'::jsonb),
+           ('revisionNumber','outside_integer_range','2147483648'::jsonb),
+           ('version','zero','0'::jsonb),
+           ('version','two','2'::jsonb),
+           ('version','negative','-1'::jsonb),
+           ('version','fractional_1_1','1.1'::jsonb),
+           ('version','fractional_1_5','1.5'::jsonb),
+           ('version','fractional_1_9','1.9'::jsonb),
+           ('version','string',to_jsonb('1'::text)),
+           ('version','null','null'::jsonb),
+           ('version','outside_integer_range','2147483648'::jsonb)
+       )
+       SELECT field_name, case_name,
+         ops.b1_command_record_valid(
+           'content.create.v1', 1, 'completed', 'content_item', $1::uuid,
+           jsonb_set(
+             jsonb_build_object('contentItemId',$1::uuid::text,'revisionNumber',1,'version',1),
+             ARRAY[field_name], candidate
+           )
+         ) AS valid
+       FROM adversarial
+       ORDER BY field_name, case_name`,
+      [resultId]
+    );
+    expect(forged.rows).toHaveLength(18);
+    expect(forged.rows.every(({ valid: accepted }) => accepted === false)).toBe(true);
+  });
+
   it("walks Organization -> Initiative -> Engagement -> opaque UTF-8 Source with no integration", async () => {
     const organization = await post("/v1/organizations", "workflow-org", {
       name: "Harbor Transit",
@@ -1005,6 +1113,408 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
           )
       )
     ).rejects.toThrow();
+  });
+
+  it("filters mixed-Space Activity associations before returning IDs or counts", async () => {
+    const hiddenOrganization = await post("/v1/organizations", "hidden-association-org", {
+      name: "Hidden Association Account",
+      domains: []
+    });
+    expect(hiddenOrganization.statusCode).toBe(201);
+    const hiddenOrganizationBody = hiddenOrganization.json<{
+      organizationId: string;
+      spaceId: string;
+    }>();
+    const hiddenInitiative = await post("/v1/initiatives", "hidden-association-initiative", {
+      primaryOrganizationId: hiddenOrganizationBody.organizationId,
+      organizationIds: [hiddenOrganizationBody.organizationId],
+      title: "Hidden restricted initiative",
+      typeKey: "security",
+      stageKey: "exploring"
+    });
+    expect(hiddenInitiative.statusCode).toBe(201);
+    const hiddenInitiativeBody = hiddenInitiative.json<{
+      initiativeId: string;
+      spaceId: string;
+    }>();
+    const mixedActivity = await post("/v1/activities", "mixed-association-activity", {
+      title: "Mixed association workshop",
+      profileTemplateKey: "ai_workshop",
+      status: "captured",
+      governingInitiativeId: state.initiativeId,
+      organizationIds: [state.organizationId, hiddenOrganizationBody.organizationId],
+      initiativeIds: [state.initiativeId, hiddenInitiativeBody.initiativeId],
+      attendeePersonIds: [devFixtures.externalPersonA]
+    });
+    expect(mixedActivity.statusCode).toBe(201);
+    const mixedActivityBody = mixedActivity.json<{ activityId: string }>();
+    const activityGrant = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES ($1,$2,'membership',$3,'viewer','space',$4,'direct') RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        state.sourceSpaceId
+      ]
+    );
+    try {
+      const response = await getAs(
+        "tenant-a-viewer",
+        `/v1/activities/${mixedActivityBody.activityId}`
+      );
+      expect(response.statusCode).toBe(200);
+      const projection = response.json<{
+        organizationIds: string[];
+        initiativeIds: string[];
+        attendeePersonIds: string[];
+        people: Array<{ id: string }>;
+      }>();
+      expect(projection.organizationIds).toEqual([]);
+      expect(projection.initiativeIds).toEqual([state.initiativeId]);
+      expect(projection.attendeePersonIds).toEqual([devFixtures.externalPersonA]);
+      expect(projection.people.map(({ id }) => id).sort()).toEqual(
+        [devFixtures.externalPersonA, devFixtures.personA].sort()
+      );
+      expect(response.body).not.toContain(hiddenOrganizationBody.organizationId);
+      expect(response.body).not.toContain(hiddenInitiativeBody.initiativeId);
+    } finally {
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        activityGrant.rows[0]!.id
+      ]);
+    }
+  });
+
+  it("reauthorizes current Relationship endpoints after access revocation and before mutation", async () => {
+    const contextGrant = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES ($1,$2,'membership',$3,'contributor','space',$4,'direct') RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        state.sourceSpaceId
+      ]
+    );
+    const endpointGrant = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES ($1,$2,'membership',$3,'viewer','space',
+         (SELECT space_id FROM work.organizations WHERE id = $4),'direct') RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        state.organizationId
+      ]
+    );
+    const racePool = createPgPool(appUrl!);
+    const bus = new AccountOperationsDomainCommandBus(racePool);
+    const blocker = await ownerPool.connect();
+    let ending: Promise<unknown> | undefined;
+    try {
+      const created = await bus.execute(
+        {
+          kind: "relationship.create",
+          idempotencyKey: "endpoint-revocation-relationship",
+          payload: {
+            subject: { type: "organization", id: state.organizationId },
+            predicate: "works_with",
+            object: { type: "person", id: devFixtures.externalPersonA },
+            context: { type: "space", id: state.sourceSpaceId }
+          }
+        },
+        createDevSecurityContext("tenant-a-owner")
+      );
+      const commandPid = await racePool.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+      await blocker.query("BEGIN");
+      await blocker.query("SELECT id FROM work.relationships WHERE id = $1 FOR UPDATE", [
+        created.relationshipId
+      ]);
+      ending = bus.execute(
+        {
+          kind: "relationship.end",
+          idempotencyKey: "endpoint-revocation-denied",
+          payload: {
+            relationshipId: created.relationshipId,
+            expectedVersion: 1,
+            validTo: "2026-07-16T12:00:00.000Z"
+          }
+        },
+        createDevSecurityContext("tenant-a-viewer")
+      );
+      await waitForBlockedBackend(ownerPool, commandPid.rows[0]!.pid);
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        endpointGrant.rows[0]!.id
+      ]);
+      await blocker.query("COMMIT");
+      await expect(ending).rejects.toMatchObject({ name: "B1AuthorizationError" });
+      const unchanged = await ownerPool.query<{ version: number; valid_to: Date | null }>(
+        "SELECT version, valid_to FROM work.relationships WHERE id = $1",
+        [created.relationshipId]
+      );
+      expect(unchanged.rows[0]).toEqual({ version: 1, valid_to: null });
+      const residue = await ownerPool.query<{ count: string }>(
+        `SELECT count(*)::text AS count FROM ops.domain_command_records
+         WHERE idempotency_key = 'endpoint-revocation-denied'`
+      );
+      expect(residue.rows[0]?.count).toBe("0");
+    } finally {
+      await blocker.query("ROLLBACK").catch(() => undefined);
+      await ending?.catch(() => undefined);
+      blocker.release();
+      await racePool.end();
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        contextGrant.rows[0]!.id
+      ]);
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        endpointGrant.rows[0]!.id
+      ]);
+    }
+  });
+
+  it("binds source provenance to the exact immutable Content revision bytes", async () => {
+    const bus = new AccountOperationsDomainCommandBus(appPool);
+    const unicodeBody = "Résumé 👩🏽‍💻\r\nΔοκιμή";
+    const created = await bus.execute(
+      {
+        kind: "content.create",
+        idempotencyKey: "origin-content-create",
+        payload: {
+          spaceId: state.sourceSpaceId,
+          type: "note",
+          title: "Exact source origin",
+          body: unicodeBody
+        }
+      },
+      createDevSecurityContext("tenant-a-owner")
+    );
+    const exact = await bus.execute(
+      {
+        kind: "source.capture",
+        idempotencyKey: "origin-source-exact",
+        payload: {
+          activityId: state.activityId,
+          sourceType: "note",
+          text: unicodeBody,
+          originContentItemId: created.contentItemId,
+          originContentRevision: 1
+        }
+      },
+      createDevSecurityContext("tenant-a-owner")
+    );
+    const stored = await ownerPool.query<{
+      immutable_text: string;
+      origin_content_item_id: string;
+      origin_content_revision: number;
+    }>(
+      `SELECT immutable_text, origin_content_item_id, origin_content_revision
+       FROM content.source_artifacts WHERE id = $1`,
+      [exact.sourceArtifactId]
+    );
+    expect(stored.rows[0]).toEqual({
+      immutable_text: unicodeBody,
+      origin_content_item_id: created.contentItemId,
+      origin_content_revision: 1
+    });
+
+    const revised = await bus.execute(
+      {
+        kind: "content.revise",
+        idempotencyKey: "origin-content-revise",
+        payload: {
+          contentItemId: created.contentItemId,
+          expectedRevision: 1,
+          body: "Second immutable revision."
+        }
+      },
+      createDevSecurityContext("tenant-a-owner")
+    );
+    expect(revised).toMatchObject({ revisionNumber: 2, version: 2 });
+    const invalidCreateContext = activityContext(state.sourceSpaceId);
+    await expect(
+      withTenantTransaction(
+        {
+          pool: appPool,
+          context: invalidCreateContext
+        },
+        async (tx) => {
+          const commands = new DomainCommandRepository(tx);
+          const commandId = "76000000-0000-7000-8000-000000000099";
+          const requestHash = hashCanonicalCommandRequest({ proof: "create-cannot-bind-later" });
+          await commands.reserve({
+            id: commandId,
+            tenantId: devFixtures.tenantA,
+            workspaceId: devFixtures.workspaceA,
+            reservationSpaceId: state.sourceSpaceId,
+            commandKind: "content.create.v1",
+            commandSchemaVersion: 1,
+            idempotencyKey: "create-cannot-bind-later",
+            canonicalRequestHash: requestHash,
+            actorUserId: invalidCreateContext.actorUserId!,
+            actorMembershipId: invalidCreateContext.actorMembershipId!,
+            policyVersionId: invalidCreateContext.policyVersion,
+            requestId: "create-cannot-bind-later",
+            traceparent
+          });
+          await commands.complete({
+            commandId,
+            tenantId: devFixtures.tenantA,
+            workspaceId: devFixtures.workspaceA,
+            reservationSpaceId: state.sourceSpaceId,
+            commandKind: "content.create.v1",
+            idempotencyKey: "create-cannot-bind-later",
+            canonicalRequestHash: requestHash,
+            resultResourceType: "content_item",
+            resultResourceId: created.contentItemId,
+            safeResponse: {
+              contentItemId: created.contentItemId,
+              revisionNumber: 2,
+              version: 2
+            }
+          });
+        }
+      )
+    ).rejects.toThrow();
+    const invalidCreateResidue = await ownerPool.query<{ count: string }>(
+      `SELECT count(*)::text AS count FROM ops.domain_command_records
+       WHERE idempotency_key = 'create-cannot-bind-later'`
+    );
+    expect(invalidCreateResidue.rows[0]?.count).toBe("0");
+
+    for (const [idempotencyKey, originContentItemId, originContentRevision, text] of [
+      ["origin-source-unicode-mismatch", created.contentItemId, 1, "Resume\u0301 👩🏽‍💻\r\nΔοκιμή"],
+      ["origin-source-missing", "70000000-0000-7000-8000-000000009991", 1, unicodeBody],
+      ["origin-source-revision-missing", created.contentItemId, 99, unicodeBody]
+    ] as const) {
+      await expect(
+        bus.execute(
+          {
+            kind: "source.capture",
+            idempotencyKey,
+            payload: {
+              activityId: state.activityId,
+              sourceType: "note",
+              text,
+              originContentItemId,
+              originContentRevision
+            }
+          },
+          createDevSecurityContext("tenant-a-owner")
+        )
+      ).rejects.toThrow();
+    }
+
+    const inaccessibleItemId = "75000000-0000-7000-8000-000000000091";
+    const inaccessibleRevisionId = "75000000-0000-7000-8000-000000000092";
+    const fixtureClient = await ownerPool.connect();
+    try {
+      await fixtureClient.query("BEGIN");
+      await fixtureClient.query(
+        `INSERT INTO content.content_items (
+           id, tenant_id, workspace_id, space_id, type, title, owner_person_id,
+           access_class, metadata, current_revision, version
+         ) VALUES ($1,$2,$3,$4,'note','Confidential exact origin',$5,
+           'confidential','{}'::jsonb,1,1)`,
+        [
+          inaccessibleItemId,
+          devFixtures.tenantA,
+          devFixtures.workspaceA,
+          state.sourceSpaceId,
+          devFixtures.personA
+        ]
+      );
+      await fixtureClient.query(
+        `INSERT INTO content.content_revisions (
+           id, tenant_id, workspace_id, space_id, content_item_id, revision_number,
+           title, body, metadata, access_class, created_by_user_id, created_by_membership_id
+         ) VALUES ($1,$2,$3,$4,$5,1,'Confidential exact origin',$6,
+           '{}'::jsonb,'confidential',$7,$8)`,
+        [
+          inaccessibleRevisionId,
+          devFixtures.tenantA,
+          devFixtures.workspaceA,
+          state.sourceSpaceId,
+          inaccessibleItemId,
+          unicodeBody,
+          devFixtures.userA,
+          devFixtures.membershipAOwner
+        ]
+      );
+      await fixtureClient.query("COMMIT");
+    } catch (error) {
+      await fixtureClient.query("ROLLBACK");
+      throw error;
+    } finally {
+      fixtureClient.release();
+    }
+    await expect(
+      bus.execute(
+        {
+          kind: "source.capture",
+          idempotencyKey: "origin-source-inaccessible",
+          payload: {
+            activityId: state.activityId,
+            sourceType: "note",
+            text: unicodeBody,
+            originContentItemId: inaccessibleItemId,
+            originContentRevision: 1
+          }
+        },
+        createDevSecurityContext("tenant-a-owner")
+      )
+    ).rejects.toMatchObject({ name: "B1AuthorizationError" });
+
+    const crossScopeSpace = await ownerPool.query<{ space_id: string }>(
+      "SELECT space_id FROM work.organizations WHERE id = $1",
+      [state.organizationId]
+    );
+    expect(crossScopeSpace.rows).toHaveLength(1);
+    const crossScope = await bus.execute(
+      {
+        kind: "content.create",
+        idempotencyKey: "origin-content-cross-scope",
+        payload: {
+          spaceId: crossScopeSpace.rows[0]!.space_id,
+          type: "note",
+          title: "Cross-scope source origin",
+          body: unicodeBody
+        }
+      },
+      createDevSecurityContext("tenant-a-owner")
+    );
+    await expect(
+      bus.execute(
+        {
+          kind: "source.capture",
+          idempotencyKey: "origin-source-cross-scope",
+          payload: {
+            activityId: state.activityId,
+            sourceType: "note",
+            text: unicodeBody,
+            originContentItemId: crossScope.contentItemId,
+            originContentRevision: 1
+          }
+        },
+        createDevSecurityContext("tenant-a-owner")
+      )
+    ).rejects.toMatchObject({ name: "B1AuthorizationError" });
+
+    const rejected = await ownerPool.query<{ commands: string; sources: string }>(
+      `SELECT
+        (SELECT count(*)::text FROM ops.domain_command_records
+          WHERE idempotency_key LIKE 'origin-source-%'
+            AND idempotency_key <> 'origin-source-exact') AS commands,
+        (SELECT count(*)::text FROM content.source_artifacts
+          WHERE origin_content_item_id = $1 AND id <> $2) AS sources`,
+      [created.contentItemId, exact.sourceArtifactId]
+    );
+    expect(rejected.rows[0]).toEqual({ commands: "0", sources: "0" });
   });
 
   it("rolls back a tombstone, chunks, audit, and command when the canonical outbox is omitted", async () => {

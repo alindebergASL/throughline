@@ -118,15 +118,85 @@ describe("Activity source-capture lock", () => {
     expect(maximumActiveQueries).toBe(1);
   });
 
+  it("materializes only caller-authorized Activity associations", async () => {
+    const visibleOrganization = "70000000-0000-7000-8000-000000000011";
+    const hiddenOrganization = "70000000-0000-7000-8000-000000000012";
+    const visibleInitiative = "70000000-0000-7000-8000-000000000013";
+    const hiddenInitiative = "70000000-0000-7000-8000-000000000014";
+    const visiblePerson = "70000000-0000-7000-8000-000000000015";
+    const hiddenPerson = "70000000-0000-7000-8000-000000000016";
+    const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      if (sql.includes("FROM work.activities WHERE")) {
+        return {
+          rows: [
+            {
+              id: "70000000-0000-7000-8000-000000000010",
+              space_id: "70000000-0000-7000-8000-000000000009",
+              subtype: "ai_workshop",
+              profile_template_key: "ai_workshop",
+              title: "Mixed-space workshop",
+              status: "captured",
+              occurred_at: null,
+              starts_at: null,
+              ends_at: null,
+              owner_person_id: hiddenPerson,
+              governing_initiative_id: hiddenInitiative,
+              governing_organization_id: null,
+              version: 1
+            }
+          ]
+        };
+      }
+      if (sql.includes("work.activity_organizations")) {
+        expect(values?.[3]).toEqual([visibleOrganization]);
+        return { rows: [{ organization_id: visibleOrganization }] };
+      }
+      if (sql.includes("work.activity_initiatives")) {
+        expect(values?.[3]).toEqual([visibleInitiative]);
+        return { rows: [{ initiative_id: visibleInitiative }] };
+      }
+      if (sql.includes("work.activity_attendees")) {
+        expect(values?.[3]).toEqual([visiblePerson]);
+        return { rows: [{ person_id: visiblePerson }] };
+      }
+      throw new Error(`unexpected query: ${sql}`);
+    });
+    const repository = new WorkGraphRepository({ query } as unknown as TenantDbTransaction);
+
+    const projected = await repository.getActivity(
+      "tenant",
+      "workspace",
+      "70000000-0000-7000-8000-000000000010",
+      {
+        organizationIds: [visibleOrganization],
+        initiativeIds: [visibleInitiative],
+        personIds: [visiblePerson]
+      }
+    );
+
+    expect(projected.organizationIds).toEqual([visibleOrganization]);
+    expect(projected.initiativeIds).toEqual([visibleInitiative]);
+    expect(projected.attendeePersonIds).toEqual([visiblePerson]);
+    expect(projected).not.toHaveProperty("ownerPersonId");
+    expect(projected).not.toHaveProperty("governingInitiativeId");
+    expect(JSON.stringify(projected)).not.toContain(hiddenOrganization);
+    expect(JSON.stringify(projected)).not.toContain(hiddenInitiative);
+    expect(JSON.stringify(projected)).not.toContain(hiddenPerson);
+  });
+
   it("keeps getActivity as a plain read", async () => {
     const query = vi.fn(async (sql: string) => {
       if (sql.includes("FROM work.activities WHERE")) return { rows: [] };
       throw new Error(`unexpected query: ${sql}`);
     });
     const repository = new WorkGraphRepository({ query } as unknown as TenantDbTransaction);
-    await expect(repository.getActivity("tenant", "workspace", "activity")).rejects.toThrow(
-      "unavailable"
-    );
+    await expect(
+      repository.getActivity("tenant", "workspace", "activity", {
+        organizationIds: [],
+        initiativeIds: [],
+        personIds: []
+      })
+    ).rejects.toThrow("unavailable");
     expect(query.mock.calls[0]?.[0]).not.toMatch(/FOR (?:UPDATE|SHARE)/);
   });
 });

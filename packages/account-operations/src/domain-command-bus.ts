@@ -150,7 +150,7 @@ export class AccountOperationsDomainCommandBus {
           ).spaceId;
         case "source.capture":
           return (
-            await graph.getActivity(
+            await graph.getActivityScope(
               context.tenantId,
               context.workspaceId,
               command.payload.activityId
@@ -608,6 +608,10 @@ export class AccountOperationsDomainCommandBus {
           reservationSpaceId
         );
         if (reservation.replay) return reservation.result;
+        await this.authorizeRelationshipEndpoints(tx, context, relationship, reservationSpaceId, {
+          type: "relationship",
+          id: relationship.id
+        });
         if (relationship.version !== command.payload.expectedVersion || relationship.validTo)
           throw new B1CommandInvariantError();
         const updated = await graph.endRelationship({
@@ -837,29 +841,40 @@ export class AccountOperationsDomainCommandBus {
           reservationSpaceId
         );
         const pin = await graph.getWorkspaceProfilePin(context.tenantId, context.workspaceId);
-        const accessClass = ContentRepository.deriveSourceAccessClass(
-          space.accessClass,
-          command.payload.requestedAccessClass
-        );
-        if (!ContentRepository.canProjectSource(context.dataClassCeiling, accessClass))
-          throw new B1AuthorizationError();
+        let originAccessClass: AccessClass | undefined;
+        let sourceText = command.payload.text;
         if (command.payload.originContentItemId) {
-          const origin = await content.getContentItemScope(
+          const origin = await content.getContentRevisionScope(
             context.tenantId,
             context.workspaceId,
-            command.payload.originContentItemId
+            command.payload.originContentItemId,
+            command.payload.originContentRevision!
           );
-          if (
-            origin.spaceId !== reservationSpaceId ||
-            origin.currentRevision !== command.payload.originContentRevision
-          )
-            throw new B1CommandInvariantError();
+          if (origin.spaceId !== reservationSpaceId) throw new B1AuthorizationError();
           await this.authorize(tx, context, "content.read", {
             type: "content_item",
             id: command.payload.originContentItemId
           });
+          const revisionBody = await content.getContentRevisionBody(
+            context.tenantId,
+            context.workspaceId,
+            command.payload.originContentItemId,
+            command.payload.originContentRevision!
+          );
+          if (!sourceTextMatchesRevisionBody(command.payload.text, revisionBody)) {
+            throw new B1CommandInvariantError();
+          }
+          sourceText = revisionBody;
+          originAccessClass = origin.accessClass;
         }
-        const normalized = normalizeAndChunkSource(command.payload.text);
+        const accessClass = ContentRepository.deriveSourceAccessClass(
+          space.accessClass,
+          command.payload.requestedAccessClass,
+          originAccessClass
+        );
+        if (!ContentRepository.canProjectSource(context.dataClassCeiling, accessClass))
+          throw new B1AuthorizationError();
+        const normalized = normalizeAndChunkSource(sourceText);
         const reservation = await reserveCommand(
           domain.commands,
           command,
@@ -1168,22 +1183,35 @@ export class AccountOperationsDomainCommandBus {
   private async authorizeRelationshipEndpoints(
     tx: TenantDbTransaction,
     context: SecurityContext,
-    payload: Extract<ParsedCommand, { kind: "relationship.create" }>["payload"],
-    governingSpaceId: string
+    payload: {
+      subject: RelationshipEndpoint;
+      object: RelationshipEndpoint;
+      context?: RelationshipEndpoint;
+    },
+    governingSpaceId: string,
+    personUseSite?: ResourceRef
   ): Promise<void> {
     const useSite: ResourceRef =
-      payload.context && payload.context.type !== "person"
+      personUseSite ??
+      (payload.context && payload.context.type !== "person"
         ? endpointResource(payload.context)
         : payload.subject.type !== "person"
           ? endpointResource(payload.subject)
           : payload.object.type !== "person"
             ? endpointResource(payload.object)
-            : { type: "space", id: governingSpaceId };
-    for (const endpoint of [
+            : { type: "space", id: governingSpaceId });
+    const endpoints = [
       payload.subject,
       payload.object,
       ...(payload.context ? [payload.context] : [])
-    ]) {
+    ]
+      .filter(
+        (endpoint, index, values) =>
+          values.findIndex((candidate) => endpointKey(candidate) === endpointKey(endpoint)) ===
+          index
+      )
+      .sort((left, right) => endpointKey(left).localeCompare(endpointKey(right)));
+    for (const endpoint of endpoints) {
       if (endpoint.type === "space") {
         await this.authorize(tx, context, "space.read", { type: "space", id: endpoint.id });
       } else if (endpoint.type === "person") {
@@ -1208,6 +1236,11 @@ export class AccountOperationsDomainCommandBus {
       }
     }
   }
+}
+
+export function sourceTextMatchesRevisionBody(sourceText: string, revisionBody: string): boolean {
+  if (sourceText !== revisionBody) return false;
+  return Buffer.from(sourceText, "utf8").equals(Buffer.from(revisionBody, "utf8"));
 }
 
 async function reserveCommand(

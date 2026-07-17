@@ -122,6 +122,48 @@ export class ContentRepository {
     };
   }
 
+  async getContentRevisionScope(
+    tenantId: string,
+    workspaceId: string,
+    contentItemId: string,
+    revisionNumber: number
+  ): Promise<{ spaceId: string; accessClass: AccessClass }> {
+    const result = await this.tx.query<{ space_id: string; access_class: AccessClass }>(
+      `SELECT revision.space_id, revision.access_class
+       FROM content.content_revisions revision
+       JOIN content.content_items item
+         ON item.tenant_id = revision.tenant_id
+        AND item.workspace_id = revision.workspace_id
+        AND item.space_id = revision.space_id
+        AND item.id = revision.content_item_id
+       WHERE revision.tenant_id = $1 AND revision.workspace_id = $2
+         AND revision.content_item_id = $3 AND revision.revision_number = $4
+       LIMIT 1`,
+      [tenantId, workspaceId, contentItemId, revisionNumber]
+    );
+    const row = result.rows[0];
+    if (!row) throw new ContentInvariantError("Content revision is unavailable");
+    return { spaceId: row.space_id, accessClass: row.access_class };
+  }
+
+  async getContentRevisionBody(
+    tenantId: string,
+    workspaceId: string,
+    contentItemId: string,
+    revisionNumber: number
+  ): Promise<string> {
+    const result = await this.tx.query<{ body: string }>(
+      `SELECT body FROM content.content_revisions
+       WHERE tenant_id = $1 AND workspace_id = $2
+         AND content_item_id = $3 AND revision_number = $4
+       LIMIT 1`,
+      [tenantId, workspaceId, contentItemId, revisionNumber]
+    );
+    const body = result.rows[0]?.body;
+    if (body === undefined) throw new ContentInvariantError("Content revision is unavailable");
+    return body;
+  }
+
   async createContent(input: {
     contentItemId: string;
     revisionId: string;
@@ -485,6 +527,15 @@ export class ContentRepository {
     workspaceId: string,
     sourceArtifactId: string
   ): Promise<SourceArtifactProjection> {
+    const currentId = await this.resolveCurrentSourceId(tenantId, workspaceId, sourceArtifactId);
+    return this.getSource(tenantId, workspaceId, currentId, true);
+  }
+
+  async resolveCurrentSourceId(
+    tenantId: string,
+    workspaceId: string,
+    sourceArtifactId: string
+  ): Promise<string> {
     const result = await this.tx.query<{ id: string }>(
       `WITH RECURSIVE chain AS (
          SELECT id, 0 AS depth FROM content.source_artifacts
@@ -504,7 +555,7 @@ export class ContentRepository {
     );
     const leaf = result.rows[0];
     if (!leaf) throw new ContentInvariantError("Source is unavailable");
-    return this.getSource(tenantId, workspaceId, leaf.id, true);
+    return leaf.id;
   }
 
   async tombstoneSource(input: {

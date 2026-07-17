@@ -34,6 +34,12 @@ interface ActivityRow {
   version: number;
 }
 
+export interface ActivityAssociationVisibility {
+  organizationIds: readonly string[];
+  initiativeIds: readonly string[];
+  personIds: readonly string[];
+}
+
 export class WorkGraphRepository {
   constructor(private readonly tx: TenantDbTransaction) {}
 
@@ -256,7 +262,12 @@ export class WorkGraphRepository {
     };
   }
 
-  async getActivity(tenantId: string, workspaceId: string, activityId: string): Promise<Activity> {
+  async getActivity(
+    tenantId: string,
+    workspaceId: string,
+    activityId: string,
+    visibility: ActivityAssociationVisibility
+  ): Promise<Activity> {
     const aggregate = await this.tx.query<ActivityRow>(
       `SELECT id, space_id, subtype, profile_template_key, title, status, occurred_at,
               starts_at, ends_at, owner_person_id, governing_initiative_id,
@@ -267,7 +278,67 @@ export class WorkGraphRepository {
     );
     const row = aggregate.rows[0];
     if (!row) throw new Error("Work graph resource is unavailable");
-    return this.projectActivity(tenantId, workspaceId, row);
+    return this.projectActivity(tenantId, workspaceId, row, visibility);
+  }
+
+  async getActivityScope(
+    tenantId: string,
+    workspaceId: string,
+    activityId: string
+  ): Promise<{ spaceId: string }> {
+    const result = await this.tx.query<{ space_id: string }>(
+      `SELECT space_id FROM work.activities
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 LIMIT 1`,
+      [tenantId, workspaceId, activityId]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Work graph resource is unavailable");
+    return { spaceId: row.space_id };
+  }
+
+  async getActivityAssociationCandidates(
+    tenantId: string,
+    workspaceId: string,
+    activityId: string
+  ): Promise<ActivityAssociationVisibility> {
+    const result = await this.tx.query<{
+      organization_ids: string[];
+      initiative_ids: string[];
+      person_ids: string[];
+    }>(
+      `SELECT
+         ARRAY(SELECT DISTINCT association.organization_id
+           FROM work.activity_organizations association
+           WHERE association.tenant_id = activity.tenant_id
+             AND association.workspace_id = activity.workspace_id
+             AND association.activity_id = activity.id
+           ORDER BY association.organization_id) AS organization_ids,
+         ARRAY(SELECT DISTINCT association.initiative_id
+           FROM work.activity_initiatives association
+           WHERE association.tenant_id = activity.tenant_id
+             AND association.workspace_id = activity.workspace_id
+             AND association.activity_id = activity.id
+           ORDER BY association.initiative_id) AS initiative_ids,
+         ARRAY(SELECT person_id FROM (
+           SELECT activity.owner_person_id AS person_id
+           UNION
+           SELECT attendee.person_id FROM work.activity_attendees attendee
+           WHERE attendee.tenant_id = activity.tenant_id
+             AND attendee.workspace_id = activity.workspace_id
+             AND attendee.activity_id = activity.id
+         ) people ORDER BY person_id) AS person_ids
+       FROM work.activities activity
+       WHERE activity.tenant_id = $1 AND activity.workspace_id = $2 AND activity.id = $3
+       LIMIT 1`,
+      [tenantId, workspaceId, activityId]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Work graph resource is unavailable");
+    return {
+      organizationIds: row.organization_ids,
+      initiativeIds: row.initiative_ids,
+      personIds: row.person_ids
+    };
   }
 
   async lockActivityForSourceCapture(
@@ -304,22 +375,35 @@ export class WorkGraphRepository {
   private async projectActivity(
     tenantId: string,
     workspaceId: string,
-    row: ActivityRow
+    row: ActivityRow,
+    visibility?: ActivityAssociationVisibility
   ): Promise<Activity> {
     const organizations = await this.tx.query<{ organization_id: string }>(
       `SELECT organization_id FROM work.activity_organizations
-       WHERE tenant_id = $1 AND workspace_id = $2 AND activity_id = $3 ORDER BY organization_id`,
-      [tenantId, workspaceId, row.id]
+       WHERE tenant_id = $1 AND workspace_id = $2 AND activity_id = $3
+         ${visibility ? "AND organization_id = ANY($4::uuid[])" : ""}
+       ORDER BY organization_id`,
+      visibility
+        ? [tenantId, workspaceId, row.id, [...visibility.organizationIds]]
+        : [tenantId, workspaceId, row.id]
     );
     const initiatives = await this.tx.query<{ initiative_id: string }>(
       `SELECT initiative_id FROM work.activity_initiatives
-       WHERE tenant_id = $1 AND workspace_id = $2 AND activity_id = $3 ORDER BY initiative_id`,
-      [tenantId, workspaceId, row.id]
+       WHERE tenant_id = $1 AND workspace_id = $2 AND activity_id = $3
+         ${visibility ? "AND initiative_id = ANY($4::uuid[])" : ""}
+       ORDER BY initiative_id`,
+      visibility
+        ? [tenantId, workspaceId, row.id, [...visibility.initiativeIds]]
+        : [tenantId, workspaceId, row.id]
     );
     const attendees = await this.tx.query<{ person_id: string }>(
       `SELECT person_id FROM work.activity_attendees
-       WHERE tenant_id = $1 AND workspace_id = $2 AND activity_id = $3 ORDER BY person_id`,
-      [tenantId, workspaceId, row.id]
+       WHERE tenant_id = $1 AND workspace_id = $2 AND activity_id = $3
+         ${visibility ? "AND person_id = ANY($4::uuid[])" : ""}
+       ORDER BY person_id`,
+      visibility
+        ? [tenantId, workspaceId, row.id, [...visibility.personIds]]
+        : [tenantId, workspaceId, row.id]
     );
     return {
       id: row.id,
@@ -333,11 +417,15 @@ export class WorkGraphRepository {
       ...(row.occurred_at === null ? {} : { occurredAt: row.occurred_at.toISOString() }),
       ...(row.starts_at === null ? {} : { startsAt: row.starts_at.toISOString() }),
       ...(row.ends_at === null ? {} : { endsAt: row.ends_at.toISOString() }),
-      ownerPersonId: row.owner_person_id,
-      ...(row.governing_initiative_id === null
+      ...(!visibility || visibility.personIds.includes(row.owner_person_id)
+        ? { ownerPersonId: row.owner_person_id }
+        : {}),
+      ...(row.governing_initiative_id === null ||
+      (visibility && !visibility.initiativeIds.includes(row.governing_initiative_id))
         ? {}
         : { governingInitiativeId: row.governing_initiative_id }),
-      ...(row.governing_organization_id === null
+      ...(row.governing_organization_id === null ||
+      (visibility && !visibility.organizationIds.includes(row.governing_organization_id))
         ? {}
         : { governingOrganizationId: row.governing_organization_id }),
       organizationIds: organizations.rows.map(({ organization_id }) => organization_id),
