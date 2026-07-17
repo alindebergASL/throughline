@@ -9,6 +9,27 @@ const sourceA = "70000000-0000-7000-8000-000000000004";
 const sourceB = "70000000-0000-7000-8000-000000000005";
 
 describe("ContentRepository source lifecycle", () => {
+  it("loads only the exact Source identifier and reservation Space for routing", async () => {
+    const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      const selectList = sql.match(/SELECT\s+([\s\S]*?)\s+FROM/i)?.[1]?.replace(/\s+/g, " ");
+      expect(selectList).toBe("id, space_id");
+      expect(sql).toContain("FROM content.source_artifacts");
+      expect(sql).not.toMatch(/\bJOIN\b|\bWITH\s+RECURSIVE\b/i);
+      expect(sql).not.toMatch(
+        /source_type|trust_class|title|immutable_text|object_key|content_hash|normalization_version|chunking_version|normalized_content_hash|hash_retention_policy|origin_content_item_id|origin_content_revision|supersedes_source_id|captured_by|occurred_at|access_class|source_snapshot_policy|retention_policy_id|deleted_at|deletion_reason|deletion_policy_ref|hash_disposition|\bversion\b|source_chunks|activity_sources/i
+      );
+      expect(values).toEqual([tenantId, workspaceId, sourceA]);
+      return { rows: [{ id: sourceA, space_id: spaceId }] };
+    });
+    const repository = new ContentRepository({ query } as unknown as TenantDbTransaction);
+
+    await expect(repository.getSourceScope(tenantId, workspaceId, sourceA)).resolves.toEqual({
+      id: sourceA,
+      spaceId
+    });
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
   it("enumerates Activity source identifiers without materializing source bytes or metadata", async () => {
     const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
       expect(sql).toContain("SELECT link.source_artifact_id AS id");

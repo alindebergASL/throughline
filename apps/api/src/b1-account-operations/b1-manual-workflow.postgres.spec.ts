@@ -19,6 +19,7 @@ import {
   seedWaveA2DeterministicData,
   withTenantTransaction,
   type PgPool,
+  type PgPoolClient,
   type TenantDbTransaction
 } from "@throughline/db";
 import { createDevSecurityContext, devFixtures } from "@throughline/tenancy";
@@ -677,6 +678,161 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
       await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
         access.rows[0]!.id
       ]);
+    }
+  }, 30_000);
+
+  it("lets a committed Space-grant revocation after reservation scope lookup deny Source mutation", async () => {
+    const access = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES ($1,$2,'membership',$3,'contributor','space',$4,'direct') RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        state.sourceSpaceId
+      ]
+    );
+    const before = await sourcePipelineCounts(ownerPool);
+    const racePool = createPgPool(appUrl!);
+    const barrier = pauseAfterSourceScopeLookup(racePool, state.sourceArtifactId);
+    const bus = new AccountOperationsDomainCommandBus(barrier.pool);
+    let correction: Promise<unknown> | undefined;
+    try {
+      correction = bus.execute(
+        {
+          kind: "source.correct",
+          idempotencyKey: "scope-lookup-revocation-denied",
+          payload: {
+            predecessorSourceArtifactId: state.sourceArtifactId,
+            sourceType: "human",
+            text: "This correction must not survive authority revocation."
+          }
+        },
+        createDevSecurityContext("tenant-a-viewer")
+      );
+      void correction.catch(() => undefined);
+      await barrier.scopeResolved.promise;
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        access.rows[0]!.id
+      ]);
+      barrier.releaseScopeLookup.resolve();
+
+      await expect(correction).rejects.toMatchObject({
+        name: "B1AuthorizationError",
+        message: "B1 resource is unavailable"
+      });
+      expect(await sourcePipelineCounts(ownerPool)).toEqual(before);
+      const unchanged = await ownerPool.query<{
+        version: number;
+        deleted_at: Date | null;
+        successors: string;
+        commands: string;
+        audits: string;
+        outbox: string;
+      }>(
+        `SELECT source.version, source.deleted_at,
+          (SELECT count(*)::text FROM content.source_artifacts successor
+           WHERE successor.supersedes_source_id = source.id) AS successors,
+          (SELECT count(*)::text FROM ops.domain_command_records command
+           WHERE command.idempotency_key = 'scope-lookup-revocation-denied') AS commands,
+          (SELECT count(*)::text FROM ops.audit_events audit
+           JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+           WHERE command.idempotency_key = 'scope-lookup-revocation-denied') AS audits,
+          (SELECT count(*)::text FROM ops.product_outbox_events event
+           JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+           WHERE command.idempotency_key = 'scope-lookup-revocation-denied') AS outbox
+         FROM content.source_artifacts source WHERE source.id = $1`,
+        [state.sourceArtifactId]
+      );
+      expect(unchanged.rows[0]).toEqual({
+        version: 1,
+        deleted_at: null,
+        successors: "0",
+        commands: "0",
+        audits: "0",
+        outbox: "0"
+      });
+    } finally {
+      barrier.releaseScopeLookup.resolve();
+      await correction?.catch(() => undefined);
+      await racePool.end();
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        access.rows[0]!.id
+      ]);
+    }
+  }, 30_000);
+
+  it("lets committed membership suspension after reservation scope lookup deny Source tombstone", async () => {
+    const before = await sourcePipelineCounts(ownerPool);
+    const racePool = createPgPool(appUrl!);
+    const barrier = pauseAfterSourceScopeLookup(racePool, state.sourceArtifactId);
+    const bus = new AccountOperationsDomainCommandBus(barrier.pool);
+    let tombstone: Promise<unknown> | undefined;
+    try {
+      tombstone = bus.execute(
+        {
+          kind: "source.tombstone",
+          idempotencyKey: "scope-lookup-tombstone-revocation-denied",
+          payload: {
+            sourceArtifactId: state.sourceArtifactId,
+            expectedVersion: 1,
+            deletionReasonCategory: "retention",
+            deletionPolicyRef: "policy:revoked-before-tombstone"
+          }
+        },
+        createDevSecurityContext("tenant-a-owner")
+      );
+      void tombstone.catch(() => undefined);
+      await barrier.scopeResolved.promise;
+      await ownerPool.query(
+        `UPDATE identity.memberships SET status = 'suspended'
+         WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+        [devFixtures.tenantA, devFixtures.workspaceA, devFixtures.membershipAOwner]
+      );
+      barrier.releaseScopeLookup.resolve();
+
+      await expect(tombstone).rejects.toMatchObject({
+        name: "B1AuthorizationError",
+        message: "B1 resource is unavailable"
+      });
+      expect(await sourcePipelineCounts(ownerPool)).toEqual(before);
+      const unchanged = await ownerPool.query<{
+        version: number;
+        deleted_at: Date | null;
+        commands: string;
+        audits: string;
+        outbox: string;
+      }>(
+        `SELECT source.version, source.deleted_at,
+          (SELECT count(*)::text FROM ops.domain_command_records command
+           WHERE command.idempotency_key = 'scope-lookup-tombstone-revocation-denied') AS commands,
+          (SELECT count(*)::text FROM ops.audit_events audit
+           JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+           WHERE command.idempotency_key = 'scope-lookup-tombstone-revocation-denied') AS audits,
+          (SELECT count(*)::text FROM ops.product_outbox_events event
+           JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+           WHERE command.idempotency_key = 'scope-lookup-tombstone-revocation-denied') AS outbox
+         FROM content.source_artifacts source WHERE source.id = $1`,
+        [state.sourceArtifactId]
+      );
+      expect(unchanged.rows[0]).toEqual({
+        version: 1,
+        deleted_at: null,
+        commands: "0",
+        audits: "0",
+        outbox: "0"
+      });
+    } finally {
+      barrier.releaseScopeLookup.resolve();
+      await tombstone?.catch(() => undefined);
+      await racePool.end();
+      await ownerPool.query(
+        `UPDATE identity.memberships SET status = 'active'
+         WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+        [devFixtures.tenantA, devFixtures.workspaceA, devFixtures.membershipAOwner]
+      );
     }
   }, 30_000);
 
@@ -2299,6 +2455,11 @@ async function activityDigest(pool: PgPool, activityId: string) {
 
 async function sourcePipelineCounts(pool: PgPool) {
   const result = await pool.query<{
+    organizations: string;
+    initiatives: string;
+    activities: string;
+    relationships: string;
+    contentItems: string;
     sources: string;
     chunks: string;
     links: string;
@@ -2307,6 +2468,11 @@ async function sourcePipelineCounts(pool: PgPool) {
     outbox: string;
   }>(
     `SELECT
+      (SELECT count(*)::text FROM work.organizations) AS organizations,
+      (SELECT count(*)::text FROM work.initiatives) AS initiatives,
+      (SELECT count(*)::text FROM work.activities) AS activities,
+      (SELECT count(*)::text FROM work.relationships) AS relationships,
+      (SELECT count(*)::text FROM content.content_items) AS "contentItems",
       (SELECT count(*)::text FROM content.source_artifacts) AS sources,
       (SELECT count(*)::text FROM content.source_chunks) AS chunks,
       (SELECT count(*)::text FROM work.activity_sources) AS links,
@@ -2315,6 +2481,53 @@ async function sourcePipelineCounts(pool: PgPool) {
       (SELECT count(*)::text FROM ops.product_outbox_events) AS outbox`
   );
   return result.rows[0]!;
+}
+
+function pauseAfterSourceScopeLookup(
+  realPool: PgPool,
+  sourceArtifactId: string
+): {
+  pool: PgPool;
+  scopeResolved: ReturnType<typeof deferred>;
+  releaseScopeLookup: ReturnType<typeof deferred>;
+} {
+  const scopeResolved = deferred();
+  const releaseScopeLookup = deferred();
+  let paused = false;
+  const pool = {
+    connect: async () => {
+      const client = await realPool.connect();
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "query") {
+            return async (text: unknown, ...args: unknown[]) => {
+              const query = target.query as unknown as (
+                text: unknown,
+                ...args: unknown[]
+              ) => Promise<unknown>;
+              const result = await query.call(target, text, ...args);
+              const values = args[0];
+              if (
+                !paused &&
+                typeof text === "string" &&
+                /SELECT\s+id,\s*space_id\s+FROM\s+content\.source_artifacts/i.test(text) &&
+                Array.isArray(values) &&
+                values[2] === sourceArtifactId
+              ) {
+                paused = true;
+                scopeResolved.resolve();
+                await releaseScopeLookup.promise;
+              }
+              return result;
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      }) as PgPoolClient;
+    }
+  } as unknown as PgPool;
+  return { pool, scopeResolved, releaseScopeLookup };
 }
 
 function deferred() {

@@ -111,6 +111,12 @@ describe("Wave B1 architecture boundaries", () => {
       commandBus.indexOf('case "source.correct": {'),
       commandBus.indexOf('case "source.tombstone": {')
     );
+    expect(correction.indexOf('this.authorize(tx, context, "source.read"')).toBeLessThan(
+      correction.indexOf("resolveSourceActivityLinkForCorrection")
+    );
+    expect(correction.indexOf('this.authorize(tx, context, "source.correct"')).toBeLessThan(
+      correction.indexOf("resolveSourceActivityLinkForCorrection")
+    );
     expect(correction.indexOf("resolveSourceActivityLinkForCorrection")).toBeLessThan(
       correction.indexOf("lockActivityForSourceCapture")
     );
@@ -120,12 +126,52 @@ describe("Wave B1 architecture boundaries", () => {
     expect(correction.indexOf("lockCurrentSourceForCorrection")).toBeLessThan(
       correction.indexOf("revalidateSourceActivityLinkForCorrection")
     );
+    expect(correction.match(/this\.authorize\(tx, context, "source\.read"/g)).toHaveLength(2);
     expect(correction.match(/this\.authorize\(tx, context, "source\.correct"/g)).toHaveLength(2);
-    expect(correction.indexOf('this.authorize(tx, context, "source.correct"')).toBeLessThan(
-      correction.indexOf("reserveCommand(")
-    );
     expect(correction.indexOf("revalidateSourceActivityLinkForCorrection")).toBeLessThan(
+      correction.lastIndexOf('this.authorize(tx, context, "source.read"')
+    );
+    expect(correction.lastIndexOf('this.authorize(tx, context, "source.read"')).toBeLessThan(
       correction.lastIndexOf('this.authorize(tx, context, "source.correct"')
+    );
+
+    const tombstone = commandBus.slice(
+      commandBus.indexOf('case "source.tombstone": {'),
+      commandBus.indexOf("private async authorize(")
+    );
+    expect(tombstone.match(/this\.authorize\(tx, context, "source\.read"/g)).toHaveLength(2);
+    expect(tombstone.match(/this\.authorize\(tx, context, "source\.tombstone"/g)).toHaveLength(2);
+    expect(tombstone.indexOf('this.authorize(tx, context, "source.read"')).toBeLessThan(
+      tombstone.indexOf("content.lockSource(")
+    );
+    expect(tombstone.indexOf('this.authorize(tx, context, "source.tombstone"')).toBeLessThan(
+      tombstone.indexOf("content.lockSource(")
+    );
+    expect(tombstone.indexOf("content.lockSource(")).toBeLessThan(
+      tombstone.lastIndexOf('this.authorize(tx, context, "source.read"')
+    );
+    expect(tombstone.lastIndexOf('this.authorize(tx, context, "source.read"')).toBeLessThan(
+      tombstone.lastIndexOf('this.authorize(tx, context, "source.tombstone"')
+    );
+  });
+
+  it("routes Source reservations through the minimal Source scope query only", async () => {
+    const repository = await source("packages/content/src/repository.ts");
+    const commandBus = await source("packages/account-operations/src/domain-command-bus.ts");
+    const reservation = commandBus.slice(
+      commandBus.indexOf("private async resolveReservationSpace("),
+      commandBus.indexOf("private async executeInTransaction(")
+    );
+    expect(reservation.match(/getSourceScope\(/g)).toHaveLength(2);
+    expect(reservation).not.toMatch(/getSource\(/);
+
+    const sourceScope = repository.slice(
+      repository.indexOf("async getSourceScope("),
+      repository.indexOf("async getContentItemScope(")
+    );
+    expect(sourceScope).toContain("SELECT id, space_id");
+    expect(sourceScope).not.toMatch(
+      /JOIN|source_chunks|activity_sources|immutable_text|title|content_hash|access_class|deleted_at|deletion_reason|hash_disposition|supersedes_source_id|\bversion\b/i
     );
   });
 
