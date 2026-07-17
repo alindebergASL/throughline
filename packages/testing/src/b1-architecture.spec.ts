@@ -101,9 +101,11 @@ describe("Wave B1 architecture boundaries", () => {
       commandBus.indexOf('case "source.capture": {'),
       commandBus.indexOf('case "source.correct": {')
     );
-    expect(capture.indexOf("lockActivityForSourceCapture")).toBeLessThan(
-      capture.indexOf('this.authorize(tx, context, "source.capture"')
-    );
+    const captureLock = capture.indexOf("lockActivityForSourceCapture");
+    const captureAuthorization = capture.indexOf('"source.capture",', captureLock);
+    expect(captureLock).toBeLessThan(captureAuthorization);
+    expect(captureAuthorization).toBeGreaterThan(-1);
+    expect(capture).toContain("requestedAccessClass: command.payload.requestedAccessClass");
 
     const correction = commandBus.slice(
       commandBus.indexOf('case "source.correct": {'),
