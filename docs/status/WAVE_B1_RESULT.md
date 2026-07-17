@@ -1,17 +1,19 @@
 # Wave B1 Result — Manual Account Work Graph and Source Capture
 
-- **Date:** 2026-07-16
-- **Status:** local implementation checkpoint passed the complete pre-result authoritative PostgreSQL/LocalStack gate; HOLD remains before commit, independent exact-head review, publication, merge, and deployment
+- **Date:** 2026-07-17 UTC
+- **Status:** pre-result corrected candidate gate PASS; HOLD remains before the complete final-byte gate and every subsequent commit, verification, review, publication, merge, deployment, or release step
+- **Branch:** `wave-b1-work-graph-source-capture`
+- **Committed blocked head:** `7e539c0a709108f72f1e616afe95a816cc86276a`
+- **Committed blocked tree:** `a2724330c4bda909e9867c863b380ecee362351c`
 - **Authorized base:** `2566cb4649c24217058d32de6a0e088b303bb07b`
 - **Authorized base tree:** `97782492085cc637e426eced81f46d3ede684cfd`
-- **Branch:** `wave-b1-work-graph-source-capture`
-- **Commit:** none; this is an uncommitted HOLD checkpoint
+- **Corrected pre-result candidate tree:** `38bade333215e6d168cd9f6e68d5472e18f7fa86`
 - **Canonical plan SHA-256:** `38a08d9cd57f3704f45c75bb35f5eb29a03d9a157e247e3ffa0af9ee6b77d39d`
-- **Tested pre-result candidate tree:** `29419ad799b199c516748bf941fb02b74a35734d`
+- **Publication state:** corrected candidate remains uncommitted; no push, PR, or publication has occurred
 
 ## Scope and outcome
 
-The implementation satisfies the B1 manual no-integration gate:
+The corrected candidate passes the B1 manual no-integration gate:
 
 > A user can manually create the account workflow and capture a source without any integration.
 
@@ -21,129 +23,114 @@ The candidate adds the approved account work graph and manual source-capture sur
 - Organization, Initiative, Activity, and Relationship aggregate storage and repository behavior;
 - ContentItem revisioning and SourceArtifact capture, correction, tombstone, and chunk storage;
 - centralized B1 action authorization and non-leaking route behavior;
-- one transaction-scoped command path that binds command reservation, aggregate mutation, audit, and the canonical B1.0 product outbox;
+- one transaction-scoped command path binding command reservation, aggregate mutation, audit, and the canonical B1.0 product outbox;
 - minimal manual HTTP routes for the approved workflow; and
 - real PostgreSQL and LocalStack proof for the complete no-integration walkthrough.
 
 No Claim, AcceptedFact, truth-ledger acceptance, ChangeSet, model call, extraction, MCP/provider integration, semantic retrieval, autonomous action, broad dashboard UI, real Kanban dispatch, deployment, or release was added.
 
-## Activity/source lock correction
+The Activity endpoint lock remains fixed and repository-controlled for source capture and correction. Forced RLS, non-owner/NOBYPASSRLS application execution, column-level `UPDATE(id)` only, permanent write denial, deterministic Activity-before-Source locking, and contributor-or-higher source authorization remain part of the verified boundary.
 
-`source.capture` and `source.correct` retain the Activity endpoint lock required by the plan. The generic caller-controlled Activity lock seam was replaced with the fixed repository operation `lockActivityForSourceCapture(...)`, whose query uses `SELECT ... FOR SHARE` against the exact Tenant, Workspace, governing Space, Activity, live-Space, and eligible-Activity predicates.
+## Resolved direct-review corrections
 
-The application role receives only the PostgreSQL capability required for that lock:
+The corrected candidate resolves all seven direct-review findings:
 
-```sql
-GRANT UPDATE (id) ON work.activities TO throughline_app;
-```
+1. The migration journal is exact, phase-aware, and fail-closed, with an exhaustive B1 catalog validator covering explicit relation and column ACLs plus bidirectional SQL `EXCEPT` checks.
+2. B1 command kind, version, payload, result, audit, and outbox mappings are closed. Malformed or unknown inputs are rejected before reservation with zero residue, and idempotency is bound to trusted input.
+3. `content.create.v1` requires exact integer initial revision/version `1` at application and database boundaries. Fractional, string, null, and range-forgery inputs are rejected.
+4. Source GET performs `source.read` authorization before correction traversal or materialization, then terminally reauthorizes; failures do not leak source data.
+5. Activity associations are authorization-filtered before projection, excluding inaccessible identifiers, counts, and metadata.
+6. `relationship.end` reauthorizes persisted endpoints, context, and current authority under deterministic locks; revocation wins with zero residue.
+7. Origin-backed capture verifies exact revision and scope authorization plus byte and encoding equality before hashes or chunks. Forged, deleted, tombstoned, cross-scope, and revoked origins are rejected.
 
-Migration `0004` supplies exactly two applicable Activity UPDATE policies:
+The separate CI correction ensures exactly one canonical `pnpm test:b1` invocation, removes the standalone final `pnpm test:b1-0` stage, and fails required-environment validation before orchestration begins.
 
-- an explicit PERMISSIVE, transaction-local, scoped lock policy with the exact Tenant/Workspace/Space/live/eligible predicates and `WITH CHECK (false)`; and
-- an explicit RESTRICTIVE permanent no-write guard with `USING (true)` and `WITH CHECK (false)`.
+## Migration identity and catalog proof
 
-Forced RLS, non-owner/NOBYPASSRLS application execution, column-level `UPDATE(id)` only, no grant option, and denial of every tested Activity write form remain intact. No table-level Activity UPDATE, non-ID update column, PUBLIC/inherited update path, owner/BYPASSRLS execution path, SECURITY DEFINER lock helper, or arbitrary Activity lock API was introduced.
-
-`source.capture` uses centralized `source.capture` authorization with contributor-or-higher authority in the governing Space. `source.correct` uses deterministic Activity `FOR SHARE` before predecessor/current SourceArtifact `FOR UPDATE`, then revalidates the relationship after the required locks.
-
-The individual post-focused lock review found no bulk grant, caller-controlled SQL, broader Activity capability, or Foundation/product-relay/worker/relay lock regression. Its external report is:
-
-`/home/ubuntu/.hermes/rollouts/throughline-b1-implementation-20260716/post-focused-lock-review.md`
-
-## Migration identity
-
-The migration journal from the passing pre-result gate recorded:
+The authoritative migration journal recorded:
 
 - `0001_wave_a2_identity_access_rls.sql` — `22b84fbeb36cfcfdd1f8270e6ffa03d819d5307c0aace86e69aa647d643b1ff7`
 - `0002_foundation_closure_async_isolation.sql` — `4264f0f760a74026bc0e0a6a38b98760e6061c76c9885848cf4236f13cda3ee2`
 - `0003_b1_0_canonical_product_outbox.sql` — `094303adaafbdc744c3c29fb1643ee3342d1e50bd7493491e96f84bd428fcc63`
 - `0004_b1_work_graph.sql` — `e3c94ed9ca9c8d5dac8791d5e35c290933c69ada8da842d9242eb2e2c2f58d76`
 - `0005_b1_content_sources.sql` — `b917adfd0acf987904156ade0c0593f6f3c27d8cf516c78c75af17072b99a19c`
-- `0006_b1_command_integrity.sql` — `33371e78f9137467d51d2c9235ab10744303b24e83b9fd77ee81881355c339db`
+- `0006_b1_command_integrity.sql` — `5534436f86d56e8f983c60f3869c9e66928ffdc73b1d1cdbd115a156c3dbfebc`
 
-Migrations `0001`–`0003` are byte-identical to the authorized base. B1 uses only additive migrations after `0003`.
+Protected migrations `0001`–`0003` remain byte-identical to the authorized base. B1 remains additive after `0003`.
 
-## Focused PostgreSQL gate
-
-The final focused run before the pre-result authoritative gate passed:
-
-`/home/ubuntu/.hermes/rollouts/throughline-b1-implementation-20260716/focused-b1-20260716T202122Z-1033851`
-
-It included:
-
-- formatting and architecture/dependency guards;
-- domain-profile, work-graph, content, account-operation, migration, transaction, and authorization tests;
-- the real 16-test B1 PostgreSQL lock/security/concurrency suite; and
-- the 16-test manual API/PostgreSQL workflow suite.
-
-The real lock proof covered exact Activity grants/policies, correct and incorrect lock contexts, stale/cross-scope/archived/cancelled denial, concurrent captures, write denial with unchanged Activity digest, lock release and pooled-context hygiene, Activity-before-Source correction ordering, correction-fork behavior, non-contributor denial, and idempotent replay/conflict behavior.
+The catalog PostgreSQL adversarial suite passed 25/25 tests. It covers the exact `0004`/`0005`/`0006` phases; missing, gapped, reordered, and checksum-drifted journals; ACL mutation; owner, RLS, policy, function, trigger, rule, role, and `search_path` mutations; and scratch cleanup.
 
 ## Complete pre-result authoritative gate
 
-A fresh disposable PostgreSQL database and LocalStack generation ran the complete gate on candidate tree `29419ad799b199c516748bf941fb02b74a35734d` with an identical end tree.
+The complete gate ran from a fresh disposable PostgreSQL and LocalStack generation:
 
-Run directory:
+`/home/ubuntu/.hermes/rollouts/throughline-b1-implementation-20260716/authoritative-b1-20260717T042343Z-1376482`
 
-`/home/ubuntu/.hermes/rollouts/throughline-b1-implementation-20260716/authoritative-b1-20260716T205459Z-1066160`
+Start tree and end tree were both `38bade333215e6d168cd9f6e68d5472e18f7fa86`.
 
-| Command | Result | Evidence |
+| Stage | Result | Evidence |
 | --- | ---: | --- |
 | `pnpm install --frozen-lockfile` | PASS | frozen lockfile accepted |
 | `pnpm format:check` | PASS | zero formatting errors |
 | `pnpm lint` | PASS | zero lint errors |
 | `pnpm typecheck` | PASS | zero type errors |
-| ordinary `pnpm test` with integration variables unset | PASS | ordinary repository suite passed |
+| ordinary `pnpm test`, service variables intentionally unset | PASS | 43 files passed, 10 skipped; 616 tests passed, 279 service-backed tests skipped |
 | `pnpm build` | PASS | all build tasks passed |
-| canonical `pnpm test:b1` | PASS | nested security, Foundation, B1.0, and B1 gates all passed |
+| canonical `pnpm test:b1`, invoked exactly once | PASS | 42 test files and 895 tests passed; 0 skipped; 0 unhandled errors |
 | `git diff --check` | PASS | zero whitespace errors |
-| authoritative log scan | PASS | zero authoritative skips and zero unhandled test errors |
 
-The canonical B1 gate included the unchanged Foundation and B1.0 real PostgreSQL/LocalStack regression gates, the product-relay PostgreSQL/LocalStack suite, B1 architecture and authorization gates, and the real B1 manual API/PostgreSQL gate.
+The ordinary-test skips are intentional collection behavior with service variables unset; they are not authoritative-gate skips. The canonical B1 gate's authoritative skip count is zero.
 
-Evidence SHA-256 values:
+Focused PostgreSQL evidence also passed:
 
-- summary: `7846c3e68136bfdd39d4600577eb0395ebeaa38885b24f5138b1ec78b10fcac0`
-- cleanup: `86a24a1ae9798b6e7b527c68f7ddd2b1eeea424188e8e11f2321e4acf2913095`
-- frozen install log: `1ab0aae6f10aa3cfc92c8115d57c737426df939fff0187c76a7238a84f55e7f7`
+- manual workflow suite: 21/21, including exact integer-one forgery tests and all six functional review seams;
+- security suite: 18/18 after global-prefix updates; and
+- Foundation/worker suites: 87/87 after global-prefix updates.
+
+## Evidence identities
+
+- summary: `9ec19c9d03def32efc2e2d62a06922450453a1ad97865911fd64feb839395bc4`
+- cleanup: `d1ea5931659b757693686367556c36b34dfb4c537dba5a3c1d00dff927527db5`
+- frozen install log: `d35e52ef2b4df5a810d57776a88bf96c29f5beb42b5b5e5615d7dedddf34d391`
 - formatting log: `68ea59b69f4f3f8e0a01c9213bb41f1e4b4578b764f035ded18d28bae6ea05f0`
-- lint log: `259f73190b81f9030e29de52736d8d3400b6db6da59f1331dc0b0b005bfe11ef`
-- typecheck log: `d279c9c1e69bb70e76d480eafbc74d7b7d2278210fd939721a678a3ecdd896f1`
-- ordinary test log: `95338a7ac65c3aa402144bcfd4307daa04f3984608f65dc7c5bbc89c10c4af76`
-- build log: `c4aafd2982ac4066d192639455e73e67ff285cf3b14b45d1143e1073b9fa8dfa`
-- complete B1 log: `3717e479ce219611788fcd2227a629e66f1b50d7a6f288c908a0eb9a99045755`
-- authoritative log scan: `0a0a36e3c2410daeb306fd0f4cafd1ab9a926b7f17b8f8cec3ec65fcbf60fd8a`
-- migration journal: `a8450880fa4252a26bdabe08aa9c0c35a3b7f44c75d6e091eaf74d28f5ba8637`
+- lint log: `8ad93493a15fb302a36fe0f0e5006b75cfa7630b014a266d5ee91714d40a86bf`
+- typecheck log: `509faf1f56b4c3c0cd83d48a49fcdbf212fc99c005de199827bb738af4bf05ee`
+- ordinary-test log: `6bbca41de79d4ee95385f0ffe3577ab29f35ef5d44bfe872994eb2524720a9a5`
+- build log: `b8e98f798c6e5a996c7306026ceead8bd72e154f94bbaf8c9aee97b8fa7bd5de`
+- complete B1 log: `c534afa117bb7e4fb4363a1a81d3c05af06d4783fe63b62485f5e0aee2b337b9`
+- diff log: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
+- authoritative scan: `0a0a36e3c2410daeb306fd0f4cafd1ab9a926b7f17b8f8cec3ec65fcbf60fd8a`
+- journal TSV: `03daedec53c734f28b7025d9a2be2fc04b54764125d917df1feee871513fe4ab`
 
 ## Cleanup
 
-Before teardown, the Foundation source queue and DLQ had zero visible and zero in-flight messages. The product queue had three visible and zero in-flight messages from the accepted-send integration scenarios. The S3 bucket had zero objects and PostgreSQL had zero residual client connections.
+Before teardown:
 
-Teardown removed both disposable containers and all associated queues, messages, bucket state, and database state. The cleanup record reports:
+- Foundation source queue: 0 visible / 0 in-flight;
+- Foundation DLQ: 0 visible / 0 in-flight;
+- product queue: 3 visible / 0 in-flight, expected accepted-send integration fixtures;
+- S3 bucket objects: 0; and
+- PostgreSQL residual client connections: 0.
 
-- LocalStack container absent: PASS;
-- PostgreSQL container absent: PASS;
-- lingering worktree processes: zero; and
-- gate exit code: zero.
+After teardown, the PostgreSQL and LocalStack containers were absent: PASS.
 
-## Test-compatibility corrections
+The broad process scanner listed eight pre-existing Hermes TypeScript LSP/`tsserver` processes attached to the worktree. They were editor tooling, not gate or test processes and not leaked disposable resources.
 
-The complete gate exposed three bounded additive-wave compatibility issues, retained as failed evidence rather than represented as passes:
+## Historical evidence
 
-1. Foundation migration-security tests assumed only migrations `0001`–`0003`. They now recognize `0004`–`0006` while preserving the A2 predecessor-adoption proof by removing only the predecessor journal row under test.
-2. Migration `0006` initially applied B1-specific result-shape and atomicity checks to non-B1 canonical fixture commands. The checks now use the closed B1 command-kind set and preserve B1.0 behavior.
-3. A B1.0 product-relay test proved absence of B1 product effects by expecting future B1 tables not to exist. It now makes the stronger additive-wave assertion that those tables contain zero rows while continuing to require the duplicate `ops.domain_events` ledger to be absent.
+The prior result artifact SHA-256 `c86acf7e216c5036f34fc8c8373ab2f93db445a74e4cd8ab40fe2458f80805e3`, its earlier candidate tree, and its earlier evidence identities are historical after this update and are not current PASS evidence.
 
-The first attempted all-stage runner also invoked `test:b1-0` directly and then invoked canonical `test:b1`, which recursively invoked B1.0 again against the same disposable queue/database generation. The first invocation passed; the repeated invocation encountered retained integration fixture state. The final authoritative runner invokes canonical `test:b1` once, matching the repository's intended nested security → Foundation → B1.0 → B1 gate composition.
+Prior failed or interrupted catalog and authoritative runs remain preserved as diagnostics only. They are not represented as PASS evidence.
 
-## Final-byte binding
+## Final-byte binding and HOLD
 
-This result artifact intentionally records the already-passing pre-result implementation tree and evidence rather than attempting to contain a self-referential hash of its own bytes. Before any commit or review, the exact candidate including this result artifact must rerun the complete authoritative gate from frozen install. That external final-byte evidence must record identical start/end trees, the exact migration journal, zero authoritative skips, zero unhandled errors, and complete cleanup.
+This artifact records the passing pre-result candidate. It does **not** claim a final-byte PASS.
 
-## Review and publication state
+The next mandatory step is a complete final-byte gate over the candidate including this updated result file. That gate must again bind identical start and end trees, the exact migration journal, all required stages, zero authoritative skips, zero unhandled errors, and complete cleanup.
 
-No implementation commit exists. No detached exact-head verifier or direct exact-head reviewer has run. Nothing has been pushed, no B1 PR exists, and no merge or deployment is authorized.
+The branch remains at the committed blocked head; the corrected candidate has not been committed. No corrected-candidate commit, push, PR, or publication has occurred.
 
-HOLD remains in force before commit, review, publication, merge, deployment, release, real Kanban dispatch, AWS/runtime access, canonical-document changes, accepted-ADR changes, or B2 work.
+HOLD remains before the final-byte gate, commit, detached verification, direct review, push, PR, merge, deployment, release, AWS/runtime access, real Kanban dispatch, canonical-document or accepted-ADR changes, and B2 work.
 
 ## Spec deviations
 
@@ -151,8 +138,8 @@ None identified.
 
 ## Known issues
 
-No known implementation blocker remains after the focused and complete pre-result gates. Final-byte gating, exact-head independent verification, direct review, and publication are intentionally pending authorization.
+No known B1 implementation blocker remains after the corrected pre-result gate. Final-byte gating and every post-gate action remain intentionally pending.
 
-## Approval needed
+## Approval state
 
-Yes. Explicit authority is required before creating commits or beginning exact-head review/publication.
+The active correction instruction conditionally authorizes bounded commits, detached exact-head verification, direct read-only review, and scoped PR publication after their prerequisite gates pass. Merge and deployment remain unauthorized under every outcome and still require separate explicit authority.

@@ -146,7 +146,7 @@ describe("B1.0 architecture and Foundation isolation", () => {
     expect(content).not.toContain("credential=secret");
   });
 
-  it("wires a unique Standard queue and serialized fail-closed real-service gate in CI", async () => {
+  it("wires a unique Standard queue and serialized fail-closed canonical B1 gate in CI", async () => {
     const workflow = await source(".github/workflows/ci.yml");
     expect(workflow).toContain(
       "PRODUCT_QUEUE_NAME: throughline-b1-0-test-product-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -154,8 +154,9 @@ describe("B1.0 architecture and Foundation isolation", () => {
     expect(workflow).toContain("--attributes MessageRetentionPeriod=86400");
     expect(workflow).toContain('has("RedrivePolicy")');
     expect(workflow).toContain("Run fail-closed Foundation PostgreSQL and LocalStack gate");
-    expect(workflow).toContain("Run fail-closed B1.0 PostgreSQL and LocalStack gate");
-    expect(workflow).toContain("run: pnpm test:b1-0");
+    expect(workflow).toContain("Run fail-closed canonical B1 PostgreSQL and LocalStack gate");
+    expect(workflow.match(/^\s+run: pnpm test:b1$/gm)).toHaveLength(1);
+    expect(workflow).not.toMatch(/^\s+run: pnpm test:b1-0$/m);
   });
 });
 
