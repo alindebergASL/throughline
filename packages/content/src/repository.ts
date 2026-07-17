@@ -481,45 +481,21 @@ export class ContentRepository {
     };
   }
 
-  async listActivitySources(input: {
+  async listActivitySourceCandidates(input: {
     tenantId: string;
     workspaceId: string;
     activityId: string;
     activitySpaceId: string;
-    permittedSourceSpaceIds: readonly string[];
-    dataClassCeiling: AccessClass;
-  }): Promise<SourceArtifactProjection[]> {
-    if (input.permittedSourceSpaceIds.length === 0) return [];
+  }): Promise<string[]> {
     const ids = await this.tx.query<{ id: string }>(
-      `SELECT source.id
+      `SELECT link.source_artifact_id AS id
        FROM work.activity_sources link
-       JOIN content.source_artifacts source
-         ON source.tenant_id = link.tenant_id AND source.workspace_id = link.workspace_id
-        AND source.id = link.source_artifact_id
-       JOIN access.spaces source_space
-         ON source_space.tenant_id = source.tenant_id
-        AND source_space.workspace_id = source.workspace_id AND source_space.id = source.space_id
        WHERE link.tenant_id = $1 AND link.workspace_id = $2 AND link.activity_id = $3
-         AND link.space_id = $4 AND source.space_id = ANY($5::uuid[])
-         AND GREATEST(
-           CASE source.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1
-             WHEN 'restricted' THEN 2 ELSE 3 END,
-           CASE source_space.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1
-             WHEN 'restricted' THEN 2 ELSE 3 END
-         ) <= $6
-       ORDER BY link.created_at, source.id`,
-      [
-        input.tenantId,
-        input.workspaceId,
-        input.activityId,
-        input.activitySpaceId,
-        input.permittedSourceSpaceIds,
-        accessRank(input.dataClassCeiling)
-      ]
+         AND link.space_id = $4
+       ORDER BY link.created_at, link.source_artifact_id`,
+      [input.tenantId, input.workspaceId, input.activityId, input.activitySpaceId]
     );
-    return Promise.all(
-      ids.rows.map(({ id }) => this.getSource(input.tenantId, input.workspaceId, id, true))
-    );
+    return ids.rows.map(({ id }) => id);
   }
 
   async resolveCurrentSource(
@@ -767,8 +743,4 @@ export class ContentRepository {
       accessClass: row.access_class
     }));
   }
-}
-
-function accessRank(value: AccessClass): number {
-  return { public: 0, workspace: 1, restricted: 2, confidential: 3 }[value];
 }

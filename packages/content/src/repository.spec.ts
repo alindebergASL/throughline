@@ -9,6 +9,27 @@ const sourceA = "70000000-0000-7000-8000-000000000004";
 const sourceB = "70000000-0000-7000-8000-000000000005";
 
 describe("ContentRepository source lifecycle", () => {
+  it("enumerates Activity source identifiers without materializing source bytes or metadata", async () => {
+    const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
+      expect(sql).toContain("SELECT link.source_artifact_id AS id");
+      expect(sql).toContain("FROM work.activity_sources link");
+      expect(sql).not.toMatch(/source_artifacts|source_chunks|immutable_text|title|content_hash/i);
+      expect(values).toEqual([tenantId, workspaceId, sourceA, spaceId]);
+      return { rows: [{ id: sourceA }, { id: sourceB }] };
+    });
+    const repository = new ContentRepository({ query } as unknown as TenantDbTransaction);
+
+    await expect(
+      repository.listActivitySourceCandidates({
+        tenantId,
+        workspaceId,
+        activityId: sourceA,
+        activitySpaceId: spaceId
+      })
+    ).resolves.toEqual([sourceA, sourceB]);
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
   it("resolves the terminal tombstone and never falls back to readable predecessor evidence", async () => {
     const query = vi.fn(async (sql: string) => {
       if (sql.includes("WITH RECURSIVE chain")) return { rows: [{ id: sourceB }] };

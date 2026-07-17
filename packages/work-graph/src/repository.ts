@@ -40,6 +40,10 @@ export interface ActivityAssociationVisibility {
   personIds: readonly string[];
 }
 
+export type InitiativeReadProjection = Omit<Initiative, "primaryOrganizationId"> & {
+  primaryOrganizationId: string | null;
+};
+
 export class WorkGraphRepository {
   constructor(private readonly tx: TenantDbTransaction) {}
 
@@ -202,8 +206,23 @@ export class WorkGraphRepository {
     tenantId: string,
     workspaceId: string,
     initiativeId: string,
-    lock = false
-  ): Promise<Initiative> {
+    lock?: false
+  ): Promise<Initiative>;
+  async getInitiative(
+    tenantId: string,
+    workspaceId: string,
+    initiativeId: string,
+    options: { organizationIds: readonly string[] }
+  ): Promise<InitiativeReadProjection>;
+  async getInitiative(
+    tenantId: string,
+    workspaceId: string,
+    initiativeId: string,
+    lockOrOptions: boolean | { organizationIds: readonly string[] } = false
+  ): Promise<Initiative | InitiativeReadProjection> {
+    const lock = typeof lockOrOptions === "boolean" ? lockOrOptions : false;
+    const visibleOrganizationIds =
+      typeof lockOrOptions === "boolean" ? undefined : lockOrOptions.organizationIds;
     const aggregate = await this.tx.query<{
       id: string;
       space_id: string;
@@ -230,8 +249,9 @@ export class WorkGraphRepository {
     }>(
       `SELECT organization_id, association_role FROM work.initiative_organizations
        WHERE tenant_id = $1 AND workspace_id = $2 AND initiative_id = $3 AND ended_at IS NULL
+         AND ($4::uuid[] IS NULL OR organization_id = ANY($4::uuid[]))
        ORDER BY association_role, organization_id`,
-      [tenantId, workspaceId, initiativeId]
+      [tenantId, workspaceId, initiativeId, visibleOrganizationIds ?? null]
     );
     const contributors = await this.tx.query<{ person_id: string }>(
       `SELECT person_id FROM work.initiative_people
@@ -242,7 +262,9 @@ export class WorkGraphRepository {
     const primary = organizations.rows.find(
       ({ association_role }) => association_role === "primary"
     );
-    if (!primary) throw new Error("Work graph resource is unavailable");
+    if (!primary && visibleOrganizationIds === undefined) {
+      throw new Error("Work graph resource is unavailable");
+    }
     return {
       id: row.id,
       tenantId,
@@ -256,10 +278,24 @@ export class WorkGraphRepository {
       profileId: row.profile_id,
       profileVersion: row.profile_version,
       organizationIds: organizations.rows.map(({ organization_id }) => organization_id),
-      primaryOrganizationId: primary.organization_id,
+      primaryOrganizationId: primary?.organization_id ?? null,
       contributorPersonIds: contributors.rows.map(({ person_id }) => person_id),
       version: row.version
     };
+  }
+
+  async getInitiativeOrganizationCandidates(
+    tenantId: string,
+    workspaceId: string,
+    initiativeId: string
+  ): Promise<string[]> {
+    const result = await this.tx.query<{ organization_id: string }>(
+      `SELECT organization_id FROM work.initiative_organizations
+       WHERE tenant_id = $1 AND workspace_id = $2 AND initiative_id = $3 AND ended_at IS NULL
+       ORDER BY association_role, organization_id`,
+      [tenantId, workspaceId, initiativeId]
+    );
+    return result.rows.map(({ organization_id }) => organization_id);
   }
 
   async getActivity(
@@ -560,24 +596,63 @@ export class WorkGraphRepository {
     relationshipId: string;
     expectedVersion: number;
     validTo: string;
-  }): Promise<{ spaceId: string; version: number }> {
-    const result = await this.tx.query<{ space_id: string; version: number }>(
-      `UPDATE work.relationships
-       SET valid_to = $5, version = version + 1, updated_at = clock_timestamp()
-       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
-         AND version = $4 AND valid_to IS NULL
-       RETURNING space_id, version`,
+    actorUserId: string;
+    actorMembershipId: string;
+    authorityRequirements: readonly { grantId: string; resourceId: string }[];
+  }): Promise<
+    | { authorized: false }
+    | { authorized: true; relationship?: { spaceId: string; version: number } }
+  > {
+    const result = await this.tx.query<{
+      authorized: boolean;
+      space_id: string | null;
+      version: number | null;
+    }>(
+      `WITH authority AS (
+         SELECT NOT EXISTS (
+           SELECT 1
+           FROM unnest($8::uuid[], $9::uuid[]) AS requirement(grant_id, resource_id)
+           WHERE NOT EXISTS (
+             SELECT 1 FROM access.access_relationships grant_record
+             WHERE grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
+               AND grant_record.id = requirement.grant_id
+               AND grant_record.resource_type = 'space'
+               AND grant_record.resource_id = requirement.resource_id
+               AND grant_record.relation IN ('owner','manager','contributor','viewer')
+               AND ((grant_record.subject_type = 'membership' AND grant_record.subject_id = $7)
+                 OR (grant_record.subject_type = 'user' AND grant_record.subject_id = $6))
+           )
+         ) AS allowed
+       ), updated AS (
+         UPDATE work.relationships
+         SET valid_to = $5, version = version + 1, updated_at = clock_timestamp()
+         WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
+           AND version = $4 AND valid_to IS NULL
+           AND (SELECT allowed FROM authority)
+         RETURNING space_id, version
+       )
+       SELECT authority.allowed AS authorized, updated.space_id, updated.version
+       FROM authority LEFT JOIN updated ON true`,
       [
         input.tenantId,
         input.workspaceId,
         input.relationshipId,
         input.expectedVersion,
-        input.validTo
+        input.validTo,
+        input.actorUserId,
+        input.actorMembershipId,
+        input.authorityRequirements.map(({ grantId }) => grantId),
+        input.authorityRequirements.map(({ resourceId }) => resourceId)
       ]
     );
-    const row = result.rows[0];
-    if (!row) throw new Error("Relationship version precondition failed");
-    return { spaceId: row.space_id, version: row.version };
+    const row = result.rows[0]!;
+    if (!row.authorized) return { authorized: false };
+    return row.space_id === null || row.version === null
+      ? { authorized: true }
+      : {
+          authorized: true,
+          relationship: { spaceId: row.space_id, version: row.version }
+        };
   }
 
   async resolveEndpoint(

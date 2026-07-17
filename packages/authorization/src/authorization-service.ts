@@ -1,4 +1,9 @@
-import type { AuthorizationDecision, ResourceRef, SecurityContext } from "@throughline/core-types";
+import type {
+  AccessClass,
+  AuthorizationDecision,
+  ResourceRef,
+  SecurityContext
+} from "@throughline/core-types";
 import type { PgPool, TenantQueryExecutor } from "@throughline/db";
 import { withTenantTransaction } from "@throughline/db";
 import { isSecurityContextExpired, parseSecurityContext } from "@throughline/tenancy";
@@ -108,7 +113,7 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
       );
     }
 
-    const membership = await loadActiveMembership(tx, context);
+    const membership = await loadActiveMembership(tx, context, options.lockAuthority === true);
     if (!membership) {
       return deny(
         context.policyVersion,
@@ -212,7 +217,7 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
         context.policyVersion,
         canReadSpace.reasonCode,
         options.explain ? canReadSpace.explanation : undefined,
-        [canReadSpace.reasonCode]
+        canReadSpace.authorityTokens
       );
     }
 
@@ -254,7 +259,7 @@ async function b1Decision(
   role: MembershipRole,
   action: AuthorizationAction,
   resource: ResourceRef,
-  options: AuthorizationDecisionOptions
+  options: TransactionAuthorizationDecisionOptions
 ): Promise<AuthorizationDecision> {
   if (action === "person.read") {
     return personReadDecision(tx, context, role, resource, options.personUseSite);
@@ -279,15 +284,20 @@ async function b1Decision(
       [context.tenantId, context.workspaceId, spaceId]
     );
     accessClass = space.rows[0]?.access_class;
+    if (accessClass && options.requestedAccessClass) {
+      accessClass = maxDataClass(accessClass, options.requestedAccessClass);
+    }
   } else {
-    const loaded = await loadB1ResourceScope(tx, context, action, resource);
+    const loaded = await loadB1ResourceScope(tx, context, action, resource, options);
     spaceId = loaded?.spaceId;
     accessClass = loaded?.accessClass;
   }
   if (!spaceId || !accessClass || !canReadDataClass(context.dataClassCeiling, accessClass)) {
     return nonLeakingB1Deny(context.policyVersion);
   }
-  const readable = await canReadSpaceResource(tx, context, spaceId, role);
+  const readable = await canReadSpaceResource(tx, context, spaceId, role, {
+    lockAuthority: options.lockAuthority === true
+  });
   if (!readable.allowed) return nonLeakingB1Deny(context.policyVersion);
 
   const readActions = new Set<AuthorizationAction>([
@@ -303,15 +313,18 @@ async function b1Decision(
       context.policyVersion,
       "b1_resource_read",
       options.explain ? "Current Space and data-class access allow this projection" : undefined,
-      [readable.reasonCode]
+      readable.authorityTokens
     );
   }
   if (action === "source.tombstone" || action === "organization.create") {
     return ownerOrAdminDecision(context.policyVersion, role, "b1_workspace_authority");
   }
-  const contributor = await hasContributorAuthority(tx, context, spaceId, role);
-  return contributor
-    ? allow(context.policyVersion, "b1_contributor_authority", undefined, [readable.reasonCode])
+  const contributor = await contributorAuthority(tx, context, spaceId, role);
+  return contributor.allowed
+    ? allow(context.policyVersion, "b1_contributor_authority", undefined, [
+        ...readable.authorityTokens,
+        ...contributor.authorityTokens
+      ])
     : deny(context.policyVersion, "b1_resource_not_available");
 }
 
@@ -319,7 +332,8 @@ async function loadB1ResourceScope(
   tx: TenantQueryExecutor,
   context: SecurityContext,
   action: AuthorizationAction,
-  resource: ResourceRef
+  resource: ResourceRef,
+  options: TransactionAuthorizationDecisionOptions
 ): Promise<
   | {
       spaceId: string;
@@ -355,13 +369,53 @@ async function loadB1ResourceScope(
          FROM content.source_artifacts source
          JOIN access.spaces space ON space.tenant_id = source.tenant_id
            AND space.workspace_id = source.workspace_id AND space.id = source.space_id
-         WHERE source.tenant_id = $1 AND source.workspace_id = $2 AND source.id = $3 LIMIT 1`
-      : `SELECT resource.space_id, space.access_class
-         FROM ${table} resource
-         JOIN access.spaces space ON space.tenant_id = resource.tenant_id
-           AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id
-         WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3 LIMIT 1`,
-    [context.tenantId, context.workspaceId, resource.id]
+         WHERE source.tenant_id = $1 AND source.workspace_id = $2 AND source.id = $3
+         LIMIT 1`
+      : table === "content.content_items" && options.contentRevision !== undefined
+        ? `SELECT resource.space_id,
+             CASE GREATEST(
+               CASE space.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
+               CASE resource.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
+               CASE revision.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END
+             ) WHEN 0 THEN 'public' WHEN 1 THEN 'workspace' WHEN 2 THEN 'restricted' ELSE 'confidential' END AS access_class
+           FROM content.content_items resource
+           JOIN content.content_revisions revision
+             ON revision.tenant_id = resource.tenant_id
+            AND revision.workspace_id = resource.workspace_id
+            AND revision.space_id = resource.space_id
+            AND revision.content_item_id = resource.id
+            AND revision.revision_number = $4
+           JOIN access.spaces space ON space.tenant_id = resource.tenant_id
+             AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id
+           WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3
+             AND ($5::uuid IS NULL OR resource.space_id = $5)
+           LIMIT 1`
+        : table === "content.content_items"
+          ? `SELECT resource.space_id,
+               CASE GREATEST(
+                 CASE space.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
+                 CASE resource.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END
+               ) WHEN 0 THEN 'public' WHEN 1 THEN 'workspace' WHEN 2 THEN 'restricted' ELSE 'confidential' END AS access_class
+             FROM content.content_items resource
+             JOIN access.spaces space ON space.tenant_id = resource.tenant_id
+               AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id
+             WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3
+             LIMIT 1`
+          : `SELECT resource.space_id, space.access_class
+             FROM ${table} resource
+             JOIN access.spaces space ON space.tenant_id = resource.tenant_id
+               AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id
+             WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3
+             LIMIT 1`,
+    table === "content.content_items" && options.contentRevision !== undefined
+      ? [
+          context.tenantId,
+          context.workspaceId,
+          resource.id,
+          options.contentRevision,
+          options.requiredSpaceId ?? null
+        ]
+      : [context.tenantId, context.workspaceId, resource.id]
   );
   const row = result.rows[0];
   return row ? { spaceId: row.space_id, accessClass: row.access_class } : undefined;
@@ -421,7 +475,7 @@ async function personReadDecision(
     }
     const readable = await canReadSpaceResource(tx, context, row.space_id, role);
     return readable.allowed
-      ? allow(context.policyVersion, "person_use_site_read", undefined, [readable.reasonCode])
+      ? allow(context.policyVersion, "person_use_site_read", undefined, readable.authorityTokens)
       : nonLeakingB1Deny(context.policyVersion);
   } else return nonLeakingB1Deny(context.policyVersion);
   const result = await tx.query<{
@@ -444,29 +498,32 @@ async function personReadDecision(
   }
   const readable = await canReadSpaceResource(tx, context, row.space_id, role);
   return readable.allowed
-    ? allow(context.policyVersion, "person_use_site_read", undefined, [readable.reasonCode])
+    ? allow(context.policyVersion, "person_use_site_read", undefined, readable.authorityTokens)
     : nonLeakingB1Deny(context.policyVersion);
 }
 
-async function hasContributorAuthority(
+async function contributorAuthority(
   tx: TenantQueryExecutor,
   context: SecurityContext,
   spaceId: string,
   role: MembershipRole
-): Promise<boolean> {
-  if (role === "owner" || role === "admin") return true;
-  const result = await tx.query<{ allowed: boolean }>(
-    `SELECT EXISTS (
-       SELECT 1 FROM access.access_relationships grant_record
+): Promise<{ allowed: boolean; authorityTokens: string[] }> {
+  if (role === "owner" || role === "admin") return { allowed: true, authorityTokens: [] };
+  const result = await tx.query<{ id: string; resource_id: string }>(
+    `SELECT grant_record.id, grant_record.resource_id
+       FROM access.access_relationships grant_record
        WHERE grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
          AND grant_record.resource_type = 'space' AND grant_record.resource_id = $3
          AND grant_record.relation IN ('owner','manager','contributor')
          AND ((grant_record.subject_type = 'membership' AND grant_record.subject_id = $4)
            OR (grant_record.subject_type = 'user' AND grant_record.subject_id = $5))
-     ) AS allowed`,
+       ORDER BY grant_record.id LIMIT 1`,
     [context.tenantId, context.workspaceId, spaceId, context.actorMembershipId, context.actorUserId]
   );
-  return result.rows[0]?.allowed === true;
+  const row = result.rows[0];
+  return row
+    ? { allowed: true, authorityTokens: [spaceGrantToken(row.id, row.resource_id)] }
+    : { allowed: false, authorityTokens: [] };
 }
 
 function canReadDataClass(
@@ -475,6 +532,15 @@ function canReadDataClass(
 ): boolean {
   const rank = { public: 0, workspace: 1, restricted: 2, confidential: 3 } as const;
   return rank[resource] <= rank[ceiling];
+}
+
+function maxDataClass(left: AccessClass, right: AccessClass): AccessClass {
+  const rank = { public: 0, workspace: 1, restricted: 2, confidential: 3 } as const;
+  return rank[left] >= rank[right] ? left : right;
+}
+
+function spaceGrantToken(grantId: string, resourceId: string): string {
+  return `space_grant:${grantId}:${resourceId}`;
 }
 
 function nonLeakingB1Deny(policyVersion: string): AuthorizationDecision {
@@ -1204,7 +1270,8 @@ async function loadActivePolicyVersion(
 
 async function loadActiveMembership(
   tx: TenantQueryExecutor,
-  context: SecurityContext
+  context: SecurityContext,
+  lockAuthority = false
 ): Promise<MembershipRecord | undefined> {
   const result = await tx.query<MembershipRecord>(
     `
@@ -1216,7 +1283,7 @@ async function loadActiveMembership(
       AND m.tenant_id = $3
       AND m.workspace_id = $4
       AND m.person_id IS NOT NULL
-    LIMIT 1
+    LIMIT 1 ${lockAuthority ? "FOR SHARE OF m, u" : ""}
     `,
     [context.actorMembershipId, context.actorUserId, context.tenantId, context.workspaceId]
   );
@@ -1229,16 +1296,22 @@ async function canReadSpaceResource(
   context: SecurityContext,
   spaceId: string,
   role: MembershipRole,
-  options: { lockedTarget?: { id: string } } = {}
-): Promise<{ allowed: boolean; reasonCode: string; explanation?: string }> {
+  options: { lockedTarget?: { id: string }; lockAuthority?: boolean } = {}
+): Promise<{
+  allowed: boolean;
+  reasonCode: string;
+  explanation?: string;
+  authorityTokens: string[];
+}> {
   if (role === "owner" || role === "admin") {
     if (options.lockedTarget) {
       return options.lockedTarget.id === spaceId
-        ? { allowed: true, reasonCode: "workspace_admin_space_read" }
+        ? { allowed: true, reasonCode: "workspace_admin_space_read", authorityTokens: [] }
         : {
             allowed: false,
             reasonCode: "space_not_found",
-            explanation: "Space is not visible in the current workspace"
+            explanation: "Space is not visible in the current workspace",
+            authorityTokens: []
           };
     }
     const exists = await tx.query<{ id: string }>(
@@ -1251,19 +1324,22 @@ async function canReadSpaceResource(
       [spaceId, context.tenantId, context.workspaceId]
     );
     return exists.rows.length > 0
-      ? { allowed: true, reasonCode: "workspace_admin_space_read" }
+      ? { allowed: true, reasonCode: "workspace_admin_space_read", authorityTokens: [] }
       : {
           allowed: false,
           reasonCode: "space_not_found",
-          explanation: "Space is not visible in the current workspace"
+          explanation: "Space is not visible in the current workspace",
+          authorityTokens: []
         };
   }
 
   const result = await tx.query<{
     is_root: boolean;
     target_restricted: boolean;
-    has_direct_grant: boolean;
-    has_inherited_grant: boolean;
+    direct_grant_ids: string[];
+    direct_grant_space_ids: string[];
+    inherited_grant_ids: string[];
+    inherited_grant_space_ids: string[];
   }>(
     `
     WITH RECURSIVE target AS (
@@ -1283,8 +1359,8 @@ async function canReadSpaceResource(
     SELECT
       EXISTS (SELECT 1 FROM target WHERE kind = 'workspace_root') AS is_root,
       EXISTS (SELECT 1 FROM target WHERE inheritance_mode = 'restricted') AS target_restricted,
-      EXISTS (
-        SELECT 1
+      ARRAY(
+        SELECT ar.id
         FROM access.access_relationships ar
         WHERE ar.resource_type = 'space'
           AND ar.resource_id = $1
@@ -1293,9 +1369,22 @@ async function canReadSpaceResource(
             (ar.subject_type = 'membership' AND ar.subject_id = $4)
             OR (ar.subject_type = 'user' AND ar.subject_id = $5)
           )
-      ) AS has_direct_grant,
-      EXISTS (
-        SELECT 1
+        ORDER BY ar.id
+      ) AS direct_grant_ids,
+      ARRAY(
+        SELECT ar.resource_id
+        FROM access.access_relationships ar
+        WHERE ar.resource_type = 'space'
+          AND ar.resource_id = $1
+          AND ar.relation IN ('owner', 'manager', 'contributor', 'viewer')
+          AND (
+            (ar.subject_type = 'membership' AND ar.subject_id = $4)
+            OR (ar.subject_type = 'user' AND ar.subject_id = $5)
+          )
+        ORDER BY ar.id
+      ) AS direct_grant_space_ids,
+      ARRAY(
+        SELECT ar.id
         FROM ancestors a
         JOIN access.access_relationships ar ON ar.resource_type = 'space' AND ar.resource_id = a.id
         WHERE a.depth > 0
@@ -1310,7 +1399,26 @@ async function canReadSpaceResource(
             (ar.subject_type = 'membership' AND ar.subject_id = $4)
             OR (ar.subject_type = 'user' AND ar.subject_id = $5)
           )
-      ) AS has_inherited_grant
+        ORDER BY a.depth, ar.id
+      ) AS inherited_grant_ids,
+      ARRAY(
+        SELECT ar.resource_id
+        FROM ancestors a
+        JOIN access.access_relationships ar ON ar.resource_type = 'space' AND ar.resource_id = a.id
+        WHERE a.depth > 0
+          AND NOT EXISTS (
+            SELECT 1
+            FROM ancestors boundary
+            WHERE boundary.depth < a.depth
+              AND boundary.inheritance_mode = 'restricted'
+          )
+          AND ar.relation IN ('owner', 'manager', 'contributor', 'viewer')
+          AND (
+            (ar.subject_type = 'membership' AND ar.subject_id = $4)
+            OR (ar.subject_type = 'user' AND ar.subject_id = $5)
+          )
+        ORDER BY a.depth, ar.id
+      ) AS inherited_grant_space_ids
     FROM target
     LIMIT 1
     `,
@@ -1322,24 +1430,72 @@ async function canReadSpaceResource(
     return {
       allowed: false,
       reasonCode: "space_not_found",
-      explanation: "Space is not visible in the current workspace"
+      explanation: "Space is not visible in the current workspace",
+      authorityTokens: []
     };
   }
   if (access.is_root) {
-    return { allowed: true, reasonCode: "workspace_root_read" };
+    return { allowed: true, reasonCode: "workspace_root_read", authorityTokens: [] };
   }
-  if (access.has_direct_grant) {
-    return { allowed: true, reasonCode: "direct_space_grant" };
+  if (access.direct_grant_ids.length > 0) {
+    const token = await lockOrConfirmSpaceGrant(
+      tx,
+      context,
+      access.direct_grant_ids[0]!,
+      access.direct_grant_space_ids[0]!,
+      options.lockAuthority === true
+    );
+    if (token) {
+      return { allowed: true, reasonCode: "direct_space_grant", authorityTokens: [token] };
+    }
   }
-  if (!access.target_restricted && access.has_inherited_grant) {
-    return { allowed: true, reasonCode: "inherited_space_grant" };
+  if (!access.target_restricted && access.inherited_grant_ids.length > 0) {
+    const token = await lockOrConfirmSpaceGrant(
+      tx,
+      context,
+      access.inherited_grant_ids[0]!,
+      access.inherited_grant_space_ids[0]!,
+      options.lockAuthority === true
+    );
+    if (token) {
+      return { allowed: true, reasonCode: "inherited_space_grant", authorityTokens: [token] };
+    }
   }
 
   return {
     allowed: false,
     reasonCode: "space_access_denied",
-    explanation: "No current Space grant authorizes this action"
+    explanation: "No current Space grant authorizes this action",
+    authorityTokens: []
   };
+}
+
+async function lockOrConfirmSpaceGrant(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  grantId: string,
+  resourceId: string,
+  lockAuthority: boolean
+): Promise<string | undefined> {
+  if (!lockAuthority) return spaceGrantToken(grantId, resourceId);
+  const locked = await tx.query<{ id: string; resource_id: string }>(
+    `SELECT id, resource_id FROM access.access_relationships
+     WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND resource_id = $4
+       AND resource_type = 'space' AND relation IN ('owner','manager','contributor','viewer')
+       AND ((subject_type = 'membership' AND subject_id = $5)
+         OR (subject_type = 'user' AND subject_id = $6))
+     LIMIT 1 FOR SHARE`,
+    [
+      context.tenantId,
+      context.workspaceId,
+      grantId,
+      resourceId,
+      context.actorMembershipId,
+      context.actorUserId
+    ]
+  );
+  const row = locked.rows[0];
+  return row ? spaceGrantToken(row.id, row.resource_id) : undefined;
 }
 
 function ownerOrAdminDecision(

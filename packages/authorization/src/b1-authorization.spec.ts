@@ -14,7 +14,8 @@ function executor(
     contributor?: boolean;
   } = {}
 ) {
-  const query = vi.fn(async (sql: string) => {
+  const query = vi.fn(async (sql: string, _values?: readonly unknown[]) => {
+    void _values;
     if (sql.includes("FROM identity.policy_versions")) return { rows: [{ id: "default-v1" }] };
     if (sql.includes("FROM identity.memberships m")) {
       return {
@@ -24,6 +25,9 @@ function executor(
       };
     }
     if (sql.includes("FROM content.source_artifacts source")) {
+      return { rows: options.resource ? [options.resource] : [] };
+    }
+    if (sql.includes("FROM content.content_items resource")) {
       return { rows: options.resource ? [options.resource] : [] };
     }
     if (sql.includes("FROM work.activities resource") && sql.includes("JOIN identity.people")) {
@@ -45,8 +49,10 @@ function executor(
           {
             is_root: false,
             target_restricted: false,
-            has_direct_grant: true,
-            has_inherited_grant: false
+            direct_grant_ids: ["70000000-0000-7000-8000-000000000091"],
+            direct_grant_space_ids: [options.resource?.space_id ?? devFixtures.rootSpaceA],
+            inherited_grant_ids: [],
+            inherited_grant_space_ids: []
           }
         ]
       };
@@ -54,8 +60,17 @@ function executor(
     if (sql.includes("SELECT id") && sql.includes("FROM access.spaces")) {
       return { rows: [{ id: options.resource?.space_id ?? devFixtures.rootSpaceA }] };
     }
-    if (sql.includes("SELECT EXISTS") && sql.includes("grant_record")) {
-      return { rows: [{ allowed: options.contributor ?? false }] };
+    if (sql.includes("SELECT grant_record.id") && sql.includes("grant_record")) {
+      return {
+        rows: options.contributor
+          ? [
+              {
+                id: "70000000-0000-7000-8000-000000000092",
+                resource_id: options.resource?.space_id ?? devFixtures.rootSpaceA
+              }
+            ]
+          : []
+      };
     }
     throw new Error(`Unexpected B1 authorization query: ${sql}`);
   });
@@ -100,6 +115,78 @@ describe("central B1 authorization", () => {
     );
     expect(denied).toMatchObject({ allowed: false, reasonCode: "b1_resource_not_available" });
     expect(absent).toEqual(denied);
+  });
+
+  it.each(["content.read", "content.revise"] as const)(
+    "enforces the content-item access ceiling for %s even when the governing Space is readable",
+    async (action) => {
+      const service = new PostgresAuthorizationService({} as never);
+      const harness = executor({
+        resource: { space_id: devFixtures.rootSpaceA, access_class: "confidential" }
+      });
+      await expect(
+        service.canInTransaction(
+          createDevSecurityContext("tenant-a-owner"),
+          action,
+          { type: "content_item", id: devFixtures.personA },
+          harness.tx as never
+        )
+      ).resolves.toMatchObject({
+        allowed: false,
+        reasonCode: "b1_resource_not_available"
+      });
+      const scopeSql = harness.query.mock.calls
+        .map(([sql]) => sql)
+        .find((sql) => sql.includes("FROM content.content_items resource"));
+      expect(scopeSql).toContain("CASE resource.access_class");
+      expect(scopeSql).toContain("CASE space.access_class");
+    }
+  );
+
+  it("authorizes an exact origin item, revision, and Space without selecting revision bytes", async () => {
+    const service = new PostgresAuthorizationService({} as never);
+    const harness = executor({
+      resource: { space_id: devFixtures.rootSpaceA, access_class: "confidential" }
+    });
+    await expect(
+      service.canInTransaction(
+        createDevSecurityContext("tenant-a-owner"),
+        "content.read",
+        { type: "content_item", id: devFixtures.personA },
+        harness.tx as never,
+        { contentRevision: 3, requiredSpaceId: devFixtures.rootSpaceA }
+      )
+    ).resolves.toMatchObject({ allowed: false, reasonCode: "b1_resource_not_available" });
+    const [sql, values] = harness.query.mock.calls.find(([candidate]) =>
+      candidate.includes("JOIN content.content_revisions revision")
+    )!;
+    expect(sql).toContain("revision.revision_number = $4");
+    expect(sql).toContain("resource.space_id = $5");
+    expect(sql).toContain("CASE revision.access_class");
+    expect(sql).not.toMatch(/revision\.body|body_encoding|octet_length/i);
+    expect(values).toEqual([
+      expect.any(String),
+      expect.any(String),
+      devFixtures.personA,
+      3,
+      devFixtures.rootSpaceA
+    ]);
+  });
+
+  it("uses the validated requested classification as the creation ceiling", async () => {
+    const service = new PostgresAuthorizationService({} as never);
+    const harness = executor({
+      resource: { space_id: devFixtures.rootSpaceA, access_class: "workspace" }
+    });
+    await expect(
+      service.canInTransaction(
+        createDevSecurityContext("tenant-a-owner"),
+        "source.capture",
+        { type: "space", id: devFixtures.rootSpaceA },
+        harness.tx as never,
+        { requestedAccessClass: "confidential" }
+      )
+    ).resolves.toMatchObject({ allowed: false, reasonCode: "b1_resource_not_available" });
   });
 
   it("does not let Activity read authority substitute for source.capture contribution", async () => {

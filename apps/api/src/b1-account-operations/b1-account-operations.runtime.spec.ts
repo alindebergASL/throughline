@@ -3,8 +3,13 @@ import type { ContentRepository } from "@throughline/content";
 import type { SecurityContext } from "@throughline/core-types";
 import type { TenantDbTransaction } from "@throughline/db";
 import { createDevSecurityContext } from "@throughline/tenancy";
+import type { WorkGraphRepository } from "@throughline/work-graph";
 import { describe, expect, it, vi } from "vitest";
-import { readAuthorizedSource } from "./b1-account-operations.runtime.js";
+import {
+  listAuthorizedActivitySources,
+  readAuthorizedSource,
+  readInitiativeWithAuthorizedOrganizations
+} from "./b1-account-operations.runtime.js";
 
 describe("authorized source projection ordering", () => {
   it("does not resolve a correction terminal or materialize source text/chunks after denial", async () => {
@@ -70,5 +75,119 @@ describe("authorized source projection ordering", () => {
       terminalId,
       true
     );
+  });
+
+  it("enumerates identifiers, authorizes every candidate, then materializes only allowed sources", async () => {
+    const sourceA = "70000000-0000-7000-8000-000000000011";
+    const sourceDenied = "70000000-0000-7000-8000-000000000012";
+    const sourceB = "70000000-0000-7000-8000-000000000013";
+    const calls: string[] = [];
+    const listActivitySourceCandidates = vi.fn(async () => {
+      calls.push("enumerate");
+      return [sourceA, sourceDenied, sourceB];
+    });
+    const canInTransaction = vi.fn(
+      async (
+        _context: SecurityContext,
+        _action: string,
+        resource: { id: string },
+        _tx: TenantDbTransaction,
+        options: { lockAuthority?: boolean }
+      ) => {
+        calls.push(`authorize:${resource.id}`);
+        expect(options).toEqual({ lockAuthority: true });
+        return {
+          allowed: resource.id !== sourceDenied,
+          reasonCode: "test",
+          policyVersion: "policy"
+        };
+      }
+    );
+    const getSource = vi.fn(async (_tenant, _workspace, id: string) => {
+      calls.push(`materialize:${id}`);
+      return { id };
+    });
+
+    await expect(
+      listAuthorizedActivitySources({
+        content: {
+          listActivitySourceCandidates,
+          getSource
+        } as unknown as ContentRepository,
+        authorization: { canInTransaction } as unknown as PostgresAuthorizationService,
+        tx: {} as TenantDbTransaction,
+        context: createDevSecurityContext("tenant-a-owner") as SecurityContext,
+        activityId: "70000000-0000-7000-8000-000000000014",
+        activitySpaceId: "70000000-0000-7000-8000-000000000015"
+      })
+    ).resolves.toEqual([{ id: sourceA }, { id: sourceB }]);
+
+    expect(calls).toEqual([
+      "enumerate",
+      `authorize:${sourceA}`,
+      `authorize:${sourceDenied}`,
+      `authorize:${sourceB}`,
+      `materialize:${sourceA}`,
+      `materialize:${sourceB}`
+    ]);
+    expect(getSource).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      sourceDenied,
+      expect.anything()
+    );
+  });
+});
+
+describe("authorized Initiative organization projection", () => {
+  it("removes unreadable associations and represents an unreadable primary as null", async () => {
+    const hiddenPrimary = "70000000-0000-7000-8000-000000000021";
+    const readableSupporting = "70000000-0000-7000-8000-000000000022";
+    const getInitiativeOrganizationCandidates = vi.fn(async () => [
+      hiddenPrimary,
+      readableSupporting
+    ]);
+    const canInTransaction = vi.fn(
+      async (_context: SecurityContext, _action: string, resource: { id: string }) => ({
+        allowed: resource.id === readableSupporting,
+        reasonCode: "test",
+        policyVersion: "policy"
+      })
+    );
+    const getInitiative = vi.fn(
+      async (
+        _tenant,
+        _workspace,
+        initiativeId: string,
+        options: { organizationIds: string[] }
+      ) => ({
+        id: initiativeId,
+        organizationIds: options.organizationIds,
+        primaryOrganizationId: null
+      })
+    );
+
+    const result = await readInitiativeWithAuthorizedOrganizations({
+      graph: {
+        getInitiativeOrganizationCandidates,
+        getInitiative
+      } as unknown as WorkGraphRepository,
+      authorization: { canInTransaction } as unknown as PostgresAuthorizationService,
+      tx: {} as TenantDbTransaction,
+      context: createDevSecurityContext("tenant-a-owner") as SecurityContext,
+      initiativeId: "70000000-0000-7000-8000-000000000023"
+    });
+
+    expect(getInitiative).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      expect.any(String),
+      { organizationIds: [readableSupporting] }
+    );
+    expect(result).toMatchObject({
+      organizationIds: [readableSupporting],
+      primaryOrganizationId: null
+    });
+    expect(JSON.stringify(result)).not.toContain(hiddenPrimary);
   });
 });

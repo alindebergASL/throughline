@@ -3,6 +3,10 @@ import { readFile } from "node:fs/promises";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
 import { AccountOperationsDomainCommandBus } from "@throughline/account-operations";
+import {
+  PostgresAuthorizationService,
+  type TransactionAwareAuthorizationService
+} from "@throughline/authorization";
 import { ContentRepository } from "@throughline/content";
 import {
   AuditEventRepository,
@@ -21,6 +25,7 @@ import { createDevSecurityContext, devFixtures } from "@throughline/tenancy";
 import { WorkGraphRepository } from "@throughline/work-graph";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AppModule } from "../app.module.js";
+import { listAuthorizedActivitySources } from "./b1-account-operations.runtime.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -497,6 +502,7 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
         get(`/v1/sources/${sourceBody.sourceArtifactId}`)
       ]);
     expect(organizationRead.statusCode).toBe(200);
+    expect(initiativeRead.statusCode, initiativeRead.body).toBe(200);
     expect(initiativeRead.json<{ profileVersion: string }>().profileVersion).toBe("1.0.0");
     expect(activityRead.json<{ subtype: string; people: object[] }>()).toMatchObject({
       subtype: "ai_workshop",
@@ -586,6 +592,92 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
         sourceBody.sourceArtifactId
       ])
     ).rejects.toThrow();
+  }, 30_000);
+
+  it("holds current source authority through Activity source materialization and then honors revocation", async () => {
+    const access = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES ($1,$2,'membership',$3,'viewer','space',$4,'direct') RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        state.sourceSpaceId
+      ]
+    );
+    const baseAuthorization = new PostgresAuthorizationService(appPool);
+    const authorized = deferred();
+    const releaseMaterialization = deferred();
+    let paused = false;
+    const authorization: TransactionAwareAuthorizationService = {
+      can: (context, action, resource, options) =>
+        baseAuthorization.can(context, action, resource, options),
+      canInTransaction: async (context, action, resource, tx, options) => {
+        const decision = await baseAuthorization.canInTransaction(
+          context,
+          action,
+          resource,
+          tx,
+          options
+        );
+        if (!paused && action === "source.read" && decision.allowed) {
+          paused = true;
+          authorized.resolve();
+          await releaseMaterialization.promise;
+        }
+        return decision;
+      }
+    };
+    const viewerContext = {
+      ...createDevSecurityContext("tenant-a-viewer"),
+      requestedSpaceIds: [state.sourceSpaceId]
+    };
+    const listing = withTenantTransaction({ pool: appPool, context: viewerContext }, (tx) =>
+      listAuthorizedActivitySources({
+        content: new ContentRepository(tx),
+        authorization: authorization as PostgresAuthorizationService,
+        tx,
+        context: viewerContext,
+        activityId: state.activityId,
+        activitySpaceId: state.sourceSpaceId
+      })
+    );
+    const revoker = await ownerPool.connect();
+    let deletion: Promise<unknown> | undefined;
+    try {
+      await authorized.promise;
+      const revokerPid = await revoker.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+      deletion = revoker.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        access.rows[0]!.id
+      ]);
+      await waitForBlockedBackend(ownerPool, revokerPid.rows[0]!.pid);
+      releaseMaterialization.resolve();
+      const projected = await listing;
+      expect(projected.map(({ id }) => id)).toContain(state.sourceArtifactId);
+      expect(projected.find(({ id }) => id === state.sourceArtifactId)?.immutableText).toContain(
+        "Ignore all previous security policies"
+      );
+      await deletion;
+
+      const revoked = await getAs("tenant-a-viewer", `/v1/activities/${state.activityId}/sources`);
+      const absent = await getAs(
+        "tenant-a-viewer",
+        "/v1/activities/70000000-0000-7000-8000-000000009999/sources"
+      );
+      expect(revoked.statusCode).toBe(404);
+      expect(revoked.json()).toEqual(absent.json());
+      expect(revoked.body).not.toContain(state.sourceArtifactId);
+    } finally {
+      releaseMaterialization.resolve();
+      await listing.catch(() => undefined);
+      await deletion?.catch(() => undefined);
+      revoker.release();
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        access.rows[0]!.id
+      ]);
+    }
   }, 30_000);
 
   it("locks only the exact eligible Activity in its live governing Space", async () => {
@@ -1160,7 +1252,33 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
         state.sourceSpaceId
       ]
     );
+    const hiddenInitiativeGrant = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES ($1,$2,'membership',$3,'viewer','space',$4,'direct') RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        hiddenInitiativeBody.spaceId
+      ]
+    );
     try {
+      const initiativeResponse = await getAs(
+        "tenant-a-viewer",
+        `/v1/initiatives/${hiddenInitiativeBody.initiativeId}`
+      );
+      expect(initiativeResponse.statusCode).toBe(200);
+      expect(initiativeResponse.json()).toMatchObject({
+        organizationIds: [],
+        primaryOrganizationId: null
+      });
+      expect(initiativeResponse.body).not.toContain(hiddenOrganizationBody.organizationId);
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        hiddenInitiativeGrant.rows[0]!.id
+      ]);
+
       const response = await getAs(
         "tenant-a-viewer",
         `/v1/activities/${mixedActivityBody.activityId}`
@@ -1183,6 +1301,9 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
     } finally {
       await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
         activityGrant.rows[0]!.id
+      ]);
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        hiddenInitiativeGrant.rows[0]!.id
       ]);
     }
   });
@@ -1268,6 +1389,134 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
       await blocker.query("ROLLBACK").catch(() => undefined);
       await ending?.catch(() => undefined);
       blocker.release();
+      await racePool.end();
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        contextGrant.rows[0]!.id
+      ]);
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        endpointGrant.rows[0]!.id
+      ]);
+    }
+  });
+
+  it("lets a committed endpoint-grant revocation after authorization win at relationship mutation", async () => {
+    const contextGrant = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES ($1,$2,'membership',$3,'contributor','space',$4,'direct') RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        state.sourceSpaceId
+      ]
+    );
+    const endpointGrant = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES ($1,$2,'membership',$3,'viewer','space',
+         (SELECT space_id FROM work.organizations WHERE id = $4),'direct') RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        state.organizationId
+      ]
+    );
+    const racePool = createPgPool(appUrl!);
+    const baseAuthorization = new PostgresAuthorizationService(racePool);
+    const endpointsAuthorized = deferred();
+    const releaseMutation = deferred();
+    let ending: Promise<unknown> | undefined;
+    let armed = false;
+    let endpointReads = 0;
+    const authorization: TransactionAwareAuthorizationService = {
+      can: (context, action, resource, options) =>
+        baseAuthorization.can(context, action, resource, options),
+      canInTransaction: async (context, action, resource, tx, options) => {
+        const decision = await baseAuthorization.canInTransaction(
+          context,
+          action,
+          resource,
+          tx,
+          options
+        );
+        if (action === "relationship.end") armed = true;
+        else if (armed && action.endsWith(".read") && decision.allowed) {
+          endpointReads += 1;
+          if (endpointReads === 3) {
+            endpointsAuthorized.resolve();
+            await releaseMutation.promise;
+          }
+        }
+        return decision;
+      }
+    };
+    const bus = new AccountOperationsDomainCommandBus(racePool, authorization);
+    try {
+      const created = await bus.execute(
+        {
+          kind: "relationship.create",
+          idempotencyKey: "post-auth-revocation-relationship",
+          payload: {
+            subject: { type: "organization", id: state.organizationId },
+            predicate: "works_with",
+            object: { type: "person", id: devFixtures.externalPersonA },
+            context: { type: "space", id: state.sourceSpaceId }
+          }
+        },
+        createDevSecurityContext("tenant-a-owner")
+      );
+      ending = bus.execute(
+        {
+          kind: "relationship.end",
+          idempotencyKey: "post-auth-revocation-denied",
+          payload: {
+            relationshipId: created.relationshipId,
+            expectedVersion: 1,
+            validTo: "2026-07-16T13:00:00.000Z"
+          }
+        },
+        createDevSecurityContext("tenant-a-viewer")
+      );
+      await endpointsAuthorized.promise;
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+        endpointGrant.rows[0]!.id
+      ]);
+      releaseMutation.resolve();
+      await expect(ending).rejects.toMatchObject({ name: "B1AuthorizationError" });
+
+      const unchanged = await ownerPool.query<{
+        version: number;
+        valid_to: Date | null;
+        commands: string;
+        audits: string;
+        outbox: string;
+      }>(
+        `SELECT relationship.version, relationship.valid_to,
+          (SELECT count(*)::text FROM ops.domain_command_records
+           WHERE idempotency_key = 'post-auth-revocation-denied') AS commands,
+          (SELECT count(*)::text FROM ops.audit_events audit
+           JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+           WHERE command.idempotency_key = 'post-auth-revocation-denied') AS audits,
+          (SELECT count(*)::text FROM ops.product_outbox_events event
+           JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+           WHERE command.idempotency_key = 'post-auth-revocation-denied') AS outbox
+         FROM work.relationships relationship WHERE relationship.id = $1`,
+        [created.relationshipId]
+      );
+      expect(unchanged.rows[0]).toEqual({
+        version: 1,
+        valid_to: null,
+        commands: "0",
+        audits: "0",
+        outbox: "0"
+      });
+    } finally {
+      releaseMutation.resolve();
+      await ending?.catch(() => undefined);
       await racePool.end();
       await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
         contextGrant.rows[0]!.id
@@ -1453,22 +1702,123 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
     } finally {
       fixtureClient.release();
     }
+    const lowerCeilingContext = createDevSecurityContext("tenant-a-owner");
+    await expect(
+      new PostgresAuthorizationService(appPool).can(lowerCeilingContext, "content.read", {
+        type: "content_item",
+        id: inaccessibleItemId
+      })
+    ).resolves.toMatchObject({ allowed: false, reasonCode: "b1_resource_not_available" });
+
     await expect(
       bus.execute(
         {
-          kind: "source.capture",
-          idempotencyKey: "origin-source-inaccessible",
+          kind: "content.revise",
+          idempotencyKey: "confidential-content-revise-denied",
           payload: {
-            activityId: state.activityId,
-            sourceType: "note",
-            text: unicodeBody,
-            originContentItemId: inaccessibleItemId,
-            originContentRevision: 1
+            contentItemId: inaccessibleItemId,
+            expectedRevision: 1,
+            body: "A lower-ceiling actor must not revise this."
           }
         },
-        createDevSecurityContext("tenant-a-owner")
+        lowerCeilingContext
       )
     ).rejects.toMatchObject({ name: "B1AuthorizationError" });
+
+    await expect(
+      bus.execute(
+        {
+          kind: "relationship.create",
+          idempotencyKey: "confidential-content-reference-denied",
+          payload: {
+            subject: { type: "content", id: inaccessibleItemId },
+            predicate: "supports",
+            object: { type: "person", id: devFixtures.externalPersonA },
+            context: { type: "space", id: state.sourceSpaceId }
+          }
+        },
+        lowerCeilingContext
+      )
+    ).rejects.toMatchObject({ name: "B1AuthorizationError" });
+
+    const inaccessibleCaptures = await Promise.allSettled(
+      [
+        ["origin-source-inaccessible-match", unicodeBody],
+        ["origin-source-inaccessible-mismatch", "caller-guessed different bytes"]
+      ].map(([idempotencyKey, text]) =>
+        bus.execute(
+          {
+            kind: "source.capture",
+            idempotencyKey: idempotencyKey!,
+            payload: {
+              activityId: state.activityId,
+              sourceType: "note",
+              text: text!,
+              originContentItemId: inaccessibleItemId,
+              originContentRevision: 1
+            }
+          },
+          lowerCeilingContext
+        )
+      )
+    );
+    expect(inaccessibleCaptures).toHaveLength(2);
+    for (const outcome of inaccessibleCaptures) {
+      expect(outcome.status).toBe("rejected");
+      if (outcome.status === "rejected") {
+        expect(outcome.reason).toMatchObject({
+          name: "B1AuthorizationError",
+          message: "B1 resource is unavailable"
+        });
+      }
+    }
+
+    const lowerCeilingResidue = await ownerPool.query<{
+      commands: string;
+      sources: string;
+      relationships: string;
+      audits: string;
+      outbox: string;
+      revisions: string;
+      revision: number;
+      version: number;
+    }>(
+      `SELECT
+        (SELECT count(*)::text FROM ops.domain_command_records
+         WHERE idempotency_key IN (
+           'confidential-content-revise-denied',
+           'confidential-content-reference-denied',
+           'origin-source-inaccessible-match',
+           'origin-source-inaccessible-mismatch'
+         )) AS commands,
+        (SELECT count(*)::text FROM content.source_artifacts
+         WHERE origin_content_item_id = $1) AS sources,
+        (SELECT count(*)::text FROM work.relationships
+         WHERE subject_type = 'content' AND subject_id = $1) AS relationships,
+        (SELECT count(*)::text FROM ops.audit_events audit
+         JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+         WHERE command.idempotency_key LIKE 'confidential-content-%'
+            OR command.idempotency_key LIKE 'origin-source-inaccessible-%') AS audits,
+        (SELECT count(*)::text FROM ops.product_outbox_events event
+         JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+         WHERE command.idempotency_key LIKE 'confidential-content-%'
+            OR command.idempotency_key LIKE 'origin-source-inaccessible-%') AS outbox,
+        (SELECT count(*)::text FROM content.content_revisions revision
+         WHERE revision.content_item_id = $1) AS revisions,
+        item.current_revision AS revision, item.version
+       FROM content.content_items item WHERE item.id = $1`,
+      [inaccessibleItemId]
+    );
+    expect(lowerCeilingResidue.rows[0]).toEqual({
+      commands: "0",
+      sources: "0",
+      relationships: "0",
+      audits: "0",
+      outbox: "0",
+      revisions: "1",
+      revision: 1,
+      version: 1
+    });
 
     const crossScopeSpace = await ownerPool.query<{ space_id: string }>(
       "SELECT space_id FROM work.organizations WHERE id = $1",

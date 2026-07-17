@@ -595,7 +595,7 @@ export class AccountOperationsDomainCommandBus {
           true
         );
         if (relationship.spaceId !== reservationSpaceId) throw new B1CommandInvariantError();
-        await this.authorize(tx, context, "relationship.end", {
+        const relationshipDecision = await this.authorize(tx, context, "relationship.end", {
           type: "relationship",
           id: relationship.id
         });
@@ -608,19 +608,31 @@ export class AccountOperationsDomainCommandBus {
           reservationSpaceId
         );
         if (reservation.replay) return reservation.result;
-        await this.authorizeRelationshipEndpoints(tx, context, relationship, reservationSpaceId, {
-          type: "relationship",
-          id: relationship.id
-        });
+        const endpointAuthority = await this.authorizeRelationshipEndpoints(
+          tx,
+          context,
+          relationship,
+          reservationSpaceId,
+          { type: "relationship", id: relationship.id }
+        );
         if (relationship.version !== command.payload.expectedVersion || relationship.validTo)
           throw new B1CommandInvariantError();
+        const authorityRequirements = spaceGrantRequirements([
+          ...(relationshipDecision.evaluatedRelationships ?? []),
+          ...endpointAuthority
+        ]);
         const updated = await graph.endRelationship({
           tenantId: context.tenantId,
           workspaceId: context.workspaceId,
           relationshipId: relationship.id,
           expectedVersion: command.payload.expectedVersion,
-          validTo: command.payload.validTo
+          validTo: command.payload.validTo,
+          actorUserId: actor.userId,
+          actorMembershipId: actor.membershipId,
+          authorityRequirements
         });
+        if (!updated.authorized) throw new B1AuthorizationError();
+        if (!updated.relationship) throw new B1CommandInvariantError();
         const relay = await relayPrincipalForSpace(tx, context, reservationSpaceId);
         await domain.audit.insert(
           auditInput(
@@ -642,7 +654,7 @@ export class AccountOperationsDomainCommandBus {
             reservationSpaceId,
             "relationship.ended",
             relationship.id,
-            updated.version,
+            updated.relationship.version,
             { relationshipId: relationship.id, validTo: command.payload.validTo }
           ),
           relayServicePrincipalId: relay,
@@ -650,7 +662,7 @@ export class AccountOperationsDomainCommandBus {
         });
         const result = {
           relationshipId: relationship.id,
-          version: updated.version,
+          version: updated.relationship.version,
           validTo: command.payload.validTo
         };
         await completeCommand(
@@ -831,10 +843,18 @@ export class AccountOperationsDomainCommandBus {
           command.payload.activityId
         );
         if (activity.spaceId !== reservationSpaceId) throw new B1CommandInvariantError();
-        await this.authorize(tx, context, "source.capture", {
-          type: "space",
-          id: reservationSpaceId
-        });
+        await this.authorize(
+          tx,
+          context,
+          "source.capture",
+          {
+            type: "space",
+            id: reservationSpaceId
+          },
+          command.payload.requestedAccessClass
+            ? { requestedAccessClass: command.payload.requestedAccessClass }
+            : undefined
+        );
         const space = await graph.getSpace(
           context.tenantId,
           context.workspaceId,
@@ -844,27 +864,17 @@ export class AccountOperationsDomainCommandBus {
         let originAccessClass: AccessClass | undefined;
         let sourceText = command.payload.text;
         if (command.payload.originContentItemId) {
-          const origin = await content.getContentRevisionScope(
-            context.tenantId,
-            context.workspaceId,
-            command.payload.originContentItemId,
-            command.payload.originContentRevision!
-          );
-          if (origin.spaceId !== reservationSpaceId) throw new B1AuthorizationError();
-          await this.authorize(tx, context, "content.read", {
-            type: "content_item",
-            id: command.payload.originContentItemId
+          const origin = await readAuthorizedOriginRevision({
+            authorization: this.authorization,
+            content,
+            tx,
+            context,
+            contentItemId: command.payload.originContentItemId,
+            revisionNumber: command.payload.originContentRevision!,
+            requiredSpaceId: reservationSpaceId,
+            guessedText: command.payload.text
           });
-          const revisionBody = await content.getContentRevisionBody(
-            context.tenantId,
-            context.workspaceId,
-            command.payload.originContentItemId,
-            command.payload.originContentRevision!
-          );
-          if (!sourceTextMatchesRevisionBody(command.payload.text, revisionBody)) {
-            throw new B1CommandInvariantError();
-          }
-          sourceText = revisionBody;
+          sourceText = origin.body;
           originAccessClass = origin.accessClass;
         }
         const accessClass = ContentRepository.deriveSourceAccessClass(
@@ -1169,7 +1179,7 @@ export class AccountOperationsDomainCommandBus {
     action: Parameters<TransactionAwareAuthorizationService["canInTransaction"]>[1],
     resource: ResourceRef,
     options?: Parameters<TransactionAwareAuthorizationService["canInTransaction"]>[4]
-  ): Promise<void> {
+  ): Promise<Awaited<ReturnType<TransactionAwareAuthorizationService["canInTransaction"]>>> {
     const decision = await this.authorization.canInTransaction(
       context,
       action,
@@ -1178,6 +1188,7 @@ export class AccountOperationsDomainCommandBus {
       options
     );
     if (!decision.allowed) throw new B1AuthorizationError();
+    return decision;
   }
 
   private async authorizeRelationshipEndpoints(
@@ -1190,7 +1201,7 @@ export class AccountOperationsDomainCommandBus {
     },
     governingSpaceId: string,
     personUseSite?: ResourceRef
-  ): Promise<void> {
+  ): Promise<string[]> {
     const useSite: ResourceRef =
       personUseSite ??
       (payload.context && payload.context.type !== "person"
@@ -1211,11 +1222,16 @@ export class AccountOperationsDomainCommandBus {
           index
       )
       .sort((left, right) => endpointKey(left).localeCompare(endpointKey(right)));
+    const authorityTokens: string[] = [];
     for (const endpoint of endpoints) {
+      let decision;
       if (endpoint.type === "space") {
-        await this.authorize(tx, context, "space.read", { type: "space", id: endpoint.id });
+        decision = await this.authorize(tx, context, "space.read", {
+          type: "space",
+          id: endpoint.id
+        });
       } else if (endpoint.type === "person") {
-        await this.authorize(
+        decision = await this.authorize(
           tx,
           context,
           "person.read",
@@ -1223,7 +1239,7 @@ export class AccountOperationsDomainCommandBus {
           { personUseSite: useSite }
         );
       } else {
-        await this.authorize(
+        decision = await this.authorize(
           tx,
           context,
           `${endpoint.type}.read` as
@@ -1234,13 +1250,71 @@ export class AccountOperationsDomainCommandBus {
           endpointResource(endpoint)
         );
       }
+      authorityTokens.push(...(decision.evaluatedRelationships ?? []));
     }
+    return authorityTokens;
   }
 }
 
 export function sourceTextMatchesRevisionBody(sourceText: string, revisionBody: string): boolean {
   if (sourceText !== revisionBody) return false;
   return Buffer.from(sourceText, "utf8").equals(Buffer.from(revisionBody, "utf8"));
+}
+
+export async function readAuthorizedOriginRevision(input: {
+  authorization: TransactionAwareAuthorizationService;
+  content: ContentRepository;
+  tx: TenantDbTransaction;
+  context: SecurityContext;
+  contentItemId: string;
+  revisionNumber: number;
+  requiredSpaceId: string;
+  guessedText: string;
+}): Promise<{ body: string; accessClass: AccessClass }> {
+  const decision = await input.authorization.canInTransaction(
+    input.context,
+    "content.read",
+    { type: "content_item", id: input.contentItemId },
+    input.tx,
+    {
+      contentRevision: input.revisionNumber,
+      requiredSpaceId: input.requiredSpaceId,
+      lockAuthority: true
+    }
+  );
+  if (!decision.allowed) throw new B1AuthorizationError();
+  const origin = await input.content.getContentRevisionScope(
+    input.context.tenantId,
+    input.context.workspaceId,
+    input.contentItemId,
+    input.revisionNumber
+  );
+  if (origin.spaceId !== input.requiredSpaceId) throw new B1AuthorizationError();
+  const body = await input.content.getContentRevisionBody(
+    input.context.tenantId,
+    input.context.workspaceId,
+    input.contentItemId,
+    input.revisionNumber
+  );
+  if (!sourceTextMatchesRevisionBody(input.guessedText, body)) {
+    throw new B1CommandInvariantError();
+  }
+  return { body, accessClass: origin.accessClass };
+}
+
+function spaceGrantRequirements(
+  tokens: readonly string[]
+): Array<{ grantId: string; resourceId: string }> {
+  const requirements = new Map<string, { grantId: string; resourceId: string }>();
+  for (const token of tokens) {
+    const match = /^space_grant:([0-9a-f-]{36}):([0-9a-f-]{36})$/i.exec(token);
+    if (!match) continue;
+    const requirement = { grantId: match[1]!.toLowerCase(), resourceId: match[2]!.toLowerCase() };
+    requirements.set(`${requirement.grantId}:${requirement.resourceId}`, requirement);
+  }
+  return [...requirements.values()].sort((left, right) =>
+    `${left.resourceId}:${left.grantId}`.localeCompare(`${right.resourceId}:${right.grantId}`)
+  );
 }
 
 async function reserveCommand(

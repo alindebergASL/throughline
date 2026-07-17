@@ -11,7 +11,11 @@ import type {
 } from "@throughline/core-types";
 import { createPgPool, type PgPool, withTenantTransaction } from "@throughline/db";
 import { createDefaultProfileRegistry } from "@throughline/domain-profiles";
-import { WorkGraphRepository, type Activity, type Initiative } from "@throughline/work-graph";
+import {
+  WorkGraphRepository,
+  type Activity,
+  type InitiativeReadProjection
+} from "@throughline/work-graph";
 
 @Injectable()
 export class B1AccountOperationsRuntime implements OnModuleDestroy {
@@ -82,11 +86,13 @@ export class B1AccountOperationsRuntime implements OnModuleDestroy {
           tx
         )
       );
-      const initiative = await graph.getInitiative(
-        context.tenantId,
-        context.workspaceId,
+      const initiative = await readInitiativeWithAuthorizedOrganizations({
+        graph,
+        authorization,
+        tx,
+        context,
         initiativeId
-      );
+      });
       return {
         ...initiative,
         people: await this.safePeopleForUseSite(
@@ -163,25 +169,14 @@ export class B1AccountOperationsRuntime implements OnModuleDestroy {
         context.workspaceId,
         activityId
       );
-      const sources = await new ContentRepository(tx).listActivitySources({
-        tenantId: context.tenantId,
-        workspaceId: context.workspaceId,
+      return listAuthorizedActivitySources({
+        content: new ContentRepository(tx),
+        authorization,
+        tx,
+        context,
         activityId,
-        activitySpaceId: activity.spaceId,
-        permittedSourceSpaceIds: [activity.spaceId],
-        dataClassCeiling: context.dataClassCeiling
+        activitySpaceId: activity.spaceId
       });
-      for (const source of sources) {
-        await requireAllowed(
-          authorization.canInTransaction(
-            context,
-            "source.read",
-            { type: "source", id: source.id },
-            tx
-          )
-        );
-      }
-      return sources;
     });
   }
 
@@ -266,7 +261,8 @@ export async function readAuthorizedSource(input: {
       input.context,
       "source.read",
       { type: "source", id: input.sourceArtifactId },
-      input.tx
+      input.tx,
+      { lockAuthority: true }
     )
   );
   const currentId = await input.content.resolveCurrentSourceId(
@@ -279,7 +275,8 @@ export async function readAuthorizedSource(input: {
       input.context,
       "source.read",
       { type: "source", id: currentId },
-      input.tx
+      input.tx,
+      { lockAuthority: true }
     )
   );
   return input.content.getSource(
@@ -287,6 +284,74 @@ export async function readAuthorizedSource(input: {
     input.context.workspaceId,
     currentId,
     true
+  );
+}
+
+export async function listAuthorizedActivitySources(input: {
+  content: ContentRepository;
+  authorization: PostgresAuthorizationService;
+  tx: Parameters<Parameters<typeof withTenantTransaction>[1]>[0];
+  context: SecurityContext;
+  activityId: string;
+  activitySpaceId: string;
+}) {
+  const candidateIds = await input.content.listActivitySourceCandidates({
+    tenantId: input.context.tenantId,
+    workspaceId: input.context.workspaceId,
+    activityId: input.activityId,
+    activitySpaceId: input.activitySpaceId
+  });
+  const authorizedIds: string[] = [];
+  for (const sourceArtifactId of candidateIds) {
+    const decision = await input.authorization.canInTransaction(
+      input.context,
+      "source.read",
+      { type: "source", id: sourceArtifactId },
+      input.tx,
+      { lockAuthority: true }
+    );
+    if (decision.allowed) authorizedIds.push(sourceArtifactId);
+  }
+  const projections = [];
+  for (const sourceArtifactId of authorizedIds) {
+    projections.push(
+      await input.content.getSource(
+        input.context.tenantId,
+        input.context.workspaceId,
+        sourceArtifactId,
+        true
+      )
+    );
+  }
+  return projections;
+}
+
+export async function readInitiativeWithAuthorizedOrganizations(input: {
+  graph: WorkGraphRepository;
+  authorization: PostgresAuthorizationService;
+  tx: Parameters<Parameters<typeof withTenantTransaction>[1]>[0];
+  context: SecurityContext;
+  initiativeId: string;
+}): Promise<InitiativeReadProjection> {
+  const candidateIds = await input.graph.getInitiativeOrganizationCandidates(
+    input.context.tenantId,
+    input.context.workspaceId,
+    input.initiativeId
+  );
+  const organizationIds = await permittedResourceIds(candidateIds, (id) =>
+    input.authorization.canInTransaction(
+      input.context,
+      "organization.read",
+      { type: "organization", id },
+      input.tx,
+      { lockAuthority: true }
+    )
+  );
+  return input.graph.getInitiative(
+    input.context.tenantId,
+    input.context.workspaceId,
+    input.initiativeId,
+    { organizationIds }
   );
 }
 
@@ -320,5 +385,5 @@ async function assertAppRole(
   }
 }
 
-export type B1InitiativeResponse = Initiative & { people: SafePersonProjection[] };
+export type B1InitiativeResponse = InitiativeReadProjection & { people: SafePersonProjection[] };
 export type B1ActivityResponse = Activity & { people: SafePersonProjection[] };

@@ -1,4 +1,9 @@
-import type { AuthorizationDecision, ResourceRef, SecurityContext } from "@throughline/core-types";
+import type {
+  AccessClass,
+  AuthorizationDecision,
+  ResourceRef,
+  SecurityContext
+} from "@throughline/core-types";
 import type { TenantDbTransaction } from "@throughline/db";
 
 export type AuthorizationAction =
@@ -47,10 +52,14 @@ export interface WorkerAuthorizationBinding {
 export interface AuthorizationDecisionOptions {
   explain?: boolean;
   personUseSite?: ResourceRef;
+  contentRevision?: number;
+  requiredSpaceId?: string;
+  requestedAccessClass?: AccessClass;
 }
 
 export interface TransactionAuthorizationDecisionOptions extends AuthorizationDecisionOptions {
   workerBinding?: WorkerAuthorizationBinding;
+  lockAuthority?: boolean;
 }
 
 export interface AuthorizationService {
