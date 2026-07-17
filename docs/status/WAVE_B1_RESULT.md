@@ -1,16 +1,15 @@
 # Wave B1 Result — Manual Account Work Graph and Source Capture
 
 - **Date:** 2026-07-17 UTC
-- **Status:** second-review corrected candidate pre-result gate PASS; HOLD remains before the complete final-byte gate and every subsequent commit, exact-head verification, review, publication, merge, deployment, or release step
+- **Status:** third-review corrected pre-result candidate PASS; HOLD remains before the complete final-byte gate, bounded commits, exact-head verification, direct review, publication, merge, deployment, or release
 - **Branch:** `wave-b1-work-graph-source-capture`
-- **Committed corrected head:** `71ad5b33ff648e2ee1749509f5bbb31170400ef2`
-- **Committed corrected tree:** `4af7f684357b4d706165c9333cdadfdf489b90d7`
-- **Original blocked head:** `7e539c0a709108f72f1e616afe95a816cc86276a`
+- **Committed parent:** `845c8e108ca542f3389c0ac6f990786ad619497c`
+- **Committed parent tree:** `7c48cdfd2bca0f9c25c9ccd60df042081678fec9`
 - **Authorized base:** `2566cb4649c24217058d32de6a0e088b303bb07b`
 - **Authorized base tree:** `97782492085cc637e426eced81f46d3ede684cfd`
-- **Second-review corrected pre-result candidate tree:** `a2be3f82d58d7460426034e0c9fb2971aec9b1f5`
+- **Third-review corrected pre-result candidate tree:** `5b58bd9a93f575fcca617109cfa892c4c8726a61`
 - **Canonical plan SHA-256:** `38a08d9cd57f3704f45c75bb35f5eb29a03d9a157e247e3ffa0af9ee6b77d39d`
-- **Publication state:** the second-review corrections remain uncommitted; no push, PR, or publication has occurred
+- **Publication state:** the third-review corrections remain uncommitted; no push, PR, merge, deployment, or publication has occurred
 
 ## Scope and outcome
 
@@ -18,55 +17,61 @@ The corrected candidate passes the B1 manual no-integration gate:
 
 > A user can manually create the account workflow and capture a source without any integration.
 
-The candidate adds the approved account work graph and manual source-capture surface:
+The B1 surface remains limited to:
 
 - strict pinned AI Solutions domain profiles and deterministic first-party interpretation;
 - Organization, Initiative, Activity, and Relationship aggregate storage and repository behavior;
 - ContentItem revisioning and SourceArtifact capture, correction, tombstone, and chunk storage;
-- centralized B1 action authorization and non-leaking route behavior;
-- one transaction-scoped command path binding command reservation, aggregate mutation, audit, and the canonical B1.0 product outbox;
-- minimal manual HTTP routes for the approved workflow; and
-- real PostgreSQL and LocalStack proof for the complete no-integration walkthrough.
+- centralized B1 authorization and non-leaking route behavior;
+- transaction-scoped command reservation, aggregate mutation, audit, and canonical B1.0 product outbox; and
+- minimal manual HTTP routes for the approved workflow.
 
-No Claim, AcceptedFact, truth-ledger acceptance, ChangeSet, model call, extraction, MCP/provider integration, semantic retrieval, autonomous action, broad dashboard UI, real Kanban dispatch, deployment, or release was added.
+No Claim, AcceptedFact, truth-ledger acceptance, ChangeSet, model call, extraction, MCP/provider integration, semantic retrieval, autonomous action, broad dashboard UI, real Kanban dispatch, deployment, or release was added. No canonical product document or accepted ADR was modified.
 
-The Activity endpoint lock remains fixed and repository-controlled for source capture and correction. Forced RLS, non-owner/NOBYPASSRLS application execution, column-level `UPDATE(id)` only, permanent write denial, deterministic Activity-before-Source locking, and contributor-or-higher source authorization remain part of the verified boundary.
+## Prior review closure
 
-## Resolved first-review corrections
+The committed parent retains the corrections for all seven first-review findings and all eight second-review findings. Those findings covered exact migration-journal/catalog adoption, closed command/result integrity, exact integers, source authorization ordering, association filtering, relationship revocation, origin-byte authorization, effective content access classes, live authority tokens, candidate-only source listing, exact PostgreSQL relation/constraint/trigger/rule/ACL inventories, and canonical `pnpm test:b1` wiring.
 
-The prior corrected head resolved all seven findings from the first direct review:
+The detached verifier for parent `845c8e108ca542f3389c0ac6f990786ad619497c` passed, but the subsequent direct review returned `BLOCK` with one additional Source-mutation authorization finding. That review superseded earlier publication authority.
 
-1. exact, phase-aware, fail-closed migration-journal and installed-catalog validation;
-2. closed B1 command kind, version, payload, result, audit, and outbox mappings;
-3. exact integer initial revision/version `1` for `content.create.v1` at application and database boundaries;
-4. `source.read` authorization before source correction traversal or materialization, with terminal reauthorization;
-5. authorization-filtered Activity associations;
-6. locked persisted-endpoint and current-authority reauthorization for `relationship.end`; and
-7. exact revision, scope, encoding, and byte equality for origin-backed capture.
+## Resolved third-review correction
 
-That corrected committed head passed detached exact-head verification, but the subsequent independent direct review returned `BLOCK` with eight additional IMPORTANT findings. No publication occurred.
+The current candidate closes that finding:
 
-## Resolved second-review corrections
+1. `ContentRepository.getSourceScope()` selects and returns only `id` and `space_id`. It does not read Source text, title, hashes, access class, deletion state, version, correction-chain state, chunks, or Activity associations.
+2. `source.correct` and `source.tombstone` route reservation scope through that minimal lookup instead of `getSource()`.
+3. Inside the mutation transaction, `source.read` and the requested action are authorized with live authority locking before Source links, Activity projections, full Source state, text, chunks, hashes, or deletion metadata can be materialized.
+4. Correction preserves deterministic Activity-before-Source row-locking. After Activity and Source locks, the exact Source identity, governing Space, and Activity link are revalidated; `source.read` and `source.correct` are repeated against live state before mutation.
+5. Tombstone repeats `source.read` and `source.tombstone` after the full Source lock and before command reservation or mutation.
+6. Denial is non-leaking and rolls back with transaction-local context cleared. Execute-path tests prove denied correction and tombstone never call the Source-link, Activity-lock, or full-Source materialization paths.
+7. Real PostgreSQL races prove a committed contributor-grant revocation after scope lookup denies correction and a committed owner-membership suspension after scope lookup denies tombstone. Both leave zero Source, chunk, link, command, audit, outbox, work-graph, content-item, or relationship residue.
 
-The current uncommitted candidate addresses all eight findings from the second direct review:
+The new Account Operations test file executes the production command bus and transaction wrapper. Repository and authorization seams are instrumented only to record production call order and to stop after the asserted boundary; denial tests also assert rollback, pooled-context cleanup, and absence of materialization calls.
 
-1. Content authorization now enforces the effective Space, ContentItem, and selected revision access-class ceiling. Origin authorization precedes reading or comparing revision bytes.
-2. Human Space authority is represented by exact current grant tokens. Relationship mutation uses locked persisted endpoints plus an atomic authority predicate so a committed revocation wins with zero mutation residue.
-3. Activity Source listing enumerates only candidate identifiers before `source.read`; full text, chunks, and metadata are materialized only after authorization while current authority is held.
-4. Initiative Organization associations are authorized individually before projection; unreadable IDs, primary association, and association count are omitted.
-5. The `work`/`content` `pg_class` inventory is closed across every relation kind, including unexpected ACL-bearing sequences. Index kind/cardinality normalization is paired with separate exact index-name and definition validation.
-6. `ops.domain_command_records` now has an exact full constraint, user-trigger, and rewrite-rule inventory; differently named extras and altered enablement or definitions fail closed.
-7. Predecessor `access`/`identity`/`ops` ACL authority is compared as normalized schema/relation/scope/column/grantee/privilege/grant-option/grantor tuples in both directions with SQL `EXCEPT`; PUBLIC, rogue-role, alternate-grantor, and inherited authority fail closed.
-8. Canonical `pnpm test:b1` includes `b1-account-operations.runtime.spec.ts`; the authoritative log scan requires that runtime suite.
+## Focused evidence
 
-Real-service correction work also fixed two validation-harness defects found before the passing gate:
+Focused unit and static verification passed:
 
-- the closed relation inventory now compares PostgreSQL and scratch index cardinality using one deterministic structural ordering without weakening separate exact index checks; and
-- the expected command-integrity relation uses the transaction-local ordinary scratch schema because PostgreSQL forbids temporary-table constraints from referencing persistent predecessor relations.
+- Account Operations: 12/12 tests, including four production command-bus ordering/denial tests;
+- Content: 14/14 tests, including exact minimal Source-scope SQL;
+- B1 architecture/dependency gate: 9/9 tests;
+- transaction cleanup: 5/5 tests;
+- focused package typecheck, lint, Prettier, and `git diff --check`: PASS.
+
+Fresh focused PostgreSQL evidence:
+
+`/home/ubuntu/.hermes/rollouts/throughline-b1-third-review-recovery-20260717T164436Z/focused-postgres-20260717T170609Z-1828354`
+
+- manual workflow: 25/25 tests passed;
+- authoritative skips: 0;
+- unhandled errors: 0;
+- start/end dirty-state digest identical;
+- PostgreSQL residual connections: 0;
+- disposable PostgreSQL container absent after cleanup: PASS.
 
 ## Migration identity and catalog proof
 
-The authoritative migration journal recorded:
+The fresh authoritative journal recorded:
 
 - `0001_wave_a2_identity_access_rls.sql` — `22b84fbeb36cfcfdd1f8270e6ffa03d819d5307c0aace86e69aa647d643b1ff7`
 - `0002_foundation_closure_async_isolation.sql` — `4264f0f760a74026bc0e0a6a38b98760e6061c76c9885848cf4236f13cda3ee2`
@@ -75,19 +80,15 @@ The authoritative migration journal recorded:
 - `0005_b1_content_sources.sql` — `b917adfd0acf987904156ade0c0593f6f3c27d8cf516c78c75af17072b99a19c`
 - `0006_b1_command_integrity.sql` — `5534436f86d56e8f983c60f3869c9e66928ffdc73b1d1cdbd115a156c3dbfebc`
 
-Protected migrations `0001`–`0003` remain byte-identical to the authorized base. B1 remains additive after `0003`.
+Protected migrations `0001`–`0003` remain byte-identical. No migration was modified by the third-review correction. The B1 catalog adversarial suite passed 31/31 tests.
 
-The expanded catalog PostgreSQL adversarial suite passed 31/31 tests. It covers exact `0004`/`0005`/`0006` phases; unknown, missing, gapped, reordered, duplicated, and checksum-drifted journals; exact-but-unjournaled installed phases; every unexpected relation kind; complete command-table constraints/triggers/rules; exact predecessor and B1 ACL authority; owner, RLS, policy, function, role, inheritance, and `search_path` mutations; and scratch cleanup.
+## Complete third-review pre-result authoritative gate
 
-The manual PostgreSQL/API workflow suite passed 23/23 tests, including source authorization-before-materialization, Initiative/Activity association filtering, exact integer-one validation, origin authorization before byte comparison, and revocation-winning relationship mutation.
+The accepted complete pre-result gate ran against fresh disposable PostgreSQL and LocalStack resources:
 
-## Complete second-review pre-result authoritative gate
+`/home/ubuntu/.hermes/rollouts/throughline-b1-third-review-recovery-20260717T164436Z/authoritative-b1-20260717T173608Z-1857242`
 
-The complete gate ran from a fresh disposable PostgreSQL and LocalStack generation:
-
-`/home/ubuntu/.hermes/rollouts/throughline-b1-review-v2-correction-20260717T062813Z/authoritative-b1-20260717T081415Z-1560788`
-
-Start tree and end tree were both `a2be3f82d58d7460426034e0c9fb2971aec9b1f5`.
+Start and end candidate trees were both `5b58bd9a93f575fcca617109cfa892c4c8726a61`.
 
 | Stage | Result | Evidence |
 | --- | ---: | --- |
@@ -95,24 +96,24 @@ Start tree and end tree were both `a2be3f82d58d7460426034e0c9fb2971aec9b1f5`.
 | `pnpm format:check` | PASS | zero formatting errors |
 | `pnpm lint` | PASS | zero lint errors |
 | `pnpm typecheck` | PASS | zero type errors |
-| ordinary `pnpm test`, service variables intentionally unset | PASS | 44 files passed, 10 skipped; 630 tests passed, 287 service-backed tests skipped |
+| ordinary `pnpm test`, service variables intentionally unset | PASS | 45 files passed, 10 skipped; 636 tests passed, 289 service-backed tests skipped |
 | `pnpm build` | PASS | all build tasks passed |
-| canonical `pnpm test:b1`, invoked exactly once | PASS | 44 test files and 923 tests passed; 0 skipped; 0 unhandled errors |
+| canonical `pnpm test:b1`, invoked exactly once | PASS | 45 test files and 931 tests passed; 0 skipped; 0 unhandled errors |
 | `git diff --check` | PASS | zero whitespace errors |
 
-The ordinary-test skips are intentional collection behavior with service variables unset; they are not authoritative-gate skips. The canonical B1 gate's authoritative skip count is zero.
+Ordinary-test skips are intentional collection behavior with integration variables unset. The canonical B1 gate has zero authoritative skips.
 
 ## Evidence identities
 
-- summary: `fbdd54a2ea86ef1a1e50b2fe8c5eccbc3c4316b33b847013483a4e2be0157aa7`
-- cleanup: `c7ebe4077a60ce804bf4247ebc843dbf3e0b7b7a831d690241973a5ba48ed9fb`
-- frozen install log: `b2b840554feaa30d80683a95a4c277ac22d1346c564e66bef22885bfdb08566b`
+- summary: `a15523cc3683a9f645a650718c179436525b5d653717f2fc4e97d0a131217478`
+- cleanup: `de9d878f6f623191c73c08fd00376eaf99eef93fa097c5b8487fb14d3d8814c4`
+- frozen install log: `d35e52ef2b4df5a810d57776a88bf96c29f5beb42b5b5e5615d7dedddf34d391`
 - formatting log: `68ea59b69f4f3f8e0a01c9213bb41f1e4b4578b764f035ded18d28bae6ea05f0`
-- lint log: `2a3809c38e5c08477931b6552d6a3e20410abc587e40ed5a1050b7abe9fc79c7`
-- typecheck log: `42a914523ec801437110f9dab3d308800689ce86d32f83a5340226a2c74527b4`
-- ordinary-test log: `72201b27f9f820423d550a579121b26269f3605e6875ae12749ec2499939b151`
-- build log: `e28b2c610dd18a569893635a2405caf125fc7a97d01ab411d674508fbb812143`
-- complete B1 log: `ef1aa22c47ea434c323d2b9e01a0f974e3b1a5ec6852abfd60b0f6205458b9fc`
+- lint log: `8b19ec0926a22dab219c0d179b64e1d56b32d4dc7b8649e8e30cd9ddd929d9c6`
+- typecheck log: `5494bf2a935f137be4b2f0d7be44c17550c503bc905b53a9e2ac27c1688de724`
+- ordinary-test log: `665954137f2c03bc375010c3cce7a0ee1ac5c1f523427630839e95900f006dbc`
+- build log: `25d831f822dc9ae778d3778c04fe2a501c428e3c1afea819a68abd0959b71b75`
+- complete B1 log: `5207f16412083ef9f992d9e99167ca02b8dc155d1641815aabee4c4a42bfa9f2`
 - diff log: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
 - authoritative scan: `0a0a36e3c2410daeb306fd0f4cafd1ab9a926b7f17b8f8cec3ec65fcbf60fd8a`
 - journal TSV: `03daedec53c734f28b7025d9a2be2fc04b54764125d917df1feee871513fe4ab`
@@ -127,25 +128,22 @@ Before teardown:
 - S3 bucket objects: 0; and
 - PostgreSQL residual client connections: 0.
 
-After teardown, the gate's PostgreSQL and LocalStack containers were absent: PASS.
+After teardown:
 
-The cleanup scanner listed four Hermes TypeScript language-service processes attached to the worktree. They were editor tooling rather than gate/test processes or disposable service leaks. They were terminated after the gate; the bounded cleanup record reports zero remaining processes and has SHA-256 `bbdf030ed44d0889255e0069f993222f1b11c4ce295330994949cfcbf111473d`.
+- PostgreSQL container absent: PASS;
+- LocalStack container absent: PASS;
+- lingering repository processes: 0; and
+- gate exit code: 0.
 
-## Historical evidence
-
-The prior first-review result, passing final-byte gate, bounded commits at `71ad5b33ff648e2ee1749509f5bbb31170400ef2`, and passing detached verifier remain valid historical evidence for those exact earlier bytes. The subsequent direct review's eight-finding `BLOCK` supersedes them as publication authority.
-
-The failed pre-result runs at `authoritative-b1-20260717T075907Z-1546547` and `authoritative-b1-20260717T080336Z-1550487` are preserved as diagnostics. They exposed, respectively, one obsolete temporary-relation helper rejected by lint and one over-broad static assertion that rejected non-filtering index normalization. Neither is represented as PASS evidence.
+An earlier run against the same candidate passed every test stage but recorded eight pre-existing Hermes TypeScript language-service processes during cleanup. It is preserved as diagnostic evidence and is not the accepted cleanup record. Those processes were terminated before the accepted rerun.
 
 ## Final-byte binding and HOLD
 
-This artifact records the passing second-review pre-result candidate. It does **not** claim a final-byte PASS.
+This artifact records the accepted passing third-review pre-result candidate. It does **not** claim a final-byte PASS because this result-file update changes the candidate tree.
 
-The next mandatory step is a complete final-byte gate over the candidate including this updated result file. That gate must again bind identical start and end trees, the exact migration journal, all required stages, zero authoritative skips, zero unhandled errors, and complete cleanup.
+The next mandatory step is a complete fresh gate over the candidate including this exact result file. That gate must again bind identical start/end trees, the exact migration journal, all required stages, zero authoritative skips, zero unhandled errors, and complete cleanup.
 
-The branch remains at committed head `71ad5b33ff648e2ee1749509f5bbb31170400ef2`; the second-review corrections have not been committed. No second-review correction commit, push, PR, or publication has occurred.
-
-HOLD remains before the final-byte gate, bounded commit, detached exact-head verification, direct review, GitHub authentication check, push, PR, merge, deployment, release, AWS/runtime access, real Kanban dispatch, canonical-document or accepted-ADR changes, and B2 work.
+The branch remains at committed parent `845c8e108ca542f3389c0ac6f990786ad619497c`; the third-review corrections have not been committed. HOLD remains before bounded commits, detached exact-head verification, direct review, push, PR, merge, deployment, release, AWS/runtime access, real Kanban dispatch, canonical-document or accepted-ADR changes, and B2 work.
 
 ## Spec deviations
 
@@ -153,8 +151,4 @@ None identified.
 
 ## Known issues
 
-No known B1 implementation blocker remains after the second-review corrected pre-result gate. Final-byte gating and every post-gate action remain intentionally pending.
-
-## Approval state
-
-The active correction instruction conditionally authorizes bounded commits, detached exact-head verification, direct read-only review, and scoped PR publication after their prerequisite gates pass. Merge and deployment remain unauthorized under every outcome and still require separate explicit authority.
+No known B1 implementation blocker remains after the third-review corrected pre-result gate. Final-byte gating and exact-head reviews remain intentionally pending.
