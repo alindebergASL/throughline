@@ -317,6 +317,8 @@ const functionContracts = [
   ["content", "validate_source_chunk", "", "trigger", "plpgsql", "v", false, false],
   ["content", "allow_chunk_delete_after_tombstone", "", "trigger", "plpgsql", "v", false, false],
   ["content", "require_source_chunk_reconstruction", "", "trigger", "plpgsql", "v", false, false],
+  ["ops", "enforce_domain_command_transition", "", "trigger", "plpgsql", "v", false, false],
+  ["ops", "reject_committed_reserved_command", "", "trigger", "plpgsql", "v", false, true],
   [
     "ops",
     "b1_command_record_valid",
@@ -430,10 +432,21 @@ export async function validateB1CatalogContract(
       await validateTablePrivileges(client, table.actualName, integrityInstalled);
     }
 
-    await validateSchemaSecurity(client, expectedTables, integrityInstalled);
+    await validateSchemaSecurity(
+      client,
+      scratch,
+      expectedTables,
+      expectedIndexes,
+      integrityInstalled
+    );
     await validateFunctions(client, installed, sources);
     if (integrityInstalled) {
-      await validateCommandIntegrityObjects(client, sources.get(B1_MIGRATION_IDS[2])!);
+      await validateCommandIntegrityObjects(
+        client,
+        scratch,
+        sources.get(B1_PREDECESSOR_IDS[2])!,
+        sources.get(B1_MIGRATION_IDS[2])!
+      );
     }
   });
   await validateIntegrityPredecessorAccess(client, integrityInstalled);
@@ -504,7 +517,7 @@ function expectedTriggerContracts(
     }));
 }
 
-function requireSource(sources: MigrationSources, migrationId: B1MigrationId): string {
+function requireSource(sources: MigrationSources, migrationId: string): string {
   const source = sources.get(migrationId);
   if (!source) throw new Error(`Missing fixed catalog source for ${migrationId}`);
   return source;
@@ -516,10 +529,6 @@ function scratchTableName(tableName: string): string {
 
 function quoteIdentifier(value: string): string {
   return `"${value.replaceAll('"', '""')}"`;
-}
-
-function temporaryRelation(name: string): string {
-  return `pg_temp.${quoteIdentifier(name)}`;
 }
 
 function scratchRelation(scratch: ScratchCatalog, name: string): string {
@@ -775,6 +784,15 @@ function assertCatalogEqual(label: string, actual: unknown, expected: unknown): 
   if (canonicalJson(actual) !== canonicalJson(expected)) {
     throw new Error(`Installed B1 catalog does not match ${label}`);
   }
+}
+
+function compareRelationInventoryRows(
+  left: { name: string; kind: string },
+  right: { name: string; kind: string }
+): number {
+  if (left.name !== right.name) return left.name < right.name ? -1 : 1;
+  if (left.kind !== right.kind) return left.kind < right.kind ? -1 : 1;
+  return 0;
 }
 
 function relationTokens(tableName: string): string[] {
@@ -1326,25 +1344,68 @@ async function validateProtectedRoles(client: PgPoolClient): Promise<void> {
 
 async function validateSchemaSecurity(
   client: PgPoolClient,
+  scratch: ScratchCatalog,
   tables: readonly ExpectedTable[],
+  indexes: readonly ExpectedIndex[],
   integrityInstalled: boolean
 ): Promise<void> {
   const expectedTables = tables.map((table) => table.actualName).sort();
   const expectedSchemaNames = [
     ...new Set(expectedTables.map((table) => table.split(".")[0]!))
   ].sort();
-  const installedTables = await client.query<{ name: string }>(
-    `SELECT namespace_record.nspname || '.' || relation_record.relname AS name
+  const installedObjects = await client.query<{ name: string; kind: string }>(
+    `SELECT CASE
+              WHEN relation_record.relkind IN ('i', 'I') THEN
+                table_namespace.nspname || '.' || table_record.relname || '.<index>'
+              ELSE namespace_record.nspname || '.' || relation_record.relname
+            END AS name,
+            relation_record.relkind::text AS kind
      FROM pg_class relation_record
      JOIN pg_namespace namespace_record ON namespace_record.oid = relation_record.relnamespace
+     LEFT JOIN pg_index index_record ON index_record.indexrelid = relation_record.oid
+     LEFT JOIN pg_class table_record ON table_record.oid = index_record.indrelid
+     LEFT JOIN pg_namespace table_namespace ON table_namespace.oid = table_record.relnamespace
      WHERE namespace_record.nspname IN ('work', 'content')
-       AND relation_record.relkind IN ('r', 'p', 'v', 'm', 'f')
-     ORDER BY 1`
+     ORDER BY 1, 2`
   );
+  const scratchObjects = await client.query<{
+    name: string;
+    kind: string;
+    table_name: string | null;
+  }>(
+    `SELECT relation_record.relname AS name, relation_record.relkind::text AS kind,
+            table_record.relname AS table_name
+     FROM pg_class relation_record
+     JOIN pg_namespace namespace_record ON namespace_record.oid = relation_record.relnamespace
+     LEFT JOIN pg_index index_record ON index_record.indexrelid = relation_record.oid
+     LEFT JOIN pg_class table_record ON table_record.oid = index_record.indrelid
+     WHERE namespace_record.nspname = $1
+     ORDER BY 1, 2, 3`,
+    [scratch.schemaName]
+  );
+  const expectedTableNames = new Map(
+    tables.map((table) => [table.scratchName, table.actualName] as const)
+  );
+  // Exact index names and definitions are checked separately by validateIndexes. Normalize every
+  // index here by its owning relation so this inventory additionally closes the pg_class kind and
+  // cardinality without depending on PostgreSQL-generated names for implicit constraint indexes.
+  void indexes;
+  const expectedObjects = scratchObjects.rows
+    .map((row) => {
+      const tableName = row.table_name ? expectedTableNames.get(row.table_name) : undefined;
+      return {
+        name:
+          (row.kind === "i" || row.kind === "I") && tableName
+            ? `${tableName}.<index>`
+            : (expectedTableNames.get(row.name) ?? row.name),
+        kind: row.kind
+      };
+    })
+    .sort(compareRelationInventoryRows);
   assertCatalogEqual(
     "closed work/content relation inventory",
-    installedTables.rows.map((row) => row.name),
-    expectedTables
+    [...installedObjects.rows].sort(compareRelationInventoryRows),
+    expectedObjects
   );
 
   const schemas = await client.query<SchemaOwnershipContract>(
@@ -1395,7 +1456,7 @@ async function validateSchemaSecurity(
 
 function functionSource(source: string, schema: string, name: string): string {
   const matcher = new RegExp(
-    `CREATE FUNCTION ${schema}\\.${name}\\([\\s\\S]*?AS \\$function\\$([\\s\\S]*?)\\$function\\$;`
+    `CREATE (?:OR REPLACE )?FUNCTION ${schema}\\.${name}\\([\\s\\S]*?AS \\$function\\$([\\s\\S]*?)\\$function\\$;`
   );
   const match = matcher.exec(source);
   if (!match) throw new Error(`Missing fixed function source for ${schema}.${name}`);
@@ -1424,7 +1485,10 @@ async function validateFunctions(
         ? B1_MIGRATION_IDS[0]
         : schema === "content"
           ? B1_MIGRATION_IDS[1]
-          : B1_MIGRATION_IDS[2];
+          : name === "enforce_domain_command_transition" ||
+              name === "reject_committed_reserved_command"
+            ? B1_PREDECESSOR_IDS[2]
+            : B1_MIGRATION_IDS[2];
     const result = await client.query<Record<string, unknown>>(
       `SELECT oidvectortypes(procedure_record.proargtypes) AS arguments,
               pg_get_function_result(procedure_record.oid) AS result,
@@ -1475,10 +1539,13 @@ async function validateFunctions(
         strict,
         security_definer: securityDefiner,
         kind: "f",
-        owner:
-          `${schema}.${name}` === "ops.require_b1_command_atomicity"
-            ? "throughline_b1_0_integrity"
-            : currentOwner,
+        owner: [
+          "ops.enforce_domain_command_transition",
+          "ops.reject_committed_reserved_command",
+          "ops.require_b1_command_atomicity"
+        ].includes(`${schema}.${name}`)
+          ? "throughline_b1_0_integrity"
+          : currentOwner,
         configuration: ["search_path=pg_catalog"],
         source: functionSource(requireSource(sources, migrationId), schema, name)
       }
@@ -1517,24 +1584,51 @@ async function validateFunctions(
 
 async function validateCommandIntegrityObjects(
   client: PgPoolClient,
+  scratch: ScratchCatalog,
+  predecessorSource: string,
   source: string
 ): Promise<void> {
-  const temporaryTable = "b1_contract_domain_command_records";
-  await client.query(`CREATE TEMP TABLE ${quoteIdentifier(temporaryTable)}
-    (LIKE ops.domain_command_records INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY)
-    ON COMMIT DROP`);
-  const constraintStatement = source.match(
+  const expectedTable = "b1_contract_domain_command_records";
+  const expectedRelation = scratchRelation(scratch, expectedTable);
+  // This must be an ordinary transaction-local scratch relation: PostgreSQL forbids temporary-table
+  // constraints from referencing the persistent predecessor relations used by the fixed contract.
+  await client.query(`CREATE TABLE ${expectedRelation}
+    (LIKE ops.domain_command_records INCLUDING DEFAULTS INCLUDING GENERATED INCLUDING IDENTITY)`);
+  const predecessorConstraintStatement = predecessorSource.match(
+    /ALTER TABLE throughline_b1_0_migration_contract\.b1_0_expected_domain_command_records[\s\S]*?;\n/
+  )?.[0];
+  const b1ConstraintStatement = source.match(
     /ALTER TABLE ops\.domain_command_records\s+ADD CONSTRAINT domain_command_records_b1_shape_check[\s\S]*?\n\s*\);/
   )?.[0];
-  if (!constraintStatement) {
+  if (!predecessorConstraintStatement || !b1ConstraintStatement) {
     throw new Error("Fixed command integrity contract parser failed");
   }
   await client.query(
-    constraintStatement.replace(
-      "ALTER TABLE ops.domain_command_records",
-      `ALTER TABLE ${temporaryRelation(temporaryTable)}`
+    predecessorConstraintStatement.replace(
+      "ALTER TABLE throughline_b1_0_migration_contract.b1_0_expected_domain_command_records",
+      `ALTER TABLE ${expectedRelation}`
     )
   );
+  await client.query(
+    b1ConstraintStatement.replace(
+      "ALTER TABLE ops.domain_command_records",
+      `ALTER TABLE ${expectedRelation}`
+    )
+  );
+
+  for (const [triggerSource, triggerName] of [
+    [predecessorSource, "domain_command_records_transition_guard"],
+    [predecessorSource, "domain_command_records_no_committed_reserved"],
+    [source, "domain_command_records_b1_atomicity_deferred"]
+  ] as const) {
+    const triggerStatement = triggerSource.match(
+      new RegExp(`CREATE (?:CONSTRAINT )?TRIGGER ${triggerName}[\\s\\S]*?;`)
+    )?.[0];
+    if (!triggerStatement) throw new Error(`Fixed ${triggerName} trigger parser failed`);
+    await client.query(
+      triggerStatement.replace("ON ops.domain_command_records", `ON ${expectedRelation}`)
+    );
+  }
 
   const constraintCatalog = async (relation: string) =>
     (
@@ -1548,40 +1642,39 @@ async function validateCommandIntegrityObjects(
                 constraint_record.connoinherit AS no_inherit
          FROM pg_constraint constraint_record
          WHERE constraint_record.conrelid = $1::regclass
-           AND constraint_record.conname = 'domain_command_records_b1_shape_check'
          ORDER BY constraint_record.conname`,
         [relation]
       )
     ).rows;
   assertCatalogEqual(
-    "B1 domain command shape constraint",
+    "exact domain command constraint inventory",
     normalizeRows(
       await constraintCatalog("ops.domain_command_records"),
       "ops.domain_command_records"
     ),
-    normalizeRows(await constraintCatalog(temporaryRelation(temporaryTable)), temporaryTable)
+    normalizeRows(await constraintCatalog(expectedRelation), expectedTable)
   );
 
-  const actualTriggers = (await triggerCatalog(client, "ops.domain_command_records")).filter(
-    (row) => String(row.name).startsWith("domain_command_records_b1_")
-  );
+  const actualTriggers = await triggerCatalog(client, "ops.domain_command_records");
+  const expectedTriggers = await triggerCatalog(client, expectedRelation);
   assertCatalogEqual(
-    "B1 domain command deferred trigger",
+    "exact domain command user-trigger inventory",
     normalizeRows(actualTriggers, "ops.domain_command_records"),
-    [
-      {
-        name: "domain_command_records_b1_atomicity_deferred",
-        type: 21,
-        enabled: "O",
-        deferrable: true,
-        initially_deferred: true,
-        is_constraint: true,
-        columns: [],
-        condition: null,
-        function: "ops.require_b1_command_atomicity()"
-      }
-    ]
+    normalizeRows(expectedTriggers, expectedTable)
   );
+
+  const rewriteRules = await client.query<Record<string, unknown>>(
+    `SELECT rewrite_record.rulename AS name,
+            rewrite_record.ev_type::text AS event,
+            rewrite_record.is_instead AS instead,
+            rewrite_record.ev_enabled::text AS enabled,
+            pg_get_ruledef(rewrite_record.oid, false) AS definition
+     FROM pg_rewrite rewrite_record
+     WHERE rewrite_record.ev_class = 'ops.domain_command_records'::regclass
+       AND rewrite_record.rulename <> '_RETURN'
+     ORDER BY rewrite_record.rulename`
+  );
+  assertCatalogEqual("exact domain command rewrite-rule inventory", rewriteRules.rows, []);
 }
 
 const integrityPolicyContracts = [
@@ -1600,6 +1693,231 @@ const integrityPolicyContracts = [
   ["content.source_artifacts", "source_artifacts_b1_integrity_select"],
   ["content.source_chunks", "source_chunks_b1_integrity_select"]
 ] as const;
+
+interface ExpectedPredecessorAcl {
+  schema_name: string;
+  relation_name: string;
+  scope: "table" | "column";
+  column_name: string | null;
+  grantee: string;
+  privilege: string;
+  grantable: boolean;
+}
+
+const predecessorAclRelations = [
+  "access.access_relationships",
+  "access.spaces",
+  "identity.policy_versions",
+  "identity.service_principals",
+  "identity.tenants",
+  "identity.workspaces",
+  "ops.audit_events",
+  "ops.domain_command_records",
+  "ops.product_outbox_events"
+] as const;
+
+function predecessorAclRows(
+  relation: string,
+  scope: "table" | "column",
+  columnNames: readonly string[],
+  grantee: string,
+  privileges: readonly string[]
+): ExpectedPredecessorAcl[] {
+  const [schema_name, relation_name] = relation.split(".") as [string, string];
+  const columns = scope === "table" ? [null] : columnNames;
+  return columns.flatMap((column_name) =>
+    privileges.map((privilege) => ({
+      schema_name,
+      relation_name,
+      scope,
+      column_name,
+      grantee,
+      privilege,
+      grantable: false
+    }))
+  );
+}
+
+function expectedPredecessorAcl(integrityInstalled: boolean): ExpectedPredecessorAcl[] {
+  const rows: ExpectedPredecessorAcl[] = [];
+  for (const relation of [
+    "access.access_relationships",
+    "access.spaces",
+    "identity.policy_versions",
+    "identity.service_principals",
+    "identity.tenants",
+    "identity.workspaces"
+  ]) {
+    rows.push(
+      ...predecessorAclRows(relation, "table", [], "throughline_app", [
+        "DELETE",
+        "INSERT",
+        "SELECT",
+        "UPDATE"
+      ])
+    );
+  }
+  const scopeColumns = {
+    "access.access_relationships": [
+      "id",
+      "tenant_id",
+      "workspace_id",
+      "subject_type",
+      "subject_id",
+      "relation",
+      "resource_type",
+      "resource_id",
+      "source"
+    ],
+    "access.spaces": ["id", "tenant_id", "workspace_id", "archived_at"],
+    "identity.tenants": ["id", "status"],
+    "identity.workspaces": ["id", "tenant_id", "status"],
+    "identity.policy_versions": ["id", "tenant_id", "workspace_id", "status"],
+    "identity.service_principals": ["id", "tenant_id", "workspace_id", "purpose", "status"]
+  } as const;
+  for (const [relation, columns] of Object.entries(scopeColumns)) {
+    for (const grantee of [
+      "throughline_relay",
+      "throughline_worker",
+      "throughline_product_relay"
+    ]) {
+      rows.push(...predecessorAclRows(relation, "column", columns, grantee, ["SELECT"]));
+      rows.push(...predecessorAclRows(relation, "column", ["id"], grantee, ["UPDATE"]));
+    }
+  }
+  rows.push(
+    ...predecessorAclRows("ops.domain_command_records", "table", [], "throughline_app", ["SELECT"]),
+    ...predecessorAclRows(
+      "ops.domain_command_records",
+      "column",
+      [
+        "id",
+        "tenant_id",
+        "workspace_id",
+        "reservation_space_id",
+        "command_kind",
+        "command_schema_version",
+        "idempotency_key",
+        "canonical_request_hash",
+        "actor_user_id",
+        "actor_membership_id",
+        "delegating_user_id",
+        "delegating_membership_id",
+        "agent_principal_id",
+        "policy_version_id",
+        "request_id",
+        "traceparent",
+        "tracestate"
+      ],
+      "throughline_app",
+      ["INSERT"]
+    ),
+    ...predecessorAclRows(
+      "ops.domain_command_records",
+      "column",
+      [
+        "state",
+        "result_resource_type",
+        "result_resource_id",
+        "safe_response",
+        "completed_at",
+        "updated_at"
+      ],
+      "throughline_app",
+      ["UPDATE"]
+    ),
+    ...predecessorAclRows(
+      "ops.domain_command_records",
+      "column",
+      ["id", "tenant_id", "workspace_id", "state"],
+      "throughline_b1_0_integrity",
+      ["SELECT"]
+    ),
+    ...predecessorAclRows("ops.audit_events", "table", [], "throughline_app", ["INSERT", "SELECT"])
+  );
+  const productCommandColumns = [
+    "id",
+    "tenant_id",
+    "workspace_id",
+    "space_id",
+    "relay_service_principal_id",
+    "policy_version_id",
+    "event_type",
+    "event_schema_version",
+    "payload_schema_version",
+    "aggregate_type",
+    "aggregate_id",
+    "aggregate_version",
+    "causation_command_id",
+    "payload",
+    "request_id",
+    "traceparent",
+    "tracestate"
+  ] as const;
+  rows.push(
+    ...predecessorAclRows(
+      "ops.product_outbox_events",
+      "column",
+      productCommandColumns,
+      "throughline_app",
+      ["INSERT", "SELECT"]
+    ),
+    ...predecessorAclRows(
+      "ops.product_outbox_events",
+      "column",
+      [
+        ...productCommandColumns,
+        "created_at",
+        "publication_state",
+        "publication_attempt",
+        "next_attempt_at",
+        "claimed_at",
+        "claimed_by",
+        "claim_token",
+        "claim_expires_at",
+        "last_outcome_code",
+        "published_at",
+        "published_message_id",
+        "terminal_at"
+      ],
+      "throughline_product_relay",
+      ["SELECT"]
+    ),
+    ...predecessorAclRows(
+      "ops.product_outbox_events",
+      "column",
+      [
+        "publication_state",
+        "publication_attempt",
+        "next_attempt_at",
+        "claimed_at",
+        "claimed_by",
+        "claim_token",
+        "claim_expires_at",
+        "last_outcome_code",
+        "published_at",
+        "published_message_id",
+        "terminal_at"
+      ],
+      "throughline_product_relay",
+      ["UPDATE"]
+    )
+  );
+  if (integrityInstalled) {
+    for (const relation of [
+      "access.access_relationships",
+      "access.spaces",
+      "identity.service_principals",
+      "ops.audit_events",
+      "ops.product_outbox_events"
+    ]) {
+      rows.push(
+        ...predecessorAclRows(relation, "table", [], "throughline_b1_0_integrity", ["SELECT"])
+      );
+    }
+  }
+  return rows;
+}
 
 async function validateIntegrityPredecessorAccess(
   client: PgPoolClient,
@@ -1636,51 +1954,83 @@ async function validateIntegrityPredecessorAccess(
     );
   assertCatalogEqual("B1 integrity policy capability boundary", policies.rows, expectedPolicies);
 
-  const tablePrivileges = await client.query<Record<string, unknown>>(
-    `SELECT namespace_record.nspname || '.' || relation_record.relname AS relation,
-            acl_record.privilege_type AS privilege,
-            acl_record.is_grantable AS grantable
-     FROM pg_class relation_record
-     JOIN pg_namespace namespace_record ON namespace_record.oid = relation_record.relnamespace
-     CROSS JOIN LATERAL aclexplode(relation_record.relacl) acl_record
-     WHERE acl_record.grantee = 'throughline_b1_0_integrity'::regrole
-     ORDER BY 1, 2`
+  const aclDiagnostics = await client.query<Record<string, unknown>>(
+    `WITH expected_acl AS (
+       SELECT expected.schema_name, expected.relation_name, expected.scope,
+              expected.column_name, expected.grantee, expected.privilege,
+              expected.grantable, current_user::text AS grantor
+       FROM jsonb_to_recordset($2::jsonb) AS expected(
+         schema_name text, relation_name text, scope text, column_name text,
+         grantee text, privilege text, grantable boolean
+       )
+     ), actual_acl AS (
+       SELECT namespace_record.nspname::text AS schema_name,
+              relation_record.relname::text AS relation_name,
+              'table'::text AS scope, NULL::text AS column_name,
+              CASE WHEN acl_record.grantee = 0 THEN 'PUBLIC'
+                   ELSE pg_get_userbyid(acl_record.grantee) END::text AS grantee,
+              acl_record.privilege_type::text AS privilege,
+              acl_record.is_grantable AS grantable,
+              CASE WHEN acl_record.grantor = 0 THEN 'PUBLIC'
+                   ELSE pg_get_userbyid(acl_record.grantor) END::text AS grantor
+       FROM pg_class relation_record
+       JOIN pg_namespace namespace_record ON namespace_record.oid = relation_record.relnamespace
+       CROSS JOIN LATERAL aclexplode(
+         CASE WHEN cardinality(relation_record.relacl) = 0 THEN NULL::aclitem[]
+              ELSE relation_record.relacl END
+       ) acl_record
+       WHERE namespace_record.nspname || '.' || relation_record.relname = ANY($1::text[])
+         AND acl_record.grantee <> relation_record.relowner
+       UNION ALL
+       SELECT namespace_record.nspname::text AS schema_name,
+              relation_record.relname::text AS relation_name,
+              'column'::text AS scope, attribute_record.attname::text AS column_name,
+              CASE WHEN acl_record.grantee = 0 THEN 'PUBLIC'
+                   ELSE pg_get_userbyid(acl_record.grantee) END::text AS grantee,
+              acl_record.privilege_type::text AS privilege,
+              acl_record.is_grantable AS grantable,
+              CASE WHEN acl_record.grantor = 0 THEN 'PUBLIC'
+                   ELSE pg_get_userbyid(acl_record.grantor) END::text AS grantor
+       FROM pg_attribute attribute_record
+       JOIN pg_class relation_record ON relation_record.oid = attribute_record.attrelid
+       JOIN pg_namespace namespace_record ON namespace_record.oid = relation_record.relnamespace
+       CROSS JOIN LATERAL aclexplode(
+         CASE WHEN cardinality(attribute_record.attacl) = 0 THEN NULL::aclitem[]
+              ELSE attribute_record.attacl END
+       ) acl_record
+       WHERE namespace_record.nspname || '.' || relation_record.relname = ANY($1::text[])
+         AND attribute_record.attnum > 0 AND NOT attribute_record.attisdropped
+         AND acl_record.grantee <> relation_record.relowner
+     ), missing_acl AS (
+       SELECT * FROM expected_acl
+       EXCEPT
+       SELECT * FROM actual_acl
+     ), unexpected_acl AS (
+       SELECT * FROM actual_acl
+       EXCEPT
+       SELECT * FROM expected_acl
+     ), missing_diagnostic AS (
+       SELECT 'missing'::text AS direction, missing_acl.* FROM missing_acl
+       ORDER BY schema_name, relation_name, scope, column_name NULLS FIRST,
+                grantee, privilege, grantable, grantor
+       LIMIT 1
+     ), unexpected_diagnostic AS (
+       SELECT 'unexpected'::text AS direction, unexpected_acl.* FROM unexpected_acl
+       ORDER BY schema_name, relation_name, scope, column_name NULLS FIRST,
+                grantee, privilege, grantable, grantor
+       LIMIT 1
+     )
+     SELECT * FROM missing_diagnostic
+     UNION ALL
+     SELECT * FROM unexpected_diagnostic
+     ORDER BY direction`,
+    [predecessorAclRelations, JSON.stringify(expectedPredecessorAcl(integrityInstalled))]
   );
-  const expectedTablePrivileges = integrityPolicyContracts
-    .filter(([relation]) => integrityInstalled && relation !== "ops.domain_command_records")
-    .map(([relation]) => ({ relation, privilege: "SELECT", grantable: false }))
-    .sort((left, right) => left.relation.localeCompare(right.relation));
-  assertCatalogEqual(
-    "B1 integrity direct table grants",
-    tablePrivileges.rows,
-    expectedTablePrivileges
-  );
-
-  const columnPrivileges = await client.query<Record<string, unknown>>(
-    `SELECT namespace_record.nspname || '.' || relation_record.relname AS relation,
-            attribute_record.attname AS column,
-            acl_record.privilege_type AS privilege,
-            acl_record.is_grantable AS grantable
-     FROM pg_attribute attribute_record
-     JOIN pg_class relation_record ON relation_record.oid = attribute_record.attrelid
-     JOIN pg_namespace namespace_record ON namespace_record.oid = relation_record.relnamespace
-     CROSS JOIN LATERAL aclexplode(
-       CASE WHEN cardinality(attribute_record.attacl) = 0 THEN NULL::aclitem[]
-            ELSE attribute_record.attacl END
-     ) acl_record
-     WHERE acl_record.grantee = 'throughline_b1_0_integrity'::regrole
-     ORDER BY 1, 2, 3`
-  );
-  assertCatalogEqual(
-    "B1 integrity column grants",
-    columnPrivileges.rows,
-    ["id", "state", "tenant_id", "workspace_id"].map((column) => ({
-      relation: "ops.domain_command_records",
-      column,
-      privilege: "SELECT",
-      grantable: false
-    }))
-  );
+  if (aclDiagnostics.rowCount !== 0) {
+    throw new Error(
+      `Installed predecessor ACL authority does not match the exact normalized contract: ${JSON.stringify(aclDiagnostics.rows)}`
+    );
+  }
 
   const schemaPrivileges = await client.query<Record<string, unknown>>(
     `SELECT namespace_record.nspname AS schema,

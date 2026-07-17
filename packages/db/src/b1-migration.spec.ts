@@ -52,7 +52,10 @@ describe("Wave B1 additive migration contract", () => {
     ]) {
       expect(contract).toContain(closedSurface);
     }
-    expect(contract).toContain(
+    expect(contract).toContain('"exact domain command constraint inventory"');
+    expect(contract).toContain('"exact domain command user-trigger inventory"');
+    expect(contract).toContain('"exact domain command rewrite-rule inventory"');
+    expect(contract).not.toContain(
       "constraint_record.conname = 'domain_command_records_b1_shape_check'"
     );
     expect(contract).not.toContain("constraint_record.conname LIKE 'domain_command_records_b1_%'");
@@ -114,6 +117,57 @@ describe("Wave B1 additive migration contract", () => {
     expect(contract).not.toContain(
       "aclexplode(COALESCE(attribute_record.attacl, '{}'::aclitem[]))"
     );
+  });
+
+  it("closes every work/content pg_class kind and every command-table catalog inventory", async () => {
+    const contract = await readFile(catalogContractUrl, "utf8");
+    const schemaSecurity = contract.match(
+      /async function validateSchemaSecurity[\s\S]*?\n}\n\nfunction functionSource/
+    )?.[0];
+    const commandSecurity = contract.match(
+      /async function validateCommandIntegrityObjects[\s\S]*?\n}\n\nconst integrityPolicyContracts/
+    )?.[0];
+    expect(schemaSecurity).toBeDefined();
+    const installedInventoryQuery = schemaSecurity?.match(
+      /const installedObjects[\s\S]*?const scratchObjects/
+    )?.[0];
+    expect(installedInventoryQuery).toBeDefined();
+    expect(installedInventoryQuery).toContain("relation_record.relkind::text AS kind");
+    expect(installedInventoryQuery).not.toMatch(
+      /WHERE[\s\S]*?relation_record\.relkind\s*(?:=|IN\b)/i
+    );
+    expect(commandSecurity).toBeDefined();
+    expect(commandSecurity).toContain("WHERE constraint_record.conrelid = $1::regclass");
+    expect(commandSecurity).not.toContain("constraint_record.conname =");
+    expect(commandSecurity).not.toContain("startsWith");
+    expect(commandSecurity).toContain("rewrite_record.rulename <> '_RETURN'");
+    expect(commandSecurity).toContain('triggerCatalog(client, "ops.domain_command_records")');
+  });
+
+  it("compares the explicit predecessor table and column authority contract in both directions", async () => {
+    const contract = await readFile(catalogContractUrl, "utf8");
+    const predecessor = contract.match(
+      /const predecessorAclRelations[\s\S]*?async function validateIntegrityPredecessorAccess[\s\S]*?\n}/
+    )?.[0];
+    expect(predecessor).toBeDefined();
+    for (const relation of [
+      "access.access_relationships",
+      "access.spaces",
+      "identity.policy_versions",
+      "identity.service_principals",
+      "identity.tenants",
+      "identity.workspaces",
+      "ops.audit_events",
+      "ops.domain_command_records",
+      "ops.product_outbox_events"
+    ]) {
+      expect(predecessor).toContain(relation);
+    }
+    expect(predecessor).toContain("acl_record.grantor");
+    expect(predecessor).toContain("acl_record.is_grantable AS grantable");
+    expect(predecessor).toContain("SELECT * FROM expected_acl");
+    expect(predecessor).toContain("SELECT * FROM actual_acl");
+    expect(predecessor).toContain("EXCEPT");
   });
 
   it("creates the exact normalized work graph with Engagement only as Activity subtype", async () => {

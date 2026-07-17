@@ -54,7 +54,7 @@ maybeDescribe("B1 fail-closed migration catalog contract", () => {
     try {
       await ownerPool.query(mutation);
       await expect(applyMigrations(ownerPool)).rejects.toThrow(
-        /catalog|B1|journal|capability|does not exist|Unexpected rewrite rule/i
+        /catalog|B1|journal|capability|authority|does not exist|Unexpected rewrite rule/i
       );
       const journal = await ownerPool.query<{ count: string }>(
         `SELECT count(*)::text AS count FROM throughline_migrations.journal
@@ -194,6 +194,21 @@ maybeDescribe("B1 fail-closed migration catalog contract", () => {
     await expectJournaledCatalogRejected("CREATE TABLE work.unreviewed_successor_object (id uuid)");
   }, 60_000);
 
+  it("rejects every unexpected work/content pg_class kind, including ACL-bearing sequences", async () => {
+    for (const mutation of [
+      `CREATE SEQUENCE work.unreviewed_sequence;
+       GRANT USAGE ON SEQUENCE work.unreviewed_sequence TO PUBLIC;
+       GRANT SELECT ON SEQUENCE work.unreviewed_sequence TO throughline_worker`,
+      "CREATE VIEW content.unreviewed_view AS SELECT id FROM content.content_items",
+      "CREATE MATERIALIZED VIEW work.unreviewed_materialized AS SELECT id FROM work.organizations",
+      "CREATE TYPE content.unreviewed_composite AS (id uuid, note text)",
+      `CREATE TABLE work.unreviewed_partitioned (id uuid NOT NULL)
+       PARTITION BY HASH (id)`
+    ]) {
+      await expectJournaledCatalogRejected(mutation);
+    }
+  }, 180_000);
+
   it("rejects column type/default/not-null/generated drift", async () => {
     await expectJournaledCatalogRejected(`
       ALTER TABLE work.organizations ALTER COLUMN name TYPE varchar(300);
@@ -215,6 +230,48 @@ maybeDescribe("B1 fail-closed migration catalog contract", () => {
       CREATE INDEX organizations_space_idx ON work.organizations (tenant_id)
     `);
   }, 60_000);
+
+  it("rejects the complete extra domain-command constraint inventory", async () => {
+    for (const mutation of [
+      `ALTER TABLE ops.domain_command_records
+       ADD CONSTRAINT command_records_unreviewed_check CHECK (length(state) > 0)`,
+      `ALTER TABLE ops.domain_command_records
+       ADD CONSTRAINT command_records_unreviewed_unique UNIQUE (id, state)`,
+      `ALTER TABLE ops.domain_command_records
+       ADD CONSTRAINT command_records_unreviewed_fk FOREIGN KEY (id)
+       REFERENCES ops.domain_command_records(id)`,
+      `ALTER TABLE ops.domain_command_records
+       ADD CONSTRAINT command_records_unreviewed_exclusion
+       EXCLUDE USING gist (tstzrange(created_at, updated_at, '[]') WITH &&)`
+    ]) {
+      await expectJournaledCatalogRejected(mutation);
+    }
+  }, 180_000);
+
+  it("rejects differently named, disabled, or altered domain-command triggers and rules", async () => {
+    await expectJournaledCatalogRejected(`
+      CREATE FUNCTION ops.unreviewed_command_trigger() RETURNS trigger
+        LANGUAGE plpgsql SET search_path = pg_catalog AS $function$
+        BEGIN RETURN NEW; END
+        $function$;
+      CREATE TRIGGER command_records_unreviewed_trigger
+        BEFORE INSERT ON ops.domain_command_records
+        FOR EACH ROW EXECUTE FUNCTION ops.unreviewed_command_trigger()
+    `);
+    await expectJournaledCatalogRejected(
+      "ALTER TABLE ops.domain_command_records DISABLE TRIGGER domain_command_records_transition_guard"
+    );
+    await expectJournaledCatalogRejected(
+      "ALTER TABLE ops.domain_command_records ENABLE REPLICA TRIGGER domain_command_records_transition_guard"
+    );
+    await expectJournaledCatalogRejected(
+      "ALTER FUNCTION ops.enforce_domain_command_transition() SECURITY DEFINER"
+    );
+    await expectJournaledCatalogRejected(`
+      CREATE RULE command_records_unreviewed_rule AS
+        ON INSERT TO ops.domain_command_records DO INSTEAD NOTHING
+    `);
+  }, 180_000);
 
   it("validates exact B1 foreign keys through a transaction-local scratch catalog", async () => {
     await applyMigrations(ownerPool);
@@ -320,6 +377,46 @@ maybeDescribe("B1 fail-closed migration catalog contract", () => {
 
     await ownerPool.query("REVOKE SELECT ON work.activities FROM throughline_b1_0_integrity");
     await expect(applyMigrations(ownerPool)).rejects.toThrow(/catalog|B1|journal|capability/i);
+    await reset();
+  }, 60_000);
+
+  it("rejects predecessor PUBLIC, rogue, grant-option, unexpected-column, and alternate-grantor ACLs", async () => {
+    for (const mutation of [
+      "GRANT SELECT ON access.spaces TO PUBLIC",
+      "GRANT SELECT ON ops.audit_events TO throughline_worker",
+      "GRANT SELECT ON access.spaces TO throughline_app WITH GRANT OPTION",
+      "GRANT SELECT (parent_space_id) ON access.spaces TO throughline_product_relay",
+      `GRANT SELECT ON access.spaces TO throughline_app WITH GRANT OPTION;
+       SET ROLE throughline_app;
+       GRANT SELECT ON access.spaces TO throughline_worker;
+       RESET ROLE`
+    ]) {
+      await expectJournaledCatalogRejected(mutation);
+    }
+  }, 180_000);
+
+  it("rejects inherited predecessor authority and completely restores role membership", async () => {
+    try {
+      await ownerPool.query("GRANT throughline_app TO throughline_worker");
+      await expect(applyMigrations(ownerPool)).rejects.toThrow(/catalog|B1|capability|role/i);
+    } finally {
+      await ownerPool.query("REVOKE throughline_app FROM throughline_worker");
+      await reset();
+    }
+  }, 60_000);
+
+  it("accepts predecessor ACL tuple equality after storage ordering changes", async () => {
+    await reset();
+    await ownerPool.query(`
+      REVOKE SELECT, INSERT ON ops.audit_events FROM throughline_app;
+      GRANT INSERT ON ops.audit_events TO throughline_app;
+      GRANT SELECT ON ops.audit_events TO throughline_app
+    `);
+    await expect(applyMigrations(ownerPool)).resolves.toEqual({
+      applied: [],
+      skipped: [...migrationIds]
+    });
+    await expectScratchCatalogClean();
     await reset();
   }, 60_000);
 
