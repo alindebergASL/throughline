@@ -8,9 +8,17 @@ import type {
   ResourceRef,
   SecurityContext
 } from "@throughline/core-types";
-import type { TransactionAwareAuthorizationService } from "@throughline/authorization";
+import type {
+  RelationshipAuthorityBatchingAuthorizationService,
+  RelationshipAuthorityRequest,
+  TransactionAwareAuthorizationService
+} from "@throughline/authorization";
 import { PostgresAuthorizationService } from "@throughline/authorization";
-import { ContentRepository, normalizeAndChunkSource } from "@throughline/content";
+import {
+  ContentInvariantError,
+  ContentRepository,
+  normalizeAndChunkSource
+} from "@throughline/content";
 import {
   ProductDomainTransactionRepositories,
   ProductDomainInvariantError,
@@ -132,7 +140,7 @@ export class AccountOperationsDomainCommandBus {
           return (await deriveRelationshipScope(tx, graph, context, command.payload)).spaceId;
         case "relationship.end":
           return (
-            await graph.getRelationship(
+            await graph.getRelationshipScope(
               context.tenantId,
               context.workspaceId,
               command.payload.relationshipId
@@ -157,21 +165,29 @@ export class AccountOperationsDomainCommandBus {
             )
           ).spaceId;
         case "source.correct":
-          return (
-            await new ContentRepository(tx).getSourceScope(
-              context.tenantId,
-              context.workspaceId,
-              command.payload.predecessorSourceArtifactId
-            )
-          ).spaceId;
+          try {
+            return (
+              await new ContentRepository(tx).getSourceScope(
+                context.tenantId,
+                context.workspaceId,
+                command.payload.predecessorSourceArtifactId
+              )
+            ).spaceId;
+          } catch (error) {
+            return normalizeMissingSource(error);
+          }
         case "source.tombstone":
-          return (
-            await new ContentRepository(tx).getSourceScope(
-              context.tenantId,
-              context.workspaceId,
-              command.payload.sourceArtifactId
-            )
-          ).spaceId;
+          try {
+            return (
+              await new ContentRepository(tx).getSourceScope(
+                context.tenantId,
+                context.workspaceId,
+                command.payload.sourceArtifactId
+              )
+            ).spaceId;
+          } catch (error) {
+            return normalizeMissingSource(error);
+          }
       }
     });
   }
@@ -586,6 +602,11 @@ export class AccountOperationsDomainCommandBus {
         return result;
       }
       case "relationship.end": {
+        const relationshipResource = {
+          type: "relationship",
+          id: command.payload.relationshipId
+        } as const;
+        await this.preauthorizeRelationshipEndInTransaction(tx, context, relationshipResource);
         const relationship = await graph.getRelationship(
           context.tenantId,
           context.workspaceId,
@@ -593,10 +614,13 @@ export class AccountOperationsDomainCommandBus {
           true
         );
         if (relationship.spaceId !== reservationSpaceId) throw new B1CommandInvariantError();
-        const relationshipDecision = await this.authorize(tx, context, "relationship.end", {
-          type: "relationship",
-          id: relationship.id
-        });
+        const currentAuthority = await this.lockAndReauthorizeRelationshipAuthorityInTransaction(
+          tx,
+          context,
+          relationship,
+          reservationSpaceId,
+          relationshipResource
+        );
         const reservation = await reserveCommand(
           domain.commands,
           command,
@@ -606,19 +630,11 @@ export class AccountOperationsDomainCommandBus {
           reservationSpaceId
         );
         if (reservation.replay) return reservation.result;
-        const endpointAuthority = await this.authorizeRelationshipEndpoints(
-          tx,
-          context,
-          relationship,
-          reservationSpaceId,
-          { type: "relationship", id: relationship.id }
-        );
         if (relationship.version !== command.payload.expectedVersion || relationship.validTo)
           throw new B1CommandInvariantError();
-        const authorityRequirements = spaceGrantRequirements([
-          ...(relationshipDecision.evaluatedRelationships ?? []),
-          ...endpointAuthority
-        ]);
+        const authorityRequirements = spaceGrantRequirements(
+          currentAuthority.evaluatedRelationships ?? []
+        );
         const updated = await graph.endRelationship({
           tenantId: context.tenantId,
           workspaceId: context.workspaceId,
@@ -627,6 +643,8 @@ export class AccountOperationsDomainCommandBus {
           validTo: command.payload.validTo,
           actorUserId: actor.userId,
           actorMembershipId: actor.membershipId,
+          policyVersionId: context.policyVersion,
+          governingSpaceId: reservationSpaceId,
           authorityRequirements
         });
         if (!updated.authorized) throw new B1AuthorizationError();
@@ -1228,6 +1246,80 @@ export class AccountOperationsDomainCommandBus {
     return decision;
   }
 
+  private async lockAndReauthorizeRelationshipAuthorityInTransaction(
+    tx: TenantDbTransaction,
+    context: SecurityContext,
+    relationship: Relationship,
+    governingSpaceId: string,
+    relationshipResource: ResourceRef & { type: "relationship" }
+  ) {
+    if (!supportsRelationshipAuthorityBatching(this.authorization)) {
+      throw new B1AuthorizationError();
+    }
+    const requests: RelationshipAuthorityRequest[] = [
+      { action: "relationship.end", resource: relationshipResource },
+      { action: "space.read", resource: { type: "space", id: governingSpaceId } }
+    ];
+    const endpoints = [
+      relationship.subject,
+      relationship.object,
+      ...(relationship.context ? [relationship.context] : [])
+    ]
+      .filter(
+        (endpoint, index, values) =>
+          values.findIndex((candidate) => endpointKey(candidate) === endpointKey(endpoint)) ===
+          index
+      )
+      .sort((left, right) => endpointKey(left).localeCompare(endpointKey(right)));
+    for (const endpoint of endpoints) {
+      if (endpoint.type === "space") {
+        requests.push({ action: "space.read", resource: { type: "space", id: endpoint.id } });
+      } else if (endpoint.type === "person") {
+        requests.push({
+          action: "person.read",
+          resource: { type: "person", id: endpoint.id },
+          personUseSite: relationshipResource
+        });
+      } else if (endpoint.type === "content") {
+        requests.push({
+          action: "content.read",
+          resource: { type: "content_item", id: endpoint.id }
+        });
+      } else {
+        requests.push({
+          action: `${endpoint.type}.read` as
+            | "organization.read"
+            | "initiative.read"
+            | "activity.read",
+          resource: { type: endpoint.type, id: endpoint.id }
+        } as RelationshipAuthorityRequest);
+      }
+    }
+    const decision = await this.authorization.lockAndReauthorizeRelationshipAuthorityInTransaction(
+      context,
+      requests,
+      tx
+    );
+    if (!decision.allowed) throw new B1AuthorizationError();
+    return decision;
+  }
+
+  private async preauthorizeRelationshipEndInTransaction(
+    tx: TenantDbTransaction,
+    context: SecurityContext,
+    relationshipResource: ResourceRef & { type: "relationship" }
+  ): Promise<void> {
+    if (!supportsRelationshipAuthorityBatching(this.authorization)) {
+      throw new B1AuthorizationError();
+    }
+    const decision = await this.authorization.preauthorizeRelationshipEndInTransaction(
+      context,
+      relationshipResource,
+      tx
+    );
+    if (!decision.allowed) throw new B1AuthorizationError();
+  }
+
   private async authorizeRelationshipEndpoints(
     tx: TenantDbTransaction,
     context: SecurityContext,
@@ -1237,7 +1329,8 @@ export class AccountOperationsDomainCommandBus {
       context?: RelationshipEndpoint;
     },
     governingSpaceId: string,
-    personUseSite?: ResourceRef
+    personUseSite?: ResourceRef,
+    authorityOptions: { lockAuthority?: boolean } = {}
   ): Promise<string[]> {
     const useSite: ResourceRef =
       personUseSite ??
@@ -1263,17 +1356,23 @@ export class AccountOperationsDomainCommandBus {
     for (const endpoint of endpoints) {
       let decision;
       if (endpoint.type === "space") {
-        decision = await this.authorize(tx, context, "space.read", {
-          type: "space",
-          id: endpoint.id
-        });
+        decision = await this.authorize(
+          tx,
+          context,
+          "space.read",
+          {
+            type: "space",
+            id: endpoint.id
+          },
+          authorityOptions
+        );
       } else if (endpoint.type === "person") {
         decision = await this.authorize(
           tx,
           context,
           "person.read",
           { type: "person", id: endpoint.id },
-          { personUseSite: useSite }
+          { personUseSite: useSite, ...authorityOptions }
         );
       } else {
         decision = await this.authorize(
@@ -1284,13 +1383,24 @@ export class AccountOperationsDomainCommandBus {
             | "initiative.read"
             | "activity.read"
             | "content.read",
-          endpointResource(endpoint)
+          endpointResource(endpoint),
+          authorityOptions
         );
       }
       authorityTokens.push(...(decision.evaluatedRelationships ?? []));
     }
     return authorityTokens;
   }
+}
+
+function supportsRelationshipAuthorityBatching(
+  authorization: TransactionAwareAuthorizationService
+): authorization is RelationshipAuthorityBatchingAuthorizationService {
+  const candidate = authorization as Partial<RelationshipAuthorityBatchingAuthorizationService>;
+  return (
+    typeof candidate.preauthorizeRelationshipEndInTransaction === "function" &&
+    typeof candidate.lockAndReauthorizeRelationshipAuthorityInTransaction === "function"
+  );
 }
 
 export function sourceTextMatchesRevisionBody(sourceText: string, revisionBody: string): boolean {
@@ -1543,6 +1653,13 @@ function requireHumanActor(context: SecurityContext): {
     membershipId: context.actorMembershipId,
     displayPersonId: context.actorDisplayPersonId
   };
+}
+
+function normalizeMissingSource(error: unknown): never {
+  if (error instanceof ContentInvariantError && error.message === "Source is unavailable") {
+    throw new B1AuthorizationError();
+  }
+  throw error;
 }
 
 function auditInput(

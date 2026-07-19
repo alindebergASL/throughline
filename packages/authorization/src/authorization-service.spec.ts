@@ -37,6 +37,600 @@ describe("AuthorizationService context boundary", () => {
   });
 });
 
+describe("B1 transaction-aware human authority locks", () => {
+  const sourceId = "70000000-0000-7000-8000-000000000081";
+  const relationshipId = "70000000-0000-7000-8000-000000000082";
+  const personId = "70000000-0000-7000-8000-000000000083";
+  const spaceId = "70000000-0000-7000-8000-000000000084";
+  const readGrantId = "70000000-0000-7000-8000-000000000085";
+  const mutationGrantId = "70000000-0000-7000-8000-000000000086";
+
+  it.each(["source.correct", "source.tombstone"] as const)(
+    "locks the active governing Space for owner/admin %s authority",
+    async (action) => {
+      const { tx, queries } = b1LockExecutor("owner");
+      const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+        createDevSecurityContext("tenant-a-owner"),
+        action,
+        { type: "source", id: sourceId },
+        tx,
+        { lockAuthority: true }
+      );
+
+      expect(decision.allowed).toBe(true);
+      const policy = queries.findIndex((sql) => sql.includes("FROM identity.policy_versions"));
+      const membership = queries.findIndex((sql) => sql.includes("FROM identity.memberships"));
+      const space = queries.findIndex((sql) => isActiveSpaceLock(sql));
+      expect([policy, membership, space]).toEqual([0, 1, expect.any(Number)]);
+      expect(space).toBeGreaterThan(membership);
+      expect(queries[policy]).toMatch(/status = 'active'[\s\S]*FOR SHARE/);
+      expect(queries[membership]).toMatch(/FOR SHARE OF m, u/);
+      expect(queries[space]).toMatch(/archived_at IS NULL[\s\S]*FOR SHARE/);
+    }
+  );
+
+  it("preauthorizes Relationship end without taking any human-authority lock", async () => {
+    const { tx, queries } = b1LockExecutor("member");
+    const decision = await new PostgresAuthorizationService(
+      {} as PgPool
+    ).preauthorizeRelationshipEndInTransaction(
+      createDevSecurityContext("tenant-a-viewer"),
+      { type: "relationship", id: relationshipId },
+      tx
+    );
+
+    expect(decision.allowed).toBe(true);
+    expect(queries).not.toHaveLength(0);
+    expect(queries.every((sql) => !/FOR SHARE/.test(sql))).toBe(true);
+  });
+
+  it("locks policy, actor membership/user/role, Space, read grant, and contributor grant in order", async () => {
+    const { tx, queries } = b1LockExecutor("member");
+    const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      createDevSecurityContext("tenant-a-viewer"),
+      "relationship.end",
+      { type: "relationship", id: relationshipId },
+      tx,
+      { lockAuthority: true }
+    );
+
+    expect(decision.allowed).toBe(true);
+    const policy = queries.findIndex((sql) => sql.includes("FROM identity.policy_versions"));
+    const membership = queries.findIndex((sql) => sql.includes("FROM identity.memberships"));
+    const space = queries.findIndex((sql) => isActiveSpaceLock(sql));
+    const readGrant = queries.findIndex((sql) =>
+      sql.includes("SELECT id, resource_id FROM access.access_relationships")
+    );
+    const contributorGrant = queries.findIndex(
+      (sql) => sql.includes("SELECT grant_record.id") && sql.includes("relation IN")
+    );
+    expect(policy).toBeLessThan(membership);
+    expect(membership).toBeLessThan(space);
+    expect(space).toBeLessThan(readGrant);
+    expect(readGrant).toBeLessThan(contributorGrant);
+    expect(queries[readGrant]).toMatch(/FOR SHARE/);
+    expect(queries[contributorGrant]).toMatch(/ORDER BY grant_record\.id[\s\S]*FOR SHARE/);
+    expect(decision.evaluatedRelationships).toEqual([
+      `space_grant:${readGrantId}:${spaceId}`,
+      `space_grant:${mutationGrantId}:${spaceId}`
+    ]);
+  });
+
+  it("propagates lockAuthority through a Relationship Person endpoint read and locks its grant", async () => {
+    const { tx, queries } = b1LockExecutor("member");
+    const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      createDevSecurityContext("tenant-a-viewer"),
+      "person.read",
+      { type: "person", id: personId },
+      tx,
+      {
+        personUseSite: { type: "relationship", id: relationshipId },
+        lockAuthority: true
+      }
+    );
+
+    expect(decision.allowed).toBe(true);
+    const space = queries.findIndex((sql) => isActiveSpaceLock(sql));
+    const grant = queries.findIndex((sql) =>
+      sql.includes("SELECT id, resource_id FROM access.access_relationships")
+    );
+    expect(space).toBeGreaterThan(
+      queries.findIndex((sql) => sql.includes("FROM work.relationships resource"))
+    );
+    expect(space).toBeLessThan(grant);
+    expect(queries[grant]).toMatch(/FOR SHARE/);
+    expect(decision.evaluatedRelationships).toEqual([`space_grant:${readGrantId}:${spaceId}`]);
+  });
+
+  it("locks and revalidates every active inherited-Space path row before accepting the grant", async () => {
+    const targetSpaceId = "70000000-0000-7000-8000-000000000087";
+    const intermediateSpaceId = "70000000-0000-7000-8000-000000000088";
+    const ancestorSpaceId = "70000000-0000-7000-8000-000000000089";
+    const inheritedGrantId = "70000000-0000-7000-8000-000000000090";
+    const queries: string[] = [];
+    const tx = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes("FROM identity.policy_versions")) return { rows: [{ id: "default-v1" }] };
+        if (sql.includes("FROM identity.memberships")) {
+          return {
+            rows: [{ role: "member", membership_status: "active", user_status: "active" }]
+          };
+        }
+        if (sql.includes("FROM work.organizations resource")) {
+          return { rows: [{ space_id: targetSpaceId, access_class: "restricted" }] };
+        }
+        if (isActiveSpaceLock(sql)) return { rows: [{ id: targetSpaceId }] };
+        if (sql.includes("WITH RECURSIVE target AS")) {
+          return {
+            rows: [
+              {
+                is_root: false,
+                target_restricted: false,
+                direct_grant_ids: [],
+                direct_grant_space_ids: [],
+                inherited_grant_ids: [inheritedGrantId],
+                inherited_grant_space_ids: [ancestorSpaceId]
+              }
+            ]
+          };
+        }
+        if (sql.includes("WITH RECURSIVE authority_path AS")) {
+          return {
+            rows: [
+              {
+                id: targetSpaceId,
+                parent_space_id: intermediateSpaceId,
+                inheritance_mode: "inherit",
+                depth: 0
+              },
+              {
+                id: intermediateSpaceId,
+                parent_space_id: ancestorSpaceId,
+                inheritance_mode: "inherit",
+                depth: 1
+              },
+              {
+                id: ancestorSpaceId,
+                parent_space_id: null,
+                inheritance_mode: "inherit",
+                depth: 2
+              }
+            ]
+          };
+        }
+        if (sql.includes("FOR SHARE OF space_row")) {
+          return {
+            rows: [{ id: ancestorSpaceId }, { id: intermediateSpaceId }, { id: targetSpaceId }]
+          };
+        }
+        if (sql.includes("SELECT id, resource_id FROM access.access_relationships")) {
+          return { rows: [{ id: inheritedGrantId, resource_id: ancestorSpaceId }] };
+        }
+        throw new Error(`Unexpected inherited authority query: ${sql}`);
+      })
+    } as unknown as TenantQueryExecutor;
+
+    const decision = await new PostgresAuthorizationService({} as PgPool).canInTransaction(
+      createDevSecurityContext("tenant-a-viewer"),
+      "organization.read",
+      { type: "organization", id: relationshipId },
+      tx,
+      { lockAuthority: true }
+    );
+
+    expect(decision.allowed).toBe(true);
+    const pathRead = queries.findIndex((sql) => sql.includes("WITH RECURSIVE authority_path AS"));
+    const pathLock = queries.findIndex((sql) => sql.includes("FOR SHARE OF space_row"));
+    const grantLock = queries.findIndex((sql) =>
+      sql.includes("SELECT id, resource_id FROM access.access_relationships")
+    );
+    const pathRevalidation = queries
+      .map((sql) => sql.includes("WITH RECURSIVE authority_path AS"))
+      .lastIndexOf(true);
+    expect(pathRead).toBeGreaterThanOrEqual(0);
+    expect(pathLock).toBeGreaterThan(pathRead);
+    expect(pathRevalidation).toBeGreaterThan(pathLock);
+    expect(grantLock).toBeGreaterThan(pathRevalidation);
+    expect(queries[pathLock]).toMatch(/ORDER BY space_row\.id[\s\S]*FOR SHARE OF space_row/);
+    expect(decision.evaluatedRelationships).toEqual([
+      `space_grant:${inheritedGrantId}:${ancestorSpaceId}`
+    ]);
+  });
+
+  it("discovers Relationship authority without locks, then deduplicates and globally orders every Space, path, and grant", async () => {
+    const governingSpaceId = "70000000-0000-7000-8000-000000000098";
+    const inheritedTargetSpaceId = "70000000-0000-7000-8000-000000000094";
+    const inheritedIntermediateSpaceId = "70000000-0000-7000-8000-000000000093";
+    const inheritedAncestorSpaceId = "70000000-0000-7000-8000-000000000091";
+    const directEndpointSpaceId = "70000000-0000-7000-8000-000000000096";
+    const governingGrantId = "70000000-0000-7000-8000-000000000099";
+    const inheritedGrantId = "70000000-0000-7000-8000-000000000095";
+    const directEndpointGrantId = "70000000-0000-7000-8000-000000000097";
+    const organizationId = "70000000-0000-7000-8000-000000000092";
+    const requests = [
+      {
+        action: "relationship.end",
+        resource: { type: "relationship", id: relationshipId }
+      },
+      {
+        action: "organization.read",
+        resource: { type: "organization", id: organizationId }
+      },
+      {
+        action: "space.read",
+        resource: { type: "space", id: directEndpointSpaceId }
+      },
+      {
+        action: "person.read",
+        resource: { type: "person", id: personId },
+        personUseSite: { type: "relationship", id: relationshipId }
+      },
+      {
+        action: "space.read",
+        resource: { type: "space", id: governingSpaceId }
+      }
+    ] as const;
+    const runs: Array<{
+      queries: Array<{ sql: string; values: readonly unknown[] | undefined }>;
+      decision: Awaited<
+        ReturnType<
+          RelationshipAuthorityBatchTestService["lockAndReauthorizeRelationshipAuthorityInTransaction"]
+        >
+      >;
+    }> = [];
+
+    for (const orderedRequests of [requests, [...requests].reverse()] as const) {
+      const queries: Array<{ sql: string; values: readonly unknown[] | undefined }> = [];
+      const spaces = new Map([
+        [
+          governingSpaceId,
+          authoritySpaceRow(governingSpaceId, devFixtures.rootSpaceA, "restricted")
+        ],
+        [
+          inheritedTargetSpaceId,
+          authoritySpaceRow(inheritedTargetSpaceId, inheritedIntermediateSpaceId, "inherit")
+        ],
+        [
+          inheritedIntermediateSpaceId,
+          authoritySpaceRow(inheritedIntermediateSpaceId, inheritedAncestorSpaceId, "inherit")
+        ],
+        [
+          inheritedAncestorSpaceId,
+          authoritySpaceRow(inheritedAncestorSpaceId, devFixtures.rootSpaceA, "inherit")
+        ],
+        [
+          directEndpointSpaceId,
+          authoritySpaceRow(directEndpointSpaceId, devFixtures.rootSpaceA, "restricted")
+        ]
+      ]);
+      const grants = new Map([
+        [governingGrantId, authorityGrantRow(governingGrantId, governingSpaceId, "contributor")],
+        [inheritedGrantId, authorityGrantRow(inheritedGrantId, inheritedAncestorSpaceId, "viewer")],
+        [
+          directEndpointGrantId,
+          authorityGrantRow(directEndpointGrantId, directEndpointSpaceId, "viewer")
+        ]
+      ]);
+      const tx = {
+        query: vi.fn(async (sql: string, values?: readonly unknown[]) => {
+          queries.push({ sql, values });
+          if (sql.includes("FROM identity.policy_versions")) {
+            return { rows: [{ id: "default-v1", status: "active" }] };
+          }
+          if (sql.includes("FROM identity.memberships")) {
+            return {
+              rows: [
+                {
+                  membership_id: devFixtures.membershipAViewer,
+                  user_id: devFixtures.userB,
+                  person_id: devFixtures.personBInTenantA,
+                  role: "member",
+                  membership_status: "active",
+                  user_status: "active"
+                }
+              ]
+            };
+          }
+          if (sql.includes("/* relationship_authority_global_spaces */")) {
+            const ids = values?.[2] as string[];
+            return { rows: ids.map((id) => spaces.get(id)!) };
+          }
+          if (sql.includes("/* relationship_authority_global_grants */")) {
+            const ids = values?.[2] as string[];
+            return { rows: ids.map((id) => grants.get(id)!) };
+          }
+          if (sql.includes("FROM work.organizations resource")) {
+            return { rows: [{ space_id: inheritedTargetSpaceId, access_class: "restricted" }] };
+          }
+          if (sql.includes("FROM work.relationships resource")) {
+            return { rows: [{ space_id: governingSpaceId, access_class: "restricted" }] };
+          }
+          if (sql.includes("/* relationship_authority_space */")) {
+            return { rows: [spaces.get(values?.[2] as string)!] };
+          }
+          if (sql.includes("WITH RECURSIVE target AS")) {
+            const targetSpaceId = values?.[0];
+            if (targetSpaceId === inheritedTargetSpaceId) {
+              return {
+                rows: [
+                  {
+                    is_root: false,
+                    target_restricted: false,
+                    direct_grant_ids: [],
+                    direct_grant_space_ids: [],
+                    inherited_grant_ids: [inheritedGrantId],
+                    inherited_grant_space_ids: [inheritedAncestorSpaceId]
+                  }
+                ]
+              };
+            }
+            const grantId =
+              targetSpaceId === governingSpaceId ? governingGrantId : directEndpointGrantId;
+            return {
+              rows: [
+                {
+                  is_root: false,
+                  target_restricted: true,
+                  direct_grant_ids: [grantId],
+                  direct_grant_space_ids: [targetSpaceId],
+                  inherited_grant_ids: [],
+                  inherited_grant_space_ids: []
+                }
+              ]
+            };
+          }
+          if (sql.includes("WITH RECURSIVE authority_path AS")) {
+            return {
+              rows: [
+                { ...spaces.get(inheritedTargetSpaceId)!, depth: 0 },
+                { ...spaces.get(inheritedIntermediateSpaceId)!, depth: 1 },
+                { ...spaces.get(inheritedAncestorSpaceId)!, depth: 2 }
+              ]
+            };
+          }
+          if (sql.includes("/* relationship_authority_grant */")) {
+            return { rows: [grants.get(values?.[2] as string)!] };
+          }
+          if (sql.includes("SELECT grant_record.id") && sql.includes("relation IN")) {
+            return { rows: [grants.get(governingGrantId)!] };
+          }
+          throw new Error(`Unexpected Relationship authority batch query: ${sql}`);
+        })
+      } as unknown as TenantQueryExecutor;
+      const service = new PostgresAuthorizationService(
+        {} as PgPool
+      ) as unknown as RelationshipAuthorityBatchTestService;
+      const decision = await service.lockAndReauthorizeRelationshipAuthorityInTransaction(
+        createDevSecurityContext("tenant-a-viewer"),
+        orderedRequests,
+        tx
+      );
+      runs.push({ queries, decision });
+    }
+
+    const expectedSpaceIds = [
+      inheritedAncestorSpaceId,
+      inheritedIntermediateSpaceId,
+      inheritedTargetSpaceId,
+      directEndpointSpaceId,
+      governingSpaceId
+    ];
+    const expectedGrantIds = [inheritedGrantId, directEndpointGrantId, governingGrantId];
+    for (const { queries, decision } of runs) {
+      expect(decision.allowed).toBe(true);
+      const firstLock = queries.findIndex(({ sql }) => /FOR SHARE/.test(sql));
+      expect(firstLock).toBeGreaterThan(0);
+      expect(queries.slice(0, firstLock).every(({ sql }) => !/FOR SHARE/.test(sql))).toBe(true);
+      const lockQueries = queries.filter(({ sql }) => /FOR SHARE/.test(sql));
+      expect(lockQueries).toHaveLength(4);
+      expect(lockQueries[0]!.sql).toContain("FROM identity.policy_versions");
+      expect(lockQueries[1]!.sql).toContain("FROM identity.memberships");
+      expect(lockQueries[2]!.sql).toMatch(
+        /relationship_authority_global_spaces[\s\S]*ORDER BY space_row\.id[\s\S]*FOR SHARE/
+      );
+      expect(lockQueries[2]!.values?.[2]).toEqual(expectedSpaceIds);
+      expect(lockQueries[3]!.sql).toMatch(
+        /relationship_authority_global_grants[\s\S]*ORDER BY grant_record\.id[\s\S]*FOR SHARE/
+      );
+      expect(lockQueries[3]!.values?.[2]).toEqual(expectedGrantIds);
+      expect(decision.evaluatedRelationships).toEqual([
+        `space_grant:${inheritedGrantId}:${inheritedAncestorSpaceId}`,
+        `space_grant:${directEndpointGrantId}:${directEndpointSpaceId}`,
+        `space_grant:${governingGrantId}:${governingSpaceId}`
+      ]);
+    }
+    expect(
+      runs.map(({ queries }) =>
+        queries
+          .filter(({ sql }) => /relationship_authority_global_(?:spaces|grants)/.test(sql))
+          .map(({ values }) => values?.[2])
+      )
+    ).toEqual([
+      [expectedSpaceIds, expectedGrantIds],
+      [expectedSpaceIds, expectedGrantIds]
+    ]);
+  });
+
+  it("fails closed when the Relationship grant token set changes before locked reauthorization", async () => {
+    const governingSpaceId = "70000000-0000-7000-8000-000000000091";
+    const governingGrantId = "70000000-0000-7000-8000-000000000092";
+    const space = authoritySpaceRow(governingSpaceId, devFixtures.rootSpaceA, "restricted");
+    const grant = authorityGrantRow(governingGrantId, governingSpaceId, "contributor");
+    const queries: string[] = [];
+    let accessReads = 0;
+    const tx = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes("FROM identity.policy_versions")) {
+          return { rows: [{ id: "default-v1", status: "active" }] };
+        }
+        if (sql.includes("FROM identity.memberships")) {
+          return {
+            rows: [
+              {
+                membership_id: devFixtures.membershipAViewer,
+                user_id: devFixtures.userB,
+                person_id: devFixtures.personBInTenantA,
+                role: "member",
+                membership_status: "active",
+                user_status: "active"
+              }
+            ]
+          };
+        }
+        if (sql.includes("relationship_authority_global_spaces")) return { rows: [space] };
+        if (sql.includes("relationship_authority_global_grants")) return { rows: [grant] };
+        if (sql.includes("FROM work.relationships resource")) {
+          return { rows: [{ space_id: governingSpaceId, access_class: "restricted" }] };
+        }
+        if (sql.includes("relationship_authority_space")) return { rows: [space] };
+        if (sql.includes("WITH RECURSIVE target AS")) {
+          accessReads += 1;
+          return {
+            rows: [
+              {
+                is_root: false,
+                target_restricted: true,
+                direct_grant_ids: accessReads === 1 ? [governingGrantId] : [],
+                direct_grant_space_ids: accessReads === 1 ? [governingSpaceId] : [],
+                inherited_grant_ids: [],
+                inherited_grant_space_ids: []
+              }
+            ]
+          };
+        }
+        if (sql.includes("relationship_authority_grant")) return { rows: [grant] };
+        if (sql.includes("SELECT grant_record.id") && sql.includes("relation IN")) {
+          return { rows: [grant] };
+        }
+        throw new Error(`Unexpected changed-token authority query: ${sql}`);
+      })
+    } as unknown as TenantQueryExecutor;
+
+    const decision = await new PostgresAuthorizationService(
+      {} as PgPool
+    ).lockAndReauthorizeRelationshipAuthorityInTransaction(
+      createDevSecurityContext("tenant-a-viewer"),
+      [
+        {
+          action: "relationship.end",
+          resource: { type: "relationship", id: relationshipId }
+        }
+      ],
+      tx
+    );
+
+    expect(decision).toMatchObject({
+      allowed: false,
+      reasonCode: "b1_resource_not_available"
+    });
+    const grantLock = queries.findIndex((sql) =>
+      sql.includes("relationship_authority_global_grants")
+    );
+    const lockedReauthorization = queries
+      .map((sql) => sql.includes("WITH RECURSIVE target AS"))
+      .lastIndexOf(true);
+    expect(grantLock).toBeGreaterThanOrEqual(0);
+    expect(lockedReauthorization).toBeGreaterThan(grantLock);
+    expect(accessReads).toBe(2);
+  });
+
+  function b1LockExecutor(role: "owner" | "member"): {
+    tx: TenantQueryExecutor;
+    queries: string[];
+  } {
+    const queries: string[] = [];
+    const tx = {
+      query: vi.fn(async (sql: string) => {
+        queries.push(sql);
+        if (sql.includes("FROM identity.policy_versions")) return { rows: [{ id: "default-v1" }] };
+        if (sql.includes("FROM identity.memberships")) {
+          return {
+            rows: [{ role, membership_status: "active", user_status: "active" }]
+          };
+        }
+        if (sql.includes("FROM content.source_artifacts")) {
+          return { rows: [{ space_id: spaceId, access_class: "restricted" }] };
+        }
+        if (sql.includes("FROM work.relationships resource")) {
+          return { rows: [{ space_id: spaceId, access_class: "restricted" }] };
+        }
+        if (isActiveSpaceLock(sql)) return { rows: [{ id: spaceId }] };
+        if (sql.includes("WITH RECURSIVE target AS")) {
+          return {
+            rows: [
+              {
+                is_root: false,
+                target_restricted: true,
+                direct_grant_ids: [readGrantId],
+                direct_grant_space_ids: [spaceId],
+                inherited_grant_ids: [],
+                inherited_grant_space_ids: []
+              }
+            ]
+          };
+        }
+        if (sql.includes("SELECT id, resource_id FROM access.access_relationships")) {
+          return { rows: [{ id: readGrantId, resource_id: spaceId }] };
+        }
+        if (sql.includes("SELECT grant_record.id") && sql.includes("relation IN")) {
+          return { rows: [{ id: mutationGrantId, resource_id: spaceId }] };
+        }
+        throw new Error(`Unexpected B1 authority query: ${sql}`);
+      })
+    } as unknown as TenantQueryExecutor;
+    return { tx, queries };
+  }
+
+  function isActiveSpaceLock(sql: string): boolean {
+    return (
+      sql.includes("SELECT id") &&
+      sql.includes("FROM access.spaces") &&
+      sql.includes("archived_at IS NULL") &&
+      sql.includes("FOR SHARE")
+    );
+  }
+});
+
+type RelationshipAuthorityBatchTestService = {
+  lockAndReauthorizeRelationshipAuthorityInTransaction(
+    context: SecurityContext,
+    requests: readonly unknown[],
+    tx: TenantQueryExecutor
+  ): Promise<{
+    allowed: boolean;
+    reasonCode: string;
+    policyVersion: string;
+    evaluatedRelationships?: string[];
+  }>;
+};
+
+function authoritySpaceRow(
+  id: string,
+  parentSpaceId: string,
+  inheritanceMode: "inherit" | "restricted"
+) {
+  return {
+    id,
+    parent_space_id: parentSpaceId,
+    kind: "knowledge",
+    access_class: "restricted",
+    inheritance_mode: inheritanceMode
+  };
+}
+
+function authorityGrantRow(id: string, resourceId: string, relation: "contributor" | "viewer") {
+  return {
+    id,
+    resource_id: resourceId,
+    resource_type: "space",
+    subject_type: "membership",
+    subject_id: devFixtures.membershipAViewer,
+    relation
+  };
+}
+
 describe("foundation.proof.create exact authorization", () => {
   function executor(role: "owner" | "admin" | "member" = "owner", hasSpace = true) {
     const queries: string[] = [];

@@ -544,6 +544,23 @@ export class WorkGraphRepository {
     );
   }
 
+  async getRelationshipScope(
+    tenantId: string,
+    workspaceId: string,
+    relationshipId: string
+  ): Promise<{ id: string; spaceId: string }> {
+    const result = await this.tx.query<{ id: string; space_id: string }>(
+      `SELECT id, space_id
+       FROM work.relationships
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
+       LIMIT 1`,
+      [tenantId, workspaceId, relationshipId]
+    );
+    const row = result.rows[0];
+    if (!row) throw new Error("Work graph resource is unavailable");
+    return { id: row.id, spaceId: row.space_id };
+  }
+
   async getRelationship(
     tenantId: string,
     workspaceId: string,
@@ -598,6 +615,8 @@ export class WorkGraphRepository {
     validTo: string;
     actorUserId: string;
     actorMembershipId: string;
+    policyVersionId: string;
+    governingSpaceId: string;
     authorityRequirements: readonly { grantId: string; resourceId: string }[];
   }): Promise<
     | { authorized: false }
@@ -609,25 +628,69 @@ export class WorkGraphRepository {
       version: number | null;
     }>(
       `WITH authority AS (
-         SELECT NOT EXISTS (
+         SELECT EXISTS (
            SELECT 1
-           FROM unnest($8::uuid[], $9::uuid[]) AS requirement(grant_id, resource_id)
-           WHERE NOT EXISTS (
-             SELECT 1 FROM access.access_relationships grant_record
-             WHERE grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
-               AND grant_record.id = requirement.grant_id
-               AND grant_record.resource_type = 'space'
-               AND grant_record.resource_id = requirement.resource_id
-               AND grant_record.relation IN ('owner','manager','contributor','viewer')
-               AND ((grant_record.subject_type = 'membership' AND grant_record.subject_id = $7)
-                 OR (grant_record.subject_type = 'user' AND grant_record.subject_id = $6))
-           )
+           FROM identity.policy_versions policy
+           JOIN identity.memberships membership
+             ON membership.tenant_id = policy.tenant_id
+            AND membership.workspace_id = policy.workspace_id
+            AND membership.id = $7
+            AND membership.user_id = $6
+            AND membership.person_id IS NOT NULL
+           JOIN identity.users actor_user
+             ON actor_user.id = membership.user_id
+           JOIN access.spaces governing_space
+             ON governing_space.tenant_id = policy.tenant_id
+            AND governing_space.workspace_id = policy.workspace_id
+            AND governing_space.id = $9
+           WHERE policy.tenant_id = $1 AND policy.workspace_id = $2
+             AND policy.id = $8 AND policy.status = 'active'
+             AND membership.status = 'active' AND actor_user.status = 'active'
+             AND governing_space.archived_at IS NULL
+             AND (
+               membership.role IN ('owner','admin')
+               OR (
+                 NOT EXISTS (
+                   SELECT 1
+                   FROM unnest($10::uuid[], $11::uuid[])
+                     AS requirement(grant_id, resource_id)
+                   WHERE NOT EXISTS (
+                     SELECT 1 FROM access.access_relationships grant_record
+                     WHERE grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
+                       AND grant_record.id = requirement.grant_id
+                       AND grant_record.resource_type = 'space'
+                       AND grant_record.resource_id = requirement.resource_id
+                       AND grant_record.relation IN ('owner','manager','contributor','viewer')
+                       AND ((grant_record.subject_type = 'membership'
+                           AND grant_record.subject_id = $7)
+                         OR (grant_record.subject_type = 'user'
+                           AND grant_record.subject_id = $6))
+                   )
+                 )
+                 AND EXISTS (
+                   SELECT 1
+                   FROM unnest($10::uuid[], $11::uuid[])
+                     AS mutation_requirement(grant_id, resource_id)
+                   JOIN access.access_relationships grant_record
+                     ON grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
+                    AND grant_record.id = mutation_requirement.grant_id
+                    AND grant_record.resource_type = 'space'
+                    AND grant_record.resource_id = mutation_requirement.resource_id
+                    AND grant_record.relation IN ('owner','manager','contributor')
+                    AND ((grant_record.subject_type = 'membership'
+                        AND grant_record.subject_id = $7)
+                      OR (grant_record.subject_type = 'user'
+                        AND grant_record.subject_id = $6))
+                 )
+               )
+             )
          ) AS allowed
        ), updated AS (
-         UPDATE work.relationships
+         UPDATE work.relationships relationship
          SET valid_to = $5, version = version + 1, updated_at = clock_timestamp()
-         WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
-           AND version = $4 AND valid_to IS NULL
+         WHERE relationship.tenant_id = $1 AND relationship.workspace_id = $2
+           AND relationship.id = $3 AND relationship.space_id = $9
+           AND relationship.version = $4 AND relationship.valid_to IS NULL
            AND (SELECT allowed FROM authority)
          RETURNING space_id, version
        )
@@ -641,6 +704,8 @@ export class WorkGraphRepository {
         input.validTo,
         input.actorUserId,
         input.actorMembershipId,
+        input.policyVersionId,
+        input.governingSpaceId,
         input.authorityRequirements.map(({ grantId }) => grantId),
         input.authorityRequirements.map(({ resourceId }) => resourceId)
       ]

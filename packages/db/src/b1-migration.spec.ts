@@ -262,12 +262,12 @@ describe("Wave B1 additive migration contract", () => {
     expect(integrity).toContain("domain_command_records_b1_atomicity_deferred");
     expect(integrity).toContain("exactly one matching audit and product notification");
     expect(integrity).toContain("throughline_b1_0_integrity");
-    expect(integrity).toContain(
-      "IF command_kind_value = 'b1_0.fixture.v1' THEN RETURN true; END IF;"
-    );
+    expect(integrity).not.toMatch(/b1_0\.fixture\.v1|test[_ .-]*(?:command|bypass)/i);
     expect(integrity).toContain("THEN RETURN false; END IF;");
     expect(integrity).not.toMatch(/NOT IN \([\s\S]*?\) THEN RETURN true;/);
-    expect(integrity).toContain("WHEN 'b1_0.fixture.v1' THEN RETURN NULL;");
+    expect(integrity).toContain(
+      "ELSE RAISE EXCEPTION 'unknown command kind cannot bypass B1 atomicity';"
+    );
     for (const kind of [
       "organization.create.v1",
       "initiative.create.v1",
@@ -281,6 +281,30 @@ describe("Wave B1 additive migration contract", () => {
       "source.tombstone.v1"
     ])
       expect(integrity).toContain(`'${kind}'`);
+  });
+
+  it("binds Source correction to one live predecessor and exact same-Activity successor links", async () => {
+    const [, , integrity] = await migrations();
+    const atomicity = integrity?.match(
+      /CREATE FUNCTION ops\.require_b1_command_atomicity[\s\S]*?\n\$function\$;/
+    )?.[0];
+    expect(atomicity).toBeDefined();
+    expect(atomicity).toContain("predecessor.deleted_at IS NULL");
+    expect(atomicity).toContain(
+      "predecessor.id = (NEW.safe_response ->> 'previousSourceArtifactId')::uuid"
+    );
+    expect(atomicity).toContain("predecessor.space_id = NEW.reservation_space_id");
+    expect(atomicity).toContain("successor.space_id = NEW.reservation_space_id");
+    expect(atomicity).toContain("predecessor_link.activity_id = successor_link.activity_id");
+    expect(atomicity).toContain("predecessor_link.space_id = successor_link.space_id");
+    expect(atomicity).toContain("audit.safe_detail ->> 'previousSourceArtifactId'");
+    expect(atomicity).toContain("event.payload ->> 'previousSourceArtifactId'");
+    expect(atomicity).toMatch(
+      /count\(\*\)[\s\S]*work\.activity_sources[\s\S]*previousSourceArtifactId[\s\S]*<> 1/
+    );
+    expect(atomicity).toMatch(
+      /count\(\*\)[\s\S]*work\.activity_sources[\s\S]*NEW\.result_resource_id[\s\S]*<> 1/
+    );
   });
 
   it("keeps the B1 command-kind surface closed and separates create from revise result shape", async () => {

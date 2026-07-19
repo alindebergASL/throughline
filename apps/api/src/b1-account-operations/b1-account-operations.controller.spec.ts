@@ -1,5 +1,6 @@
 import { HttpException } from "@nestjs/common";
 import { parseB1Command, B1AuthorizationError } from "@throughline/account-operations";
+import { ContentInvariantError } from "@throughline/content";
 import { createDevSecurityContext } from "@throughline/tenancy";
 import { describe, expect, it, vi } from "vitest";
 import { B1AccountOperationsController } from "./b1-account-operations.controller.js";
@@ -111,4 +112,144 @@ describe("B1AccountOperationsController", () => {
     expect(failure).toMatchObject({ status: 404, response: { message: "Resource unavailable" } });
     expect(JSON.stringify(failure)).not.toContain("70000000-0000-7000-8000-000000000003");
   });
+
+  it("normalizes missing and unauthorized Sources to an identical public status, code, and body", async () => {
+    const sourceArtifactId = "70000000-0000-7000-8000-000000000013";
+    const denied = new B1AccountOperationsController({
+      getSource: vi.fn(async () => {
+        throw new B1AuthorizationError();
+      })
+    } as unknown as B1AccountOperationsRuntime);
+    const missing = new B1AccountOperationsController({
+      getSource: vi.fn(async () => {
+        throw new ContentInvariantError("Source is unavailable");
+      })
+    } as unknown as B1AccountOperationsRuntime);
+    const deniedReadBoundary = new B1AccountOperationsController({
+      getSource: vi.fn(async () => {
+        throw new Error("B1 resource is unavailable");
+      })
+    } as unknown as B1AccountOperationsRuntime);
+
+    const deniedFailure = await controllerFailure(() =>
+      denied.getSource(request(), sourceArtifactId)
+    );
+    const missingFailure = await controllerFailure(() =>
+      missing.getSource(request(), sourceArtifactId)
+    );
+    const deniedReadBoundaryFailure = await controllerFailure(() =>
+      deniedReadBoundary.getSource(request(), sourceArtifactId)
+    );
+    expect({ status: deniedFailure.getStatus(), response: deniedFailure.getResponse() }).toEqual({
+      status: missingFailure.getStatus(),
+      response: missingFailure.getResponse()
+    });
+    expect({
+      status: deniedReadBoundaryFailure.getStatus(),
+      response: deniedReadBoundaryFailure.getResponse()
+    }).toEqual({
+      status: missingFailure.getStatus(),
+      response: missingFailure.getResponse()
+    });
+    expect({ status: deniedFailure.getStatus(), response: deniedFailure.getResponse() }).toEqual({
+      status: 404,
+      response: {
+        error: "Not Found",
+        message: "Resource unavailable",
+        statusCode: 404
+      }
+    });
+    expect(JSON.stringify(deniedFailure.getResponse())).not.toContain(sourceArtifactId);
+  });
+
+  it("does not turn a database/system failure into the Source unavailable 404 contract", async () => {
+    const controller = new B1AccountOperationsController({
+      getSource: vi.fn(async () => {
+        throw new Error("database is unavailable");
+      })
+    } as unknown as B1AccountOperationsRuntime);
+
+    const failure = await controllerFailure(() =>
+      controller.getSource(request(), "70000000-0000-7000-8000-000000000014")
+    );
+    expect(failure.getStatus()).toBe(500);
+    expect(failure.getResponse()).toEqual({
+      error: "Internal Server Error",
+      message: "Request could not be completed",
+      statusCode: 500
+    });
+  });
+
+  it("does not turn an unrelated typed Content invariant ending in unavailable into a 404", async () => {
+    const controller = new B1AccountOperationsController({
+      execute: vi.fn(async () => {
+        throw new ContentInvariantError("Content projection is unavailable");
+      })
+    } as unknown as B1AccountOperationsRuntime);
+
+    const failure = await controllerFailure(() =>
+      controller.createOrganization(request("unrelated-content-unavailable"), {
+        name: "Acme",
+        domains: []
+      })
+    );
+    expect(failure.getStatus()).toBe(409);
+    expect(failure.getResponse()).toEqual({
+      error: "Conflict",
+      message: "Command precondition failed",
+      statusCode: 409
+    });
+  });
+
+  it.each(["Source correction predecessor is unavailable", "Source Activity link is unavailable"])(
+    "keeps the expected Content invariant '%s' non-disclosing",
+    async (message) => {
+      const controller = new B1AccountOperationsController({
+        execute: vi.fn(async () => {
+          throw new ContentInvariantError(message);
+        })
+      } as unknown as B1AccountOperationsRuntime);
+
+      const failure = await controllerFailure(() =>
+        controller.createOrganization(request(`content-invariant-${message.length}`), {
+          name: "Acme",
+          domains: []
+        })
+      );
+      expect(failure.getStatus()).toBe(404);
+      expect(failure.getResponse()).toEqual({
+        error: "Not Found",
+        message: "Resource unavailable",
+        statusCode: 404
+      });
+    }
+  );
+
+  it("maps a typed Content precondition failure to the public command-conflict contract", async () => {
+    const controller = new B1AccountOperationsController({
+      execute: vi.fn(async () => {
+        throw new ContentInvariantError("Source tombstone precondition failed");
+      })
+    } as unknown as B1AccountOperationsRuntime);
+
+    const failure = await controllerFailure(() =>
+      controller.createOrganization(request("content-precondition"), { name: "Acme", domains: [] })
+    );
+    expect(failure.getStatus()).toBe(409);
+    expect(failure.getResponse()).toEqual({
+      error: "Conflict",
+      message: "Command precondition failed",
+      statusCode: 409
+    });
+  });
 });
+
+async function controllerFailure(callback: () => Promise<unknown>): Promise<HttpException> {
+  try {
+    await callback();
+  } catch (error) {
+    if (error instanceof HttpException) return error;
+    throw error;
+  }
+  throw new Error("Expected controller request to fail");
+}

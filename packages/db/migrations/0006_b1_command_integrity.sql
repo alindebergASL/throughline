@@ -59,7 +59,6 @@ DECLARE
   version_value numeric;
   counter_value numeric;
 BEGIN
-  IF command_kind_value = 'b1_0.fixture.v1' THEN RETURN true; END IF;
   IF command_kind_value NOT IN (
     'organization.create.v1', 'initiative.create.v1', 'activity.create.v1',
     'relationship.create.v1', 'relationship.end.v1', 'content.create.v1',
@@ -157,7 +156,6 @@ DECLARE
 BEGIN
   IF NEW.state <> 'completed' THEN RETURN NULL; END IF;
   CASE NEW.command_kind
-    WHEN 'b1_0.fixture.v1' THEN RETURN NULL;
     WHEN 'organization.create.v1' THEN expected_action := 'organization.create'; expected_event := 'organization.created'; expected_aggregate := 'organization';
     WHEN 'initiative.create.v1' THEN expected_action := 'initiative.create'; expected_event := 'initiative.created'; expected_aggregate := 'initiative';
     WHEN 'activity.create.v1' THEN expected_action := 'activity.create'; expected_event := 'activity.created'; expected_aggregate := 'activity';
@@ -271,12 +269,59 @@ BEGIN
       AND link.activity_id = (NEW.safe_response ->> 'activityId')::uuid
       AND link.source_artifact_id = NEW.result_resource_id AND link.space_id = aggregate_space
   ) THEN RAISE EXCEPTION 'captured source is not linked to its Activity'; END IF;
-  IF NEW.command_kind = 'source.correct.v1' AND NOT EXISTS (
-    SELECT 1 FROM content.source_artifacts successor
-    WHERE successor.tenant_id = NEW.tenant_id AND successor.workspace_id = NEW.workspace_id
-      AND successor.id = NEW.result_resource_id
-      AND successor.supersedes_source_id = (NEW.safe_response ->> 'previousSourceArtifactId')::uuid
-  ) THEN RAISE EXCEPTION 'corrected source does not reference its predecessor'; END IF;
+  IF NEW.command_kind = 'source.correct.v1' AND (
+    (SELECT count(*) FROM work.activity_sources predecessor_link
+      WHERE predecessor_link.tenant_id = NEW.tenant_id
+        AND predecessor_link.workspace_id = NEW.workspace_id
+        AND predecessor_link.source_artifact_id =
+          (NEW.safe_response ->> 'previousSourceArtifactId')::uuid) <> 1
+    OR (SELECT count(*) FROM work.activity_sources successor_link
+      WHERE successor_link.tenant_id = NEW.tenant_id
+        AND successor_link.workspace_id = NEW.workspace_id
+        AND successor_link.source_artifact_id = NEW.result_resource_id) <> 1
+    OR NOT EXISTS (
+      SELECT 1
+      FROM content.source_artifacts predecessor
+      JOIN content.source_artifacts successor
+        ON successor.tenant_id = predecessor.tenant_id
+       AND successor.workspace_id = predecessor.workspace_id
+       AND successor.space_id = predecessor.space_id
+       AND successor.supersedes_source_id = predecessor.id
+      JOIN work.activity_sources predecessor_link
+        ON predecessor_link.tenant_id = predecessor.tenant_id
+       AND predecessor_link.workspace_id = predecessor.workspace_id
+       AND predecessor_link.space_id = predecessor.space_id
+       AND predecessor_link.source_artifact_id = predecessor.id
+      JOIN work.activity_sources successor_link
+        ON successor_link.tenant_id = successor.tenant_id
+       AND successor_link.workspace_id = successor.workspace_id
+       AND successor_link.space_id = successor.space_id
+       AND successor_link.source_artifact_id = successor.id
+      WHERE predecessor.tenant_id = NEW.tenant_id
+        AND predecessor.workspace_id = NEW.workspace_id
+        AND predecessor.id = (NEW.safe_response ->> 'previousSourceArtifactId')::uuid
+        AND predecessor.space_id = NEW.reservation_space_id
+        AND predecessor.deleted_at IS NULL
+        AND successor.id = NEW.result_resource_id
+        AND successor.space_id = NEW.reservation_space_id
+        AND predecessor_link.space_id = NEW.reservation_space_id
+        AND successor_link.space_id = NEW.reservation_space_id
+        AND predecessor_link.space_id = successor_link.space_id
+        AND predecessor_link.activity_id = successor_link.activity_id
+    )
+    OR (SELECT count(*) FROM ops.audit_events audit
+      WHERE audit.tenant_id = NEW.tenant_id AND audit.workspace_id = NEW.workspace_id
+        AND audit.causation_command_id = NEW.id
+        AND audit.safe_detail ->> 'previousSourceArtifactId' =
+          NEW.safe_response ->> 'previousSourceArtifactId') <> 1
+    OR (SELECT count(*) FROM ops.product_outbox_events event
+      WHERE event.tenant_id = NEW.tenant_id AND event.workspace_id = NEW.workspace_id
+        AND event.causation_command_id = NEW.id
+        AND event.payload ->> 'previousSourceArtifactId' =
+          NEW.safe_response ->> 'previousSourceArtifactId') <> 1
+  ) THEN
+    RAISE EXCEPTION 'corrected source links do not bind one live predecessor and successor to the same Activity';
+  END IF;
   IF NEW.command_kind = 'source.tombstone.v1' AND NOT EXISTS (
     SELECT 1 FROM content.source_artifacts source
     WHERE source.tenant_id = NEW.tenant_id AND source.workspace_id = NEW.workspace_id

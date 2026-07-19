@@ -29,7 +29,7 @@ const reservation = {
   tenantId: ids.tenant,
   workspaceId: ids.workspace,
   reservationSpaceId: ids.space,
-  commandKind: "b1_0.fixture.v1",
+  commandKind: "organization.create.v1",
   commandSchemaVersion: 1,
   idempotencyKey: "fixture-command-1",
   canonicalRequestHash: requestHash,
@@ -95,7 +95,7 @@ describe("transaction-bound product domain repositories", () => {
       policy_version_id: "dev-policy-v1",
       result_resource_type: "organization",
       result_resource_id: ids.aggregate,
-      safe_response: { organizationId: ids.aggregate },
+      safe_response: { organizationId: ids.aggregate, spaceId: ids.space, version: 1 },
       completed_at: new Date("2026-07-14T12:00:00Z")
     };
     const exact = txWithRows([], [completed]);
@@ -119,7 +119,7 @@ describe("transaction-bound product domain repositories", () => {
         id: ids.command,
         result_resource_type: "organization",
         result_resource_id: ids.aggregate,
-        safe_response: { organizationId: ids.aggregate },
+        safe_response: { organizationId: ids.aggregate, spaceId: ids.space, version: 1 },
         completed_at: completedAt
       }
     ]);
@@ -128,12 +128,12 @@ describe("transaction-bound product domain repositories", () => {
       tenantId: ids.tenant,
       workspaceId: ids.workspace,
       reservationSpaceId: ids.space,
-      commandKind: "b1_0.fixture.v1",
+      commandKind: "organization.create.v1",
       idempotencyKey: "fixture-command-1",
       canonicalRequestHash: requestHash,
       resultResourceType: "organization",
       resultResourceId: ids.aggregate,
-      safeResponse: { organizationId: ids.aggregate }
+      safeResponse: { organizationId: ids.aggregate, spaceId: ids.space, version: 1 }
     });
     const sql = query.mock.calls[0]?.[0] as string;
     expect(sql).toContain("state = 'completed'");
@@ -149,7 +149,7 @@ describe("transaction-bound product domain repositories", () => {
         tenantId: ids.tenant,
         workspaceId: ids.workspace,
         reservationSpaceId: ids.space,
-        commandKind: "b1_0.fixture.v1",
+        commandKind: "organization.create.v1",
         idempotencyKey: "fixture-command-1",
         canonicalRequestHash: requestHash,
         resultResourceId: ids.aggregate

@@ -18,7 +18,7 @@ import {
   B1CommandValidationError,
   B1IdempotencyConflictError
 } from "@throughline/account-operations";
-import { SourceTextValidationError } from "@throughline/content";
+import { ContentInvariantError, SourceTextValidationError } from "@throughline/content";
 import { WorkGraphInvariantError } from "@throughline/work-graph";
 import {
   B1AccountOperationsGuard,
@@ -167,7 +167,7 @@ export class B1AccountOperationsController {
       if (error instanceof B1AuthorizationError || isUnavailable(error)) {
         throw new NotFoundException("Resource unavailable");
       }
-      if (error instanceof B1CommandInvariantError) {
+      if (error instanceof B1CommandInvariantError || error instanceof ContentInvariantError) {
         throw new ConflictException("Command precondition failed");
       }
       throw new InternalServerErrorException("Request could not be completed");
@@ -204,5 +204,19 @@ function requireUuid(value: string): string {
 }
 
 function isUnavailable(error: unknown): boolean {
-  return error instanceof Error && /unavailable|not available/i.test(error.message);
+  if (error instanceof ContentInvariantError) {
+    return [
+      "Source is unavailable",
+      "Source correction predecessor is unavailable",
+      "Source Activity link is unavailable"
+    ].includes(error.message);
+  }
+  return (
+    error instanceof Error &&
+    [
+      "B1 resource is unavailable",
+      "Work graph resource is unavailable",
+      "Person projection is unavailable"
+    ].includes(error.message)
+  );
 }

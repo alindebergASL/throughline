@@ -7,10 +7,15 @@ import {
   PostgresAuthorizationService,
   type TransactionAwareAuthorizationService
 } from "@throughline/authorization";
-import { ContentRepository } from "@throughline/content";
+import {
+  ContentInvariantError,
+  ContentRepository,
+  normalizeAndChunkSource
+} from "@throughline/content";
 import {
   AuditEventRepository,
   DomainCommandRepository,
+  ProductDomainTransactionRepositories,
   applyMigrations,
   createPgPool,
   hashCanonicalCommandRequest,
@@ -326,7 +331,7 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
     expect(noContext.rows[0]).toEqual({ organizations: "0", sources: "0" });
   });
 
-  it("accepts only the predecessor fixture and the closed ten B1 v1 command shapes", async () => {
+  it("accepts only the closed ten production B1 v1 command shapes", async () => {
     const resultId = "70000000-0000-7000-8000-000000000001";
     const validations = await ownerPool.query<{
       fixture: boolean;
@@ -370,7 +375,7 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
       [resultId]
     );
     expect(validations.rows[0]).toEqual({
-      fixture: true,
+      fixture: false,
       source_v2: false,
       typo: false,
       unknown: false,
@@ -379,6 +384,162 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
       create_later_version: false,
       revise_later: true
     });
+
+    const catalog = await ownerPool.query<{ definitions: string }>(
+      `SELECT concat_ws(E'\n',
+         pg_get_functiondef('ops.b1_command_record_valid(text,integer,text,text,uuid,jsonb)'::regprocedure),
+         pg_get_functiondef('ops.require_b1_command_atomicity()'::regprocedure),
+         (SELECT string_agg(pg_get_constraintdef(constraint_record.oid), E'\n')
+          FROM pg_constraint constraint_record
+          WHERE constraint_record.conrelid = 'ops.domain_command_records'::regclass),
+         (SELECT string_agg(pg_get_triggerdef(trigger_record.oid), E'\n')
+          FROM pg_trigger trigger_record
+          WHERE trigger_record.tgrelid = 'ops.domain_command_records'::regclass
+            AND NOT trigger_record.tgisinternal)
+       ) AS definitions`
+    );
+    expect(catalog.rows[0]!.definitions).not.toMatch(
+      /b1_0\.fixture\.v1|test[_ .-]*(?:command|bypass)/i
+    );
+  });
+
+  it("rejects unknown commands, arbitrary results, and completion without exact companions with zero residue", async () => {
+    const context = {
+      ...createDevSecurityContext("tenant-a-owner"),
+      requestedSpaceIds: [devFixtures.restrictedSpaceA]
+    };
+    const rejectedKeys = [
+      "unknown-command-reservation",
+      "test-command-reservation",
+      "unknown-command-completion",
+      "arbitrary-command-result",
+      "missing-command-companions"
+    ];
+    const baseReservation = {
+      tenantId: context.tenantId,
+      workspaceId: context.workspaceId,
+      reservationSpaceId: devFixtures.restrictedSpaceA,
+      commandSchemaVersion: 1,
+      canonicalRequestHash: hashCanonicalCommandRequest({ proof: "closed-command-catalog" }),
+      actorUserId: context.actorUserId!,
+      actorMembershipId: context.actorMembershipId!,
+      policyVersionId: context.policyVersion,
+      requestId: context.requestId,
+      traceparent
+    };
+
+    for (const [index, commandKind] of ["unknown.command.v1", "b1_0.fixture.v1"].entries()) {
+      await expect(
+        withTenantTransaction({ pool: appPool, context }, (tx) =>
+          new DomainCommandRepository(tx).reserve({
+            ...baseReservation,
+            id: `78000000-0000-7000-8000-00000000000${index + 1}`,
+            commandKind,
+            idempotencyKey: rejectedKeys[index]!
+          })
+        )
+      ).rejects.toMatchObject({ code: "23514" });
+    }
+
+    await expect(
+      withTenantTransaction({ pool: appPool, context }, async (tx) => {
+        const commands = new DomainCommandRepository(tx);
+        await commands.reserve({
+          ...baseReservation,
+          id: "78000000-0000-7000-8000-000000000003",
+          commandKind: "relationship.create.v1",
+          idempotencyKey: rejectedKeys[2]!
+        });
+        await commands.complete({
+          commandId: "78000000-0000-7000-8000-000000000003",
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId,
+          reservationSpaceId: devFixtures.restrictedSpaceA,
+          commandKind: "b1_0.fixture.v1",
+          idempotencyKey: rejectedKeys[2]!,
+          canonicalRequestHash: baseReservation.canonicalRequestHash,
+          resultResourceType: "relationship",
+          resultResourceId: "78000000-0000-7000-8000-000000000013",
+          safeResponse: {
+            relationshipId: "78000000-0000-7000-8000-000000000013",
+            spaceId: devFixtures.restrictedSpaceA,
+            version: 1
+          }
+        });
+      })
+    ).rejects.toThrow();
+
+    await expect(
+      withTenantTransaction({ pool: appPool, context }, async (tx) => {
+        const commands = new DomainCommandRepository(tx);
+        await commands.reserve({
+          ...baseReservation,
+          id: "78000000-0000-7000-8000-000000000004",
+          commandKind: "relationship.create.v1",
+          idempotencyKey: rejectedKeys[3]!
+        });
+        await tx.query(
+          `UPDATE ops.domain_command_records
+           SET state = 'completed', result_resource_type = 'relationship',
+               result_resource_id = $2, safe_response = $3::jsonb,
+               completed_at = clock_timestamp()
+           WHERE id = $1`,
+          [
+            "78000000-0000-7000-8000-000000000004",
+            "78000000-0000-7000-8000-000000000014",
+            JSON.stringify({ arbitrary: "must-not-persist" })
+          ]
+        );
+      })
+    ).rejects.toMatchObject({ code: "23514" });
+
+    const companionlessRelationshipId = "78000000-0000-7000-8000-000000000015";
+    await expect(
+      withTenantTransaction({ pool: appPool, context }, async (tx) => {
+        const commands = new DomainCommandRepository(tx);
+        await commands.reserve({
+          ...baseReservation,
+          id: "78000000-0000-7000-8000-000000000005",
+          commandKind: "relationship.create.v1",
+          idempotencyKey: rejectedKeys[4]!
+        });
+        await new WorkGraphRepository(tx).createRelationship({
+          id: companionlessRelationshipId,
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId,
+          spaceId: devFixtures.restrictedSpaceA,
+          subject: { type: "person", id: devFixtures.personA },
+          predicate: "contributor_to",
+          object: { type: "space", id: devFixtures.restrictedSpaceA },
+          version: 1
+        });
+        await commands.complete({
+          commandId: "78000000-0000-7000-8000-000000000005",
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId,
+          reservationSpaceId: devFixtures.restrictedSpaceA,
+          commandKind: "relationship.create.v1",
+          idempotencyKey: rejectedKeys[4]!,
+          canonicalRequestHash: baseReservation.canonicalRequestHash,
+          resultResourceType: "relationship",
+          resultResourceId: companionlessRelationshipId,
+          safeResponse: {
+            relationshipId: companionlessRelationshipId,
+            spaceId: devFixtures.restrictedSpaceA,
+            version: 1
+          }
+        });
+      })
+    ).rejects.toThrow(/exactly one matching audit and product notification/);
+
+    const residue = await ownerPool.query<{ commands: string; relationships: string }>(
+      `SELECT
+         (SELECT count(*)::text FROM ops.domain_command_records
+          WHERE idempotency_key = ANY($1::text[])) AS commands,
+         (SELECT count(*)::text FROM work.relationships WHERE id = $2) AS relationships`,
+      [rejectedKeys, companionlessRelationshipId]
+    );
+    expect(residue.rows[0]).toEqual({ commands: "0", relationships: "0" });
   });
 
   it("rejects forged non-integer-one content-create counters at the PostgreSQL boundary", async () => {
@@ -593,6 +754,114 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
         sourceBody.sourceArtifactId
       ])
     ).rejects.toThrow();
+  }, 30_000);
+
+  it("gives missing and unauthorized Source commands the same denial with rollback and zero residue", async () => {
+    const before = await sourcePipelineCounts(ownerPool);
+    const missingSourceId = "70000000-0000-7000-8000-000000009991";
+    const bus = new AccountOperationsDomainCommandBus(appPool);
+    const cases = [
+      {
+        name: "correction",
+        missingKey: "oracle-missing-correction",
+        deniedKey: "oracle-denied-correction",
+        missing: {
+          kind: "source.correct" as const,
+          idempotencyKey: "oracle-missing-correction",
+          payload: {
+            predecessorSourceArtifactId: missingSourceId,
+            sourceType: "human" as const,
+            text: "Missing correction."
+          }
+        },
+        denied: {
+          kind: "source.correct" as const,
+          idempotencyKey: "oracle-denied-correction",
+          payload: {
+            predecessorSourceArtifactId: state.sourceArtifactId,
+            sourceType: "human" as const,
+            text: "Denied correction."
+          }
+        }
+      },
+      {
+        name: "tombstone",
+        missingKey: "oracle-missing-tombstone",
+        deniedKey: "oracle-denied-tombstone",
+        missing: {
+          kind: "source.tombstone" as const,
+          idempotencyKey: "oracle-missing-tombstone",
+          payload: {
+            sourceArtifactId: missingSourceId,
+            expectedVersion: 1,
+            deletionReasonCategory: "retention",
+            deletionPolicyRef: "policy:oracle"
+          }
+        },
+        denied: {
+          kind: "source.tombstone" as const,
+          idempotencyKey: "oracle-denied-tombstone",
+          payload: {
+            sourceArtifactId: state.sourceArtifactId,
+            expectedVersion: 1,
+            deletionReasonCategory: "retention",
+            deletionPolicyRef: "policy:oracle"
+          }
+        }
+      }
+    ];
+
+    for (const testCase of cases) {
+      const missing = await captureError(() =>
+        bus.execute(testCase.missing as never, createDevSecurityContext("tenant-a-owner"))
+      );
+      const denied = await captureError(() =>
+        bus.execute(testCase.denied as never, createDevSecurityContext("tenant-a-viewer"))
+      );
+      expect(
+        {
+          constructor: missing.constructor,
+          name: missing.name,
+          message: missing.message
+        },
+        testCase.name
+      ).toEqual({
+        constructor: denied.constructor,
+        name: denied.name,
+        message: denied.message
+      });
+      expect(missing).toMatchObject({
+        name: "B1AuthorizationError",
+        message: "B1 resource is unavailable"
+      });
+    }
+
+    expect(await sourcePipelineCounts(ownerPool)).toEqual(before);
+    const residue = await ownerPool.query<{ commands: string; audits: string; outbox: string }>(
+      `SELECT
+         (SELECT count(*)::text FROM ops.domain_command_records
+          WHERE idempotency_key LIKE 'oracle-%') AS commands,
+         (SELECT count(*)::text FROM ops.audit_events audit
+          JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+          WHERE command.idempotency_key LIKE 'oracle-%') AS audits,
+         (SELECT count(*)::text FROM ops.product_outbox_events event
+          JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+          WHERE command.idempotency_key LIKE 'oracle-%') AS outbox`
+    );
+    expect(residue.rows[0]).toEqual({ commands: "0", audits: "0", outbox: "0" });
+
+    const unauthorized = await getAs("tenant-a-viewer", `/v1/sources/${state.sourceArtifactId}`);
+    const absent = await get(`/v1/sources/${missingSourceId}`);
+    expect({ status: unauthorized.statusCode, body: unauthorized.json() }).toEqual({
+      status: absent.statusCode,
+      body: absent.json()
+    });
+    expect(unauthorized.statusCode).toBe(404);
+    expect(unauthorized.json()).toMatchObject({
+      statusCode: 404,
+      message: "Resource unavailable"
+    });
+    expect(unauthorized.body).not.toContain(state.sourceArtifactId);
   }, 30_000);
 
   it("holds current source authority through Activity source materialization and then honors revocation", async () => {
@@ -833,6 +1102,588 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
          WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
         [devFixtures.tenantA, devFixtures.workspaceA, devFixtures.membershipAOwner]
       );
+    }
+  }, 30_000);
+
+  it("denies protected Source correction and tombstone when Space archival commits first", async () => {
+    for (const kind of ["source.correct", "source.tombstone"] as const) {
+      const capturedResponse = await post(
+        `/v1/activities/${state.activityId}/sources`,
+        `source-archive-wins-${kind}`,
+        { sourceType: "note", text: `Archive-wins predecessor for ${kind}.` }
+      );
+      expect(capturedResponse.statusCode).toBe(201);
+      const captured = capturedResponse.json<{ sourceArtifactId: string }>();
+      const key = `archive-wins-${kind}`;
+      const racePool = createPgPool(appUrl!);
+      const barrier = pauseAfterSourceScopeLookup(racePool, captured.sourceArtifactId);
+      const command =
+        kind === "source.correct"
+          ? {
+              kind,
+              idempotencyKey: key,
+              payload: {
+                predecessorSourceArtifactId: captured.sourceArtifactId,
+                sourceType: "human" as const,
+                text: "Archive-wins correction must roll back."
+              }
+            }
+          : {
+              kind,
+              idempotencyKey: key,
+              payload: {
+                sourceArtifactId: captured.sourceArtifactId,
+                expectedVersion: 1,
+                deletionReasonCategory: "retention",
+                deletionPolicyRef: "policy:archive-wins"
+              }
+            };
+      let mutation: Promise<unknown> | undefined;
+      try {
+        mutation = new AccountOperationsDomainCommandBus(barrier.pool).execute(
+          command as never,
+          createDevSecurityContext("tenant-a-owner")
+        );
+        void mutation.catch(() => undefined);
+        await withDeadline(barrier.scopeResolved.promise, `${kind} scope barrier`);
+        await ownerPool.query(
+          "UPDATE access.spaces SET archived_at = clock_timestamp() WHERE id = $1",
+          [state.sourceSpaceId]
+        );
+        barrier.releaseScopeLookup.resolve();
+        await expect(withDeadline(mutation, `${kind} archive-wins denial`)).rejects.toMatchObject({
+          name: "B1AuthorizationError",
+          message: "B1 resource is unavailable"
+        });
+        const residue = await ownerPool.query<{
+          version: number;
+          deleted_at: Date | null;
+          successors: string;
+          commands: string;
+          audits: string;
+          outbox: string;
+        }>(
+          `SELECT source.version, source.deleted_at,
+             (SELECT count(*)::text FROM content.source_artifacts successor
+              WHERE successor.supersedes_source_id = source.id) AS successors,
+             (SELECT count(*)::text FROM ops.domain_command_records
+              WHERE idempotency_key = $2) AS commands,
+             (SELECT count(*)::text FROM ops.audit_events audit
+              JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+              WHERE command.idempotency_key = $2) AS audits,
+             (SELECT count(*)::text FROM ops.product_outbox_events event
+              JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+              WHERE command.idempotency_key = $2) AS outbox
+           FROM content.source_artifacts source WHERE source.id = $1`,
+          [captured.sourceArtifactId, key]
+        );
+        expect(residue.rows[0]).toEqual({
+          version: 1,
+          deleted_at: null,
+          successors: "0",
+          commands: "0",
+          audits: "0",
+          outbox: "0"
+        });
+      } finally {
+        barrier.releaseScopeLookup.resolve();
+        await mutation?.catch(() => undefined);
+        await ownerPool.query("UPDATE access.spaces SET archived_at = NULL WHERE id = $1", [
+          state.sourceSpaceId
+        ]);
+        await racePool.end();
+      }
+    }
+  }, 30_000);
+
+  it("binds active Space authority so protected Source mutation wins before archival", async () => {
+    for (const kind of ["source.correct", "source.tombstone"] as const) {
+      const capturedResponse = await post(
+        `/v1/activities/${state.activityId}/sources`,
+        `source-mutation-wins-${kind}`,
+        { sourceType: "note", text: `Mutation-wins predecessor for ${kind}.` }
+      );
+      expect(capturedResponse.statusCode).toBe(201);
+      const captured = capturedResponse.json<{ sourceArtifactId: string }>();
+      const key = `mutation-wins-${kind}`;
+      const racePool = createPgPool(appUrl!);
+      const baseAuthorization = new PostgresAuthorizationService(racePool);
+      const authorityLocked = deferred();
+      const releaseMutation = deferred();
+      let paused = false;
+      const authorization: TransactionAwareAuthorizationService = {
+        can: (context, action, resource, options) =>
+          baseAuthorization.can(context, action, resource, options),
+        canInTransaction: async (context, action, resource, tx, options) => {
+          const decision = await baseAuthorization.canInTransaction(
+            context,
+            action,
+            resource,
+            tx,
+            options
+          );
+          if (!paused && action === kind && decision.allowed && options?.lockAuthority === true) {
+            paused = true;
+            authorityLocked.resolve();
+            await releaseMutation.promise;
+          }
+          return decision;
+        }
+      };
+      const command =
+        kind === "source.correct"
+          ? {
+              kind,
+              idempotencyKey: key,
+              payload: {
+                predecessorSourceArtifactId: captured.sourceArtifactId,
+                sourceType: "human" as const,
+                text: "Mutation-wins correction."
+              }
+            }
+          : {
+              kind,
+              idempotencyKey: key,
+              payload: {
+                sourceArtifactId: captured.sourceArtifactId,
+                expectedVersion: 1,
+                deletionReasonCategory: "retention",
+                deletionPolicyRef: "policy:mutation-wins"
+              }
+            };
+      const archiver = await ownerPool.connect();
+      let mutation: Promise<unknown> | undefined;
+      let archival: Promise<unknown> | undefined;
+      try {
+        mutation = new AccountOperationsDomainCommandBus(racePool, authorization).execute(
+          command as never,
+          createDevSecurityContext("tenant-a-owner")
+        );
+        void mutation.catch(() => undefined);
+        await withDeadline(authorityLocked.promise, `${kind} authority lock`);
+        const archiverPid = await archiver.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+        archival = archiver.query(
+          "UPDATE access.spaces SET archived_at = clock_timestamp() WHERE id = $1",
+          [state.sourceSpaceId]
+        );
+        await waitForBlockedBackend(ownerPool, archiverPid.rows[0]!.pid);
+        releaseMutation.resolve();
+        await expect(withDeadline(mutation, `${kind} mutation deadlocked`)).resolves.toMatchObject(
+          kind === "source.correct"
+            ? { previousSourceArtifactId: captured.sourceArtifactId, version: 1 }
+            : { sourceArtifactId: captured.sourceArtifactId, version: 2 }
+        );
+        await withDeadline(archival, `${kind} archival did not resume`);
+        const residue = await ownerPool.query<{ commands: string; audits: string; outbox: string }>(
+          `SELECT
+             (SELECT count(*)::text FROM ops.domain_command_records
+              WHERE idempotency_key = $1) AS commands,
+             (SELECT count(*)::text FROM ops.audit_events audit
+              JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+              WHERE command.idempotency_key = $1) AS audits,
+             (SELECT count(*)::text FROM ops.product_outbox_events event
+              JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+              WHERE command.idempotency_key = $1) AS outbox`,
+          [key]
+        );
+        expect(residue.rows[0]).toEqual({ commands: "1", audits: "1", outbox: "1" });
+      } finally {
+        releaseMutation.resolve();
+        await mutation?.catch(() => undefined);
+        await archival?.catch(() => undefined);
+        archiver.release();
+        await ownerPool.query("UPDATE access.spaces SET archived_at = NULL WHERE id = $1", [
+          state.sourceSpaceId
+        ]);
+        await racePool.end();
+      }
+    }
+  }, 30_000);
+
+  it("rejects forged Source correction links or companions, changed Activity, and changed Space atomically", async () => {
+    const alternateActivityResponse = await post("/v1/activities", "correction-link-alt-activity", {
+      title: "Correction-link alternate Activity",
+      profileTemplateKey: "ai_workshop",
+      status: "captured",
+      governingInitiativeId: state.initiativeId,
+      organizationIds: [state.organizationId],
+      initiativeIds: [state.initiativeId]
+    });
+    expect(alternateActivityResponse.statusCode).toBe(201);
+    const alternateActivityId = alternateActivityResponse.json<{ activityId: string }>().activityId;
+    const relay = await ownerPool.query<{ id: string }>(
+      `SELECT principal.id FROM identity.service_principals principal
+       JOIN access.access_relationships grant_record
+         ON grant_record.tenant_id = principal.tenant_id
+        AND grant_record.workspace_id = principal.workspace_id
+        AND grant_record.subject_type = 'service_principal'
+        AND grant_record.subject_id = principal.id
+        AND grant_record.relation = 'manager'
+        AND grant_record.resource_type = 'space'
+        AND grant_record.resource_id = $3
+        AND grant_record.source = 'direct'
+       WHERE principal.tenant_id = $1 AND principal.workspace_id = $2
+         AND principal.purpose = 'product_notification_relay' AND principal.status = 'active'
+       ORDER BY principal.id`,
+      [devFixtures.tenantA, devFixtures.workspaceA, state.sourceSpaceId]
+    );
+    expect(relay.rows).toHaveLength(1);
+    const context = {
+      ...createDevSecurityContext("tenant-a-owner"),
+      requestedSpaceIds: [state.sourceSpaceId]
+    };
+
+    async function composeCorrection(
+      tx: TenantDbTransaction,
+      input: {
+        index: number;
+        key: string;
+        predecessorId: string;
+        companionPredecessorId?: string;
+        successorActivityId?: string;
+        successorLinkSpaceId?: string;
+        reservationSpaceId: string;
+      }
+    ) {
+      const id = (offset: number) =>
+        `78100000-0000-7000-8000-${String(input.index * 100 + offset).padStart(12, "0")}`;
+      const commandId = id(1);
+      const successorId = id(2);
+      const requestHash = hashCanonicalCommandRequest({
+        kind: "source.correct",
+        scenario: input.key
+      });
+      const normalized = normalizeAndChunkSource(`Forged correction candidate ${input.key}.`);
+      const domain = new ProductDomainTransactionRepositories(tx);
+      await domain.commands.reserve({
+        id: commandId,
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        reservationSpaceId: input.reservationSpaceId,
+        commandKind: "source.correct.v1",
+        commandSchemaVersion: 1,
+        idempotencyKey: input.key,
+        canonicalRequestHash: requestHash,
+        actorUserId: context.actorUserId!,
+        actorMembershipId: context.actorMembershipId!,
+        policyVersionId: context.policyVersion,
+        requestId: input.key,
+        traceparent
+      });
+      await new ContentRepository(tx).persistSource({
+        sourceArtifactId: successorId,
+        chunkIds: normalized.chunks.map((_chunk, chunkIndex) => id(10 + chunkIndex)),
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        spaceId: state.sourceSpaceId,
+        sourceType: "human",
+        source: normalized.source,
+        chunks: normalized.chunks,
+        capturedByUserId: context.actorUserId!,
+        capturedByMembershipId: context.actorMembershipId!,
+        accessClass: "restricted",
+        hashRetentionPolicy: "retain",
+        supersedesSourceId: input.predecessorId,
+        ...(input.successorActivityId && !input.successorLinkSpaceId
+          ? { activityId: input.successorActivityId }
+          : {})
+      });
+      if (input.successorActivityId && input.successorLinkSpaceId) {
+        await tx.query(
+          `INSERT INTO work.activity_sources
+           (tenant_id, workspace_id, space_id, activity_id, source_artifact_id)
+           VALUES ($1,$2,$3,$4,$5)`,
+          [
+            context.tenantId,
+            context.workspaceId,
+            input.successorLinkSpaceId,
+            input.successorActivityId,
+            successorId
+          ]
+        );
+      }
+      await domain.audit.insert({
+        id: id(3),
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        spaceId: state.sourceSpaceId,
+        causationCommandId: commandId,
+        actorUserId: context.actorUserId!,
+        actorMembershipId: context.actorMembershipId!,
+        policyVersionId: context.policyVersion,
+        requestId: input.key,
+        traceparent,
+        action: "source_artifact.correct",
+        resourceType: "source_artifact",
+        resourceId: successorId,
+        auditSchemaVersion: 1,
+        safeDetail: {
+          sourceArtifactId: successorId,
+          previousSourceArtifactId: input.companionPredecessorId ?? input.predecessorId
+        }
+      });
+      await domain.outbox.insertOrReplay({
+        envelope: {
+          eventId: id(4),
+          eventType: "source_artifact.corrected",
+          eventSchemaVersion: 1,
+          payloadSchemaVersion: 1,
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId,
+          spaceId: state.sourceSpaceId,
+          aggregateType: "source_artifact",
+          aggregateId: successorId,
+          aggregateVersion: 1,
+          causationCommandId: commandId,
+          payload: {
+            sourceArtifactId: successorId,
+            previousSourceArtifactId: input.companionPredecessorId ?? input.predecessorId
+          },
+          requestId: input.key,
+          traceparent
+        },
+        relayServicePrincipalId: relay.rows[0]!.id,
+        policyVersionId: context.policyVersion
+      });
+      await domain.commands.complete({
+        commandId,
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        reservationSpaceId: input.reservationSpaceId,
+        commandKind: "source.correct.v1",
+        idempotencyKey: input.key,
+        canonicalRequestHash: requestHash,
+        resultResourceType: "source_artifact",
+        resultResourceId: successorId,
+        safeResponse: {
+          sourceArtifactId: successorId,
+          previousSourceArtifactId: input.predecessorId,
+          chunkCount: normalized.chunks.length,
+          version: 1
+        }
+      });
+      return { commandId, successorId };
+    }
+
+    const scenarios = [
+      { name: "forged-successor-link", successorActivityId: undefined },
+      { name: "changed-activity", successorActivityId: alternateActivityId },
+      {
+        name: "forged-companion-identity",
+        successorActivityId: state.activityId,
+        companionPredecessorId: "78199999-0000-7000-8000-000000000001"
+      }
+    ];
+    for (const [index, scenario] of scenarios.entries()) {
+      const predecessorResponse = await post(
+        `/v1/activities/${state.activityId}/sources`,
+        `correction-${scenario.name}-predecessor`,
+        { sourceType: "note", text: `Predecessor for ${scenario.name}.` }
+      );
+      expect(predecessorResponse.statusCode).toBe(201);
+      const predecessorId = predecessorResponse.json<{ sourceArtifactId: string }>()
+        .sourceArtifactId;
+      const key = `correction-${scenario.name}`;
+      await expect(
+        withTenantTransaction({ pool: appPool, context }, (tx) =>
+          composeCorrection(tx, {
+            index: index + 1,
+            key,
+            predecessorId,
+            reservationSpaceId: state.sourceSpaceId,
+            ...(scenario.companionPredecessorId
+              ? { companionPredecessorId: scenario.companionPredecessorId }
+              : {}),
+            ...(scenario.successorActivityId
+              ? { successorActivityId: scenario.successorActivityId }
+              : {})
+          }).then(() => undefined)
+        )
+      ).rejects.toThrow(/corrected source.*link/i);
+      const residue = await ownerPool.query<{
+        successors: string;
+        commands: string;
+        audits: string;
+        outbox: string;
+      }>(
+        `SELECT
+           (SELECT count(*)::text FROM content.source_artifacts
+            WHERE supersedes_source_id = $1) AS successors,
+           (SELECT count(*)::text FROM ops.domain_command_records
+            WHERE idempotency_key = $2) AS commands,
+           (SELECT count(*)::text FROM ops.audit_events audit
+            JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+            WHERE command.idempotency_key = $2) AS audits,
+           (SELECT count(*)::text FROM ops.product_outbox_events event
+            JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+            WHERE command.idempotency_key = $2) AS outbox`,
+        [predecessorId, key]
+      );
+      expect(residue.rows[0]).toEqual({
+        successors: "0",
+        commands: "0",
+        audits: "0",
+        outbox: "0"
+      });
+    }
+
+    const changedLinkSpacePredecessor = await post(
+      `/v1/activities/${state.activityId}/sources`,
+      "correction-changed-link-space-predecessor",
+      { sourceType: "note", text: "Predecessor for changed link Space." }
+    );
+    const changedLinkSpacePredecessorId = changedLinkSpacePredecessor.json<{
+      sourceArtifactId: string;
+    }>().sourceArtifactId;
+    await expect(
+      ownerTransaction(ownerPool, (tx) =>
+        composeCorrection(tx, {
+          index: 4,
+          key: "correction-changed-link-space",
+          predecessorId: changedLinkSpacePredecessorId,
+          successorActivityId: state.activityId,
+          successorLinkSpaceId: devFixtures.rootSpaceA,
+          reservationSpaceId: state.sourceSpaceId
+        }).then(() => undefined)
+      )
+    ).rejects.toMatchObject({ code: "23503" });
+    const changedLinkSpaceResidue = await ownerPool.query<{
+      successors: string;
+      commands: string;
+    }>(
+      `SELECT
+         (SELECT count(*)::text FROM content.source_artifacts
+          WHERE supersedes_source_id = $1) AS successors,
+         (SELECT count(*)::text FROM ops.domain_command_records
+          WHERE idempotency_key = 'correction-changed-link-space') AS commands`,
+      [changedLinkSpacePredecessorId]
+    );
+    expect(changedLinkSpaceResidue.rows[0]).toEqual({ successors: "0", commands: "0" });
+
+    const changedSpacePredecessor = await post(
+      `/v1/activities/${state.activityId}/sources`,
+      "correction-changed-space-predecessor",
+      { sourceType: "note", text: "Predecessor for changed reservation Space." }
+    );
+    const changedSpacePredecessorId = changedSpacePredecessor.json<{
+      sourceArtifactId: string;
+    }>().sourceArtifactId;
+    await expect(
+      ownerTransaction(ownerPool, (tx) =>
+        composeCorrection(tx, {
+          index: 3,
+          key: "correction-changed-space",
+          predecessorId: changedSpacePredecessorId,
+          successorActivityId: state.activityId,
+          reservationSpaceId: devFixtures.rootSpaceA
+        }).then(() => undefined)
+      )
+    ).rejects.toThrow(/reservation Space/i);
+    const changedSpaceResidue = await ownerPool.query<{ successors: string; commands: string }>(
+      `SELECT
+         (SELECT count(*)::text FROM content.source_artifacts
+          WHERE supersedes_source_id = $1) AS successors,
+         (SELECT count(*)::text FROM ops.domain_command_records
+          WHERE idempotency_key = 'correction-changed-space') AS commands`,
+      [changedSpacePredecessorId]
+    );
+    expect(changedSpaceResidue.rows[0]).toEqual({ successors: "0", commands: "0" });
+  }, 30_000);
+
+  it("rejects a concurrent predecessor relink and commits only the exact same-Activity correction", async () => {
+    const alternateActivityResponse = await post(
+      "/v1/activities",
+      "concurrent-relink-alt-activity",
+      {
+        title: "Concurrent relink alternate Activity",
+        profileTemplateKey: "ai_workshop",
+        status: "captured",
+        governingInitiativeId: state.initiativeId,
+        organizationIds: [state.organizationId],
+        initiativeIds: [state.initiativeId]
+      }
+    );
+    expect(alternateActivityResponse.statusCode).toBe(201);
+    const alternateActivityId = alternateActivityResponse.json<{ activityId: string }>().activityId;
+    const predecessorResponse = await post(
+      `/v1/activities/${state.activityId}/sources`,
+      "concurrent-relink-predecessor",
+      { sourceType: "note", text: "Concurrent relink predecessor." }
+    );
+    const predecessorId = predecessorResponse.json<{ sourceArtifactId: string }>().sourceArtifactId;
+    const racePool = createPgPool(appUrl!);
+    const baseAuthorization = new PostgresAuthorizationService(racePool);
+    const authorized = deferred();
+    const releaseCorrection = deferred();
+    let paused = false;
+    const authorization: TransactionAwareAuthorizationService = {
+      can: (context, action, resource, options) =>
+        baseAuthorization.can(context, action, resource, options),
+      canInTransaction: async (context, action, resource, tx, options) => {
+        const decision = await baseAuthorization.canInTransaction(
+          context,
+          action,
+          resource,
+          tx,
+          options
+        );
+        if (!paused && action === "source.correct" && decision.allowed) {
+          paused = true;
+          authorized.resolve();
+          await releaseCorrection.promise;
+        }
+        return decision;
+      }
+    };
+    let correction: Promise<unknown> | undefined;
+    try {
+      correction = new AccountOperationsDomainCommandBus(racePool, authorization).execute(
+        {
+          kind: "source.correct",
+          idempotencyKey: "concurrent-relink-correction",
+          payload: {
+            predecessorSourceArtifactId: predecessorId,
+            sourceType: "human",
+            text: "Exact correction after rejected relink."
+          }
+        },
+        createDevSecurityContext("tenant-a-owner")
+      );
+      void correction.catch(() => undefined);
+      await withDeadline(authorized.promise, "Source correction authorization barrier");
+      await expect(
+        ownerPool.query(
+          `UPDATE work.activity_sources SET activity_id = $2
+           WHERE source_artifact_id = $1`,
+          [predecessorId, alternateActivityId]
+        )
+      ).rejects.toThrow(/immutable/);
+      releaseCorrection.resolve();
+      const corrected = await withDeadline(correction, "Source correction relink race deadlocked");
+      expect(corrected).toMatchObject({ previousSourceArtifactId: predecessorId, version: 1 });
+      const links = await ownerPool.query<{
+        source_artifact_id: string;
+        activity_id: string;
+        space_id: string;
+      }>(
+        `SELECT link.source_artifact_id, link.activity_id, link.space_id
+         FROM work.activity_sources link
+         JOIN content.source_artifacts source ON source.id = link.source_artifact_id
+         WHERE source.id = $1 OR source.supersedes_source_id = $1
+         ORDER BY source.supersedes_source_id NULLS FIRST`,
+        [predecessorId]
+      );
+      expect(links.rows).toHaveLength(2);
+      expect(new Set(links.rows.map(({ activity_id }) => activity_id))).toEqual(
+        new Set([state.activityId])
+      );
+      expect(new Set(links.rows.map(({ space_id }) => space_id))).toEqual(
+        new Set([state.sourceSpaceId])
+      );
+    } finally {
+      releaseCorrection.resolve();
+      await correction?.catch(() => undefined);
+      await racePool.end();
     }
   }, 30_000);
 
@@ -1491,11 +2342,11 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
       ]
     );
     const racePool = createPgPool(appUrl!);
-    const bus = new AccountOperationsDomainCommandBus(racePool);
-    const blocker = await ownerPool.connect();
+    const createBus = new AccountOperationsDomainCommandBus(racePool);
     let ending: Promise<unknown> | undefined;
+    let barrier: ReturnType<typeof pauseAfterRelationshipScopeLookup> | undefined;
     try {
-      const created = await bus.execute(
+      const created = await createBus.execute(
         {
           kind: "relationship.create",
           idempotencyKey: "endpoint-revocation-relationship",
@@ -1508,12 +2359,8 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
         },
         createDevSecurityContext("tenant-a-owner")
       );
-      const commandPid = await racePool.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
-      await blocker.query("BEGIN");
-      await blocker.query("SELECT id FROM work.relationships WHERE id = $1 FOR UPDATE", [
-        created.relationshipId
-      ]);
-      ending = bus.execute(
+      barrier = pauseAfterRelationshipScopeLookup(racePool, created.relationshipId);
+      ending = new AccountOperationsDomainCommandBus(barrier.pool).execute(
         {
           kind: "relationship.end",
           idempotencyKey: "endpoint-revocation-denied",
@@ -1525,26 +2372,35 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
         },
         createDevSecurityContext("tenant-a-viewer")
       );
-      await waitForBlockedBackend(ownerPool, commandPid.rows[0]!.pid);
+      void ending.catch(() => undefined);
+      await withDeadline(barrier.scopeResolved.promise, "Relationship scope lookup did not pause");
       await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
         endpointGrant.rows[0]!.id
       ]);
-      await blocker.query("COMMIT");
-      await expect(ending).rejects.toMatchObject({ name: "B1AuthorizationError" });
+      barrier.releaseScopeLookup.resolve();
+      await expect(
+        withDeadline(ending, "Relationship grant-revocation denial deadlocked")
+      ).rejects.toMatchObject({ name: "B1AuthorizationError" });
       const unchanged = await ownerPool.query<{ version: number; valid_to: Date | null }>(
         "SELECT version, valid_to FROM work.relationships WHERE id = $1",
         [created.relationshipId]
       );
       expect(unchanged.rows[0]).toEqual({ version: 1, valid_to: null });
-      const residue = await ownerPool.query<{ count: string }>(
-        `SELECT count(*)::text AS count FROM ops.domain_command_records
-         WHERE idempotency_key = 'endpoint-revocation-denied'`
+      const residue = await ownerPool.query<{ commands: string; audits: string; outbox: string }>(
+        `SELECT
+           (SELECT count(*)::text FROM ops.domain_command_records
+            WHERE idempotency_key = 'endpoint-revocation-denied') AS commands,
+           (SELECT count(*)::text FROM ops.audit_events audit
+            JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+            WHERE command.idempotency_key = 'endpoint-revocation-denied') AS audits,
+           (SELECT count(*)::text FROM ops.product_outbox_events event
+            JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+            WHERE command.idempotency_key = 'endpoint-revocation-denied') AS outbox`
       );
-      expect(residue.rows[0]?.count).toBe("0");
+      expect(residue.rows[0]).toEqual({ commands: "0", audits: "0", outbox: "0" });
     } finally {
-      await blocker.query("ROLLBACK").catch(() => undefined);
+      barrier?.releaseScopeLookup.resolve();
       await ending?.catch(() => undefined);
-      blocker.release();
       await racePool.end();
       await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
         contextGrant.rows[0]!.id
@@ -1553,9 +2409,138 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
         endpointGrant.rows[0]!.id
       ]);
     }
-  });
+  }, 30_000);
 
-  it("lets a committed endpoint-grant revocation after authorization win at relationship mutation", async () => {
+  it("denies Relationship end when membership, user, policy, or Space revocation commits first", async () => {
+    const actorContext = createDevSecurityContext("tenant-a-owner");
+    const cases = [
+      {
+        name: "membership",
+        revoke: () =>
+          ownerPool.query("UPDATE identity.memberships SET status = 'suspended' WHERE id = $1", [
+            devFixtures.membershipAOwner
+          ]),
+        restore: () =>
+          ownerPool.query("UPDATE identity.memberships SET status = 'active' WHERE id = $1", [
+            devFixtures.membershipAOwner
+          ])
+      },
+      {
+        name: "user",
+        revoke: () =>
+          ownerPool.query("UPDATE identity.users SET status = 'disabled' WHERE id = $1", [
+            devFixtures.userA
+          ]),
+        restore: () =>
+          ownerPool.query("UPDATE identity.users SET status = 'active' WHERE id = $1", [
+            devFixtures.userA
+          ])
+      },
+      {
+        name: "policy",
+        revoke: () =>
+          ownerPool.query(
+            `UPDATE identity.policy_versions SET status = 'retired'
+             WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+            [devFixtures.tenantA, devFixtures.workspaceA, actorContext.policyVersion]
+          ),
+        restore: () =>
+          ownerPool.query(
+            `UPDATE identity.policy_versions SET status = 'active'
+             WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+            [devFixtures.tenantA, devFixtures.workspaceA, actorContext.policyVersion]
+          )
+      },
+      {
+        name: "space",
+        revoke: () =>
+          ownerPool.query(
+            "UPDATE access.spaces SET archived_at = clock_timestamp() WHERE id = $1",
+            [state.sourceSpaceId]
+          ),
+        restore: () =>
+          ownerPool.query("UPDATE access.spaces SET archived_at = NULL WHERE id = $1", [
+            state.sourceSpaceId
+          ])
+      }
+    ];
+
+    for (const [index, authorityCase] of cases.entries()) {
+      const key = `relationship-${authorityCase.name}-revocation-wins`;
+      const created = await new AccountOperationsDomainCommandBus(appPool).execute(
+        {
+          kind: "relationship.create",
+          idempotencyKey: `${key}-fixture`,
+          payload: {
+            subject: { type: "person", id: devFixtures.externalPersonA },
+            predicate: `authority.${authorityCase.name}`,
+            object: { type: "space", id: state.sourceSpaceId }
+          }
+        },
+        actorContext
+      );
+      const racePool = createPgPool(appUrl!);
+      const barrier = pauseAfterRelationshipScopeLookup(racePool, created.relationshipId);
+      let ending: Promise<unknown> | undefined;
+      try {
+        ending = new AccountOperationsDomainCommandBus(barrier.pool).execute(
+          {
+            kind: "relationship.end",
+            idempotencyKey: key,
+            payload: {
+              relationshipId: created.relationshipId,
+              expectedVersion: 1,
+              validTo: `2026-07-16T1${index}:30:00.000Z`
+            }
+          },
+          actorContext
+        );
+        void ending.catch(() => undefined);
+        await withDeadline(barrier.scopeResolved.promise, `${authorityCase.name} scope barrier`);
+        await authorityCase.revoke();
+        barrier.releaseScopeLookup.resolve();
+        await expect(
+          withDeadline(ending, `${authorityCase.name} revocation denial`)
+        ).rejects.toMatchObject({
+          name: "B1AuthorizationError",
+          message: "B1 resource is unavailable"
+        });
+        const result = await ownerPool.query<{
+          version: number;
+          valid_to: Date | null;
+          commands: string;
+          audits: string;
+          outbox: string;
+        }>(
+          `SELECT relationship.version, relationship.valid_to,
+             (SELECT count(*)::text FROM ops.domain_command_records
+              WHERE idempotency_key = $2) AS commands,
+             (SELECT count(*)::text FROM ops.audit_events audit
+              JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+              WHERE command.idempotency_key = $2) AS audits,
+             (SELECT count(*)::text FROM ops.product_outbox_events event
+              JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+              WHERE command.idempotency_key = $2) AS outbox
+           FROM work.relationships relationship WHERE relationship.id = $1`,
+          [created.relationshipId, key]
+        );
+        expect(result.rows[0]).toEqual({
+          version: 1,
+          valid_to: null,
+          commands: "0",
+          audits: "0",
+          outbox: "0"
+        });
+      } finally {
+        barrier.releaseScopeLookup.resolve();
+        await ending?.catch(() => undefined);
+        await authorityCase.restore();
+        await racePool.end();
+      }
+    }
+  }, 30_000);
+
+  it("binds endpoint grants so Relationship mutation wins and revocation blocks without deadlock", async () => {
     const contextGrant = await ownerPool.query<{ id: string }>(
       `INSERT INTO access.access_relationships (
          tenant_id, workspace_id, subject_type, subject_id, relation,
@@ -1583,34 +2568,34 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
     );
     const racePool = createPgPool(appUrl!);
     const baseAuthorization = new PostgresAuthorizationService(racePool);
-    const endpointsAuthorized = deferred();
+    const baseBatch = baseAuthorization as unknown as RelationshipAuthorityBatchTestService;
+    const relationshipAuthorityLocked = deferred();
     const releaseMutation = deferred();
     let ending: Promise<unknown> | undefined;
-    let armed = false;
-    let endpointReads = 0;
-    const authorization: TransactionAwareAuthorizationService = {
+    const authorization: TransactionAwareAuthorizationService &
+      RelationshipAuthorityBatchTestService = {
       can: (context, action, resource, options) =>
         baseAuthorization.can(context, action, resource, options),
-      canInTransaction: async (context, action, resource, tx, options) => {
-        const decision = await baseAuthorization.canInTransaction(
+      canInTransaction: (context, action, resource, tx, options) =>
+        baseAuthorization.canInTransaction(context, action, resource, tx, options),
+      preauthorizeRelationshipEndInTransaction: (context, resource, tx) =>
+        baseBatch.preauthorizeRelationshipEndInTransaction(context, resource, tx),
+      lockAndReauthorizeRelationshipAuthorityInTransaction: async (context, requests, tx) => {
+        const decision = await baseBatch.lockAndReauthorizeRelationshipAuthorityInTransaction(
           context,
-          action,
-          resource,
-          tx,
-          options
+          requests,
+          tx
         );
-        if (action === "relationship.end") armed = true;
-        else if (armed && action.endsWith(".read") && decision.allowed) {
-          endpointReads += 1;
-          if (endpointReads === 3) {
-            endpointsAuthorized.resolve();
-            await releaseMutation.promise;
-          }
+        if (decision.allowed) {
+          relationshipAuthorityLocked.resolve();
+          await releaseMutation.promise;
         }
         return decision;
       }
     };
     const bus = new AccountOperationsDomainCommandBus(racePool, authorization);
+    const revoker = await ownerPool.connect();
+    let deletion: Promise<unknown> | undefined;
     try {
       const created = await bus.execute(
         {
@@ -1628,7 +2613,7 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
       ending = bus.execute(
         {
           kind: "relationship.end",
-          idempotencyKey: "post-auth-revocation-denied",
+          idempotencyKey: "post-auth-mutation-wins",
           payload: {
             relationshipId: created.relationshipId,
             expectedVersion: 1,
@@ -1637,14 +2622,24 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
         },
         createDevSecurityContext("tenant-a-viewer")
       );
-      await endpointsAuthorized.promise;
-      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
+      void ending.catch(() => undefined);
+      await withDeadline(
+        relationshipAuthorityLocked.promise,
+        "Relationship endpoint locks were not acquired"
+      );
+      const revokerPid = await revoker.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+      deletion = revoker.query("DELETE FROM access.access_relationships WHERE id = $1", [
         endpointGrant.rows[0]!.id
       ]);
+      await waitForBlockedBackend(ownerPool, revokerPid.rows[0]!.pid);
       releaseMutation.resolve();
-      await expect(ending).rejects.toMatchObject({ name: "B1AuthorizationError" });
+      await expect(withDeadline(ending, "Relationship end deadlocked")).resolves.toMatchObject({
+        relationshipId: created.relationshipId,
+        version: 2
+      });
+      await withDeadline(deletion, "Endpoint grant revocation did not finish after mutation");
 
-      const unchanged = await ownerPool.query<{
+      const committed = await ownerPool.query<{
         version: number;
         valid_to: Date | null;
         commands: string;
@@ -1653,26 +2648,28 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
       }>(
         `SELECT relationship.version, relationship.valid_to,
           (SELECT count(*)::text FROM ops.domain_command_records
-           WHERE idempotency_key = 'post-auth-revocation-denied') AS commands,
+           WHERE idempotency_key = 'post-auth-mutation-wins') AS commands,
           (SELECT count(*)::text FROM ops.audit_events audit
            JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
-           WHERE command.idempotency_key = 'post-auth-revocation-denied') AS audits,
+           WHERE command.idempotency_key = 'post-auth-mutation-wins') AS audits,
           (SELECT count(*)::text FROM ops.product_outbox_events event
            JOIN ops.domain_command_records command ON command.id = event.causation_command_id
-           WHERE command.idempotency_key = 'post-auth-revocation-denied') AS outbox
+           WHERE command.idempotency_key = 'post-auth-mutation-wins') AS outbox
          FROM work.relationships relationship WHERE relationship.id = $1`,
         [created.relationshipId]
       );
-      expect(unchanged.rows[0]).toEqual({
-        version: 1,
-        valid_to: null,
-        commands: "0",
-        audits: "0",
-        outbox: "0"
+      expect(committed.rows[0]).toEqual({
+        version: 2,
+        valid_to: new Date("2026-07-16T13:00:00.000Z"),
+        commands: "1",
+        audits: "1",
+        outbox: "1"
       });
     } finally {
       releaseMutation.resolve();
       await ending?.catch(() => undefined);
+      await deletion?.catch(() => undefined);
+      revoker.release();
       await racePool.end();
       await ownerPool.query("DELETE FROM access.access_relationships WHERE id = $1", [
         contextGrant.rows[0]!.id
@@ -1682,6 +2679,506 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
       ]);
     }
   });
+
+  it("binds inherited endpoint Space paths across restriction, archival, and reparent races", async () => {
+    const ancestorSpaceId = "79000000-0000-7000-8000-000000000100";
+    const intermediateSpaceId = "79000000-0000-7000-8000-000000000101";
+    const targetSpaceId = "79000000-0000-7000-8000-000000000102";
+    const alternateParentSpaceId = "79000000-0000-7000-8000-000000000103";
+    await ownerPool.query(
+      `INSERT INTO access.spaces
+       (id, tenant_id, workspace_id, parent_space_id, kind, name, slug, access_class, inheritance_mode)
+       VALUES
+       ($1,$5,$6,$7,'knowledge','Inherited authority ancestor','b1-inherited-authority-ancestor','restricted','inherit'),
+       ($2,$5,$6,$1,'knowledge','Inherited authority intermediate','b1-inherited-authority-intermediate','restricted','inherit'),
+       ($3,$5,$6,$2,'knowledge','Inherited authority target','b1-inherited-authority-target','restricted','inherit'),
+       ($4,$5,$6,$7,'knowledge','Inherited authority alternate','b1-inherited-authority-alternate','restricted','inherit')`,
+      [
+        ancestorSpaceId,
+        intermediateSpaceId,
+        targetSpaceId,
+        alternateParentSpaceId,
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.rootSpaceA
+      ]
+    );
+    const grants = await ownerPool.query<{ id: string; relation: string }>(
+      `INSERT INTO access.access_relationships
+       (tenant_id, workspace_id, subject_type, subject_id, relation, resource_type, resource_id, source)
+       VALUES
+       ($1,$2,'membership',$3,'contributor','space',$4,'direct'),
+       ($1,$2,'membership',$3,'viewer','space',$5,'direct')
+       RETURNING id, relation`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        state.sourceSpaceId,
+        ancestorSpaceId
+      ]
+    );
+    expect(grants.rows).toHaveLength(2);
+    const ownerContext = createDevSecurityContext("tenant-a-owner");
+    const viewerContext = createDevSecurityContext("tenant-a-viewer");
+
+    const raceCases = [
+      {
+        name: "intermediate-restriction",
+        revokeSql: "UPDATE access.spaces SET inheritance_mode = 'restricted' WHERE id = $1",
+        revokeValues: [intermediateSpaceId],
+        restoreSql: "UPDATE access.spaces SET inheritance_mode = 'inherit' WHERE id = $1",
+        restoreValues: [intermediateSpaceId]
+      },
+      {
+        name: "ancestor-archival",
+        revokeSql: "UPDATE access.spaces SET archived_at = clock_timestamp() WHERE id = $1",
+        revokeValues: [ancestorSpaceId],
+        restoreSql: "UPDATE access.spaces SET archived_at = NULL WHERE id = $1",
+        restoreValues: [ancestorSpaceId]
+      },
+      {
+        name: "intermediate-reparent",
+        revokeSql: "UPDATE access.spaces SET parent_space_id = $2 WHERE id = $1",
+        revokeValues: [intermediateSpaceId, alternateParentSpaceId],
+        restoreSql: "UPDATE access.spaces SET parent_space_id = $2 WHERE id = $1",
+        restoreValues: [intermediateSpaceId, ancestorSpaceId]
+      }
+    ];
+
+    async function createRaceRelationship(key: string) {
+      return new AccountOperationsDomainCommandBus(appPool).execute(
+        {
+          kind: "relationship.create",
+          idempotencyKey: `${key}-fixture`,
+          payload: {
+            subject: { type: "person", id: devFixtures.externalPersonA },
+            predicate: `inherited_path.${key.replace(/-/g, "_")}`,
+            object: { type: "space", id: targetSpaceId },
+            context: { type: "space", id: state.sourceSpaceId }
+          }
+        },
+        ownerContext
+      );
+    }
+
+    try {
+      for (const [index, raceCase] of raceCases.entries()) {
+        const key = `inherited-${raceCase.name}-revocation-wins`;
+        const created = await createRaceRelationship(key);
+        const racePool = createPgPool(appUrl!);
+        const barrier = pauseAfterRelationshipScopeLookup(racePool, created.relationshipId);
+        let ending: Promise<unknown> | undefined;
+        try {
+          ending = new AccountOperationsDomainCommandBus(barrier.pool).execute(
+            {
+              kind: "relationship.end",
+              idempotencyKey: key,
+              payload: {
+                relationshipId: created.relationshipId,
+                expectedVersion: 1,
+                validTo: `2026-07-16T0${index + 1}:00:00.000Z`
+              }
+            },
+            viewerContext
+          );
+          void ending.catch(() => undefined);
+          await withDeadline(barrier.scopeResolved.promise, `${raceCase.name} scope barrier`);
+          await ownerPool.query(raceCase.revokeSql, raceCase.revokeValues);
+          barrier.releaseScopeLookup.resolve();
+          await expect(
+            withDeadline(ending, `${raceCase.name} revocation-wins denial`)
+          ).rejects.toMatchObject({
+            name: "B1AuthorizationError",
+            message: "B1 resource is unavailable"
+          });
+          const denied = await ownerPool.query<{
+            version: number;
+            valid_to: Date | null;
+            commands: string;
+            audits: string;
+            outbox: string;
+          }>(
+            `SELECT relationship.version, relationship.valid_to,
+               (SELECT count(*)::text FROM ops.domain_command_records
+                WHERE idempotency_key = $2) AS commands,
+               (SELECT count(*)::text FROM ops.audit_events audit
+                JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+                WHERE command.idempotency_key = $2) AS audits,
+               (SELECT count(*)::text FROM ops.product_outbox_events event
+                JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+                WHERE command.idempotency_key = $2) AS outbox
+             FROM work.relationships relationship WHERE relationship.id = $1`,
+            [created.relationshipId, key]
+          );
+          expect(denied.rows[0]).toEqual({
+            version: 1,
+            valid_to: null,
+            commands: "0",
+            audits: "0",
+            outbox: "0"
+          });
+        } finally {
+          barrier.releaseScopeLookup.resolve();
+          await ending?.catch(() => undefined);
+          await ownerPool.query(raceCase.restoreSql, raceCase.restoreValues);
+          await racePool.end();
+        }
+      }
+
+      for (const [index, raceCase] of raceCases.entries()) {
+        const key = `inherited-${raceCase.name}-mutation-wins`;
+        const created = await createRaceRelationship(key);
+        const racePool = createPgPool(appUrl!);
+        const baseAuthorization = new PostgresAuthorizationService(racePool);
+        const baseBatch = baseAuthorization as unknown as RelationshipAuthorityBatchTestService;
+        const inheritedPathLocked = deferred();
+        const releaseMutation = deferred();
+        let paused = false;
+        const authorization: TransactionAwareAuthorizationService &
+          RelationshipAuthorityBatchTestService = {
+          can: (context, action, resource, options) =>
+            baseAuthorization.can(context, action, resource, options),
+          canInTransaction: (context, action, resource, tx, options) =>
+            baseAuthorization.canInTransaction(context, action, resource, tx, options),
+          preauthorizeRelationshipEndInTransaction: (context, resource, tx) =>
+            baseBatch.preauthorizeRelationshipEndInTransaction(context, resource, tx),
+          lockAndReauthorizeRelationshipAuthorityInTransaction: async (context, requests, tx) => {
+            const decision = await baseBatch.lockAndReauthorizeRelationshipAuthorityInTransaction(
+              context,
+              requests,
+              tx
+            );
+            if (!paused && decision.allowed) {
+              paused = true;
+              inheritedPathLocked.resolve();
+              await releaseMutation.promise;
+            }
+            return decision;
+          }
+        };
+        const revoker = await ownerPool.connect();
+        let ending: Promise<unknown> | undefined;
+        let revocation: Promise<unknown> | undefined;
+        try {
+          ending = new AccountOperationsDomainCommandBus(racePool, authorization).execute(
+            {
+              kind: "relationship.end",
+              idempotencyKey: key,
+              payload: {
+                relationshipId: created.relationshipId,
+                expectedVersion: 1,
+                validTo: `2026-07-16T1${index + 1}:00:00.000Z`
+              }
+            },
+            viewerContext
+          );
+          void ending.catch(() => undefined);
+          await withDeadline(inheritedPathLocked.promise, `${raceCase.name} inherited path lock`);
+          const revokerPid = await revoker.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+          revocation = revoker.query(raceCase.revokeSql, raceCase.revokeValues);
+          await waitForBlockedBackend(ownerPool, revokerPid.rows[0]!.pid);
+          releaseMutation.resolve();
+          await expect(
+            withDeadline(ending, `${raceCase.name} mutation deadlocked`)
+          ).resolves.toMatchObject({
+            relationshipId: created.relationshipId,
+            version: 2
+          });
+          await withDeadline(revocation, `${raceCase.name} revocation did not resume`);
+          const committed = await ownerPool.query<{
+            version: number;
+            commands: string;
+            audits: string;
+            outbox: string;
+          }>(
+            `SELECT relationship.version,
+               (SELECT count(*)::text FROM ops.domain_command_records
+                WHERE idempotency_key = $2) AS commands,
+               (SELECT count(*)::text FROM ops.audit_events audit
+                JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+                WHERE command.idempotency_key = $2) AS audits,
+               (SELECT count(*)::text FROM ops.product_outbox_events event
+                JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+                WHERE command.idempotency_key = $2) AS outbox
+             FROM work.relationships relationship WHERE relationship.id = $1`,
+            [created.relationshipId, key]
+          );
+          expect(committed.rows[0]).toEqual({
+            version: 2,
+            commands: "1",
+            audits: "1",
+            outbox: "1"
+          });
+        } finally {
+          releaseMutation.resolve();
+          await ending?.catch(() => undefined);
+          await revocation?.catch(() => undefined);
+          await ownerPool.query(raceCase.restoreSql, raceCase.restoreValues);
+          revoker.release();
+          await racePool.end();
+        }
+      }
+    } finally {
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = ANY($1::uuid[])", [
+        grants.rows.map(({ id }) => id)
+      ]);
+    }
+  }, 60_000);
+
+  it("globally orders Relationship authority against an opposing ancestor-first multi-row mutation", async () => {
+    const ancestorSpaceId = "78000000-0000-7000-8000-000000000100";
+    const intermediateSpaceId = "78000000-0000-7000-8000-000000000200";
+    const targetSpaceId = "78000000-0000-7000-8000-000000000300";
+    const alternateParentSpaceId = "78000000-0000-7000-8000-000000000400";
+    const governingSpaceId = "78000000-0000-7000-8000-000000000900";
+    await ownerPool.query(
+      `INSERT INTO access.spaces
+       (id, tenant_id, workspace_id, parent_space_id, kind, name, slug, access_class, inheritance_mode)
+       VALUES
+       ($1,$6,$7,$8,'knowledge','Lock order ancestor','b1-lock-order-ancestor','restricted','inherit'),
+       ($2,$6,$7,$1,'knowledge','Lock order intermediate','b1-lock-order-intermediate','restricted','inherit'),
+       ($3,$6,$7,$2,'knowledge','Lock order target','b1-lock-order-target','restricted','inherit'),
+       ($4,$6,$7,$8,'knowledge','Lock order alternate','b1-lock-order-alternate','restricted','inherit'),
+       ($5,$6,$7,$8,'knowledge','Lock order governing','b1-lock-order-governing','restricted','restricted')`,
+      [
+        ancestorSpaceId,
+        intermediateSpaceId,
+        targetSpaceId,
+        alternateParentSpaceId,
+        governingSpaceId,
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.rootSpaceA
+      ]
+    );
+    const relay = await ownerPool.query<{ id: string }>(
+      `SELECT principal.id FROM identity.service_principals principal
+       JOIN access.access_relationships grant_record
+         ON grant_record.tenant_id = principal.tenant_id
+        AND grant_record.workspace_id = principal.workspace_id
+        AND grant_record.subject_type = 'service_principal'
+        AND grant_record.subject_id = principal.id
+        AND grant_record.relation = 'manager'
+        AND grant_record.resource_type = 'space'
+        AND grant_record.resource_id = $3
+        AND grant_record.source = 'direct'
+       WHERE principal.tenant_id = $1 AND principal.workspace_id = $2
+         AND principal.purpose = 'product_notification_relay' AND principal.status = 'active'
+       ORDER BY principal.id`,
+      [devFixtures.tenantA, devFixtures.workspaceA, state.sourceSpaceId]
+    );
+    expect(relay.rows).toHaveLength(1);
+    const grants = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships
+       (tenant_id, workspace_id, subject_type, subject_id, relation, resource_type, resource_id, source)
+       VALUES
+       ($1,$2,'membership',$3,'contributor','space',$4,'direct'),
+       ($1,$2,'membership',$3,'viewer','space',$5,'direct'),
+       ($1,$2,'service_principal',$6,'manager','space',$4,'direct')
+       RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        governingSpaceId,
+        ancestorSpaceId,
+        relay.rows[0]!.id
+      ]
+    );
+    const ownerContext = createDevSecurityContext("tenant-a-owner");
+    const viewerContext = createDevSecurityContext("tenant-a-viewer");
+    const createRelationship = (key: string) =>
+      new AccountOperationsDomainCommandBus(appPool).execute(
+        {
+          kind: "relationship.create",
+          idempotencyKey: `${key}-fixture`,
+          payload: {
+            subject: { type: "person", id: devFixtures.externalPersonA },
+            predicate: `lock_order.${key.replace(/-/g, "_")}`,
+            object: { type: "space", id: targetSpaceId },
+            context: { type: "space", id: governingSpaceId }
+          }
+        },
+        ownerContext
+      );
+
+    try {
+      const authorityWinsKey = "global-lock-order-authority-wins";
+      const authorityWinsRelationship = await createRelationship(authorityWinsKey);
+      const authorityClient = await ownerPool.connect();
+      const authorityRacePool = createPgPool(appUrl!);
+      let authorityEnding: Promise<unknown> | undefined;
+      try {
+        await authorityClient.query("BEGIN");
+        await authorityClient.query("SELECT id FROM access.spaces WHERE id = $1 FOR UPDATE", [
+          ancestorSpaceId
+        ]);
+        const authorityPid = await authorityClient.query<{ pid: number }>(
+          "SELECT pg_backend_pid() AS pid"
+        );
+        authorityEnding = new AccountOperationsDomainCommandBus(authorityRacePool).execute(
+          {
+            kind: "relationship.end",
+            idempotencyKey: authorityWinsKey,
+            payload: {
+              relationshipId: authorityWinsRelationship.relationshipId,
+              expectedVersion: 1,
+              validTo: "2026-07-16T16:00:00.000Z"
+            }
+          },
+          viewerContext
+        );
+        void authorityEnding.catch(() => undefined);
+        await waitForAppSpaceAuthorityLockBlocked(
+          ownerPool,
+          authorityPid.rows[0]!.pid,
+          "authority-wins Relationship lock"
+        );
+        await withDeadline(
+          authorityClient.query("SELECT id FROM access.spaces WHERE id = $1 FOR UPDATE", [
+            governingSpaceId
+          ]),
+          "Ancestor-first authority transaction deadlocked on governing Space"
+        );
+        await authorityClient.query("UPDATE access.spaces SET parent_space_id = $2 WHERE id = $1", [
+          intermediateSpaceId,
+          alternateParentSpaceId
+        ]);
+        await authorityClient.query("COMMIT");
+        await expect(
+          withDeadline(authorityEnding, "Authority-wins Relationship denial deadlocked")
+        ).rejects.toMatchObject({
+          name: "B1AuthorizationError",
+          message: "B1 resource is unavailable"
+        });
+        const denied = await relationshipRaceOutcome(
+          ownerPool,
+          authorityWinsRelationship.relationshipId,
+          authorityWinsKey
+        );
+        expect(denied).toEqual({
+          version: 1,
+          valid_to: null,
+          commands: "0",
+          audits: "0",
+          outbox: "0"
+        });
+      } finally {
+        await authorityClient.query("ROLLBACK").catch(() => undefined);
+        await authorityEnding?.catch(() => undefined);
+        authorityClient.release();
+        await authorityRacePool.end();
+        await ownerPool.query("UPDATE access.spaces SET parent_space_id = $2 WHERE id = $1", [
+          intermediateSpaceId,
+          ancestorSpaceId
+        ]);
+      }
+
+      const mutationWinsKey = "global-lock-order-mutation-wins";
+      const mutationWinsRelationship = await createRelationship(mutationWinsKey);
+      const mutationRacePool = createPgPool(appUrl!);
+      const baseAuthorization = new PostgresAuthorizationService(mutationRacePool);
+      const baseBatch = baseAuthorization as unknown as RelationshipAuthorityBatchTestService;
+      const authorityLocked = deferred();
+      const releaseRelationship = deferred();
+      const authorization: TransactionAwareAuthorizationService &
+        RelationshipAuthorityBatchTestService = {
+        can: (context, action, resource, options) =>
+          baseAuthorization.can(context, action, resource, options),
+        canInTransaction: (context, action, resource, tx, options) =>
+          baseAuthorization.canInTransaction(context, action, resource, tx, options),
+        preauthorizeRelationshipEndInTransaction: (context, resource, tx) =>
+          baseBatch.preauthorizeRelationshipEndInTransaction(context, resource, tx),
+        lockAndReauthorizeRelationshipAuthorityInTransaction: async (context, requests, tx) => {
+          const decision = await baseBatch.lockAndReauthorizeRelationshipAuthorityInTransaction(
+            context,
+            requests,
+            tx
+          );
+          if (decision.allowed) {
+            authorityLocked.resolve();
+            await releaseRelationship.promise;
+          }
+          return decision;
+        }
+      };
+      const mutationClient = await ownerPool.connect();
+      let mutationEnding: Promise<unknown> | undefined;
+      let opposingLock: Promise<unknown> | undefined;
+      try {
+        mutationEnding = new AccountOperationsDomainCommandBus(
+          mutationRacePool,
+          authorization
+        ).execute(
+          {
+            kind: "relationship.end",
+            idempotencyKey: mutationWinsKey,
+            payload: {
+              relationshipId: mutationWinsRelationship.relationshipId,
+              expectedVersion: 1,
+              validTo: "2026-07-16T17:00:00.000Z"
+            }
+          },
+          viewerContext
+        );
+        void mutationEnding.catch(() => undefined);
+        await withDeadline(authorityLocked.promise, "Global Relationship authority lock barrier");
+        await mutationClient.query("BEGIN");
+        const mutationPid = await mutationClient.query<{ pid: number }>(
+          "SELECT pg_backend_pid() AS pid"
+        );
+        opposingLock = mutationClient.query(
+          `SELECT id FROM access.spaces
+           WHERE id = ANY($1::uuid[])
+           ORDER BY id FOR UPDATE`,
+          [[ancestorSpaceId, intermediateSpaceId, governingSpaceId]]
+        );
+        void opposingLock.catch(() => undefined);
+        await waitForBlockedBackend(ownerPool, mutationPid.rows[0]!.pid);
+        releaseRelationship.resolve();
+        await expect(
+          withDeadline(mutationEnding, "Mutation-wins Relationship end deadlocked")
+        ).resolves.toMatchObject({
+          relationshipId: mutationWinsRelationship.relationshipId,
+          version: 2
+        });
+        await withDeadline(opposingLock, "Opposing multi-row Space lock did not resume");
+        await mutationClient.query("UPDATE access.spaces SET parent_space_id = $2 WHERE id = $1", [
+          intermediateSpaceId,
+          alternateParentSpaceId
+        ]);
+        await mutationClient.query("COMMIT");
+        const committed = await relationshipRaceOutcome(
+          ownerPool,
+          mutationWinsRelationship.relationshipId,
+          mutationWinsKey
+        );
+        expect(committed).toEqual({
+          version: 2,
+          valid_to: new Date("2026-07-16T17:00:00.000Z"),
+          commands: "1",
+          audits: "1",
+          outbox: "1"
+        });
+      } finally {
+        releaseRelationship.resolve();
+        await mutationClient.query("ROLLBACK").catch(() => undefined);
+        await mutationEnding?.catch(() => undefined);
+        await opposingLock?.catch(() => undefined);
+        mutationClient.release();
+        await mutationRacePool.end();
+        await ownerPool.query("UPDATE access.spaces SET parent_space_id = $2 WHERE id = $1", [
+          intermediateSpaceId,
+          ancestorSpaceId
+        ]);
+      }
+    } finally {
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = ANY($1::uuid[])", [
+        grants.rows.map(({ id }) => id)
+      ]);
+    }
+  }, 60_000);
 
   it("binds source provenance to the exact immutable Content revision bytes", async () => {
     const bus = new AccountOperationsDomainCommandBus(appPool);
@@ -2215,6 +3712,13 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
     );
     expect(attempts.filter(({ status }) => status === "fulfilled")).toHaveLength(1);
     expect(attempts.filter(({ status }) => status === "rejected")).toHaveLength(1);
+    const losingAttempt = attempts.find(
+      (attempt): attempt is PromiseRejectedResult => attempt.status === "rejected"
+    );
+    expect(losingAttempt?.reason).toBeInstanceOf(ContentInvariantError);
+    expect(losingAttempt?.reason).toMatchObject({
+      message: "Source correction predecessor is unavailable"
+    });
     const counts = await ownerPool.query<{
       successors: string;
       successor_chunks: string;
@@ -2530,12 +4034,124 @@ function pauseAfterSourceScopeLookup(
   return { pool, scopeResolved, releaseScopeLookup };
 }
 
+function pauseAfterRelationshipScopeLookup(
+  realPool: PgPool,
+  relationshipId: string
+): {
+  pool: PgPool;
+  scopeResolved: ReturnType<typeof deferred>;
+  releaseScopeLookup: ReturnType<typeof deferred>;
+} {
+  const scopeResolved = deferred();
+  const releaseScopeLookup = deferred();
+  let paused = false;
+  const pool = {
+    connect: async () => {
+      const client = await realPool.connect();
+      return new Proxy(client, {
+        get(target, property) {
+          if (property === "query") {
+            return async (text: unknown, ...args: unknown[]) => {
+              const query = target.query as unknown as (
+                text: unknown,
+                ...args: unknown[]
+              ) => Promise<unknown>;
+              const result = await query.call(target, text, ...args);
+              const values = args[0];
+              if (
+                !paused &&
+                typeof text === "string" &&
+                /SELECT\s+id,\s*space_id\s+FROM\s+work\.relationships/i.test(text) &&
+                Array.isArray(values) &&
+                values[2] === relationshipId
+              ) {
+                paused = true;
+                scopeResolved.resolve();
+                await releaseScopeLookup.promise;
+              }
+              return result;
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        }
+      }) as PgPoolClient;
+    }
+  } as unknown as PgPool;
+  return { pool, scopeResolved, releaseScopeLookup };
+}
+
+type RelationshipAuthorityBatchTestService = {
+  preauthorizeRelationshipEndInTransaction(
+    context: Parameters<TransactionAwareAuthorizationService["canInTransaction"]>[0],
+    resource: Parameters<TransactionAwareAuthorizationService["canInTransaction"]>[2],
+    tx: TenantDbTransaction
+  ): Promise<Awaited<ReturnType<TransactionAwareAuthorizationService["canInTransaction"]>>>;
+
+  lockAndReauthorizeRelationshipAuthorityInTransaction(
+    context: Parameters<TransactionAwareAuthorizationService["canInTransaction"]>[0],
+    requests: readonly unknown[],
+    tx: TenantDbTransaction
+  ): Promise<Awaited<ReturnType<TransactionAwareAuthorizationService["canInTransaction"]>>>;
+};
+
+async function relationshipRaceOutcome(pool: PgPool, relationshipId: string, key: string) {
+  const result = await pool.query<{
+    version: number;
+    valid_to: Date | null;
+    commands: string;
+    audits: string;
+    outbox: string;
+  }>(
+    `SELECT relationship.version, relationship.valid_to,
+       (SELECT count(*)::text FROM ops.domain_command_records
+        WHERE idempotency_key = $2) AS commands,
+       (SELECT count(*)::text FROM ops.audit_events audit
+        JOIN ops.domain_command_records command ON command.id = audit.causation_command_id
+        WHERE command.idempotency_key = $2) AS audits,
+       (SELECT count(*)::text FROM ops.product_outbox_events event
+        JOIN ops.domain_command_records command ON command.id = event.causation_command_id
+        WHERE command.idempotency_key = $2) AS outbox
+     FROM work.relationships relationship WHERE relationship.id = $1`,
+    [relationshipId, key]
+  );
+  return result.rows[0];
+}
+
 function deferred() {
   let resolve!: () => void;
   const promise = new Promise<void>((innerResolve) => {
     resolve = innerResolve;
   });
   return { promise, resolve };
+}
+
+async function captureError(callback: () => Promise<unknown>): Promise<Error> {
+  try {
+    await callback();
+  } catch (error) {
+    if (error instanceof Error) return error;
+    throw error;
+  }
+  throw new Error("Expected operation to fail");
+}
+
+async function withDeadline<T>(
+  promise: Promise<T>,
+  label: string,
+  milliseconds = 5_000
+): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error(`${label} timed out`)), milliseconds);
+      })
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }
 
 async function waitForBlockedBackend(pool: PgPool, pid: number): Promise<void> {
@@ -2549,6 +4165,28 @@ async function waitForBlockedBackend(pool: PgPool, pid: number): Promise<void> {
     await new Promise<void>((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(`Backend ${pid} did not reach the Activity lock barrier`);
+}
+
+async function waitForAppSpaceAuthorityLockBlocked(
+  pool: PgPool,
+  blockerPid: number,
+  label: string
+): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ pid: number }>(
+      `SELECT activity.pid FROM pg_stat_activity activity
+       WHERE activity.usename = 'throughline_app'
+         AND $1 = ANY(pg_blocking_pids(activity.pid))
+         AND activity.query LIKE '%access.spaces%'
+         AND activity.query LIKE '%FOR SHARE%'
+       ORDER BY activity.pid LIMIT 1`,
+      [blockerPid]
+    );
+    if (result.rows.length === 1) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`${label} did not reach the Space authority lock barrier`);
 }
 
 async function waitForAppActivityLockBlocked(pool: PgPool, blockerPid: number): Promise<void> {

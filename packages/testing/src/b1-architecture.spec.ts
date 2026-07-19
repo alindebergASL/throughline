@@ -44,6 +44,13 @@ describe("Wave B1 architecture boundaries", () => {
     expect(sources).not.toMatch(/\b(?:Claim|AcceptedFact|DerivedView|ChangeSet|AgentRun)\b/);
     expect(sources).not.toMatch(/@throughline\/(?:integrations|agent-runtime|truth-ledger|search)/);
     expect(sources).not.toMatch(/OpenAI|model\.generate|MCP|Kanban|event-source mapping/i);
+    const productionCommandSurfaces = await combined([
+      "packages/db/migrations/0006_b1_command_integrity.sql",
+      "packages/account-operations/src/domain-command-bus.ts",
+      "packages/authorization/src/authorization-service.ts",
+      "packages/db/src/product-domain-repositories.ts"
+    ]);
+    expect(productionCommandSurfaces).not.toContain("b1_0.fixture.v1");
   });
 
   it("keeps routes SQL-free and every mutation behind the typed command facade", async () => {
@@ -173,6 +180,48 @@ describe("Wave B1 architecture boundaries", () => {
     expect(sourceScope).not.toMatch(
       /JOIN|source_chunks|activity_sources|immutable_text|title|content_hash|access_class|deleted_at|deletion_reason|hash_disposition|supersedes_source_id|\bversion\b/i
     );
+  });
+
+  it("routes Relationship end by minimal scope and batches authority locks after protected materialization", async () => {
+    const repository = await source("packages/work-graph/src/repository.ts");
+    const commandBus = await source("packages/account-operations/src/domain-command-bus.ts");
+    const reservation = commandBus.slice(
+      commandBus.indexOf("private async resolveReservationSpace("),
+      commandBus.indexOf("private async executeInTransaction(")
+    );
+    const relationshipReservation = reservation.slice(
+      reservation.indexOf('case "relationship.end"'),
+      reservation.indexOf('case "content.create"')
+    );
+    expect(relationshipReservation).toContain("getRelationshipScope(");
+    expect(relationshipReservation).not.toContain("getRelationship(");
+
+    const relationshipScope = repository.slice(
+      repository.indexOf("async getRelationshipScope("),
+      repository.indexOf("async getRelationship(")
+    );
+    expect(relationshipScope).toContain("SELECT id, space_id");
+    expect(relationshipScope).not.toMatch(
+      /subject_type|subject_id|predicate|object_type|object_id|context_type|context_id|valid_from|valid_to|\bversion\b/i
+    );
+
+    const ending = commandBus.slice(
+      commandBus.indexOf('case "relationship.end": {'),
+      commandBus.indexOf('case "content.create": {')
+    );
+    const initialAuthorization = ending.indexOf("preauthorizeRelationshipEndInTransaction(");
+    const commandReservation = ending.indexOf("reserveCommand(");
+    const relationshipLock = ending.indexOf("graph.getRelationship(");
+    const globalAuthorityLock = ending.indexOf(
+      "lockAndReauthorizeRelationshipAuthorityInTransaction("
+    );
+    expect(initialAuthorization).toBeGreaterThan(-1);
+    expect(commandReservation).toBeGreaterThan(initialAuthorization);
+    expect(initialAuthorization).toBeLessThan(relationshipLock);
+    expect(ending.slice(0, relationshipLock)).not.toContain("lockAuthority: true");
+    expect(globalAuthorityLock).toBeGreaterThan(relationshipLock);
+    expect(globalAuthorityLock).toBeLessThan(ending.indexOf("graph.endRelationship("));
+    expect(ending).not.toContain("authorizeRelationshipEndpoints(");
   });
 
   it("limits raw scope switching to the fixed transaction helper", async () => {

@@ -2407,7 +2407,7 @@ maybeDescribe("B1.0 real PostgreSQL product-domain prerequisite", () => {
       tenantId: scope.tenantId,
       workspaceId: scope.workspaceId,
       reservationSpaceId: scope.spaceId,
-      commandKind: "b1_0.fixture.v1",
+      commandKind: "organization.create.v1",
       commandSchemaVersion: 1,
       idempotencyKey: `fixture-${suffix}`,
       canonicalRequestHash,
@@ -2464,7 +2464,11 @@ maybeDescribe("B1.0 real PostgreSQL product-domain prerequisite", () => {
       canonicalRequestHash: fixture.reservation.canonicalRequestHash,
       resultResourceType: "organization",
       resultResourceId: fixture.aggregateId,
-      safeResponse: { organizationId: fixture.aggregateId }
+      safeResponse: {
+        organizationId: fixture.aggregateId,
+        spaceId: fixture.reservation.reservationSpaceId,
+        version: 1
+      }
     };
   }
 
@@ -2776,7 +2780,7 @@ function completedCommandInsertStatement(
              agent_principal_id, policy_version_id, request_id, traceparent, tracestate,
              state, result_resource_type, result_resource_id, safe_response, completed_at
            ) VALUES (
-             $1, $2, $3, $4, 'b1_0.fixture.v1',
+             $1, $2, $3, $4, 'organization.create.v1',
              1, $5, $6,
              $7, $8, NULL, NULL,
              NULL, $9, $10, $11, NULL,
@@ -2795,7 +2799,11 @@ function completedCommandInsertStatement(
       `request-${idempotencyKey}`,
       traceparent,
       resultId,
-      JSON.stringify({ organizationId: resultId }),
+      JSON.stringify({
+        organizationId: resultId,
+        spaceId: devFixtures.restrictedSpaceA,
+        version: 1
+      }),
       new Date()
     ]
   };

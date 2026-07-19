@@ -10,20 +10,53 @@ import { isSecurityContextExpired, parseSecurityContext } from "@throughline/ten
 import type {
   AuthorizationAction,
   AuthorizationDecisionOptions,
+  RelationshipAuthorityBatchingAuthorizationService,
+  RelationshipAuthorityRequest,
   TransactionAuthorizationDecisionOptions,
-  TransactionAwareAuthorizationService,
   WorkerAuthorizationBinding
 } from "./types.js";
 
 type MembershipRole = "owner" | "admin" | "member" | "viewer";
 
 interface MembershipRecord {
+  membership_id?: string;
+  user_id?: string;
+  person_id?: string;
   role: MembershipRole;
   membership_status: "invited" | "active" | "suspended";
   user_status: "active" | "disabled";
 }
 
-export class PostgresAuthorizationService implements TransactionAwareAuthorizationService {
+interface PolicyAuthorityRecord {
+  id: string;
+  status: "active";
+}
+
+interface RelationshipAuthoritySpaceRow {
+  id: string;
+  parent_space_id: string | null;
+  kind: string;
+  access_class: AccessClass;
+  inheritance_mode: "inherit" | "restricted";
+}
+
+interface RelationshipAuthorityGrantRow {
+  id: string;
+  resource_id: string;
+  resource_type: "space";
+  subject_type: "membership" | "user";
+  subject_id: string;
+  relation: "owner" | "manager" | "contributor" | "viewer";
+}
+
+interface RelationshipAuthorityDiscovery {
+  spaces: Map<string, RelationshipAuthoritySpaceRow>;
+  grants: Map<string, RelationshipAuthorityGrantRow>;
+  paths: Map<string, readonly string[]>;
+  inconsistent: boolean;
+}
+
+export class PostgresAuthorizationService implements RelationshipAuthorityBatchingAuthorizationService {
   constructor(private readonly pool: PgPool) {}
 
   async can(
@@ -76,6 +109,22 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
     return this.decideInTransaction(contextResult.context, action, resource, tx, options);
   }
 
+  async lockAndReauthorizeRelationshipAuthorityInTransaction(
+    inputContext: SecurityContext,
+    requests: readonly RelationshipAuthorityRequest[],
+    tx: TenantQueryExecutor
+  ): Promise<AuthorizationDecision> {
+    return lockAndReauthorizeRelationshipAuthority(tx, inputContext, requests);
+  }
+
+  async preauthorizeRelationshipEndInTransaction(
+    inputContext: SecurityContext,
+    resource: ResourceRef & { type: "relationship" },
+    tx: TenantQueryExecutor
+  ): Promise<AuthorizationDecision> {
+    return preauthorizeRelationshipEnd(tx, inputContext, resource);
+  }
+
   private async decideInTransaction(
     context: SecurityContext,
     action: AuthorizationAction,
@@ -96,7 +145,7 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
       return productOutboxRelayPublishDecision(tx, context, resource, options);
     }
 
-    const hasActivePolicyVersion = await loadActivePolicyVersion(tx, context);
+    const hasActivePolicyVersion = await loadActivePolicyVersion(tx, context, true);
     if (!hasActivePolicyVersion) {
       return deny(
         context.policyVersion,
@@ -207,7 +256,9 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
       );
     }
 
-    const canReadSpace = await canReadSpaceResource(tx, context, resource.id, membership.role);
+    const canReadSpace = await canReadSpaceResource(tx, context, resource.id, membership.role, {
+      lockAuthority: options.lockAuthority === true
+    });
     if (!canReadSpace.allowed) {
       return deny(context.policyVersion, canReadSpace.reasonCode, canReadSpace.explanation);
     }
@@ -227,6 +278,301 @@ export class PostgresAuthorizationService implements TransactionAwareAuthorizati
 
     return deny(context.policyVersion, "unsupported_action", "Action is not implemented in A2");
   }
+}
+
+async function preauthorizeRelationshipEnd(
+  tx: TenantQueryExecutor,
+  inputContext: SecurityContext,
+  resource: ResourceRef & { type: "relationship" }
+): Promise<AuthorizationDecision> {
+  const contextResult = parseContextForDecision(inputContext);
+  if (!contextResult.ok) {
+    return deny(
+      inputContext.policyVersion ?? "unknown",
+      contextResult.reasonCode,
+      contextResult.explanation
+    );
+  }
+  const context = contextResult.context;
+  if (isSecurityContextExpired(context)) {
+    return deny(context.policyVersion, "context_expired", "SecurityContext has expired");
+  }
+  if (context.servicePrincipalId || context.agentPrincipalId) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const policy = await loadActivePolicyRecord(tx, context, false);
+  const membership = await loadActiveMembership(tx, context, false);
+  if (
+    !policy ||
+    !membership ||
+    membership.membership_status !== "active" ||
+    membership.user_status !== "active"
+  ) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  return b1Decision(tx, context, membership.role, "relationship.end", resource, {});
+}
+
+async function lockAndReauthorizeRelationshipAuthority(
+  tx: TenantQueryExecutor,
+  inputContext: SecurityContext,
+  inputRequests: readonly RelationshipAuthorityRequest[]
+): Promise<AuthorizationDecision> {
+  const contextResult = parseContextForDecision(inputContext);
+  if (!contextResult.ok) {
+    return deny(
+      inputContext.policyVersion ?? "unknown",
+      contextResult.reasonCode,
+      contextResult.explanation
+    );
+  }
+  const context = contextResult.context;
+  if (isSecurityContextExpired(context)) {
+    return deny(context.policyVersion, "context_expired", "SecurityContext has expired");
+  }
+  if (
+    !context.actorUserId ||
+    !context.actorMembershipId ||
+    context.servicePrincipalId ||
+    context.agentPrincipalId
+  ) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const requests = normalizeRelationshipAuthorityRequests(inputRequests);
+  if (!requests) return nonLeakingB1Deny(context.policyVersion);
+
+  const expectedPolicy = await loadActivePolicyRecord(tx, context, false);
+  const expectedMembership = await loadActiveMembership(tx, context, false);
+  const expectedActor = exactHumanAuthorityActor(context, expectedMembership);
+  if (!expectedPolicy || !expectedActor) return nonLeakingB1Deny(context.policyVersion);
+
+  const expectedDiscovery = createRelationshipAuthorityDiscovery();
+  const expectedDecisions = await evaluateRelationshipAuthorityRequests(
+    tx,
+    context,
+    expectedActor.role,
+    requests,
+    expectedDiscovery
+  );
+  if (
+    expectedDiscovery.inconsistent ||
+    expectedDecisions.some(({ decision }) => !decision.allowed)
+  ) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const expectedSnapshot = relationshipAuthoritySnapshot(
+    expectedPolicy,
+    expectedActor,
+    expectedDiscovery,
+    expectedDecisions
+  );
+  const expectedSpaces = [...expectedDiscovery.spaces.values()].sort((left, right) =>
+    left.id.localeCompare(right.id)
+  );
+  const expectedGrants = [...expectedDiscovery.grants.values()].sort((left, right) =>
+    left.id.localeCompare(right.id)
+  );
+
+  const lockedPolicy = await loadActivePolicyRecord(tx, context, true);
+  if (!lockedPolicy || !sameAuthorityValue(lockedPolicy, expectedPolicy)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const lockedMembership = await loadActiveMembership(tx, context, true);
+  const lockedActor = exactHumanAuthorityActor(context, lockedMembership);
+  if (!lockedActor || !sameAuthorityValue(lockedActor, expectedActor)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const lockedSpaces = await lockRelationshipAuthoritySpaces(
+    tx,
+    context,
+    expectedSpaces.map(({ id }) => id)
+  );
+  if (!sameAuthorityValue(lockedSpaces, expectedSpaces)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const lockedGrants = await lockRelationshipAuthorityGrants(
+    tx,
+    context,
+    expectedGrants.map(({ id }) => id)
+  );
+  if (!sameAuthorityValue(lockedGrants, expectedGrants)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+
+  const currentDiscovery = createRelationshipAuthorityDiscovery();
+  const currentDecisions = await evaluateRelationshipAuthorityRequests(
+    tx,
+    context,
+    lockedActor.role,
+    requests,
+    currentDiscovery
+  );
+  if (currentDiscovery.inconsistent || currentDecisions.some(({ decision }) => !decision.allowed)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const currentSnapshot = relationshipAuthoritySnapshot(
+    lockedPolicy,
+    lockedActor,
+    currentDiscovery,
+    currentDecisions
+  );
+  if (!sameAuthorityValue(currentSnapshot, expectedSnapshot)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+
+  const authorityTokens = [
+    ...new Set(currentDecisions.flatMap(({ decision }) => decision.evaluatedRelationships ?? []))
+  ].sort();
+  return allow(context.policyVersion, "relationship_authority_batch", undefined, authorityTokens);
+}
+
+function normalizeRelationshipAuthorityRequests(
+  requests: readonly RelationshipAuthorityRequest[]
+): RelationshipAuthorityRequest[] | undefined {
+  const expectedResourceTypes: Record<RelationshipAuthorityRequest["action"], ResourceRef["type"]> =
+    {
+      "relationship.end": "relationship",
+      "space.read": "space",
+      "person.read": "person",
+      "organization.read": "organization",
+      "initiative.read": "initiative",
+      "activity.read": "activity",
+      "content.read": "content_item"
+    };
+  const unique = new Map<string, RelationshipAuthorityRequest>();
+  for (const request of requests) {
+    if (expectedResourceTypes[request.action] !== request.resource.type) return undefined;
+    if (request.action === "person.read" && request.personUseSite.type !== "relationship") {
+      return undefined;
+    }
+    unique.set(relationshipAuthorityRequestKey(request), request);
+  }
+  const normalized = [...unique.values()].sort((left, right) =>
+    relationshipAuthorityRequestKey(left).localeCompare(relationshipAuthorityRequestKey(right))
+  );
+  const relationshipRequests = normalized.filter(
+    (request): request is Extract<RelationshipAuthorityRequest, { action: "relationship.end" }> =>
+      request.action === "relationship.end"
+  );
+  if (relationshipRequests.length !== 1) return undefined;
+  const relationshipId = relationshipRequests[0]!.resource.id;
+  if (
+    normalized.some(
+      (request) => request.action === "person.read" && request.personUseSite.id !== relationshipId
+    )
+  ) {
+    return undefined;
+  }
+  return normalized;
+}
+
+function relationshipAuthorityRequestKey(request: RelationshipAuthorityRequest): string {
+  return `${request.action}:${request.resource.type}:${request.resource.id}:${
+    request.action === "person.read" ? request.personUseSite.id : ""
+  }`;
+}
+
+async function evaluateRelationshipAuthorityRequests(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  role: MembershipRole,
+  requests: readonly RelationshipAuthorityRequest[],
+  discovery: RelationshipAuthorityDiscovery
+): Promise<Array<{ key: string; decision: AuthorizationDecision }>> {
+  const decisions: Array<{ key: string; decision: AuthorizationDecision }> = [];
+  for (const request of requests) {
+    const decision =
+      request.action === "space.read"
+        ? await relationshipSpaceReadDecision(tx, context, role, request.resource, discovery)
+        : await b1Decision(
+            tx,
+            context,
+            role,
+            request.action,
+            request.resource,
+            request.action === "person.read" ? { personUseSite: request.personUseSite } : {},
+            discovery
+          );
+    decisions.push({ key: relationshipAuthorityRequestKey(request), decision });
+  }
+  return decisions;
+}
+
+async function relationshipSpaceReadDecision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  role: MembershipRole,
+  resource: ResourceRef & { type: "space" },
+  discovery: RelationshipAuthorityDiscovery
+): Promise<AuthorizationDecision> {
+  const readable = await canReadSpaceResource(tx, context, resource.id, role, {
+    authorityDiscovery: discovery
+  });
+  return readable.allowed
+    ? allow(context.policyVersion, readable.reasonCode, undefined, readable.authorityTokens)
+    : nonLeakingB1Deny(context.policyVersion);
+}
+
+function createRelationshipAuthorityDiscovery(): RelationshipAuthorityDiscovery {
+  return { spaces: new Map(), grants: new Map(), paths: new Map(), inconsistent: false };
+}
+
+function exactHumanAuthorityActor(
+  context: SecurityContext,
+  membership: MembershipRecord | undefined
+):
+  | {
+      membershipId: string;
+      userId: string;
+      personId: string;
+      role: MembershipRole;
+      membershipStatus: "active";
+      userStatus: "active";
+    }
+  | undefined {
+  if (
+    !membership ||
+    !context.actorMembershipId ||
+    !context.actorUserId ||
+    membership.membership_id !== context.actorMembershipId ||
+    membership.user_id !== context.actorUserId ||
+    !membership.person_id ||
+    membership.membership_status !== "active" ||
+    membership.user_status !== "active"
+  ) {
+    return undefined;
+  }
+  return {
+    membershipId: membership.membership_id,
+    userId: membership.user_id,
+    personId: membership.person_id,
+    role: membership.role,
+    membershipStatus: membership.membership_status,
+    userStatus: membership.user_status
+  };
+}
+
+function relationshipAuthoritySnapshot(
+  policy: PolicyAuthorityRecord,
+  actor: NonNullable<ReturnType<typeof exactHumanAuthorityActor>>,
+  discovery: RelationshipAuthorityDiscovery,
+  decisions: readonly { key: string; decision: AuthorizationDecision }[]
+) {
+  return {
+    policy,
+    actor,
+    spaces: [...discovery.spaces.values()].sort((left, right) => left.id.localeCompare(right.id)),
+    grants: [...discovery.grants.values()].sort((left, right) => left.id.localeCompare(right.id)),
+    paths: [...discovery.paths.entries()].sort(([left], [right]) => left.localeCompare(right)),
+    decisions: decisions.map(({ key, decision }) => ({
+      key,
+      authorityTokens: [...(decision.evaluatedRelationships ?? [])].sort()
+    }))
+  };
+}
+
+function sameAuthorityValue(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
 }
 
 const b1Actions = new Set<AuthorizationAction>([
@@ -259,10 +605,11 @@ async function b1Decision(
   role: MembershipRole,
   action: AuthorizationAction,
   resource: ResourceRef,
-  options: TransactionAuthorizationDecisionOptions
+  options: TransactionAuthorizationDecisionOptions,
+  authorityDiscovery?: RelationshipAuthorityDiscovery
 ): Promise<AuthorizationDecision> {
   if (action === "person.read") {
-    return personReadDecision(tx, context, role, resource, options.personUseSite);
+    return personReadDecision(tx, context, role, resource, options, authorityDiscovery);
   }
 
   const createActions = new Set<AuthorizationAction>([
@@ -296,7 +643,8 @@ async function b1Decision(
     return nonLeakingB1Deny(context.policyVersion);
   }
   const readable = await canReadSpaceResource(tx, context, spaceId, role, {
-    lockAuthority: options.lockAuthority === true
+    lockAuthority: options.lockAuthority === true,
+    ...(authorityDiscovery ? { authorityDiscovery } : {})
   });
   if (!readable.allowed) return nonLeakingB1Deny(context.policyVersion);
 
@@ -319,7 +667,14 @@ async function b1Decision(
   if (action === "source.tombstone" || action === "organization.create") {
     return ownerOrAdminDecision(context.policyVersion, role, "b1_workspace_authority");
   }
-  const contributor = await contributorAuthority(tx, context, spaceId, role);
+  const contributor = await contributorAuthority(
+    tx,
+    context,
+    spaceId,
+    role,
+    options.lockAuthority === true,
+    authorityDiscovery
+  );
   return contributor.allowed
     ? allow(context.policyVersion, "b1_contributor_authority", undefined, [
         ...readable.authorityTokens,
@@ -426,8 +781,10 @@ async function personReadDecision(
   context: SecurityContext,
   role: MembershipRole,
   resource: ResourceRef,
-  useSite: ResourceRef | undefined
+  options: TransactionAuthorizationDecisionOptions,
+  authorityDiscovery?: RelationshipAuthorityDiscovery
 ): Promise<AuthorizationDecision> {
+  const useSite = options.personUseSite;
   if (resource.type !== "person" || !useSite) return nonLeakingB1Deny(context.policyVersion);
   let associationQuery: string;
   let table: string;
@@ -473,7 +830,10 @@ async function personReadDecision(
     if (!row || !canReadDataClass(context.dataClassCeiling, row.access_class)) {
       return nonLeakingB1Deny(context.policyVersion);
     }
-    const readable = await canReadSpaceResource(tx, context, row.space_id, role);
+    const readable = await canReadSpaceResource(tx, context, row.space_id, role, {
+      lockAuthority: options.lockAuthority === true,
+      ...(authorityDiscovery ? { authorityDiscovery } : {})
+    });
     return readable.allowed
       ? allow(context.policyVersion, "person_use_site_read", undefined, readable.authorityTokens)
       : nonLeakingB1Deny(context.policyVersion);
@@ -496,7 +856,10 @@ async function personReadDecision(
   if (!row || !canReadDataClass(context.dataClassCeiling, row.access_class)) {
     return nonLeakingB1Deny(context.policyVersion);
   }
-  const readable = await canReadSpaceResource(tx, context, row.space_id, role);
+  const readable = await canReadSpaceResource(tx, context, row.space_id, role, {
+    lockAuthority: options.lockAuthority === true,
+    ...(authorityDiscovery ? { authorityDiscovery } : {})
+  });
   return readable.allowed
     ? allow(context.policyVersion, "person_use_site_read", undefined, readable.authorityTokens)
     : nonLeakingB1Deny(context.policyVersion);
@@ -506,23 +869,29 @@ async function contributorAuthority(
   tx: TenantQueryExecutor,
   context: SecurityContext,
   spaceId: string,
-  role: MembershipRole
+  role: MembershipRole,
+  lockAuthority: boolean,
+  authorityDiscovery?: RelationshipAuthorityDiscovery
 ): Promise<{ allowed: boolean; authorityTokens: string[] }> {
   if (role === "owner" || role === "admin") return { allowed: true, authorityTokens: [] };
-  const result = await tx.query<{ id: string; resource_id: string }>(
-    `SELECT grant_record.id, grant_record.resource_id
+  const result = await tx.query<RelationshipAuthorityGrantRow>(
+    `SELECT grant_record.id, grant_record.resource_id, grant_record.resource_type,
+            grant_record.subject_type, grant_record.subject_id, grant_record.relation
        FROM access.access_relationships grant_record
        WHERE grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
          AND grant_record.resource_type = 'space' AND grant_record.resource_id = $3
          AND grant_record.relation IN ('owner','manager','contributor')
          AND ((grant_record.subject_type = 'membership' AND grant_record.subject_id = $4)
            OR (grant_record.subject_type = 'user' AND grant_record.subject_id = $5))
-       ORDER BY grant_record.id LIMIT 1`,
+       ORDER BY grant_record.id LIMIT 1 ${lockAuthority ? "FOR SHARE" : ""}`,
     [context.tenantId, context.workspaceId, spaceId, context.actorMembershipId, context.actorUserId]
   );
   const row = result.rows[0];
+  if (row && authorityDiscovery) recordRelationshipAuthorityGrant(authorityDiscovery, row);
   return row
-    ? { allowed: true, authorityTokens: [spaceGrantToken(row.id, row.resource_id)] }
+    ? authorityDiscovery?.inconsistent
+      ? { allowed: false, authorityTokens: [] }
+      : { allowed: true, authorityTokens: [spaceGrantToken(row.id, row.resource_id)] }
     : { allowed: false, authorityTokens: [] };
 }
 
@@ -1249,23 +1618,30 @@ async function foundationProofCreateDecision(
 
 async function loadActivePolicyVersion(
   tx: TenantQueryExecutor,
-  context: SecurityContext
+  context: SecurityContext,
+  lockAuthority = false
 ): Promise<boolean> {
-  const result = await tx.query<{ id: string }>(
+  return Boolean(await loadActivePolicyRecord(tx, context, lockAuthority));
+}
+
+async function loadActivePolicyRecord(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  lockAuthority: boolean
+): Promise<PolicyAuthorityRecord | undefined> {
+  const result = await tx.query<PolicyAuthorityRecord>(
     `
-    SELECT id
+    SELECT id, status
     FROM identity.policy_versions
     WHERE id = $1
       AND tenant_id = $2
       AND workspace_id = $3
       AND status = 'active'
-    LIMIT 1
-    FOR SHARE
+    LIMIT 1 ${lockAuthority ? "FOR SHARE" : ""}
     `,
     [context.policyVersion, context.tenantId, context.workspaceId]
   );
-
-  return result.rows.length === 1;
+  return result.rows[0];
 }
 
 async function loadActiveMembership(
@@ -1275,7 +1651,8 @@ async function loadActiveMembership(
 ): Promise<MembershipRecord | undefined> {
   const result = await tx.query<MembershipRecord>(
     `
-    SELECT m.role, m.status AS membership_status, u.status AS user_status
+    SELECT m.id AS membership_id, m.user_id, m.person_id, m.role,
+           m.status AS membership_status, u.status AS user_status
     FROM identity.memberships m
     JOIN identity.users u ON u.id = m.user_id
     WHERE m.id = $1
@@ -1291,21 +1668,137 @@ async function loadActiveMembership(
   return result.rows[0];
 }
 
+async function lockRelationshipAuthoritySpaces(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  spaceIds: readonly string[]
+): Promise<RelationshipAuthoritySpaceRow[]> {
+  if (spaceIds.length === 0) return [];
+  const result = await tx.query<RelationshipAuthoritySpaceRow>(
+    `/* relationship_authority_global_spaces */
+     SELECT space_row.id, space_row.parent_space_id, space_row.kind,
+            space_row.access_class, space_row.inheritance_mode
+     FROM access.spaces space_row
+     WHERE space_row.tenant_id = $1 AND space_row.workspace_id = $2
+       AND space_row.id = ANY($3::uuid[]) AND space_row.archived_at IS NULL
+     ORDER BY space_row.id
+     FOR SHARE OF space_row`,
+    [context.tenantId, context.workspaceId, [...spaceIds].sort()]
+  );
+  return result.rows;
+}
+
+async function lockRelationshipAuthorityGrants(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  grantIds: readonly string[]
+): Promise<RelationshipAuthorityGrantRow[]> {
+  if (grantIds.length === 0) return [];
+  const result = await tx.query<RelationshipAuthorityGrantRow>(
+    `/* relationship_authority_global_grants */
+     SELECT grant_record.id, grant_record.resource_id, grant_record.resource_type,
+            grant_record.subject_type, grant_record.subject_id, grant_record.relation
+     FROM access.access_relationships grant_record
+     WHERE grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
+       AND grant_record.id = ANY($3::uuid[])
+       AND grant_record.resource_type = 'space'
+       AND grant_record.relation IN ('owner','manager','contributor','viewer')
+       AND ((grant_record.subject_type = 'membership' AND grant_record.subject_id = $4)
+         OR (grant_record.subject_type = 'user' AND grant_record.subject_id = $5))
+     ORDER BY grant_record.id
+     FOR SHARE OF grant_record`,
+    [
+      context.tenantId,
+      context.workspaceId,
+      [...grantIds].sort(),
+      context.actorMembershipId,
+      context.actorUserId
+    ]
+  );
+  return result.rows;
+}
+
+async function loadRelationshipAuthoritySpace(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  spaceId: string
+): Promise<RelationshipAuthoritySpaceRow | undefined> {
+  const result = await tx.query<RelationshipAuthoritySpaceRow>(
+    `/* relationship_authority_space */
+     SELECT space_row.id, space_row.parent_space_id, space_row.kind,
+            space_row.access_class, space_row.inheritance_mode
+     FROM access.spaces space_row
+     WHERE space_row.tenant_id = $1 AND space_row.workspace_id = $2
+       AND space_row.id = $3 AND space_row.archived_at IS NULL
+     LIMIT 1`,
+    [context.tenantId, context.workspaceId, spaceId]
+  );
+  return result.rows[0];
+}
+
 async function canReadSpaceResource(
   tx: TenantQueryExecutor,
   context: SecurityContext,
   spaceId: string,
   role: MembershipRole,
-  options: { lockedTarget?: { id: string }; lockAuthority?: boolean } = {}
+  options: {
+    lockedTarget?: { id: string };
+    lockAuthority?: boolean;
+    authorityDiscovery?: RelationshipAuthorityDiscovery;
+  } = {}
 ): Promise<{
   allowed: boolean;
   reasonCode: string;
   explanation?: string;
   authorityTokens: string[];
 }> {
+  let discoveredTarget: RelationshipAuthoritySpaceRow | undefined;
+  if (options.authorityDiscovery) {
+    discoveredTarget = await loadRelationshipAuthoritySpace(tx, context, spaceId);
+    if (!discoveredTarget) {
+      return {
+        allowed: false,
+        reasonCode: "space_not_found",
+        explanation: "Space is not visible in the current workspace",
+        authorityTokens: []
+      };
+    }
+    recordRelationshipAuthoritySpace(options.authorityDiscovery, discoveredTarget);
+    if (options.authorityDiscovery.inconsistent) {
+      return {
+        allowed: false,
+        reasonCode: "space_access_denied",
+        explanation: "Current Space authority changed during evaluation",
+        authorityTokens: []
+      };
+    }
+  }
+  let lockedTarget = options.lockedTarget;
+  if (options.lockAuthority && !lockedTarget) {
+    const locked = await tx.query<{ id: string }>(
+      `SELECT id
+       FROM access.spaces
+       WHERE id = $1 AND tenant_id = $2 AND workspace_id = $3 AND archived_at IS NULL
+       LIMIT 1
+       FOR SHARE`,
+      [spaceId, context.tenantId, context.workspaceId]
+    );
+    lockedTarget = locked.rows[0];
+    if (!lockedTarget) {
+      return {
+        allowed: false,
+        reasonCode: "space_not_found",
+        explanation: "Space is not visible in the current workspace",
+        authorityTokens: []
+      };
+    }
+  }
   if (role === "owner" || role === "admin") {
-    if (options.lockedTarget) {
-      return options.lockedTarget.id === spaceId
+    if (discoveredTarget) {
+      return { allowed: true, reasonCode: "workspace_admin_space_read", authorityTokens: [] };
+    }
+    if (lockedTarget) {
+      return lockedTarget.id === spaceId
         ? { allowed: true, reasonCode: "workspace_admin_space_read", authorityTokens: [] }
         : {
             allowed: false,
@@ -1438,25 +1931,44 @@ async function canReadSpaceResource(
     return { allowed: true, reasonCode: "workspace_root_read", authorityTokens: [] };
   }
   if (access.direct_grant_ids.length > 0) {
-    const token = await lockOrConfirmSpaceGrant(
-      tx,
-      context,
-      access.direct_grant_ids[0]!,
-      access.direct_grant_space_ids[0]!,
-      options.lockAuthority === true
-    );
+    const token = options.authorityDiscovery
+      ? await discoverRelationshipAuthorityGrant(
+          tx,
+          context,
+          access.direct_grant_ids[0]!,
+          access.direct_grant_space_ids[0]!,
+          options.authorityDiscovery
+        )
+      : await lockOrConfirmSpaceGrant(
+          tx,
+          context,
+          access.direct_grant_ids[0]!,
+          access.direct_grant_space_ids[0]!,
+          options.lockAuthority === true
+        );
     if (token) {
       return { allowed: true, reasonCode: "direct_space_grant", authorityTokens: [token] };
     }
   }
   if (!access.target_restricted && access.inherited_grant_ids.length > 0) {
-    const token = await lockOrConfirmSpaceGrant(
-      tx,
-      context,
-      access.inherited_grant_ids[0]!,
-      access.inherited_grant_space_ids[0]!,
-      options.lockAuthority === true
-    );
+    const token = options.authorityDiscovery
+      ? await discoverInheritedRelationshipAuthorityGrant(
+          tx,
+          context,
+          spaceId,
+          access.inherited_grant_ids[0]!,
+          access.inherited_grant_space_ids[0]!,
+          options.authorityDiscovery
+        )
+      : options.lockAuthority === true
+        ? await lockOrConfirmInheritedSpaceGrant(
+            tx,
+            context,
+            spaceId,
+            access.inherited_grant_ids[0]!,
+            access.inherited_grant_space_ids[0]!
+          )
+        : spaceGrantToken(access.inherited_grant_ids[0]!, access.inherited_grant_space_ids[0]!);
     if (token) {
       return { allowed: true, reasonCode: "inherited_space_grant", authorityTokens: [token] };
     }
@@ -1468,6 +1980,172 @@ async function canReadSpaceResource(
     explanation: "No current Space grant authorizes this action",
     authorityTokens: []
   };
+}
+
+type InheritedAuthorityPathRow = RelationshipAuthoritySpaceRow & {
+  depth: number;
+};
+
+async function loadInheritedAuthorityPath(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  targetSpaceId: string,
+  grantSpaceId: string
+): Promise<InheritedAuthorityPathRow[] | undefined> {
+  const result = await tx.query<InheritedAuthorityPathRow>(
+    `WITH RECURSIVE authority_path AS (
+       SELECT id, parent_space_id, kind, access_class, inheritance_mode, 0 AS depth
+       FROM access.spaces
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
+         AND archived_at IS NULL
+       UNION ALL
+       SELECT parent.id, parent.parent_space_id, parent.kind, parent.access_class,
+              parent.inheritance_mode, authority_path.depth + 1
+       FROM access.spaces parent
+       JOIN authority_path ON authority_path.parent_space_id = parent.id
+       WHERE parent.tenant_id = $1 AND parent.workspace_id = $2
+         AND parent.archived_at IS NULL
+     )
+     SELECT id, parent_space_id, kind, access_class, inheritance_mode, depth
+     FROM authority_path
+     ORDER BY depth`,
+    [context.tenantId, context.workspaceId, targetSpaceId]
+  );
+  const grantIndex = result.rows.findIndex(({ id }) => id === grantSpaceId);
+  if (grantIndex <= 0) return undefined;
+  const path = result.rows.slice(0, grantIndex + 1);
+  return path.slice(0, -1).some(({ inheritance_mode }) => inheritance_mode === "restricted")
+    ? undefined
+    : path;
+}
+
+async function discoverInheritedRelationshipAuthorityGrant(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  targetSpaceId: string,
+  grantId: string,
+  grantSpaceId: string,
+  discovery: RelationshipAuthorityDiscovery
+): Promise<string | undefined> {
+  const path = await loadInheritedAuthorityPath(tx, context, targetSpaceId, grantSpaceId);
+  if (!path) return undefined;
+  const pathKey = `${targetSpaceId}:${grantSpaceId}`;
+  const pathIds = path.map(({ id }) => id);
+  const priorPath = discovery.paths.get(pathKey);
+  if (priorPath && !sameAuthorityValue(priorPath, pathIds)) discovery.inconsistent = true;
+  else discovery.paths.set(pathKey, pathIds);
+  for (const row of path) recordRelationshipAuthoritySpace(discovery, row);
+  if (discovery.inconsistent) return undefined;
+  return discoverRelationshipAuthorityGrant(tx, context, grantId, grantSpaceId, discovery);
+}
+
+async function discoverRelationshipAuthorityGrant(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  grantId: string,
+  resourceId: string,
+  discovery: RelationshipAuthorityDiscovery
+): Promise<string | undefined> {
+  const result = await tx.query<RelationshipAuthorityGrantRow>(
+    `/* relationship_authority_grant */
+     SELECT grant_record.id, grant_record.resource_id, grant_record.resource_type,
+            grant_record.subject_type, grant_record.subject_id, grant_record.relation
+     FROM access.access_relationships grant_record
+     WHERE grant_record.tenant_id = $1 AND grant_record.workspace_id = $2
+       AND grant_record.id = $3 AND grant_record.resource_id = $4
+       AND grant_record.resource_type = 'space'
+       AND grant_record.relation IN ('owner','manager','contributor','viewer')
+       AND ((grant_record.subject_type = 'membership' AND grant_record.subject_id = $5)
+         OR (grant_record.subject_type = 'user' AND grant_record.subject_id = $6))
+     LIMIT 1`,
+    [
+      context.tenantId,
+      context.workspaceId,
+      grantId,
+      resourceId,
+      context.actorMembershipId,
+      context.actorUserId
+    ]
+  );
+  const row = result.rows[0];
+  if (!row) return undefined;
+  recordRelationshipAuthorityGrant(discovery, row);
+  return discovery.inconsistent ? undefined : spaceGrantToken(row.id, row.resource_id);
+}
+
+function recordRelationshipAuthoritySpace(
+  discovery: RelationshipAuthorityDiscovery,
+  row: RelationshipAuthoritySpaceRow
+): void {
+  const normalized: RelationshipAuthoritySpaceRow = {
+    id: row.id,
+    parent_space_id: row.parent_space_id,
+    kind: row.kind,
+    access_class: row.access_class,
+    inheritance_mode: row.inheritance_mode
+  };
+  const prior = discovery.spaces.get(normalized.id);
+  if (prior && !sameAuthorityValue(prior, normalized)) discovery.inconsistent = true;
+  else discovery.spaces.set(normalized.id, normalized);
+}
+
+function recordRelationshipAuthorityGrant(
+  discovery: RelationshipAuthorityDiscovery,
+  row: RelationshipAuthorityGrantRow
+): void {
+  const normalized: RelationshipAuthorityGrantRow = {
+    id: row.id,
+    resource_id: row.resource_id,
+    resource_type: row.resource_type,
+    subject_type: row.subject_type,
+    subject_id: row.subject_id,
+    relation: row.relation
+  };
+  const prior = discovery.grants.get(normalized.id);
+  if (prior && !sameAuthorityValue(prior, normalized)) discovery.inconsistent = true;
+  else discovery.grants.set(normalized.id, normalized);
+}
+
+async function lockOrConfirmInheritedSpaceGrant(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  targetSpaceId: string,
+  grantId: string,
+  grantSpaceId: string
+): Promise<string | undefined> {
+  const expectedPath = await loadInheritedAuthorityPath(tx, context, targetSpaceId, grantSpaceId);
+  if (!expectedPath) return undefined;
+  const expectedIds = expectedPath.map(({ id }) => id);
+  const locked = await tx.query<{ id: string }>(
+    `SELECT space_row.id
+     FROM access.spaces space_row
+     WHERE space_row.tenant_id = $1 AND space_row.workspace_id = $2
+       AND space_row.id = ANY($3::uuid[]) AND space_row.archived_at IS NULL
+     ORDER BY space_row.id
+     FOR SHARE OF space_row`,
+    [context.tenantId, context.workspaceId, [...expectedIds].sort()]
+  );
+  if (
+    locked.rows.length !== expectedIds.length ||
+    new Set(locked.rows.map(({ id }) => id)).size !== expectedIds.length
+  ) {
+    return undefined;
+  }
+  const currentPath = await loadInheritedAuthorityPath(tx, context, targetSpaceId, grantSpaceId);
+  if (
+    !currentPath ||
+    currentPath.length !== expectedPath.length ||
+    currentPath.some(
+      (row, index) =>
+        row.id !== expectedPath[index]!.id ||
+        row.parent_space_id !== expectedPath[index]!.parent_space_id ||
+        row.inheritance_mode !== expectedPath[index]!.inheritance_mode ||
+        row.depth !== expectedPath[index]!.depth
+    )
+  ) {
+    return undefined;
+  }
+  return lockOrConfirmSpaceGrant(tx, context, grantId, grantSpaceId, true);
 }
 
 async function lockOrConfirmSpaceGrant(

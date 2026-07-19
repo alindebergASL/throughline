@@ -51,18 +51,35 @@ describe("WorkGraphRepository authorized projections", () => {
     });
   });
 
-  it("ends a relationship only when every persisted grant requirement is still current", async () => {
+  it("ends a relationship only while every live human authority input is still current", async () => {
     const grantId = "70000000-0000-7000-8000-000000000006";
     const query = vi.fn(async (sql: string, values?: readonly unknown[]) => {
       expect(sql).toContain("WITH authority AS");
       expect(sql).toContain("UPDATE work.relationships");
+      expect(sql).toContain("FROM identity.policy_versions policy");
+      expect(sql).toContain("JOIN identity.memberships membership");
+      expect(sql).toContain("JOIN identity.users actor_user");
+      expect(sql).toContain("JOIN access.spaces governing_space");
+      expect(sql).toContain("policy.status = 'active'");
+      expect(sql).toContain("membership.status = 'active'");
+      expect(sql).toContain("actor_user.status = 'active'");
+      expect(sql).toContain("governing_space.archived_at IS NULL");
       expect(sql).toContain("NOT EXISTS (");
-      expect(sql).toContain("FROM unnest($8::uuid[], $9::uuid[])");
+      expect(sql).toContain("FROM unnest($10::uuid[], $11::uuid[])");
       expect(sql).toContain("grant_record.id = requirement.grant_id");
       expect(sql).toContain("grant_record.resource_id = requirement.resource_id");
       expect(sql).toContain("grant_record.subject_id = $7");
       expect(sql).toContain("grant_record.subject_id = $6");
-      expect(values?.slice(7)).toEqual([[grantId], [initiativeSpaceId]]);
+      expect(sql).toMatch(
+        /membership\.role IN \('owner','admin'\)[\s\S]*grant_record\.relation IN \('owner','manager','contributor'\)/
+      );
+      expect(sql).toContain("relationship.space_id = $9");
+      expect(values?.slice(7)).toEqual([
+        "default-v1",
+        initiativeSpaceId,
+        [grantId],
+        [initiativeSpaceId]
+      ]);
       return { rows: [{ authorized: false, space_id: null, version: null }] };
     });
     const repository = new WorkGraphRepository({ query } as unknown as TenantDbTransaction);
@@ -76,6 +93,8 @@ describe("WorkGraphRepository authorized projections", () => {
         validTo: "2026-07-17T00:00:00.000Z",
         actorUserId: "70000000-0000-7000-8000-000000000007",
         actorMembershipId: "70000000-0000-7000-8000-000000000008",
+        policyVersionId: "default-v1",
+        governingSpaceId: initiativeSpaceId,
         authorityRequirements: [{ grantId, resourceId: initiativeSpaceId }]
       })
     ).resolves.toEqual({ authorized: false });

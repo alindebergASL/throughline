@@ -80,3 +80,50 @@ export interface TransactionAwareAuthorizationService extends AuthorizationServi
     options?: TransactionAuthorizationDecisionOptions
   ): Promise<AuthorizationDecision>;
 }
+
+type ExactResourceRef<T extends ResourceRef["type"]> = ResourceRef & { type: T };
+
+export type RelationshipAuthorityRequest =
+  | {
+      action: "relationship.end";
+      resource: ExactResourceRef<"relationship">;
+    }
+  | {
+      action: "space.read";
+      resource: ExactResourceRef<"space">;
+    }
+  | {
+      action: "person.read";
+      resource: ExactResourceRef<"person">;
+      personUseSite: ExactResourceRef<"relationship">;
+    }
+  | {
+      action: "organization.read";
+      resource: ExactResourceRef<"organization">;
+    }
+  | {
+      action: "initiative.read";
+      resource: ExactResourceRef<"initiative">;
+    }
+  | {
+      action: "activity.read";
+      resource: ExactResourceRef<"activity">;
+    }
+  | {
+      action: "content.read";
+      resource: ExactResourceRef<"content_item">;
+    };
+
+export interface RelationshipAuthorityBatchingAuthorizationService extends TransactionAwareAuthorizationService {
+  preauthorizeRelationshipEndInTransaction(
+    context: SecurityContext,
+    resource: ExactResourceRef<"relationship">,
+    tx: TenantDbTransaction
+  ): Promise<AuthorizationDecision>;
+
+  lockAndReauthorizeRelationshipAuthorityInTransaction(
+    context: SecurityContext,
+    requests: readonly RelationshipAuthorityRequest[],
+    tx: TenantDbTransaction
+  ): Promise<AuthorizationDecision>;
+}
