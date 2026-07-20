@@ -1,14 +1,17 @@
 # Wave B1 Result — Manual Account Work Graph and Source Capture
 
-- **Date:** 2026-07-19 UTC
-- **Status:** replacement-review BLOCK corrected; fresh pre-result candidate PASS; HOLD remains before final-byte verification, bounded commits, exact-head verification, direct review, publication, merge, deployment, or release
+- **Date:** 2026-07-20 UTC
+- **Status:** PR #7 reconciliation merge committed locally; focused reconciliation checks and a complete post-reconciliation pre-result gate PASS; HOLD remains before final-byte verification, exact-head verification/review, republication, merge, deployment, or release
 - **Branch:** `wave-b1-work-graph-source-capture`
-- **Committed parent:** `6acac5f790cd8e3fae096c243a28c912c7102ba5`
-- **Committed parent tree:** `86657946334e8b22d163e1f4f81e5436bd9360f9`
-- **Authorized base:** `2566cb4649c24217058d32de6a0e088b303bb07b`
-- **Corrected pre-result candidate tree:** `c46c4a5d231fc641233c76e83d46c550d177a712`
+- **Historical published PR #8 head:** `81a58639667a290d395b52116cefa6234b3754c1`
+- **Historical published PR #8 tree:** `66465e4e48fffddca07aeb882823865b43168293`
+- **Original merge base:** `2566cb4649c24217058d32de6a0e088b303bb07b`
+- **Reconciled current main:** `a302c1f4a48a632b965be7bfcd1e8086795c0e8d`
+- **Local reconciliation merge:** `ee467b748d8b9f531b61bdc935cacd58bf419673`
+- **Merge parents:** `81a58639667a290d395b52116cefa6234b3754c1` and `a302c1f4a48a632b965be7bfcd1e8086795c0e8d`
+- **Reconciled pre-result candidate tree:** `f2031959fb2b762e00eee860f3d53fd589f8d45a`
 - **Canonical plan SHA-256:** `38a08d9cd57f3704f45c75bb35f5eb29a03d9a157e247e3ffa0af9ee6b77d39d`
-- **Publication state:** corrections remain uncommitted; no push, PR, merge, deployment, AWS access, or publication has occurred
+- **Publication state:** PR #8 remains OPEN and unmerged at historical remote head `81a58639667a290d395b52116cefa6234b3754c1`; the reconciliation merge and this result update are local only; no deployment, release, AWS/runtime access, or B2 work has occurred
 
 ## Scope and outcome
 
@@ -68,7 +71,7 @@ The candidate PostgreSQL race matrix now covers both serialization directions wi
 
 Authority-wins leaves the Relationship unchanged with zero command/audit/outbox residue and returns the non-leaking authorization contract. Mutation-wins blocks the opposing authority mutation, completes exactly once, then releases it.
 
-The membership, user, policy, and governing-Space mutation-first cases added after the exact-head HOLD passed Hermes' fresh isolated focused PostgreSQL verification. Complete final-byte gating and exact-head rereview remain pending.
+The membership, user, policy, and governing-Space mutation-first cases added after the exact-head HOLD passed Hermes' isolated focused PostgreSQL verification. The subsequent final-byte gate, detached exact-head verifier, direct reviewer, and PR #8 CI all passed for historical tree `66465e4e48fffddca07aeb882823865b43168293`; after PR #7 merged, that evidence remains historical and is not merge authority for the reconciled tree.
 
 ### 4. Source Space-archival race closed
 
@@ -147,7 +150,7 @@ The fresh authoritative migration journal recorded:
 
 Migrations `0001`–`0003` remain byte-identical. Migration-journal SHA-256: `3b1cbf86c9c9b1323cf1b5d7f1ddf9b9fa6256045966aea30a49d573bb52fa74`.
 
-## Complete post-review pre-result authoritative gate
+## Historical pre-PR #7 post-review pre-result authoritative gate
 
 Accepted run:
 
@@ -168,7 +171,7 @@ Start and end candidate trees were both `62204b8ded7cd125b2911fc73a4ee3f480ac673
 
 Ordinary-test skips are intentional collection behavior with service variables unset. The canonical B1 gate had zero authoritative skips.
 
-## Evidence identities
+## Historical pre-PR #7 evidence identities
 
 - summary: `6b1205a3419ca6b40ce97849b82158f8343b358468bcfdff551d43bf9ed76a4f`
 - cleanup: `81223871bcb490bf257d2c46ad50ce902b2cb86ab6dcecab4525a216a148da2c`
@@ -183,7 +186,7 @@ Ordinary-test skips are intentional collection behavior with service variables u
 - authoritative scan: `0a0a36e3c2410daeb306fd0f4cafd1ab9a926b7f17b8f8cec3ec65fcbf60fd8a`
 - migration journal: `3b1cbf86c9c9b1323cf1b5d7f1ddf9b9fa6256045966aea30a49d573bb52fa74`
 
-## Cleanup
+## Historical pre-PR #7 cleanup
 
 Before teardown:
 
@@ -200,13 +203,123 @@ After teardown:
 - lingering repository gate/test processes: 0; and
 - gate exit code: 0.
 
+## PR #7 reconciliation
+
+PR #7 (`fix/throughline-docker-harness-cleanup`) merged as `a302c1f4a48a632b965be7bfcd1e8086795c0e8d` from exact head `8ab7b174849aa934593dde4895115b0ee82ce378`. Post-merge push CI passed at:
+
+`https://github.com/alindebergASL/throughline/actions/runs/29774272560`
+
+The pre-mutation inventory resolved a prior report's ambiguous `228900dd822cb3b5ed22ee674fb0a5cf98fa8560` reference: it is the historical `b1-0-canonical-product-outbox` head for merged PR #6, not PR #8's live head. PR #8's mutation target was and remains `wave-b1-work-graph-source-capture`, whose historical published head was `81a58639667a290d395b52116cefa6234b3754c1`.
+
+One mutation owner created normal merge commit `ee467b748d8b9f531b61bdc935cacd58bf419673` with ordered parents:
+
+1. `81a58639667a290d395b52116cefa6234b3754c1`; and
+2. `a302c1f4a48a632b965be7bfcd1e8086795c0e8d`.
+
+There was no rebase, reset, amend, cherry-pick, force-push, or history rewrite. Git's `ort` strategy auto-merged the sole overlapping path, `package.json`, without conflict. The merge changed exactly the five PR #7 paths relative to the historical PR #8 head:
+
+- `HERMES_RUNBOOK.md` — exact PR #7 bytes, SHA-256 `f0bc7d02d383a2e62c781e6a564f541b68512a54d5e670e89574af7056f91cb7`;
+- `README.md` — exact PR #7 bytes, SHA-256 `03f411998fb3001d41a90494f9d705a7f6b3d9c5ed89e9be873f2c92d45f0aef`;
+- `scripts/throughline-docker-harness.sh` — exact PR #7 bytes, SHA-256 `7e3d0fd79e302f056cb90c2086dc2d73d415121bd0f74fb58806aae5efacc97f`;
+- `scripts/throughline-docker-harness.test.sh` — exact PR #7 bytes, SHA-256 `dab1131ad9dc1607cc780c67afbf47a65dcd9b4b5e6e5c979a42590e37324671`; and
+- `package.json` — mechanical union preserving PR #7's `"test": "pnpm test:docker-harness && turbo test"` and `test:docker-harness` command plus B1's complete `test:b1` command.
+
+Migrations `0001`–`0003` remain byte-identical at the hashes recorded above. No B1 production, migration, security-boundary, canonical product-document, or accepted-ADR bytes changed during reconciliation.
+
+The external pre-reconciliation manifest and verified Git bundle are preserved under:
+
+`/home/ubuntu/.hermes/rollouts/throughline-pr8-reconcile-pr7-20260720`
+
+## Focused reconciliation evidence
+
+- repository Docker-harness regression: PASS;
+- focused B1 architecture, test-gate, and dependency-boundary checks: 3 files / 10 tests PASS;
+- exact five-path merge scope: PASS;
+- exact PR #7 script/README/runbook bytes: PASS;
+- combined `test`, `test:docker-harness`, and `test:b1` commands: PASS;
+- migrations `0001`–`0003` unchanged: PASS;
+- candidate tree unchanged during focused checks: `f2031959fb2b762e00eee860f3d53fd589f8d45a`;
+- pre-existing dangling-volume set unchanged at exactly 16 volumes; and
+- protected `throughline-postgres-1`, `throughline-localstack-1`, `throughline_postgres-data`, and `throughline_localstack-data` identities remained untouched.
+
+Focused log SHA-256 values:
+
+- Docker harness: `114987f0e56b576aa8a5c667ab0b64f6716d4d3f6a67e67e7a126cf5e59297b6`;
+- focused B1: `8075b771f90d9f3236285355b103128455faaee3c4dbdeea424981790d145334`.
+
+## Rejected diagnostic gate
+
+The first generated post-reconciliation gate run is preserved at:
+
+`/home/ubuntu/.hermes/rollouts/throughline-pr8-reconcile-pr7-20260720/authoritative-pr8-reconciled-preresult-20260720T213732Z-4038005`
+
+It stopped fail-closed at the explicit Foundation preflight because the disposable database name omitted the required `test` marker. This was an external rollout-harness naming error, not a repository change or product failure. Its cleanup still proved zero residual clients, exact disposable-container removal through the repository harness, the unchanged 16-volume dangling set, untouched protected services, and zero lingering repository processes. It is diagnostic evidence only and is not counted as PASS.
+
+## Accepted post-reconciliation pre-result authoritative gate
+
+Accepted run:
+
+`/home/ubuntu/.hermes/rollouts/throughline-pr8-reconcile-pr7-20260720/authoritative-pr8-reconciled-preresult-20260720T215546Z-4054507`
+
+Start and end candidate trees were both `f2031959fb2b762e00eee860f3d53fd589f8d45a`.
+
+| Stage | Result | Evidence |
+| --- | ---: | --- |
+| `pnpm install --frozen-lockfile` | PASS | frozen lockfile accepted |
+| `pnpm format:check` | PASS | zero formatting errors |
+| `pnpm lint` | PASS | zero lint errors |
+| `pnpm typecheck` | PASS | zero type errors |
+| ordinary `pnpm test` | PASS | repository Docker-harness regression PASS; 45 files and 656 tests passed; 10 files / 299 service-backed tests intentionally skipped outside authoritative service mode |
+| `pnpm build` | PASS | all build tasks passed |
+| explicit `pnpm test:security` | PASS | 3 files / 114 tests; 0 skipped |
+| explicit `pnpm test:foundation` | PASS | 14 files / 477 tests; 0 skipped |
+| explicit `pnpm test:b1-0` | PASS | 26 files / 727 tests; 0 skipped |
+| canonical `pnpm test:b1` | PASS | 45 files / 985 tests; 0 skipped; 0 unhandled errors |
+| `git diff --check` | PASS | zero whitespace errors |
+
+The authoritative service-backed logs had zero skips and zero unhandled errors. The migration journal remained exact.
+
+Accepted evidence SHA-256 values:
+
+- summary: `584dd70298cb647179dae90d14f06562c6fa247b22d2ea8515a4f0fad726cc28`;
+- cleanup: `cc15955a461579795eb3114d65d412f6faecf7696ef4e89d594402dd3a063db8`;
+- frozen install: `6a4d3b8aa8d1508317753dc2b2bed42ccc56a0f1e8e21ede343761d4bd755de7`;
+- format: `68ea59b69f4f3f8e0a01c9213bb41f1e4b4578b764f035ded18d28bae6ea05f0`;
+- lint: `81758c3e0131618e4238c2c9e014eceaa683b947ec0e07df1ba1e38c493a5c8a`;
+- typecheck: `293aa25b875c0c052f935cb78dbf55345ec153d3167d065131e6f3cc4bf83889`;
+- ordinary test: `0671dc818c7a97e8f49813b2d4d7a3a6c5d32fcd8fbad00d80c499261efb1fcf`;
+- build: `1dc571d83b398333bcf65b46aedfd5b166f24c5ef135cadcc5c3e6b253677b40`;
+- security: `0c75ba28957531ce3f21c09ede941e8c221ca5b56056c774e64a4d434d608f3d`;
+- Foundation: `d271491637f92f2945a5f464a7deb1f8c8d0292b83354eaad8a5a53c3b1a93b8`;
+- B1.0: `8f8effb454c8041753da9c9c25e3926431eefbe000b76f3a9c8394544c756745`;
+- canonical B1: `ca9e0d29f10a30da56a90994d0c7fed9314e7c22b9d14e7d20d30e056e57184c`;
+- diff check: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
+- authoritative scan: `036e768f9350ba79fe1aa3264229a035079fc618063bcfa86e4a8c788e99cee0`;
+- migration journal: `3b1cbf86c9c9b1323cf1b5d7f1ddf9b9fa6256045966aea30a49d573bb52fa74`.
+
+## Post-reconciliation Docker cleanup proof
+
+Before and after the accepted gate:
+
+- pre-existing dangling-volume count: exactly 16;
+- dangling-volume set SHA-256: `0e50889a556c819f1b018b44556f3438a41f0631b8c26ae736f43fcddf9f2b6d` both before and after;
+- all-volume set SHA-256: `8bd1d16f9c27e032d59de28735ae20360e36c38239600476278f73e808359038` both before and after;
+- protected-service fingerprint SHA-256: `4ddfd1b108d2687c92ac95093a2ab16a42d37d689ac16938bde7fb93bf63de68` both before and after;
+- disposable PostgreSQL and LocalStack IDs and names absent after cleanup: PASS;
+- repository-owned Docker-harness cleanup result: 0;
+- residual PostgreSQL client connections: 0;
+- lingering repository processes before and after cleanup: 0; and
+- gate exit code: 0.
+
+No legacy volume was deleted. The protected live PostgreSQL and LocalStack containers, their start identities, and their named volumes remained untouched.
+
 ## Final-byte binding and HOLD
 
-This record describes the accepted corrected pre-result candidate. Updating this file changes the candidate tree, so it does not itself claim final-byte PASS.
+This updated record describes the accepted reconciled pre-result candidate. Updating this file changes the candidate tree, so the accepted pre-result gate is historical evidence for the immediately preceding result bytes and does not itself claim final-byte PASS.
 
-The next mandatory step is one complete fresh gate over the candidate including these exact result-file bytes. That gate must again prove identical start/end trees, exact migration identity, all stages passing, zero authoritative skips, zero unhandled errors, zero residual connections, absent disposable containers, and no lingering gate/test processes.
+The next mandatory step is one complete fresh gate over the candidate including these exact result-file bytes. That gate must again prove identical start/end trees, exact migration identity, all stages passing, zero authoritative skips, zero unhandled errors, zero residual connections, repository-harness removal of disposable containers and volumes, unchanged 16-volume dangling set, untouched protected services, and no lingering repository processes.
 
-HOLD remains before bounded commits, detached exact-head verification, a fresh independent direct read-only review, push, PR, merge, deployment, release, or B2 work.
+HOLD remains before the result update commit, detached exact-head verification, fresh direct read-only review, normal push, PR #8 description update, exact-new-head GitHub Actions, or a durable reconciliation checkpoint. Merge, deployment, release, AWS/runtime access, B2 work, real Kanban dispatch, canonical-document changes, accepted-ADR changes, shared Hermes-control changes, and Atliera actions remain unauthorized.
 
 ## Spec deviations
 
@@ -214,4 +327,4 @@ None identified.
 
 ## Known issues
 
-No known B1 implementation blocker remains after the exact-head review correction and fresh post-review pre-result gate. Final-byte gating and exact-head rereview remain intentionally pending.
+No known B1 implementation blocker remains after PR #7 reconciliation and the accepted post-reconciliation pre-result gate. Final-byte gating, exact-head verification/review, republication, and CI remain intentionally pending.
