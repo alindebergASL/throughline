@@ -58,7 +58,7 @@ The command now:
 8. performs the versioned mutation through an atomic predicate binding active policy, active membership, active user, current role, active governing Space, and every exact relied-upon grant; and
 9. writes the audit, canonical product outbox, and command completion atomically.
 
-PostgreSQL races prove both serialization directions without deadlock for:
+The candidate PostgreSQL race matrix now covers both serialization directions without deadlock for:
 
 - membership, user, policy, governing-Space, and endpoint-grant revocation;
 - intermediate inherited-path restriction;
@@ -67,6 +67,8 @@ PostgreSQL races prove both serialization directions without deadlock for:
 - an opposing ancestor-first multi-row Space mutation that also requests the governing Space.
 
 Authority-wins leaves the Relationship unchanged with zero command/audit/outbox residue and returns the non-leaking authorization contract. Mutation-wins blocks the opposing authority mutation, completes exactly once, then releases it.
+
+The membership, user, policy, and governing-Space mutation-first cases added after the exact-head HOLD passed Hermes' fresh isolated focused PostgreSQL verification. Complete final-byte gating and exact-head rereview remain pending.
 
 ### 4. Source Space-archival race closed
 
@@ -110,27 +112,27 @@ Command reservation now occurs only after the Relationship and full authority ba
 
 Accepted run:
 
-`/home/ubuntu/.hermes/rollouts/throughline-b1-fourth-review-correction-20260717T210807Z/focused-postgres-20260719T185924Z-3235703`
+`/home/ubuntu/.hermes/rollouts/throughline-b1-final-review-correction-20260720/focused-postgres-20260720T173823Z-3869540`
 
 - authorization service: 86/86 tests;
 - B1 product-domain PostgreSQL: 17/17 tests;
-- manual workflow and concurrency: 34/34 tests;
-- total: 137/137 tests;
+- manual workflow and concurrency: 35/35 tests;
+- total: 138/138 tests;
 - authoritative skips: 0;
 - unhandled errors: 0;
-- start/end candidate trees: `c46c4a5d231fc641233c76e83d46c550d177a712`;
+- start/end candidate trees: `6b00bf8e4e45f59807b52d6a5c1540890aeab6c8`;
 - residual PostgreSQL client connections: 0;
 - disposable PostgreSQL container absent after cleanup: PASS; and
 - lingering repository processes: 0.
 
 Focused evidence SHA-256 values:
 
-- summary: `1b7f5df1493fca5a7ca49b1d50d5fe56390f36b2894a9509944325e38fdd3a96`
-- cleanup: `07485a4ac6fd0c4ec665ae5bca99259d7ffb36f854e33fd27230798c0a83e548`
+- summary: `d1f43d15411364fa45be17aa931a35903b5dfb1e3e2fd0da24265d1ea0fcf8ae`
+- cleanup: `111e2b66906fdaddf9ea150249203cfc902d6db0b89de57557d36a982780c52c`
 - log scan: `7de5fa3fe2de775e29ed6ce5526b15bba8e2833066e534b43a4a9f051cc1a3a1`
-- authorization log: `45c33b2de632a08048a0923c81e4924f1aa574b9c98568bc38f452a2c47ba5e7`
-- B1 product-domain log: `3ceb71366625664c1c41043052f42e9dfc4e38806af427c999aaa829c16443ef`
-- manual-workflow log: `e9382ba8e4c2d892d9280f4972d2b175a48a53fdc3efec80ab78944c2125aaae`
+- authorization log: `bc03b7b58a93ab4e3f90cd5c16318507663a10587c7fd7fb46aba886e192e84b`
+- B1 product-domain log: `de106094abbcbdf0c0403ce9c8f27cfe99d2323f11ad8511c0f19cb189364c6b`
+- manual-workflow log: `0d94614dd2fab03dcd85b0d72ec6794777086ec6d4be9dcc2828add8220485ab`
 
 ## Migration identity and catalog proof
 
@@ -145,13 +147,13 @@ The fresh authoritative migration journal recorded:
 
 Migrations `0001`–`0003` remain byte-identical. Migration-journal SHA-256: `3b1cbf86c9c9b1323cf1b5d7f1ddf9b9fa6256045966aea30a49d573bb52fa74`.
 
-## Complete corrected pre-result authoritative gate
+## Complete post-review pre-result authoritative gate
 
 Accepted run:
 
-`/home/ubuntu/.hermes/rollouts/throughline-b1-fourth-review-correction-20260717T210807Z/authoritative-b1-20260719T190156Z-3238372`
+`/home/ubuntu/.hermes/rollouts/throughline-b1-final-review-correction-20260720/authoritative-b1-20260720T174555Z-3875816`
 
-Start and end candidate trees were both `c46c4a5d231fc641233c76e83d46c550d177a712`.
+Start and end candidate trees were both `62204b8ded7cd125b2911fc73a4ee3f480ac6735`.
 
 | Stage | Result | Evidence |
 | --- | ---: | --- |
@@ -159,24 +161,24 @@ Start and end candidate trees were both `c46c4a5d231fc641233c76e83d46c550d177a71
 | `pnpm format:check` | PASS | zero formatting errors |
 | `pnpm lint` | PASS | zero lint errors |
 | `pnpm typecheck` | PASS | zero type errors |
-| ordinary `pnpm test`, service variables intentionally unset | PASS | 45 files passed, 10 skipped; 656 tests passed, 298 service-backed tests skipped |
+| ordinary `pnpm test`, service variables intentionally unset | PASS | 45 files passed, 10 skipped; 656 tests passed, 299 service-backed tests skipped |
 | `pnpm build` | PASS | all build tasks passed |
-| canonical `pnpm test:b1`, invoked exactly once | PASS | 45 files and 984 tests passed; 0 skipped; 0 unhandled errors |
+| canonical `pnpm test:b1`, invoked exactly once | PASS | 45 files and 985 tests passed; 0 skipped; 0 unhandled errors |
 | `git diff --check` | PASS | zero whitespace errors |
 
 Ordinary-test skips are intentional collection behavior with service variables unset. The canonical B1 gate had zero authoritative skips.
 
 ## Evidence identities
 
-- summary: `b1f1dd3515989307cb83ea2b9c5574830eefe8f85626381ac78dfb54b34e0ac3`
-- cleanup: `8aa8762a8569d81bf8439588ee293fb57a1559165ee6c8d99665caaf1fbb95db`
-- frozen install log: `087cc219be1176d501720a054ba1ab2186733181b6c36330b41ebe4f648a47c6`
+- summary: `6b1205a3419ca6b40ce97849b82158f8343b358468bcfdff551d43bf9ed76a4f`
+- cleanup: `81223871bcb490bf257d2c46ad50ce902b2cb86ab6dcecab4525a216a148da2c`
+- frozen install log: `f6c3ead6a0216ab8e49a34f03794cf2e52b8070a22835f9f54eb7c0cbdaa835a`
 - formatting log: `68ea59b69f4f3f8e0a01c9213bb41f1e4b4578b764f035ded18d28bae6ea05f0`
-- lint log: `d632b838686f60134b789835be888df1879ccceb705d2581bbe2136d529e68fc`
-- typecheck log: `2d638f5380c790fa4e7aae4346795d047f2287fc2fc37a60419f3b1b2e4aa5b4`
-- ordinary-test log: `508fa540e48d2290805f3ed595632f56bc99770b925f4e4534072eda34c9b0d0`
-- build log: `282e37679bd2582d16aa74876c7c017d7462decac48227650bb7d78526715459`
-- complete B1 log: `0be765f2aafcd888d7a6fb7bc1073cf10442512ad295cc296cc5b7a26b13e246`
+- lint log: `12eda237957e39e56c75d42300f7d3204bf64bf22db9bdca25a294e20c3bb81b`
+- typecheck log: `1c189a4ee878c809e90e6fc64c44c8838a08bbccd9c5ede23284a513a5f7e3b2`
+- ordinary-test log: `d5a8aeec42ab665bf79d09735551b5c7dfa0fe07e64c6e4b616bd90ae087d9fa`
+- build log: `9753b15e3b6969cc5758fa1b628b8a30fc905b7b24a48d81b6294a6f8d8e9db9`
+- complete B1 log: `b3b2c1997986aa572274c0ce6a670d6f3c1973c6cb93edd42965c8f67df27dc2`
 - diff log: `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
 - authoritative scan: `0a0a36e3c2410daeb306fd0f4cafd1ab9a926b7f17b8f8cec3ec65fcbf60fd8a`
 - migration journal: `3b1cbf86c9c9b1323cf1b5d7f1ddf9b9fa6256045966aea30a49d573bb52fa74`
@@ -212,4 +214,4 @@ None identified.
 
 ## Known issues
 
-No known B1 implementation blocker remains after the replacement-review correction and fresh pre-result gate. Final-byte gating and exact-head reviews remain intentionally pending.
+No known B1 implementation blocker remains after the exact-head review correction and fresh post-review pre-result gate. Final-byte gating and exact-head rereview remain intentionally pending.
