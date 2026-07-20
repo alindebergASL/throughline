@@ -105,6 +105,67 @@ If a tool is not installed or not authenticated, record it clearly and stop befo
 
 ---
 
+## Disposable Docker verification harnesses
+
+PostgreSQL/pgvector and LocalStack images declare data `VOLUME`s. A detached container launched with
+`--rm` and then force-removed by a cleanup trap can leave those anonymous volumes behind. Future
+Throughline verification harnesses that launch either image directly must source the repository-owned
+helper; do not copy an older rollout script's Docker lifecycle:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+repo="${repo:-$(git rev-parse --show-toplevel)}"
+source "$repo/scripts/throughline-docker-harness.sh"
+
+cleanup() {
+  local rc=$? cleanup_rc
+  trap - EXIT INT TERM
+  set +e
+  # Capture any gate-specific diagnostics before removing the services.
+  throughline_docker_harness_cleanup
+  cleanup_rc=$?
+  if [ "$rc" -eq 0 ] && [ "$cleanup_rc" -ne 0 ]; then rc="$cleanup_rc"; fi
+  exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Install traps before initialization so an initialization failure cannot bypass
+# the harness cleanup path. Use a collision-resistant suffix for concurrent gates.
+run_id="${THROUGHLINE_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+db_name=throughline_harness_test
+pg_name="throughline-gate-pg-$run_id"
+ls_name="throughline-gate-localstack-$run_id"
+throughline_docker_harness_init
+
+throughline_docker_run "$pg_name" \
+  -e POSTGRES_DB="$db_name" \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_HOST_AUTH_METHOD=trust \
+  -p 127.0.0.1::5432 \
+  pgvector/pgvector:pg16
+throughline_docker_run "$ls_name" \
+  -e SERVICES=sqs,s3 \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  -p 127.0.0.1::4566 \
+  localstack/localstack:3.6
+```
+
+The helper snapshots the pre-run dangling-volume set, rejects Docker `--rm` and caller-supplied
+`--name`, creates and records only `throughline-*` containers before starting them, removes each recorded
+container with `docker rm -f -v`, verifies the containers are absent, and fails the gate if any new
+dangling volume remains. The dangling-volume assertion is intentionally host-wide and fail-closed: an
+unrelated process that leaks a volume during the gate will also fail the check and must be investigated.
+A caller may prepend its own domain-specific cleanup diagnostics, but must fold a helper cleanup failure
+into the final exit status as shown. Historical `.hermes/rollouts/` scripts are immutable evidence; do not
+edit or rerun their older `docker run -d --rm` lifecycle as the canonical implementation. Generate all
+new gates from the current repo/runbook and run `pnpm test:docker-harness` before using a changed
+harness.
+
+---
+
 ## Branching model
 
 Do not work directly on `main`.
