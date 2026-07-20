@@ -101,6 +101,16 @@ Run the focused Wave A1 smoke tests:
 pnpm test:smoke
 ```
 
+Run the repository-owned regression for disposable PostgreSQL/LocalStack harness cleanup:
+
+```bash
+pnpm test:docker-harness
+```
+
+Future direct Docker verification gates must use `scripts/throughline-docker-harness.sh` as documented
+in `HERMES_RUNBOOK.md`; it records immutable container IDs, deterministically removes each exact test
+container's anonymous volumes, and fails if the run leaves any new dangling volume.
+
 Wave A2 migrations are applied in deterministic filename order through a durable
 `throughline_migrations.journal`. Each filename, SHA-256 checksum, and applied timestamp is
 recorded atomically with its SQL. Reapplying an unchanged migration is a no-op; changing an applied
