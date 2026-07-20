@@ -73,25 +73,57 @@ throughline_docker_run() {
         printf 'Do not override Docker --name; the harness owns the validated Throughline container name.\n' >&2
         return 1
         ;;
+      --cidfile|--cidfile=*)
+        printf 'Do not override Docker --cidfile; the harness uses it to preserve immutable ownership.\n' >&2
+        return 1
+        ;;
     esac
   done
 
-  if grep -Fqx -- "$name" "$_THROUGHLINE_DOCKER_HARNESS_STATE_DIR/containers"; then
-    printf 'Container is already registered with this harness: %s\n' "$name" >&2
-    return 1
-  fi
+  local registered_id registered_name
+  while IFS=$'\t' read -r registered_id registered_name; do
+    if [[ "$registered_name" == "$name" ]]; then
+      printf 'Container is already registered with this harness: %s\n' "$name" >&2
+      return 1
+    fi
+  done <"$_THROUGHLINE_DOCKER_HARNESS_STATE_DIR/containers"
 
-  local container_id
-  if ! container_id="$(throughline_docker_cli create --name "$name" "$@")"; then
+  local container_id pending_id pending_name
+  pending_id="$_THROUGHLINE_DOCKER_HARNESS_STATE_DIR/pending-id"
+  pending_name="$_THROUGHLINE_DOCKER_HARNESS_STATE_DIR/pending-name"
+  if [[ -e "$pending_id" || -e "$pending_name" ]]; then
+    printf 'A pending Throughline container identity requires cleanup before another launch.\n' >&2
     return 1
   fi
-  if ! printf '%s\n' "$name" >>"$_THROUGHLINE_DOCKER_HARNESS_STATE_DIR/containers"; then
-    printf 'Unable to record container; removing it immediately: %s\n' "$name" >&2
-    throughline_docker_cli rm -f -v "$name" >/dev/null 2>&1 || true
+  if ! printf '%s\n' "$name" >"$pending_name"; then
+    printf 'Unable to record the pending Throughline container name: %s\n' "$name" >&2
     return 1
   fi
-  if ! throughline_docker_cli start "$name" >/dev/null; then
-    printf 'Failed to start recorded Throughline test container: %s\n' "$name" >&2
+  if ! throughline_docker_cli create --cidfile "$pending_id" --name "$name" "$@" >/dev/null; then
+    if [[ ! -s "$pending_id" ]]; then
+      rm -f "$pending_id" "$pending_name"
+    fi
+    return 1
+  fi
+  if [[ ! -s "$pending_id" ]]; then
+    printf 'Docker create did not write an immutable container ID for %s.\n' "$name" >&2
+    return 1
+  fi
+  container_id="$(<"$pending_id")"
+  if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ ]]; then
+    printf 'Docker create wrote an invalid immutable container ID for %s; refusing name-based deletion.\n' "$name" >&2
+    return 1
+  fi
+  if ! printf '%s\t%s\n' "$container_id" "$name" >>"$_THROUGHLINE_DOCKER_HARNESS_STATE_DIR/containers"; then
+    printf 'Unable to record container; removing its exact ID immediately: %s (%s)\n' "$name" "$container_id" >&2
+    if throughline_docker_cli rm -f -v "$container_id" >/dev/null 2>&1; then
+      rm -f "$pending_id" "$pending_name"
+    fi
+    return 1
+  fi
+  rm -f "$pending_id" "$pending_name"
+  if ! throughline_docker_cli start "$container_id" >/dev/null; then
+    printf 'Failed to start recorded Throughline test container: %s (%s)\n' "$name" "$container_id" >&2
     return 1
   fi
   printf '%s\n' "$container_id"
@@ -105,19 +137,57 @@ throughline_docker_harness_cleanup() {
 
   # Clear first so a caller's EXIT trap can safely invoke cleanup more than once.
   _THROUGHLINE_DOCKER_HARNESS_STATE_DIR=""
-  local cleanup_status=0 name raw_current current new_volumes
+  local cleanup_status=0 container_id name raw_current current new_volumes
+  local cleanup_entries cleanup_entries_unique pending_id pending_name
+  cleanup_entries="$state_dir/cleanup-entries"
+  cleanup_entries_unique="$state_dir/cleanup-entries-unique"
+  pending_id="$state_dir/pending-id"
+  pending_name="$state_dir/pending-name"
 
-  while IFS= read -r name; do
-    [[ -n "$name" ]] || continue
-    if ! throughline_docker_cli rm -f -v "$name"; then
-      printf 'Failed to remove Throughline test container and its anonymous volumes: %s\n' "$name" >&2
+  if ! : >"$cleanup_entries"; then
+    printf 'Unable to prepare Throughline container cleanup state.\n' >&2
+    cleanup_status=1
+  fi
+  if [[ -s "$pending_id" && -s "$pending_name" ]]; then
+    container_id="$(<"$pending_id")"
+    name="$(<"$pending_name")"
+    if [[ "$container_id" =~ ^[0-9a-f]{64}$ && "$name" =~ ^throughline-[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+      printf '%s\t%s\n' "$container_id" "$name" >>"$cleanup_entries" || cleanup_status=1
+    else
+      printf 'Invalid pending Throughline container identity; refusing name-based cleanup.\n' >&2
       cleanup_status=1
     fi
-    if throughline_docker_cli container inspect "$name" >/dev/null 2>&1; then
-      printf 'Throughline test container still exists after cleanup: %s\n' "$name" >&2
-      cleanup_status=1
-    fi
-  done <"$state_dir/containers"
+  elif [[ -e "$pending_id" || -e "$pending_name" ]]; then
+    printf 'Incomplete pending Throughline container identity; refusing name-based cleanup.\n' >&2
+    cleanup_status=1
+  fi
+  if ! cat "$state_dir/containers" >>"$cleanup_entries"; then
+    printf 'Unable to read recorded Throughline container identities.\n' >&2
+    cleanup_status=1
+  fi
+  if ! LC_ALL=C sort -u "$cleanup_entries" >"$cleanup_entries_unique"; then
+    printf 'Unable to normalize recorded Throughline container identities.\n' >&2
+    cleanup_status=1
+  fi
+
+  if [[ -f "$cleanup_entries_unique" ]]; then
+    while IFS=$'\t' read -r container_id name || [[ -n "$container_id" ]]; do
+      [[ -n "$container_id" && -n "$name" ]] || continue
+      if [[ ! "$container_id" =~ ^[0-9a-f]{64}$ || ! "$name" =~ ^throughline-[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+        printf 'Invalid recorded Throughline container identity; refusing cleanup entry.\n' >&2
+        cleanup_status=1
+        continue
+      fi
+      if ! throughline_docker_cli rm -f -v "$container_id"; then
+        printf 'Failed to remove exact Throughline test container and its anonymous volumes: %s (%s)\n' "$name" "$container_id" >&2
+        cleanup_status=1
+      fi
+      if throughline_docker_cli container inspect "$container_id" >/dev/null 2>&1; then
+        printf 'Exact Throughline test container still exists after cleanup: %s (%s)\n' "$name" "$container_id" >&2
+        cleanup_status=1
+      fi
+    done <"$cleanup_entries_unique"
+  fi
 
   raw_current="$state_dir/current.raw"
   current="$state_dir/current"
@@ -139,7 +209,16 @@ throughline_docker_harness_cleanup() {
     cleanup_status=1
   fi
 
-  rm -f "$state_dir/containers" "$state_dir/baseline" "$raw_current" "$current" "$new_volumes"
+  rm -f \
+    "$state_dir/containers" \
+    "$state_dir/baseline" \
+    "$pending_id" \
+    "$pending_name" \
+    "$cleanup_entries" \
+    "$cleanup_entries_unique" \
+    "$raw_current" \
+    "$current" \
+    "$new_volumes"
   if ! rmdir "$state_dir" 2>/dev/null; then
     printf 'Unable to remove Throughline Docker harness state directory: %s\n' "$state_dir" >&2
     cleanup_status=1

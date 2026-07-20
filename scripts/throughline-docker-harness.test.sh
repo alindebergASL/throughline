@@ -16,6 +16,21 @@ printf '\n' >>"$FAKE_DOCKER_STATE/invocations.log"
 command_name="${1:-}"
 subcommand="${2:-}"
 
+resolve_container_reference() {
+  local reference="$1"
+  if [[ -e "$FAKE_DOCKER_STATE/containers/$reference" ]]; then
+    RESOLVED_NAME="$reference"
+    RESOLVED_ID="$(<"$FAKE_DOCKER_STATE/container-ids/$reference")"
+    return 0
+  fi
+  if [[ -e "$FAKE_DOCKER_STATE/ids/$reference" ]]; then
+    RESOLVED_ID="$reference"
+    RESOLVED_NAME="$(<"$FAKE_DOCKER_STATE/ids/$reference")"
+    return 0
+  fi
+  return 1
+}
+
 if [[ "$command_name" == "volume" && "$subcommand" == "ls" ]]; then
   sort -u "$FAKE_DOCKER_STATE/dangling"
   exit 0
@@ -25,6 +40,7 @@ if [[ "$command_name" == "run" || "$command_name" == "create" ]]; then
   lifecycle_command="$command_name"
   shift
   name=""
+  cidfile=""
   while (($#)); do
     if [[ "$1" == "--name" ]]; then
       name="${2:-}"
@@ -36,36 +52,62 @@ if [[ "$command_name" == "run" || "$command_name" == "create" ]]; then
       shift
       continue
     fi
+    if [[ "$1" == "--cidfile" ]]; then
+      cidfile="${2:-}"
+      shift 2
+      continue
+    fi
+    if [[ "$1" == --cidfile=* ]]; then
+      cidfile="${1#--cidfile=}"
+      shift
+      continue
+    fi
     shift
   done
   [[ -n "$name" ]]
+  if [[ "${FAKE_DOCKER_FAIL_CREATE:-0}" == "1" ]]; then
+    exit 125
+  fi
   [[ ! -e "$FAKE_DOCKER_STATE/containers/$name" ]]
-  touch "$FAKE_DOCKER_STATE/containers/$name"
   counter="$(<"$FAKE_DOCKER_STATE/counter")"
   counter=$((counter + 1))
   printf '%s\n' "$counter" >"$FAKE_DOCKER_STATE/counter"
+  printf -v container_id '%064x' "$counter"
+  touch "$FAKE_DOCKER_STATE/containers/$name"
+  printf '%s\n' "$container_id" >"$FAKE_DOCKER_STATE/container-ids/$name"
+  printf '%s\n' "$name" >"$FAKE_DOCKER_STATE/ids/$container_id"
   printf 'anonymous-%s\n' "$counter" >"$FAKE_DOCKER_STATE/volumes/$name"
+  if [[ -n "$cidfile" && "${FAKE_DOCKER_SKIP_CIDFILE:-0}" != "1" ]]; then
+    if [[ "${FAKE_DOCKER_MALFORMED_CIDFILE:-0}" == "1" ]]; then
+      printf 'not-a-container-id\n' >"$cidfile"
+    else
+      printf '%s\n' "$container_id" >"$cidfile"
+    fi
+  fi
+  if [[ "${FAKE_DOCKER_FAIL_AFTER_CIDFILE:-0}" == "1" ]]; then
+    exit 125
+  fi
   if [[ "$lifecycle_command" == "run" && "${FAKE_DOCKER_FAIL_START:-0}" == "1" ]]; then
     exit 125
   fi
-  printf 'fake-container-%s\n' "$counter"
+  printf '%s\n' "$container_id"
   exit 0
 fi
 
 if [[ "$command_name" == "start" ]]; then
-  name="${2:-}"
-  [[ -e "$FAKE_DOCKER_STATE/containers/$name" ]]
+  reference="${2:-}"
+  resolve_container_reference "$reference"
   if [[ "${FAKE_DOCKER_FAIL_START:-0}" == "1" ]]; then
     exit 125
   fi
-  printf '%s\n' "$name"
+  printf '%s\n' "$reference"
   exit 0
 fi
 
 if [[ "$command_name" == "rm" ]]; then
   shift
   remove_volumes=0
-  names=()
+  references=()
   while (($#)); do
     case "$1" in
       -v|--volumes|-fv|-vf)
@@ -74,13 +116,15 @@ if [[ "$command_name" == "rm" ]]; then
       -f|--force)
         ;;
       *)
-        names+=("$1")
+        references+=("$1")
         ;;
     esac
     shift
   done
-  for name in "${names[@]}"; do
-    [[ -e "$FAKE_DOCKER_STATE/containers/$name" ]]
+  for reference in "${references[@]}"; do
+    resolve_container_reference "$reference"
+    name="$RESOLVED_NAME"
+    container_id="$RESOLVED_ID"
     if [[ "${FAKE_DOCKER_FAIL_RM:-0}" == "1" ]]; then
       exit 1
     fi
@@ -88,16 +132,20 @@ if [[ "$command_name" == "rm" ]]; then
       cat "$FAKE_DOCKER_STATE/volumes/$name" >>"$FAKE_DOCKER_STATE/dangling"
     fi
     if [[ "${FAKE_DOCKER_KEEP_CONTAINER:-0}" != "1" ]]; then
-      rm -f "$FAKE_DOCKER_STATE/containers/$name" "$FAKE_DOCKER_STATE/volumes/$name"
+      rm -f \
+        "$FAKE_DOCKER_STATE/containers/$name" \
+        "$FAKE_DOCKER_STATE/container-ids/$name" \
+        "$FAKE_DOCKER_STATE/ids/$container_id" \
+        "$FAKE_DOCKER_STATE/volumes/$name"
     fi
-    printf '%s\n' "$name"
+    printf '%s\n' "$reference"
   done
   exit 0
 fi
 
 if [[ "$command_name" == "container" && "$subcommand" == "inspect" ]]; then
-  name="${3:-}"
-  [[ -e "$FAKE_DOCKER_STATE/containers/$name" ]]
+  reference="${3:-}"
+  resolve_container_reference "$reference"
   exit 0
 fi
 
@@ -110,7 +158,7 @@ chmod +x "$fake_docker"
 
 new_state() {
   local state="$1"
-  mkdir -p "$state/containers" "$state/volumes"
+  mkdir -p "$state/containers" "$state/container-ids" "$state/ids" "$state/volumes"
   : >"$state/dangling"
   : >"$state/invocations.log"
   printf '0\n' >"$state/counter"
@@ -136,7 +184,7 @@ assert_not_contains() {
 
 run_cleanup_case() (
   set -euo pipefail
-  local state="$test_root/cleanup"
+  local state="$test_root/cleanup" container_id
   new_state "$state"
   printf 'preserved-before-run\n' >"$state/dangling"
   export FAKE_DOCKER_STATE="$state"
@@ -145,15 +193,16 @@ run_cleanup_case() (
   source "$helper"
 
   throughline_docker_harness_init
-  throughline_docker_run throughline-harness-test-pg fake/pgvector:test
+  container_id="$(throughline_docker_run throughline-harness-test-pg fake/pgvector:test)"
   throughline_docker_harness_cleanup
   throughline_docker_harness_cleanup
 
   [[ "$(cat "$state/dangling")" == "preserved-before-run" ]]
   [[ ! -e "$state/containers/throughline-harness-test-pg" ]]
-  assert_contains "$state/invocations.log" "create --name throughline-harness-test-pg fake/pgvector:test"
-  assert_contains "$state/invocations.log" "start throughline-harness-test-pg"
-  assert_contains "$state/invocations.log" "rm -f -v throughline-harness-test-pg"
+  assert_contains "$state/invocations.log" "--name throughline-harness-test-pg fake/pgvector:test"
+  assert_contains "$state/invocations.log" "start $container_id"
+  assert_contains "$state/invocations.log" "rm -f -v $container_id"
+  assert_not_contains "$state/invocations.log" "rm -f -v throughline-harness-test-pg"
   assert_not_contains "$state/invocations.log" "run -d"
   assert_not_contains "$state/invocations.log" "--rm"
 )
@@ -172,8 +221,16 @@ run_reject_auto_remove_case() (
     printf 'expected caller-supplied --rm to be rejected\n' >&2
     exit 1
   fi
+  if throughline_docker_run throughline-harness-test-pg --cidfile "$state/caller.cid" fake/pgvector:test; then
+    printf 'expected caller-supplied --cidfile to be rejected\n' >&2
+    exit 1
+  fi
+  if throughline_docker_run throughline-harness-test-pg --cidfile="$state/caller.cid" fake/pgvector:test; then
+    printf 'expected caller-supplied --cidfile=... to be rejected\n' >&2
+    exit 1
+  fi
   throughline_docker_harness_cleanup
-  assert_not_contains "$state/invocations.log" "create --name"
+  assert_not_contains "$state/invocations.log" "create "
 )
 
 run_leak_detection_case() (
@@ -210,7 +267,7 @@ run_name_scope_case() (
     exit 1
   fi
   throughline_docker_harness_cleanup
-  assert_not_contains "$state/invocations.log" "create --name"
+  assert_not_contains "$state/invocations.log" "create "
 )
 
 run_name_override_case() (
@@ -233,12 +290,12 @@ run_name_override_case() (
     exit 1
   fi
   throughline_docker_harness_cleanup
-  assert_not_contains "$state/invocations.log" "create --name"
+  assert_not_contains "$state/invocations.log" "create "
 )
 
 run_start_failure_case() (
   set -euo pipefail
-  local state="$test_root/start-failure"
+  local state="$test_root/start-failure" container_id
   new_state "$state"
   printf 'preserved-before-run\n' >"$state/dangling"
   export FAKE_DOCKER_STATE="$state"
@@ -252,13 +309,14 @@ run_start_failure_case() (
     printf 'expected a Docker start failure to propagate\n' >&2
     exit 1
   fi
+  container_id="$(<"$state/container-ids/throughline-harness-test-pg")"
   unset FAKE_DOCKER_FAIL_START
   throughline_docker_harness_cleanup
   [[ ! -e "$state/containers/throughline-harness-test-pg" ]]
   [[ "$(cat "$state/dangling")" == "preserved-before-run" ]]
-  assert_contains "$state/invocations.log" "create --name throughline-harness-test-pg"
-  assert_contains "$state/invocations.log" "start throughline-harness-test-pg"
-  assert_contains "$state/invocations.log" "rm -f -v throughline-harness-test-pg"
+  assert_contains "$state/invocations.log" "--name throughline-harness-test-pg"
+  assert_contains "$state/invocations.log" "start $container_id"
+  assert_contains "$state/invocations.log" "rm -f -v $container_id"
 )
 
 run_remove_failure_case() (
@@ -342,6 +400,115 @@ run_trap_status_case() {
   fi
 }
 
+run_create_failure_retry_case() (
+  set -euo pipefail
+  local state="$test_root/create-failure" container_id
+  new_state "$state"
+  export FAKE_DOCKER_STATE="$state"
+  export THROUGHLINE_DOCKER_BIN="$fake_docker"
+  export FAKE_DOCKER_FAIL_CREATE=1
+  # shellcheck source=/dev/null
+  source "$helper"
+
+  throughline_docker_harness_init
+  if throughline_docker_run throughline-harness-test-pg fake/pgvector:test; then
+    printf 'expected Docker create failure to propagate\n' >&2
+    exit 1
+  fi
+  unset FAKE_DOCKER_FAIL_CREATE
+  container_id="$(throughline_docker_run throughline-harness-test-pg fake/pgvector:test)"
+  throughline_docker_harness_cleanup
+  [[ ! -e "$state/containers/throughline-harness-test-pg" ]]
+  assert_contains "$state/invocations.log" "rm -f -v $container_id"
+)
+
+run_pending_identity_recovery_case() (
+  set -euo pipefail
+  local state="$test_root/pending-identity" container_id
+  new_state "$state"
+  printf 'preserved-before-run\n' >"$state/dangling"
+  export FAKE_DOCKER_STATE="$state"
+  export THROUGHLINE_DOCKER_BIN="$fake_docker"
+  export FAKE_DOCKER_FAIL_AFTER_CIDFILE=1
+  # shellcheck source=/dev/null
+  source "$helper"
+
+  throughline_docker_harness_init
+  if throughline_docker_run throughline-harness-test-pg fake/pgvector:test; then
+    printf 'expected Docker failure after cidfile creation to propagate\n' >&2
+    exit 1
+  fi
+  unset FAKE_DOCKER_FAIL_AFTER_CIDFILE
+  if throughline_docker_run throughline-harness-test-second fake/pgvector:test; then
+    printf 'expected unresolved pending identity to block a second launch\n' >&2
+    exit 1
+  fi
+  [[ "$(grep -c '^create ' "$state/invocations.log")" -eq 1 ]]
+  container_id="$(<"$state/container-ids/throughline-harness-test-pg")"
+  throughline_docker_harness_cleanup
+  [[ ! -e "$state/containers/throughline-harness-test-pg" ]]
+  [[ "$(<"$state/dangling")" == "preserved-before-run" ]]
+  assert_contains "$state/invocations.log" "rm -f -v $container_id"
+  assert_not_contains "$state/invocations.log" "rm -f -v throughline-harness-test-pg"
+)
+
+run_invalid_cidfile_case() (
+  set -euo pipefail
+  local mode="$1" state="$test_root/invalid-cidfile-$1"
+  new_state "$state"
+  export FAKE_DOCKER_STATE="$state"
+  export THROUGHLINE_DOCKER_BIN="$fake_docker"
+  if [[ "$mode" == "malformed" ]]; then
+    export FAKE_DOCKER_MALFORMED_CIDFILE=1
+  else
+    export FAKE_DOCKER_SKIP_CIDFILE=1
+  fi
+  # shellcheck source=/dev/null
+  source "$helper"
+
+  throughline_docker_harness_init
+  if throughline_docker_run throughline-harness-test-pg fake/pgvector:test; then
+    printf 'expected invalid Docker cidfile output to fail the launch\n' >&2
+    exit 1
+  fi
+  if throughline_docker_harness_cleanup >"$state/cleanup.out" 2>"$state/cleanup.err"; then
+    printf 'expected invalid pending identity to fail cleanup\n' >&2
+    exit 1
+  fi
+  [[ -e "$state/containers/throughline-harness-test-pg" ]]
+  assert_not_contains "$state/invocations.log" "rm -f -v throughline-harness-test-pg"
+)
+
+run_name_reuse_identity_case() (
+  set -euo pipefail
+  local state="$test_root/name-reuse" original_id replacement_id removal_count
+  new_state "$state"
+  export FAKE_DOCKER_STATE="$state"
+  export THROUGHLINE_DOCKER_BIN="$fake_docker"
+  # shellcheck source=/dev/null
+  source "$helper"
+
+  throughline_docker_harness_init
+  original_id="$(throughline_docker_run throughline-harness-test-pg fake/pgvector:test)"
+
+  # Simulate an external actor removing the harness container and reusing its
+  # mutable name before the harness trap runs.
+  "$fake_docker" rm -f -v "$original_id" >/dev/null
+  replacement_id="$("$fake_docker" create --name throughline-harness-test-pg fake/replacement:test)"
+  "$fake_docker" start "$replacement_id" >/dev/null
+
+  if throughline_docker_harness_cleanup >"$state/cleanup.out" 2>"$state/cleanup.err"; then
+    printf 'expected missing original container ID to fail cleanup\n' >&2
+    exit 1
+  fi
+
+  [[ -e "$state/containers/throughline-harness-test-pg" ]]
+  [[ "$(<"$state/container-ids/throughline-harness-test-pg")" == "$replacement_id" ]]
+  removal_count="$(grep -F -c -- "rm -f -v $original_id" "$state/invocations.log")"
+  [[ "$removal_count" -eq 2 ]]
+  assert_not_contains "$state/invocations.log" "rm -f -v $replacement_id"
+)
+
 run_resource_case() (
   set -euo pipefail
   local state="$test_root/resource"
@@ -371,5 +538,10 @@ run_remove_failure_case
 run_still_present_case
 run_trap_status_case preserve-original 7 0 7
 run_trap_status_case adopt-cleanup-failure 0 1 1
+run_create_failure_retry_case
+run_pending_identity_recovery_case
+run_invalid_cidfile_case malformed
+run_invalid_cidfile_case missing
+run_name_reuse_identity_case
 run_resource_case
 printf 'throughline docker harness tests: PASS\n'

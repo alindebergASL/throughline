@@ -154,9 +154,9 @@ throughline_docker_run "$ls_name" \
 ```
 
 The helper snapshots the pre-run dangling-volume set, rejects Docker `--rm` and caller-supplied
-`--name`, creates and records only `throughline-*` containers before starting them, removes each recorded
-container with `docker rm -f -v`, verifies the containers are absent, and fails the gate if any new
-dangling volume remains. The dangling-volume assertion is intentionally host-wide and fail-closed: an
+`--name`, creates only `throughline-*` containers, records each immutable container ID before starting
+it, removes each recorded ID with `docker rm -f -v`, verifies those exact containers are absent, and
+fails the gate if any new dangling volume remains. The dangling-volume assertion is intentionally host-wide and fail-closed: an
 unrelated process that leaks a volume during the gate will also fail the check and must be investigated.
 A caller may prepend its own domain-specific cleanup diagnostics, but must fold a helper cleanup failure
 into the final exit status as shown. Historical `.hermes/rollouts/` scripts are immutable evidence; do not

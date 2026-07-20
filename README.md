@@ -108,8 +108,8 @@ pnpm test:docker-harness
 ```
 
 Future direct Docker verification gates must use `scripts/throughline-docker-harness.sh` as documented
-in `HERMES_RUNBOOK.md`; it deterministically removes each test container's anonymous volumes and
-fails if the run leaves any new dangling volume.
+in `HERMES_RUNBOOK.md`; it records immutable container IDs, deterministically removes each exact test
+container's anonymous volumes, and fails if the run leaves any new dangling volume.
 
 Wave A2 migrations are applied in deterministic filename order through a durable
 `throughline_migrations.journal`. Each filename, SHA-256 checksum, and applied timestamp is
