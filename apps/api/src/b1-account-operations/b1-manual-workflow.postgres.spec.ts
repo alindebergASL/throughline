@@ -2540,6 +2540,184 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
     }
   }, 30_000);
 
+  it("binds actor, policy, and governing Space rows so Relationship mutation wins before revocation", async () => {
+    const actorContext = createDevSecurityContext("tenant-a-owner");
+    const cases = [
+      {
+        name: "membership",
+        revoke: (client: PgPoolClient) =>
+          client.query(
+            `UPDATE identity.memberships SET status = 'suspended'
+             WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND status = 'active'`,
+            [actorContext.tenantId, actorContext.workspaceId, actorContext.actorMembershipId]
+          ),
+        restore: () =>
+          ownerPool.query(
+            `UPDATE identity.memberships SET status = 'active'
+             WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+            [actorContext.tenantId, actorContext.workspaceId, actorContext.actorMembershipId]
+          )
+      },
+      {
+        name: "user",
+        revoke: (client: PgPoolClient) =>
+          client.query(
+            "UPDATE identity.users SET status = 'disabled' WHERE id = $1 AND status = 'active'",
+            [actorContext.actorUserId]
+          ),
+        restore: () =>
+          ownerPool.query("UPDATE identity.users SET status = 'active' WHERE id = $1", [
+            actorContext.actorUserId
+          ])
+      },
+      {
+        name: "policy",
+        revoke: (client: PgPoolClient) =>
+          client.query(
+            `UPDATE identity.policy_versions SET status = 'retired'
+             WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND status = 'active'`,
+            [actorContext.tenantId, actorContext.workspaceId, actorContext.policyVersion]
+          ),
+        restore: () =>
+          ownerPool.query(
+            `UPDATE identity.policy_versions SET status = 'active'
+             WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+            [actorContext.tenantId, actorContext.workspaceId, actorContext.policyVersion]
+          )
+      },
+      {
+        name: "space",
+        revoke: (client: PgPoolClient) =>
+          client.query(
+            `UPDATE access.spaces SET archived_at = clock_timestamp()
+             WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND archived_at IS NULL`,
+            [actorContext.tenantId, actorContext.workspaceId, state.sourceSpaceId]
+          ),
+        restore: () =>
+          ownerPool.query(
+            `UPDATE access.spaces SET archived_at = NULL
+             WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+            [actorContext.tenantId, actorContext.workspaceId, state.sourceSpaceId]
+          )
+      }
+    ];
+
+    for (const [index, authorityCase] of cases.entries()) {
+      const key = `relationship-${authorityCase.name}-mutation-wins`;
+      const validTo = `2026-07-16T2${index}:30:00.000Z`;
+      const created = await new AccountOperationsDomainCommandBus(appPool).execute(
+        {
+          kind: "relationship.create",
+          idempotencyKey: `${key}-fixture`,
+          payload: {
+            subject: { type: "person", id: devFixtures.externalPersonA },
+            predicate: `authority.${authorityCase.name}.mutation_wins`,
+            object: { type: "space", id: state.sourceSpaceId }
+          }
+        },
+        actorContext
+      );
+      expect(created.spaceId).toBe(state.sourceSpaceId);
+
+      const racePool = createPgPool(appUrl!);
+      const baseAuthorization = new PostgresAuthorizationService(racePool);
+      const baseBatch = baseAuthorization as unknown as RelationshipAuthorityBatchTestService;
+      const completeAuthorityBatchLocked = deferred();
+      const releaseRelationshipEnd = deferred();
+      let paused = false;
+      let relationshipBackendPid = -1;
+      const authorization: TransactionAwareAuthorizationService &
+        RelationshipAuthorityBatchTestService = {
+        can: (context, action, resource, options) =>
+          baseAuthorization.can(context, action, resource, options),
+        canInTransaction: (context, action, resource, tx, options) =>
+          baseAuthorization.canInTransaction(context, action, resource, tx, options),
+        preauthorizeRelationshipEndInTransaction: (context, resource, tx) =>
+          baseBatch.preauthorizeRelationshipEndInTransaction(context, resource, tx),
+        lockAndReauthorizeRelationshipAuthorityInTransaction: async (context, requests, tx) => {
+          const decision = await baseBatch.lockAndReauthorizeRelationshipAuthorityInTransaction(
+            context,
+            requests,
+            tx
+          );
+          if (!paused && decision.allowed) {
+            paused = true;
+            const backend = await tx.query<{ pid: number }>("SELECT pg_backend_pid() AS pid");
+            relationshipBackendPid = backend.rows[0]!.pid;
+            completeAuthorityBatchLocked.resolve();
+            await releaseRelationshipEnd.promise;
+          }
+          return decision;
+        }
+      };
+      const authorityMutator = await ownerPool.connect();
+      let ending: Promise<unknown> | undefined;
+      let opposingMutation: Promise<{ rowCount: number | null }> | undefined;
+      try {
+        ending = new AccountOperationsDomainCommandBus(racePool, authorization).execute(
+          {
+            kind: "relationship.end",
+            idempotencyKey: key,
+            payload: {
+              relationshipId: created.relationshipId,
+              expectedVersion: 1,
+              validTo
+            }
+          },
+          actorContext
+        );
+        void ending.catch(() => undefined);
+        await withDeadline(
+          completeAuthorityBatchLocked.promise,
+          `${authorityCase.name} complete Relationship authority batch lock`
+        );
+        expect(relationshipBackendPid).toBeGreaterThan(0);
+
+        const mutatorPid = await authorityMutator.query<{ pid: number }>(
+          "SELECT pg_backend_pid() AS pid"
+        );
+        opposingMutation = authorityCase.revoke(authorityMutator);
+        void opposingMutation.catch(() => undefined);
+        await waitForBlockedBackend(ownerPool, mutatorPid.rows[0]!.pid);
+        const blockers = await ownerPool.query<{ blockers: number[] }>(
+          "SELECT pg_blocking_pids($1)::integer[] AS blockers",
+          [mutatorPid.rows[0]!.pid]
+        );
+        expect(blockers.rows[0]!.blockers).toContain(relationshipBackendPid);
+
+        releaseRelationshipEnd.resolve();
+        await expect(
+          withDeadline(ending, `${authorityCase.name} mutation-first Relationship end deadlocked`)
+        ).resolves.toMatchObject({
+          relationshipId: created.relationshipId,
+          version: 2
+        });
+        const opposingResult = await withDeadline(
+          opposingMutation,
+          `${authorityCase.name} revocation did not resume after Relationship end`
+        );
+        expect(opposingResult.rowCount).toBe(1);
+        expect(await relationshipRaceOutcome(ownerPool, created.relationshipId, key)).toEqual({
+          version: 2,
+          valid_to: new Date(validTo),
+          commands: "1",
+          audits: "1",
+          outbox: "1"
+        });
+      } finally {
+        releaseRelationshipEnd.resolve();
+        try {
+          await ending?.catch(() => undefined);
+          await opposingMutation?.catch(() => undefined);
+          await authorityCase.restore();
+        } finally {
+          authorityMutator.release();
+          await racePool.end();
+        }
+      }
+    }
+  }, 60_000);
+
   it("binds endpoint grants so Relationship mutation wins and revocation blocks without deadlock", async () => {
     const contextGrant = await ownerPool.query<{ id: string }>(
       `INSERT INTO access.access_relationships (
