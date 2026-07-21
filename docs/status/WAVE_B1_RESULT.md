@@ -1,17 +1,19 @@
 # Wave B1 Result — Manual Account Work Graph and Source Capture
 
-- **Date:** 2026-07-20 UTC
-- **Status:** PR #7 reconciliation merge committed locally; focused reconciliation checks and a complete post-reconciliation pre-result gate PASS; HOLD remains before final-byte verification, exact-head verification/review, republication, merge, deployment, or release
+- **Date:** 2026-07-21 UTC
+- **Status:** reconciled final-byte gate, detached exact-head verification, direct read-only review, normal publication, exact-head CI, and durable checkpoint PASS for reviewed implementation/evidence parent `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84`; PR #8 remains OPEN and merge remains unauthorized
 - **Branch:** `wave-b1-work-graph-source-capture`
 - **Historical published PR #8 head:** `81a58639667a290d395b52116cefa6234b3754c1`
 - **Historical published PR #8 tree:** `66465e4e48fffddca07aeb882823865b43168293`
 - **Original merge base:** `2566cb4649c24217058d32de6a0e088b303bb07b`
 - **Reconciled current main:** `a302c1f4a48a632b965be7bfcd1e8086795c0e8d`
-- **Local reconciliation merge:** `ee467b748d8b9f531b61bdc935cacd58bf419673`
+- **Reconciliation merge:** `ee467b748d8b9f531b61bdc935cacd58bf419673`
 - **Merge parents:** `81a58639667a290d395b52116cefa6234b3754c1` and `a302c1f4a48a632b965be7bfcd1e8086795c0e8d`
 - **Reconciled pre-result candidate tree:** `f2031959fb2b762e00eee860f3d53fd589f8d45a`
+- **Reviewed implementation/evidence parent:** `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84`
+- **Reviewed implementation/evidence tree:** `351b209eb39aa9b2f2114ab89e793db2fba27e11`
 - **Canonical plan SHA-256:** `38a08d9cd57f3704f45c75bb35f5eb29a03d9a157e247e3ffa0af9ee6b77d39d`
-- **Publication state:** PR #8 remains OPEN and unmerged at historical remote head `81a58639667a290d395b52116cefa6234b3754c1`; the reconciliation merge and this result update are local only; no deployment, release, AWS/runtime access, or B2 work has occurred
+- **Publication state:** PR #8 was normally published at reviewed parent `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84`; exact-head CI run `29789153257` succeeded; durable checkpoint `5028715935` was posted and verified; PR #8 remains OPEN and unmerged
 
 ## Scope and outcome
 
@@ -313,13 +315,57 @@ Before and after the accepted gate:
 
 No legacy volume was deleted. The protected live PostgreSQL and LocalStack containers, their start identities, and their named volumes remained untouched.
 
-## Final-byte binding and HOLD
+## Reconciled final-byte and exact-head closeout
 
-This updated record describes the accepted reconciled pre-result candidate. Updating this file changes the candidate tree, so the accepted pre-result gate is historical evidence for the immediately preceding result bytes and does not itself claim final-byte PASS.
+The complete reconciled final-byte gate succeeded over exact tree `351b209eb39aa9b2f2114ab89e793db2fba27e11`:
 
-The next mandatory step is one complete fresh gate over the candidate including these exact result-file bytes. That gate must again prove identical start/end trees, exact migration identity, all stages passing, zero authoritative skips, zero unhandled errors, zero residual connections, repository-harness removal of disposable containers and volumes, unchanged 16-volume dangling set, untouched protected services, and no lingering repository processes.
+`/home/ubuntu/.hermes/rollouts/throughline-pr8-reconcile-pr7-20260720/authoritative-pr8-reconciled-final-byte-20260720T223127Z-4087476`
 
-HOLD remains before the result update commit, detached exact-head verification, fresh direct read-only review, normal push, PR #8 description update, exact-new-head GitHub Actions, or a durable reconciliation checkpoint. Merge, deployment, release, AWS/runtime access, B2 work, real Kanban dispatch, canonical-document changes, accepted-ADR changes, shared Hermes-control changes, and Atliera actions remain unauthorized.
+It passed frozen install, formatting, lint, typecheck, ordinary tests, build, explicit security, Foundation, B1.0, canonical B1, and diff checking. Canonical B1 passed 45 files / 985 tests with zero authoritative skips and zero unhandled errors. Start and end candidate trees were identical. Cleanup proved zero residual PostgreSQL clients, exact disposable-container absence, an unchanged 16-volume dangling set, untouched protected services and volumes, and zero lingering repository processes.
+
+Final-byte evidence SHA-256 values:
+
+- summary: `406666234e54463f5961b9a2878a286c9457fd863702284bee91854912351f18`;
+- cleanup: `ef37756ef9e476bed02562c098ffe0169773ff33259e02ae75e6e85730a10fe3`;
+- authoritative scan: `036e768f9350ba79fe1aa3264229a035079fc618063bcfa86e4a8c788e99cee0`;
+- migration journal: `3b1cbf86c9c9b1323cf1b5d7f1ddf9b9fa6256045966aea30a49d573bb52fa74`.
+
+A fresh detached exact-head verifier then repeated the complete gate successfully against reviewed implementation/evidence parent `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84` and tree `351b209eb39aa9b2f2114ab89e793db2fba27e11`:
+
+`/home/ubuntu/.hermes/rollouts/throughline-pr8-reconcile-pr7-20260720/detached-exact-head-verifier-da478e9-20260720T230519Z-4118459`
+
+Detached-verifier evidence SHA-256 values:
+
+- summary: `140df198fcc5a6d372d71fad583d704940b7e86c46778dbebec8b794d1e89459`;
+- cleanup: `b995098fef30f35ba1a25e64c4a7d89e2ecf63986a50d7d666f6f1e183125283`.
+
+The independent direct read-only reviewer returned explicit PASS with no blocking findings for the complete current-main diff and reconciliation delta, bound to the same head and tree. Raw verdict:
+
+`/home/ubuntu/.hermes/rollouts/throughline-pr8-reconcile-pr7-20260720/reviewer-verdict-da478e9.json`
+
+Verdict SHA-256: `dc14de75916761dcc320e3fb5fb7aaef4b9d2c9962b92adc935af2b5880b9a7a`.
+
+## Publication and durable checkpoint
+
+PR #8 was normally published without force or history rewriting at reviewed implementation/evidence parent `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84`.
+
+Exact-head pull-request CI run `29789153257` completed successfully:
+
+`https://github.com/alindebergASL/throughline/actions/runs/29789153257`
+
+Durable reconciliation checkpoint `5028715935` was posted and read back byte-for-byte:
+
+`https://github.com/alindebergASL/throughline/pull/8#issuecomment-5028715935`
+
+The earlier database-naming run at `authoritative-pr8-reconciled-preresult-20260720T213732Z-4038005` remains rejected diagnostic evidence only. It failed closed at Foundation preflight because its disposable database name omitted the required `test` marker; it is not counted as PASS and does not replace the accepted final-byte or detached exact-head evidence.
+
+## Docs-only closeout child and merge HOLD
+
+This durable artifact identifies `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84` explicitly as the reviewed implementation/evidence parent. This closeout changes only `docs/status/WAVE_B1_RESULT.md`; it does not alter implementation, migrations, tests, dependencies, workflows, Docker harnesses, canonical product documents, or accepted ADRs.
+
+To avoid a self-referential identifier, this file does not name its eventual docs-only child SHA. The exact child head/tree, corrected result-file SHA-256, exact-delta verifier/reviewer evidence, and child CI are recorded in the PR description and final docs-closeout checkpoint after normal publication.
+
+PR #8 remains OPEN and unmerged. Merge remains unauthorized pending explicit approval. No deployment, release, AWS/runtime access, B2 work, canonical-document change, accepted-ADR change, real Kanban dispatch, Docker-volume cleanup, shared Hermes-control change, history rewrite, or Atliera action occurred.
 
 ## Spec deviations
 
@@ -327,4 +373,4 @@ None identified.
 
 ## Known issues
 
-No known B1 implementation blocker remains after PR #7 reconciliation and the accepted post-reconciliation pre-result gate. Final-byte gating, exact-head verification/review, republication, and CI remain intentionally pending.
+No known B1 implementation or reconciliation blocker remains. The continuing HOLD is solely the explicit merge-authorization boundary.
