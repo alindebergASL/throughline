@@ -2,7 +2,7 @@
   "name": "@throughline/work-graph",
   "version": "0.0.0",
   "private": true,
-  "description": "Universal work graph package placeholder; domain records are deferred.",
+  "description": "B1 Organization, Initiative, Activity, and Relationship work graph.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -14,6 +14,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@throughline/core-types": "workspace:*"
+    "@throughline/core-types": "workspace:*",
+    "@throughline/db": "workspace:*"
   }
 }

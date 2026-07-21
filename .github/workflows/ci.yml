@@ -160,8 +160,8 @@ jobs:
           test "$(jq 'has("RedrivePolicy")' <<<"$attributes")" = "false"
           test "$(jq -r '.FifoQueue // "false"' <<<"$attributes")" = "false"
 
-      - name: Run fail-closed B1.0 PostgreSQL and LocalStack gate
-        run: pnpm test:b1-0
+      - name: Run fail-closed canonical B1 PostgreSQL and LocalStack gate
+        run: pnpm test:b1
         env:
           TEST_DATABASE_URL: postgres://postgres@127.0.0.1:5432/throughline_test
           TEST_APP_DATABASE_URL: postgres://throughline_app@127.0.0.1:5432/throughline_test

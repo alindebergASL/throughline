@@ -30,6 +30,7 @@ function fixturePool(options: { roleRows?: object[]; claimRows?: object[] } = {}
         return { rows: options.claimRows ?? [] };
       }
       if (sql.includes("UPDATE ops.outbox_events")) return { rows: [{ id: values?.[0] }] };
+      if (sql.includes("AS settings_cleared")) return { rows: [{ settings_cleared: true }] };
       return { rows: [] };
     }),
     release: vi.fn()
@@ -309,6 +310,7 @@ describe("RelayOutboxRepository fixed scoped surface", () => {
           if (!commitTruth) throw new Error("injected failure before mark");
           return { rows: [{ id: values?.[0] }] };
         }
+        if (sql.includes("AS settings_cleared")) return { rows: [{ settings_cleared: true }] };
         return { rows: [] };
       }),
       release: vi.fn()
@@ -321,6 +323,7 @@ describe("RelayOutboxRepository fixed scoped surface", () => {
         if (sql.includes("SELECT id") && sql.includes("published_message_id")) {
           return { rows: commitTruth ? [{ id: row.event_id }] : [] };
         }
+        if (sql.includes("AS settings_cleared")) return { rows: [{ settings_cleared: true }] };
         return { rows: [] };
       }),
       release: vi.fn()

@@ -67,21 +67,14 @@ describe("B1.0 architecture and Foundation isolation", () => {
     }
   });
 
-  it("contains no later migration, product event ledger, or shadow command/audit table", async () => {
+  it("keeps the B1.0 migration isolated from later additive migrations and shadow ledgers", async () => {
     const migrationDirectory = join(repositoryRoot, "packages/db/migrations");
     const migrationFiles = (await readdir(migrationDirectory)).sort();
-    expect(migrationFiles).toEqual([
+    expect(migrationFiles.slice(0, 3)).toEqual([
       "0001_wave_a2_identity_access_rls.sql",
       "0002_foundation_closure_async_isolation.sql",
       "0003_b1_0_canonical_product_outbox.sql"
     ]);
-    expect(migrationFiles).not.toEqual(
-      expect.arrayContaining([
-        expect.stringMatching(/^0004_/),
-        expect.stringMatching(/^0005_/),
-        expect.stringMatching(/^0006_/)
-      ])
-    );
     const migration = await source("packages/db/migrations/0003_b1_0_canonical_product_outbox.sql");
     expect(migration).not.toContain("ops.domain_events");
     expect(
@@ -90,8 +83,8 @@ describe("B1.0 architecture and Foundation isolation", () => {
     expect(migration).not.toMatch(/CREATE TABLE (?:public|test|shadow)\./i);
   });
 
-  it("adds no B1 route, handler, aggregate, consumer, worker, or event-source mapping", async () => {
-    const productionRoots = ["apps/api/src", "apps/agent-worker/src", "apps/connector-worker/src"];
+  it("adds no product consumer, worker, or event-source mapping to the B1.0 runtime", async () => {
+    const productionRoots = ["apps/agent-worker/src", "apps/connector-worker/src"];
     for (const root of productionRoots) {
       const files = await typescriptFiles(join(repositoryRoot, root));
       for (const file of files) {
@@ -153,7 +146,7 @@ describe("B1.0 architecture and Foundation isolation", () => {
     expect(content).not.toContain("credential=secret");
   });
 
-  it("wires a unique Standard queue and serialized fail-closed real-service gate in CI", async () => {
+  it("wires a unique Standard queue and serialized fail-closed canonical B1 gate in CI", async () => {
     const workflow = await source(".github/workflows/ci.yml");
     expect(workflow).toContain(
       "PRODUCT_QUEUE_NAME: throughline-b1-0-test-product-${{ github.run_id }}-${{ github.run_attempt }}"
@@ -161,8 +154,9 @@ describe("B1.0 architecture and Foundation isolation", () => {
     expect(workflow).toContain("--attributes MessageRetentionPeriod=86400");
     expect(workflow).toContain('has("RedrivePolicy")');
     expect(workflow).toContain("Run fail-closed Foundation PostgreSQL and LocalStack gate");
-    expect(workflow).toContain("Run fail-closed B1.0 PostgreSQL and LocalStack gate");
-    expect(workflow).toContain("run: pnpm test:b1-0");
+    expect(workflow).toContain("Run fail-closed canonical B1 PostgreSQL and LocalStack gate");
+    expect(workflow.match(/^\s+run: pnpm test:b1$/gm)).toHaveLength(1);
+    expect(workflow).not.toMatch(/^\s+run: pnpm test:b1-0$/m);
   });
 });
 

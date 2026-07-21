@@ -2,7 +2,7 @@
   "name": "@throughline/account-operations",
   "version": "0.0.0",
   "private": true,
-  "description": "First-party Account & Partner Operations package placeholder.",
+  "description": "Typed Account Operations commands for the manual B1 trusted-memory capture loop.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -14,7 +14,12 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
+    "@throughline/authorization": "workspace:*",
+    "@throughline/content": "workspace:*",
     "@throughline/core-types": "workspace:*",
-    "@throughline/work-graph": "workspace:*"
+    "@throughline/db": "workspace:*",
+    "@throughline/domain-profiles": "workspace:*",
+    "@throughline/work-graph": "workspace:*",
+    "zod": "^4.0.14"
   }
 }

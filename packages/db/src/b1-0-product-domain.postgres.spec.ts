@@ -4,7 +4,10 @@ import type { DomainNotificationEnvelope, SecurityContext } from "@throughline/c
 import { createDevSecurityContext, devFixtures, DEV_POLICY_VERSION } from "@throughline/tenancy";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { applyMigrations, type MigrationRunResult } from "./migrations.js";
+import {
+  applyMigrations as applyRepositoryMigrations,
+  type MigrationRunResult
+} from "./migrations.js";
 import {
   ProductDomainInvariantError,
   ProductDomainTransactionRepositories,
@@ -29,6 +32,13 @@ const migrationIds = [
   "0002_foundation_closure_async_isolation.sql",
   "0003_b1_0_canonical_product_outbox.sql"
 ] as const;
+
+function applyMigrations(pool: pg.Pool, options: { reset?: boolean } = {}) {
+  return applyRepositoryMigrations(pool, {
+    ...options,
+    through: migrationIds[2]
+  });
+}
 const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
 const ids = {
   commandA: "71000000-0000-7000-8000-000000000001",
@@ -2397,7 +2407,7 @@ maybeDescribe("B1.0 real PostgreSQL product-domain prerequisite", () => {
       tenantId: scope.tenantId,
       workspaceId: scope.workspaceId,
       reservationSpaceId: scope.spaceId,
-      commandKind: "b1_0.fixture.v1",
+      commandKind: "organization.create.v1",
       commandSchemaVersion: 1,
       idempotencyKey: `fixture-${suffix}`,
       canonicalRequestHash,
@@ -2454,7 +2464,11 @@ maybeDescribe("B1.0 real PostgreSQL product-domain prerequisite", () => {
       canonicalRequestHash: fixture.reservation.canonicalRequestHash,
       resultResourceType: "organization",
       resultResourceId: fixture.aggregateId,
-      safeResponse: { organizationId: fixture.aggregateId }
+      safeResponse: {
+        organizationId: fixture.aggregateId,
+        spaceId: fixture.reservation.reservationSpaceId,
+        version: 1
+      }
     };
   }
 
@@ -2766,7 +2780,7 @@ function completedCommandInsertStatement(
              agent_principal_id, policy_version_id, request_id, traceparent, tracestate,
              state, result_resource_type, result_resource_id, safe_response, completed_at
            ) VALUES (
-             $1, $2, $3, $4, 'b1_0.fixture.v1',
+             $1, $2, $3, $4, 'organization.create.v1',
              1, $5, $6,
              $7, $8, NULL, NULL,
              NULL, $9, $10, $11, NULL,
@@ -2785,7 +2799,11 @@ function completedCommandInsertStatement(
       `request-${idempotencyKey}`,
       traceparent,
       resultId,
-      JSON.stringify({ organizationId: resultId }),
+      JSON.stringify({
+        organizationId: resultId,
+        spaceId: devFixtures.restrictedSpaceA,
+        version: 1
+      }),
       new Date()
     ]
   };

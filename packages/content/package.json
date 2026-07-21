@@ -2,7 +2,7 @@
   "name": "@throughline/content",
   "version": "0.0.0",
   "private": true,
-  "description": "Content and SourceArtifact package placeholder; ingestion behavior is deferred.",
+  "description": "B1 collaborative content and deterministic manual SourceArtifact capture.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -14,6 +14,7 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@throughline/core-types": "workspace:*"
+    "@throughline/core-types": "workspace:*",
+    "@throughline/db": "workspace:*"
   }
 }

@@ -717,21 +717,21 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     expect(marker.rows[0]?.published_at).toBeInstanceOf(Date);
     expect(marker.rows[0]?.published_message_id).not.toBe(event.eventId);
     const effects = await ownerPool.query<{
-      organizations: string | null;
-      activities: string | null;
-      content_items: string | null;
+      organizations: string;
+      activities: string;
+      content_items: string;
       domain_events: string | null;
     }>(`
       SELECT
-        to_regclass('work.organizations')::text AS organizations,
-        to_regclass('work.activities')::text AS activities,
-        to_regclass('content.content_items')::text AS content_items,
+        (SELECT count(*)::text FROM work.organizations) AS organizations,
+        (SELECT count(*)::text FROM work.activities) AS activities,
+        (SELECT count(*)::text FROM content.content_items) AS content_items,
         to_regclass('ops.domain_events')::text AS domain_events
     `);
     expect(effects.rows[0]).toEqual({
-      organizations: null,
-      activities: null,
-      content_items: null,
+      organizations: "0",
+      activities: "0",
+      content_items: "0",
       domain_events: null
     });
   }, 15_000);
@@ -741,6 +741,19 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     await withTenantTransaction({ pool: appPool, context: appContext() }, async (tx) => {
       const repositories = new ProductDomainTransactionRepositories(tx);
       await repositories.commands.reserve(fixture.reservation);
+      await tx.query(
+        `INSERT INTO work.relationships (
+           id, tenant_id, workspace_id, space_id, subject_type, subject_id, predicate,
+           object_type, object_id, context_type, context_id, valid_from, version
+         ) VALUES ($1,$2,$3,$4,'person',$5,'contributor_to','space',$4,NULL,NULL,NULL,1)`,
+        [
+          fixture.aggregateId,
+          devFixtures.tenantA,
+          devFixtures.workspaceA,
+          devFixtures.restrictedSpaceA,
+          devFixtures.personA
+        ]
+      );
       await repositories.audit.insert(fixture.audit);
       await repositories.outbox.insertOrReplay({
         envelope: fixture.envelope,
@@ -819,17 +832,17 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     const requestHash = hashCanonicalCommandRequest({ sequence, aggregateId });
     const envelope: DomainNotificationEnvelope = {
       eventId,
-      eventType: "organization.created",
+      eventType: "relationship.created",
       eventSchemaVersion: 1,
       payloadSchemaVersion: 1,
       tenantId: devFixtures.tenantA,
       workspaceId: devFixtures.workspaceA,
       spaceId: devFixtures.restrictedSpaceA,
-      aggregateType: "organization",
+      aggregateType: "relationship",
       aggregateId,
       aggregateVersion: 1,
       causationCommandId: commandId,
-      payload: { organizationId: aggregateId },
+      payload: { relationshipId: aggregateId },
       requestId: `product-relay-${sequence}`,
       traceparent
     };
@@ -838,7 +851,7 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
       tenantId: devFixtures.tenantA,
       workspaceId: devFixtures.workspaceA,
       reservationSpaceId: devFixtures.restrictedSpaceA,
-      commandKind: "b1_0.fixture.v1",
+      commandKind: "relationship.create.v1",
       commandSchemaVersion: 1,
       idempotencyKey: `product-relay-${sequence}`,
       canonicalRequestHash: requestHash,
@@ -860,8 +873,8 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
         workspaceId: devFixtures.workspaceA,
         spaceId: devFixtures.restrictedSpaceA,
         causationCommandId: commandId,
-        action: "organization.create" as const,
-        resourceType: "organization" as const,
+        action: "relationship.create" as const,
+        resourceType: "relationship" as const,
         resourceId: aggregateId,
         actorUserId: devFixtures.userA,
         actorMembershipId: devFixtures.membershipAOwner,
@@ -869,7 +882,7 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
         requestId: envelope.requestId,
         traceparent,
         auditSchemaVersion: 1 as const,
-        safeDetail: { organizationId: aggregateId }
+        safeDetail: { relationshipId: aggregateId }
       },
       completion: {
         commandId,
@@ -879,9 +892,13 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
         commandKind: reservation.commandKind,
         idempotencyKey: reservation.idempotencyKey,
         canonicalRequestHash: requestHash,
-        resultResourceType: "organization",
+        resultResourceType: "relationship",
         resultResourceId: aggregateId,
-        safeResponse: { organizationId: aggregateId }
+        safeResponse: {
+          relationshipId: aggregateId,
+          spaceId: devFixtures.restrictedSpaceA,
+          version: 1
+        }
       }
     };
   }

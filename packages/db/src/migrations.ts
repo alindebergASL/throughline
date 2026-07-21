@@ -3,6 +3,12 @@ import { readdir, readFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PgPool, PgPoolClient } from "./client.js";
+import {
+  assertB1MigrationStateAbsent,
+  B1_MIGRATION_IDS,
+  validateB1CatalogContract,
+  validateMigrationJournal
+} from "./b1-catalog-contract.js";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const migrationsDir = join(packageRoot, "migrations");
@@ -15,7 +21,7 @@ export interface MigrationRunResult {
 
 export async function applyMigrations(
   pool: PgPool,
-  options: { reset?: boolean } = {}
+  options: { reset?: boolean; through?: string } = {}
 ): Promise<MigrationRunResult> {
   const client = await pool.connect();
   const result: MigrationRunResult = { applied: [], skipped: [] };
@@ -28,6 +34,8 @@ export async function applyMigrations(
     if (options.reset) {
       await client.query("BEGIN");
       try {
+        await client.query("DROP SCHEMA IF EXISTS content CASCADE");
+        await client.query("DROP SCHEMA IF EXISTS work CASCADE");
         await client.query("DROP SCHEMA IF EXISTS access CASCADE");
         await client.query("DROP SCHEMA IF EXISTS identity CASCADE");
         await client.query("DROP SCHEMA IF EXISTS ops CASCADE");
@@ -41,31 +49,53 @@ export async function applyMigrations(
 
     await ensureMigrationJournal(client);
 
-    const files = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
+    const allFiles = (await readdir(migrationsDir)).filter((file) => file.endsWith(".sql")).sort();
+    const migrationSources = new Map<string, string>();
+    const migrationChecksums = new Map<string, string>();
+    for (const file of allFiles) {
+      const sql = await readFile(join(migrationsDir, file), "utf8");
+      migrationSources.set(file, sql);
+      migrationChecksums.set(file, createHash("sha256").update(sql).digest("hex"));
+    }
+    const journal = await validateMigrationJournal(client, migrationChecksums);
+    const files = allFiles.filter((file) => !options.through || file <= options.through);
 
     for (const file of files) {
-      const sql = await readFile(join(migrationsDir, file), "utf8");
-      const checksum = createHash("sha256").update(sql).digest("hex");
-      const recorded = await client.query<{ checksum: string }>(
-        "SELECT checksum FROM throughline_migrations.journal WHERE id = $1",
-        [file]
-      );
+      const sql = migrationSources.get(file)!;
+      const checksum = migrationChecksums.get(file)!;
+      const recordedChecksum = journal.get(file);
+      const isB1Migration = B1_MIGRATION_IDS.includes(file as (typeof B1_MIGRATION_IDS)[number]);
 
-      if (recorded.rows[0]) {
-        if (recorded.rows[0].checksum !== checksum) {
-          throw new Error(`Migration checksum mismatch for ${file}`);
+      if (recordedChecksum) {
+        if (isB1Migration) {
+          await client.query("BEGIN");
+          try {
+            await validateB1CatalogContract(client, journal, migrationSources);
+            await client.query("ROLLBACK");
+          } catch (error) {
+            await client.query("ROLLBACK");
+            throw error;
+          }
         }
-
         result.skipped.push(file);
         continue;
       }
 
       await client.query("BEGIN");
       try {
+        if (isB1Migration) {
+          await validateB1CatalogContract(client, journal, migrationSources);
+          await assertB1MigrationStateAbsent(client, file as (typeof B1_MIGRATION_IDS)[number]);
+        }
         await client.query("SELECT set_config('throughline.migration_batch_applied', $1, true)", [
           result.applied.join(",")
         ]);
         await client.query(sql);
+        if (isB1Migration) {
+          const nextJournal = new Map(journal);
+          nextJournal.set(file, checksum);
+          await validateB1CatalogContract(client, nextJournal, migrationSources);
+        }
         await client.query(
           `
           INSERT INTO throughline_migrations.journal (id, checksum)
@@ -74,6 +104,7 @@ export async function applyMigrations(
           [file, checksum]
         );
         await client.query("COMMIT");
+        journal.set(file, checksum);
         result.applied.push(file);
       } catch (error) {
         await client.query("ROLLBACK");
