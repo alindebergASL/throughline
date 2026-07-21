@@ -1,9 +1,16 @@
 # Wave B1.0 Result — Canonical Product Outbox Correction
 
 - **Date:** 2026-07-15
-- **Status:** reviewed implementation checkpoint passed the authoritative gate, detached verification, direct review, publication, and exact-head CI; PR remains open and unmerged on HOLD
+- **Status:** PR #6 was squash-merged after its reviewed implementation checkpoint passed the authoritative gate, detached verification, direct review, publication, and exact-head CI
 - **PR:** `alindebergASL/throughline#6`
+- **Authorized PR head:** `228900dd822cb3b5ed22ee674fb0a5cf98fa8560`
 - **Authorized base:** `b454ae8c865c77639adbf82daf8963db67922ad6`
+- **Merged main:** `2566cb4649c24217058d32de6a0e088b303bb07b`
+- **Merged tree:** `97782492085cc637e426eced81f46d3ede684cfd`
+- **Sole parent:** `b454ae8c865c77639adbf82daf8963db67922ad6`
+- **Merge time:** `2026-07-16T15:53:00Z`
+- **Post-merge CI:** `https://github.com/alindebergASL/throughline/actions/runs/29513153082`
+- **Merge checkpoint:** `https://github.com/alindebergASL/throughline/pull/6#issuecomment-4993983399`
 - **Correction parent:** `7d385391d08e0fdd2605a628960ee920fe75c7ca`
 - **Parent tree:** `017c78aed14f39772451baf8407be7abf9eea90a`
 - **Tested pre-result implementation tree:** `8152155cfc3970cc8e3fd2b633ac38d1faad2bc3`
@@ -48,7 +55,7 @@ One minimal shared migration-runner change sets transaction-local `throughline.m
 - `0003_b1_0_canonical_product_outbox.sql`:
   `094303adaafbdc744c3c29fb1643ee3342d1e50bd7493491e96f84bd428fcc63`
 
-Migrations `0001` and `0002` are byte-identical to the correction parent. No migration after `0003` exists.
+At the reviewed B1.0 checkpoint, migrations `0001` and `0002` were byte-identical to the correction parent, and no migration after `0003` existed.
 
 ## Final pre-result candidate freeze
 
@@ -161,4 +168,16 @@ Reviewed implementation checkpoint `5ef2781c2c7acbcf01881fb4b2ce5d765699e878` co
 
 The historical failed and intermediate review attempts above remain evidence of the correction path; none is substituted for the final exact-head passes.
 
-PR #6 is open, cleanly mergeable, and unmerged. Publication gates are complete for reviewed implementation checkpoint `5ef2781c2c7acbcf01881fb4b2ce5d765699e878`, but merge, deployment, release, B1 implementation, real Kanban dispatch, AWS/runtime access, canonical-document changes, and accepted-ADR changes remain explicitly on HOLD. This docs-only child correction intentionally does not name its own commit; its exact SHA and tree must be bound through the PR description and durable checkpoint only after exact-new-head CI succeeds.
+At the historical pre-merge checkpoint, PR #6 was open and unmerged, and merge, deployment,
+release, B1 implementation, real Kanban dispatch, AWS/runtime access, canonical-document changes,
+and accepted-ADR changes were explicitly on HOLD. The authorized PR head
+`228900dd822cb3b5ed22ee674fb0a5cf98fa8560` was subsequently squash-merged as
+`2566cb4649c24217058d32de6a0e088b303bb07b` with tree
+`97782492085cc637e426eced81f46d3ede684cfd` and sole parent
+`b454ae8c865c77639adbf82daf8963db67922ad6` at `2026-07-16T15:53:00Z`. Post-merge CI succeeded:
+
+`https://github.com/alindebergASL/throughline/actions/runs/29513153082`
+
+The merge checkpoint is:
+
+`https://github.com/alindebergASL/throughline/pull/6#issuecomment-4993983399`

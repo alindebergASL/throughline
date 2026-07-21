@@ -1,8 +1,15 @@
 # Wave B1 Result — Manual Account Work Graph and Source Capture
 
 - **Date:** 2026-07-21 UTC
-- **Status:** reconciled final-byte gate, detached exact-head verification, direct read-only review, normal publication, exact-head CI, and durable checkpoint PASS for reviewed implementation/evidence parent `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84`; PR #8 remains OPEN and merge remains unauthorized
+- **Status:** PR #8 was squash-merged after the reconciled final-byte gate, detached exact-head verification, direct read-only review, normal publication, exact-head CI, and durable checkpoint passed; B1 is merged but not deployed, and B2 has not started
 - **Branch:** `wave-b1-work-graph-source-capture`
+- **Authorized PR #8 head:** `55afbfd4221745c5a541db855149de52878137a7`
+- **Merged main:** `32c97afd13ee2288b84134a6a358c99fa165f157`
+- **Merged tree:** `6527a6ba927711deb09d5bebfb264a2e977a9131`
+- **Sole parent:** `a302c1f4a48a632b965be7bfcd1e8086795c0e8d`
+- **Merge time:** `2026-07-21T04:58:20Z`
+- **Exact-new-main push CI:** `https://github.com/alindebergASL/throughline/actions/runs/29802678285`
+- **Merge checkpoint:** `https://github.com/alindebergASL/throughline/pull/8#issuecomment-5030374515`
 - **Historical published PR #8 head:** `81a58639667a290d395b52116cefa6234b3754c1`
 - **Historical published PR #8 tree:** `66465e4e48fffddca07aeb882823865b43168293`
 - **Original merge base:** `2566cb4649c24217058d32de6a0e088b303bb07b`
@@ -13,7 +20,7 @@
 - **Reviewed implementation/evidence parent:** `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84`
 - **Reviewed implementation/evidence tree:** `351b209eb39aa9b2f2114ab89e793db2fba27e11`
 - **Canonical plan SHA-256:** `38a08d9cd57f3704f45c75bb35f5eb29a03d9a157e247e3ffa0af9ee6b77d39d`
-- **Publication state:** PR #8 was normally published at reviewed parent `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84`; exact-head CI run `29789153257` succeeded; durable checkpoint `5028715935` was posted and verified; PR #8 remains OPEN and unmerged
+- **Historical publication state:** PR #8 was normally published at reviewed parent `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84`; exact-head CI run `29789153257` succeeded; durable checkpoint `5028715935` was posted and verified before the later authorized head was squash-merged
 
 ## Scope and outcome
 
@@ -359,13 +366,31 @@ Durable reconciliation checkpoint `5028715935` was posted and read back byte-for
 
 The earlier database-naming run at `authoritative-pr8-reconciled-preresult-20260720T213732Z-4038005` remains rejected diagnostic evidence only. It failed closed at Foundation preflight because its disposable database name omitted the required `test` marker; it is not counted as PASS and does not replace the accepted final-byte or detached exact-head evidence.
 
-## Docs-only closeout child and merge HOLD
+## Historical docs-only closeout child and pre-merge HOLD
 
-This durable artifact identifies `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84` explicitly as the reviewed implementation/evidence parent. This closeout changes only `docs/status/WAVE_B1_RESULT.md`; it does not alter implementation, migrations, tests, dependencies, workflows, Docker harnesses, canonical product documents, or accepted ADRs.
+The pre-merge durable artifact identified `da478e9f05f0dfd0274cc3d8ffa425c4df0d8f84` explicitly as the reviewed implementation/evidence parent. That historical closeout changed only `docs/status/WAVE_B1_RESULT.md`; it did not alter implementation, migrations, tests, dependencies, workflows, Docker harnesses, canonical product documents, or accepted ADRs.
 
-To avoid a self-referential identifier, this file does not name its eventual docs-only child SHA. The exact child head/tree, corrected result-file SHA-256, exact-delta verifier/reviewer evidence, and child CI are recorded in the PR description and final docs-closeout checkpoint after normal publication.
+To avoid a self-referential identifier, that artifact did not name its eventual docs-only child SHA. The exact child head/tree, corrected result-file SHA-256, exact-delta verifier/reviewer evidence, and child CI were recorded in the PR description and final docs-closeout checkpoint after normal publication.
 
-PR #8 remains OPEN and unmerged. Merge remains unauthorized pending explicit approval. No deployment, release, AWS/runtime access, B2 work, canonical-document change, accepted-ADR change, real Kanban dispatch, Docker-volume cleanup, shared Hermes-control change, history rewrite, or Atliera action occurred.
+At that historical checkpoint, PR #8 remained open and unmerged, and merge remained unauthorized
+pending explicit approval. No deployment, release, AWS/runtime access, B2 work, canonical-document
+change, accepted-ADR change, real Kanban dispatch, Docker-volume cleanup, shared Hermes-control
+change, history rewrite, or Atliera action occurred.
+
+The later authorized PR #8 head `55afbfd4221745c5a541db855149de52878137a7` was squash-merged as
+`32c97afd13ee2288b84134a6a358c99fa165f157` with tree
+`6527a6ba927711deb09d5bebfb264a2e977a9131` and sole parent
+`a302c1f4a48a632b965be7bfcd1e8086795c0e8d` at `2026-07-21T04:58:20Z`. Exact-new-main push CI
+succeeded:
+
+`https://github.com/alindebergASL/throughline/actions/runs/29802678285`
+
+The merge checkpoint is:
+
+`https://github.com/alindebergASL/throughline/pull/8#issuecomment-5030374515`
+
+B1 is merged but has not been deployed. B2 has not started. This documentation closeout does not
+claim that its own future PR is merged.
 
 ## Spec deviations
 
@@ -373,4 +398,4 @@ None identified.
 
 ## Known issues
 
-No known B1 implementation or reconciliation blocker remains. The continuing HOLD is solely the explicit merge-authorization boundary.
+No known B1 implementation or reconciliation blocker remains.
