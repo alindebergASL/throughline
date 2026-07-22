@@ -4,12 +4,10 @@ Throughline is an AI-native Work OS identified by active, trusted organizational
 first product is Account & Partner Operations, the first domain profile is AI Solutions, and the
 first loop is Engagement -> Memory -> Action.
 
-The scoped Wave A2 tenancy, identity, authorization, and RLS implementation is merged. The
-repository is now in post-A2 foundation alignment: the remaining asynchronous foundation proof
-(transactional outbox, SQS relay, idempotent worker consumption, signed context rehydration,
-cross-boundary isolation, and end-to-end trace propagation) is planned but not implemented. B1 has
-not started. Product features such as ChangeSets, truth ledger behavior, MCP adapters, extraction,
-semantic search, and production UI screens remain intentionally deferred.
+Wave A2, Foundation Closure, B1.0, and B1 are merged. B1 has not been deployed. B2 Truth Ledger is
+the next implementation wave and has not started. ChangeSets and governed runtime behavior, model
+extraction, Account Research MCP adapters, semantic retrieval, and production UI remain deferred
+to their later planned waves.
 
 ## Start here
 
