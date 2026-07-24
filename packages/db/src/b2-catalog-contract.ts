@@ -263,7 +263,7 @@ async function validateTruthTables(client: PgPoolClient): Promise<void> {
 async function validateTruthColumnsAndConstraints(client: PgPoolClient): Promise<void> {
   const columns = await client.query<{ table_name: string; columns: string[] }>(
     `SELECT relation.relname AS table_name,
-            array_agg(attribute.attname ORDER BY attribute.attnum) AS columns
+            array_agg(attribute.attname::text ORDER BY attribute.attnum) AS columns
        FROM pg_class relation
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
        JOIN pg_attribute attribute ON attribute.attrelid = relation.oid

@@ -86,6 +86,17 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(contract).toContain("B2 Slice 1 truth table authority drifted");
   });
 
+  it("casts PostgreSQL name columns to text before aggregating the exact inventory", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+
+    expect(contract).toContain(
+      "array_agg(attribute.attname::text ORDER BY attribute.attnum) AS columns"
+    );
+    expect(contract).not.toMatch(
+      /array_agg\(attribute\.attname ORDER BY attribute\.attnum\) AS columns/
+    );
+  });
+
   it("inspects PUBLIC through expanded PostgreSQL ACLs instead of role-name helpers", async () => {
     const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
 
