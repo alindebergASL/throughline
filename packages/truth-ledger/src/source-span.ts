@@ -2,6 +2,8 @@ import {
   SOURCE_CHUNKING_VERSION,
   SOURCE_CHUNK_MAX_SCALARS,
   SOURCE_NORMALIZATION_VERSION,
+  SourceTextPrimitiveError,
+  UnicodeScalarOffsetError,
   maxAccessClass,
   normalizeStoredSourceText,
   sliceUnicodeScalarSpan,
@@ -19,7 +21,8 @@ import {
   requirePositiveInteger,
   requireSha256,
   requireString,
-  requireUuidV7
+  requireUuidV7,
+  TruthContractValidationError
 } from "./validation.js";
 
 const verifiedClaimSourceSpanBrand = Symbol("VerifiedClaimSourceSpan");
@@ -122,6 +125,13 @@ export class VerifiedClaimSourceSpanError extends Error {
   }
 }
 
+export class VerifiedClaimSourceSpanOperationalError extends Error {
+  constructor(cause: unknown) {
+    super("Trusted claim evidence lookup or verification failed", { cause });
+    this.name = "VerifiedClaimSourceSpanOperationalError";
+  }
+}
+
 export class VerifiedClaimSourceSpanAdmission {
   constructor(
     private readonly snapshots: AuthorizedClaimEvidenceSnapshotLookup,
@@ -129,11 +139,28 @@ export class VerifiedClaimSourceSpanAdmission {
   ) {}
 
   async admit(input: unknown): Promise<VerifiedClaimSourceSpan> {
+    let candidate: ReturnType<typeof parseAdmissionCandidate>;
     try {
-      const candidate = parseAdmissionCandidate(input);
-      const tenantId = requireUuidV7(this.authorizedScope.tenantId);
-      const workspaceId = requireUuidV7(this.authorizedScope.workspaceId);
-      const snapshot = await this.snapshots.getAuthorizedClaimEvidenceSnapshot({
+      candidate = parseAdmissionCandidate(input);
+    } catch (cause) {
+      if (cause instanceof TruthContractValidationError) {
+        throw new VerifiedClaimSourceSpanError();
+      }
+      throw new VerifiedClaimSourceSpanOperationalError(cause);
+    }
+
+    let tenantId: string;
+    let workspaceId: string;
+    try {
+      tenantId = requireUuidV7(this.authorizedScope.tenantId);
+      workspaceId = requireUuidV7(this.authorizedScope.workspaceId);
+    } catch (cause) {
+      throw new VerifiedClaimSourceSpanOperationalError(cause);
+    }
+
+    let snapshot: AuthorizedClaimEvidenceSnapshot | null;
+    try {
+      snapshot = await this.snapshots.getAuthorizedClaimEvidenceSnapshot({
         tenantId,
         workspaceId,
         subjectType: candidate.subject.type,
@@ -141,6 +168,11 @@ export class VerifiedClaimSourceSpanAdmission {
         sourceArtifactId: candidate.evidence.sourceArtifactId,
         sourceChunkId: candidate.evidence.sourceChunkId
       });
+    } catch (cause) {
+      throw new VerifiedClaimSourceSpanOperationalError(cause);
+    }
+
+    try {
       if (!snapshot) throw new VerifiedClaimSourceSpanError();
       return verifySnapshot(
         snapshot,
@@ -148,8 +180,16 @@ export class VerifiedClaimSourceSpanAdmission {
         candidate.subject,
         candidate.evidence
       );
-    } catch {
-      throw new VerifiedClaimSourceSpanError();
+    } catch (cause) {
+      if (
+        cause instanceof VerifiedClaimSourceSpanError ||
+        cause instanceof TruthContractValidationError ||
+        cause instanceof SourceTextPrimitiveError ||
+        cause instanceof UnicodeScalarOffsetError
+      ) {
+        throw new VerifiedClaimSourceSpanError();
+      }
+      throw new VerifiedClaimSourceSpanOperationalError(cause);
     }
   }
 }
@@ -302,15 +342,10 @@ function verifySnapshot(
   if (normalizeStoredSourceText(source.immutableText) !== normalizedText) {
     throw new VerifiedClaimSourceSpanError();
   }
-  const rawHashWithoutBom = sha256Utf8(source.immutableText);
-  const rawHashWithStrippedUtf8Bom = sha256Utf8(`\uFEFF${source.immutableText}`);
-  if (
-    source.contentHash !== rawHashWithoutBom &&
-    source.contentHash !== rawHashWithStrippedUtf8Bom
-  ) {
+  const rawHash = sha256Utf8(source.immutableText);
+  if (source.contentHash !== rawHash) {
     throw new VerifiedClaimSourceSpanError();
   }
-  const rawHash = source.contentHash;
   const normalizedHash = sha256Utf8(normalizedText);
   const excerpt = sliceUnicodeScalarSpan(
     selected.normalizedText,

@@ -70,8 +70,8 @@ export function parseB2Command(input: unknown): B2AuthorizedDomainCommand {
       )
     };
     switch (kind) {
-      case "claim.propose":
-        return { ...metadata, kind, payload: parseProposeClaim(command.payload) };
+      case "claim.create":
+        return { ...metadata, kind, payload: parseCreateClaim(command.payload) };
       case "fact.accept":
         return { ...metadata, kind, payload: parseAcceptFact(command.payload) };
       case "fact.contest":
@@ -132,7 +132,7 @@ export function serializeB2CommandResult<K extends B2CommandKind>(kind: K, input
   return canonicalJsonStringify(parseB2CommandResult(kind, input));
 }
 
-function parseProposeClaim(input: unknown): B2CommandPayloadMap["claim.propose"] {
+function parseCreateClaim(input: unknown): B2CommandPayloadMap["claim.create"] {
   const value = exactObject(
     input,
     ["subject", "predicate", "valueJson", "normalizedText", "confidence", "evidence"],
@@ -386,7 +386,7 @@ function parseEvidence(input: unknown): ClaimSourceSpanCandidate {
 
 function parseResult(kind: B2CommandKind, input: unknown): B2CommandResultMap[B2CommandKind] {
   switch (kind) {
-    case "claim.propose": {
+    case "claim.create": {
       const value = exactObject(input, ["claimId", "version", "status"]);
       return {
         claimId: requireUuidV7(value.claimId),

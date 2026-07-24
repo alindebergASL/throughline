@@ -17,7 +17,8 @@ import {
 } from "@throughline/core-types";
 import {
   calculateAcceptedFactConfidence,
-  type AcceptedFactConfidenceResult
+  type AcceptedFactConfidenceResult,
+  type RecordedConfidenceSupportAssessment
 } from "./confidence.js";
 import { resolvePredicateDefinition, type TruthSubjectKind } from "./predicate-registry.js";
 import { isVerifiedClaimSourceSpan, type VerifiedClaimSourceSpan } from "./source-span.js";
@@ -133,6 +134,10 @@ export function constructAcceptedFactAtTrustedBoundary(
     return failContract();
   }
   const claims = [...input.claims];
+  const factId = requireUuidV7(input.id);
+  const supersedesFactId =
+    input.supersedesFactId === undefined ? undefined : requireUuidV7(input.supersedesFactId);
+  if (supersedesFactId === factId) return failContract();
   const first = claims[0]!;
   const definition = resolvePredicateDefinition(first.predicate, first.subjectType);
   definition.valueSchema.parse(first.valueJson);
@@ -228,7 +233,7 @@ export function constructAcceptedFactAtTrustedBoundary(
     ])
   );
   const fact = {
-    id: requireUuidV7(input.id),
+    id: factId,
     version: 1 as const,
     tenantId: requireUuidV7(first.tenantId),
     workspaceId: requireUuidV7(first.workspaceId),
@@ -245,9 +250,7 @@ export function constructAcceptedFactAtTrustedBoundary(
     ...(first.validTo === undefined ? {} : { validTo: requireTimestamp(first.validTo) }),
     recordedAt: requireTimestamp(input.recordedAt),
     status: "current" as const,
-    ...(input.supersedesFactId === undefined
-      ? {}
-      : { supersedesFactId: requireUuidV7(input.supersedesFactId) }),
+    ...(supersedesFactId === undefined ? {} : { supersedesFactId }),
     accessClass,
     acceptedByUserId: requireUuidV7(input.acceptedByUserId),
     acceptedByMembershipId: requireUuidV7(input.acceptedByMembershipId),
@@ -396,6 +399,12 @@ export type SourceLifecycleEvidence = Readonly<
   | { kind: "source.erased"; reason: SourceErasureReason }
 >;
 
+type ReviewRequiredSupportAssessment = RecordedConfidenceSupportAssessment &
+  Readonly<{
+    disposition: "review_required";
+    recomputedStoredConfidence: false;
+  }>;
+
 export type SourceReconciliationEvidence = Readonly<
   | {
       kind: "fact.source_correction_review_required";
@@ -404,6 +413,28 @@ export type SourceReconciliationEvidence = Readonly<
       fromStatus: "current";
       toStatus: "contested";
       reason: SourceCorrectionReason;
+      commandId: string;
+      recordedAt: string;
+    }
+  | {
+      kind: "fact.source_support_review_required";
+      factId: string;
+      fromStatus: "current";
+      toStatus: "contested";
+      reviewReason: "support_invalidated";
+      reviewReasonAdded: false;
+      supportAssessment: ReviewRequiredSupportAssessment;
+      commandId: string;
+      recordedAt: string;
+    }
+  | {
+      kind: "fact.source_support_review_required";
+      factId: string;
+      fromStatus: "contested";
+      toStatus: "contested";
+      reviewReason: "support_invalidated";
+      reviewReasonAdded: true;
+      supportAssessment: ReviewRequiredSupportAssessment;
       commandId: string;
       recordedAt: string;
     }
@@ -458,7 +489,6 @@ export interface FactConflictEvidence {
 
 interface DeterministicTruthViewFactInputBase {
   readonly factId: string;
-  readonly version: number;
   readonly subjectType: TruthSubjectKind;
   readonly subjectId: string;
   readonly predicate: B2TruthPredicate;
@@ -472,15 +502,29 @@ interface DeterministicTruthViewFactInputBase {
   readonly supportingClaimIds: readonly string[];
 }
 
-/** Audience-projected status: an inaccessible contest has no presentation or identity effect. */
+export type DeterministicTruthViewReviewState = Readonly<
+  | {
+      kind: "none";
+    }
+  | {
+      kind: "visible_claim_conflict";
+      audienceFilteredConflictIds: readonly [string, ...string[]];
+    }
+  | {
+      kind: "source_support_review";
+      reason: "source_corrected" | "support_invalidated";
+    }
+>;
+
+/** Audience-projected state only; raw Fact lifecycle versions and hidden conflicts are excluded. */
 export type DeterministicTruthViewFactInput = Readonly<
   | (DeterministicTruthViewFactInputBase & {
       status: "current";
-      authorizedVisibleConflictIds: readonly [];
+      reviewState: Extract<DeterministicTruthViewReviewState, { kind: "none" }>;
     })
   | (DeterministicTruthViewFactInputBase & {
       status: "contested";
-      authorizedVisibleConflictIds: readonly [string, ...string[]];
+      reviewState: Exclude<DeterministicTruthViewReviewState, { kind: "none" }>;
     })
 >;
 
@@ -495,6 +539,7 @@ export interface DeterministicTruthViewClaimInput {
   readonly validTo?: string;
   readonly accessClass: AccessClass;
   readonly verifiedSourceSpan: VerifiedClaimSourceSpan;
+  readonly visibleToAudience: true;
 }
 
 export interface DeterministicTruthViewConflictInput {
@@ -522,8 +567,8 @@ export interface DeterministicTruthViewInput {
   readonly policyVersion: string;
   readonly audienceFingerprint: string;
   readonly facts: readonly DeterministicTruthViewFactInput[];
-  readonly claims: readonly DeterministicTruthViewClaimInput[];
-  readonly conflicts: readonly DeterministicTruthViewConflictInput[];
+  readonly audienceFilteredClaims: readonly DeterministicTruthViewClaimInput[];
+  readonly audienceFilteredConflicts: readonly DeterministicTruthViewConflictInput[];
   readonly verifiedSourceSpans: readonly VerifiedClaimSourceSpan[];
 }
 

@@ -9,6 +9,8 @@ import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   VerifiedClaimSourceSpanAdmission,
+  VerifiedClaimSourceSpanError,
+  VerifiedClaimSourceSpanOperationalError,
   isVerifiedClaimSourceSpan,
   type AuthorizedClaimEvidenceSnapshot,
   type AuthorizedClaimEvidenceSnapshotLookup
@@ -238,15 +240,37 @@ describe("VerifiedClaimSourceSpan admission", () => {
     });
   });
 
-  it("accepts the exact B1 raw hash when TextDecoder stripped one UTF-8 BOM", async () => {
+  it("rejects an alternate BOM-prefixed raw hash that does not match persisted immutable text", async () => {
     const value = fixture({ raw: "abc", normalized: "abc", localStart: 0, localEnd: 3 });
-    const originalB1BytesHash = sha256("\uFEFFabc");
-    (value.snapshot.source as { contentHash: string }).contentHash = originalB1BytesHash;
-    value.candidate.evidence.sourceContentHash = originalB1BytesHash;
-    await expect(admission(value.snapshot).admit(value.candidate)).resolves.toMatchObject({
-      excerpt: "abc",
-      sourceContentHash: originalB1BytesHash
-    });
+    const alternateHash = sha256("\uFEFFabc");
+    (value.snapshot.source as { contentHash: string }).contentHash = alternateHash;
+    value.candidate.evidence.sourceContentHash = alternateHash;
+    await expect(admission(value.snapshot).admit(value.candidate)).rejects.toBeInstanceOf(
+      VerifiedClaimSourceSpanError
+    );
+  });
+
+  it("preserves a trusted lookup failure as one internal operational error with its cause", async () => {
+    const value = fixture();
+    const sentinel = new Error("sentinel trusted lookup failure");
+    const failingAdmission = new VerifiedClaimSourceSpanAdmission(
+      {
+        async getAuthorizedClaimEvidenceSnapshot() {
+          throw sentinel;
+        }
+      },
+      { tenantId: ids.tenant, workspaceId: ids.workspace }
+    );
+
+    let caught: unknown;
+    try {
+      await failingAdmission.admit(value.candidate);
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(VerifiedClaimSourceSpanOperationalError);
+    expect(caught).not.toBeInstanceOf(VerifiedClaimSourceSpanError);
+    expect((caught as Error & { cause: unknown }).cause).toBe(sentinel);
   });
 
   it("rejects lookup misses, fabricated IDs, and every scope/ownership mismatch", async () => {

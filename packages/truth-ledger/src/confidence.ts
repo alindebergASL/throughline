@@ -110,7 +110,7 @@ export function assessRecordedConfidenceSupport(input: {
   activeClaims: readonly SelectedClaimConfidence[];
 }): RecordedConfidenceSupportAssessment {
   if (!Object.hasOwn(CONFIDENCE_RANK, input.recordedConfidence)) return failContract();
-  const active = validateClaims(input.activeClaims).filter(({ valid }) => valid);
+  const active = validateClaims(input.activeClaims, true).filter(({ valid }) => valid);
   const strongestActiveSupport =
     active.length === 0
       ? null
@@ -129,9 +129,10 @@ export function assessRecordedConfidenceSupport(input: {
 }
 
 function validateClaims(
-  claims: readonly SelectedClaimConfidence[]
+  claims: readonly SelectedClaimConfidence[],
+  allowEmpty = false
 ): readonly SelectedClaimConfidence[] {
-  if (!Array.isArray(claims) || claims.length === 0 || claims.length > 100) {
+  if (!Array.isArray(claims) || (!allowEmpty && claims.length === 0) || claims.length > 100) {
     return failContract();
   }
   const seen = new Set<string>();

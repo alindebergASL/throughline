@@ -70,6 +70,7 @@ describe("AcceptedFact confidence", () => {
   });
 
   it("rejects an attempted raise, a no-op lowering, missing support, and unsafe rationale", () => {
+    expect(() => calculateAcceptedFactConfidence({ selectedClaims: [] })).toThrow();
     expect(() =>
       calculateAcceptedFactConfidence({
         selectedClaims: [claim("01", "weak")],
@@ -104,7 +105,22 @@ describe("AcceptedFact confidence", () => {
     ).toThrow();
   });
 
-  it("never silently mutates recorded confidence when later support weakens", () => {
+  it("accepts zero active support for reassessment and requires review without mutation", () => {
+    const assessment = assessRecordedConfidenceSupport({
+      recordedConfidence: "strong",
+      activeClaims: []
+    });
+    expect(assessment).toEqual({
+      rule: "recorded-confidence-support-assessment.v1",
+      recordedConfidence: "strong",
+      strongestActiveSupport: null,
+      disposition: "review_required",
+      recomputedStoredConfidence: false,
+      activeValidClaimIds: []
+    });
+  });
+
+  it("requires review for weaker surviving support and never mutates recorded confidence", () => {
     const assessment = assessRecordedConfidenceSupport({
       recordedConfidence: "strong",
       activeClaims: [claim("01", "weak"), claim("02", "weak")]
@@ -114,6 +130,25 @@ describe("AcceptedFact confidence", () => {
       recordedConfidence: "strong",
       strongestActiveSupport: "weak",
       disposition: "review_required",
+      recomputedStoredConfidence: false,
+      activeValidClaimIds: [
+        "018f0000-0000-7000-8000-000000000001",
+        "018f0000-0000-7000-8000-000000000002"
+      ]
+    });
+  });
+
+  it("marks support as sustained only when surviving support sustains recorded confidence", () => {
+    expect(
+      assessRecordedConfidenceSupport({
+        recordedConfidence: "strong",
+        activeClaims: [claim("01", "weak"), claim("02", "strong")]
+      })
+    ).toEqual({
+      rule: "recorded-confidence-support-assessment.v1",
+      recordedConfidence: "strong",
+      strongestActiveSupport: "strong",
+      disposition: "sustained",
       recomputedStoredConfidence: false,
       activeValidClaimIds: [
         "018f0000-0000-7000-8000-000000000001",

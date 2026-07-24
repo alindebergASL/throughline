@@ -46,9 +46,9 @@ const metadata = {
 } as const;
 
 const commands = {
-  "claim.propose": {
+  "claim.create": {
     ...metadata,
-    kind: "claim.propose",
+    kind: "claim.create",
     payload: {
       subject: { type: "activity", id: ids.subject, expectedVersion: 3 },
       predicate: "activity.outcome",
@@ -186,7 +186,7 @@ const commands = {
 } as const satisfies { [K in B2CommandKind]: B2AuthorizedDomainCommand<K> };
 
 const results = {
-  "claim.propose": { claimId: ids.claim1, version: 1, status: "proposed" },
+  "claim.create": { claimId: ids.claim1, version: 1, status: "proposed" },
   "fact.accept": {
     factId: ids.fact,
     version: 1,
@@ -252,7 +252,7 @@ const results = {
 describe("B2 strict command contracts", () => {
   it("pins the complete explicit command vocabulary and parses every exact shape", () => {
     expect(B2_COMMAND_KINDS).toEqual([
-      "claim.propose",
+      "claim.create",
       "fact.accept",
       "fact.contest",
       "fact.uphold",
@@ -284,9 +284,9 @@ describe("B2 strict command contracts", () => {
   it("accepts both product-owned subject/predicate/scope pairs", () => {
     expect(
       parseB2Command({
-        ...commands["claim.propose"],
+        ...commands["claim.create"],
         payload: {
-          ...commands["claim.propose"].payload,
+          ...commands["claim.create"].payload,
           subject: { type: "initiative", id: ids.subject, expectedVersion: 3 },
           predicate: "initiative.primary_objective",
           valueJson: "Reduce response time",
@@ -294,7 +294,7 @@ describe("B2 strict command contracts", () => {
         }
       })
     ).toMatchObject({
-      kind: "claim.propose",
+      kind: "claim.create",
       payload: { predicate: "initiative.primary_objective", subject: { type: "initiative" } }
     });
     expect(
@@ -310,37 +310,37 @@ describe("B2 strict command contracts", () => {
   });
 
   it("rejects missing, extra, type-confused, non-v7, noncanonical, and caller-trusted fields", () => {
-    expect(() => parseB2Command({ ...commands["claim.propose"], kind: "claim.create" })).toThrow();
+    expect(() => parseB2Command({ ...commands["claim.create"], kind: "claim.propose" })).toThrow();
     expect(() =>
-      parseB2Command({ ...commands["claim.propose"], predicateCatalogVersion: "catalog.attacker" })
+      parseB2Command({ ...commands["claim.create"], predicateCatalogVersion: "catalog.attacker" })
     ).toThrow();
-    expect(() => parseB2Command({ ...commands["claim.propose"], idempotencyKey: "" })).toThrow();
+    expect(() => parseB2Command({ ...commands["claim.create"], idempotencyKey: "" })).toThrow();
     expect(() =>
       parseB2Command({
-        ...commands["claim.propose"],
-        payload: { ...commands["claim.propose"].payload, predicate: "initiative.stage" }
+        ...commands["claim.create"],
+        payload: { ...commands["claim.create"].payload, predicate: "initiative.stage" }
       })
     ).toThrow();
     expect(() =>
       parseB2Command({
-        ...commands["claim.propose"],
+        ...commands["claim.create"],
         payload: {
-          ...commands["claim.propose"].payload,
+          ...commands["claim.create"].payload,
           subject: { type: "initiative", id: ids.subject, expectedVersion: 3 }
         }
       })
     ).toThrow();
     expect(() =>
       parseB2Command({
-        ...commands["claim.propose"],
-        payload: { ...commands["claim.propose"].payload, valueJson: " Noncanonical" }
+        ...commands["claim.create"],
+        payload: { ...commands["claim.create"].payload, valueJson: " Noncanonical" }
       })
     ).toThrow();
     expect(() =>
       parseB2Command({
-        ...commands["claim.propose"],
+        ...commands["claim.create"],
         payload: {
-          ...commands["claim.propose"].payload,
+          ...commands["claim.create"].payload,
           subject: {
             type: "activity",
             id: "00000000-0000-4000-8000-000000000000",
@@ -351,7 +351,7 @@ describe("B2 strict command contracts", () => {
     ).toThrow();
     expect(() => {
       const missingPayload: { payload?: unknown } & Record<string, unknown> = {
-        ...commands["claim.propose"]
+        ...commands["claim.create"]
       };
       delete missingPayload.payload;
       parseB2Command(missingPayload);
@@ -370,8 +370,8 @@ describe("B2 strict command contracts", () => {
     ]) {
       expect(() =>
         parseB2Command({
-          ...commands["claim.propose"],
-          payload: { ...commands["claim.propose"].payload, [key]: "caller-controlled" }
+          ...commands["claim.create"],
+          payload: { ...commands["claim.create"].payload, [key]: "caller-controlled" }
         })
       ).toThrow();
     }
@@ -457,8 +457,8 @@ describe("B2 strict command contracts", () => {
     for (const observedAt of ["2026-02-30T00:00:00Z", "2026-01-01T24:00:00Z"]) {
       expect(() =>
         parseB2Command({
-          ...commands["claim.propose"],
-          payload: { ...commands["claim.propose"].payload, observedAt }
+          ...commands["claim.create"],
+          payload: { ...commands["claim.create"].payload, observedAt }
         })
       ).toThrow();
     }
@@ -488,7 +488,7 @@ describe("B2 strict command contracts", () => {
   });
 
   it("canonicalizes object-key order and includes all material identity fields", () => {
-    const command = commands["claim.propose"];
+    const command = commands["claim.create"];
     const reordered = {
       payload: {
         evidence: { ...command.payload.evidence },
@@ -509,7 +509,7 @@ describe("B2 strict command contracts", () => {
       recipe: "truth-ledger-command-identity.v1",
       commandSchemaVersion: 1,
       predicateCatalogVersion: "truth-predicate-catalog.v1",
-      kind: "claim.propose"
+      kind: "claim.create"
     });
     expect(serializeB2CommandIdentity(command)).toContain(
       '"predicateCatalogVersion":"truth-predicate-catalog.v1"'
@@ -522,7 +522,7 @@ describe("B2 strict command contracts", () => {
     }
     expectTypeOf<{
       kind: "fact.revoke";
-      payload: (typeof commands)["claim.propose"]["payload"];
+      payload: (typeof commands)["claim.create"]["payload"];
     }>().not.toMatchTypeOf<B2CanonicalCommandIdentityInput>();
 
     const hashes = [
@@ -585,7 +585,7 @@ describe("B2 strict command contracts", () => {
       B2_COMMAND_KINDS.map((kind) => [kind, hashB2CommandIdentity(commands[kind])])
     );
     expect(goldenHashes).toEqual({
-      "claim.propose": "fdd1696920f764abbd2eff252f9b84cc4b04446bfc3fa86af6339b81a33c8eec",
+      "claim.create": "66c8f793b462cfcb99913845c7301a8e2ecc851db880d7aeda0326b8e363dd8f",
       "fact.accept": "f794d35986417e2f26d519172a2cd2434e86da12122b68c67f3018c96be56691",
       "fact.contest": "fdd9683d7ddb66727dd5a9cf9457d6e8bb87902ed24a0fa7c88f46c117bb6753",
       "fact.uphold": "f71ba178ad3f3b6c033e4438697263932c598fd7db42bda7184d6c51e1587900",

@@ -16,7 +16,10 @@ import {
   type AcceptedFact,
   type Claim,
   type DerivedViewSnapshot,
+  type DeterministicTruthViewClaimInput,
+  type DeterministicTruthViewConflictInput,
   type DeterministicTruthViewFactInput,
+  type DeterministicTruthViewInput,
   type FactLifecycleEvidence,
   type NewlyAcceptedFact,
   type SourceReconciliationEvidence
@@ -269,6 +272,12 @@ describe("construction-controlled truth records", () => {
     expect(() =>
       constructAcceptedFactAtTrustedBoundary({
         ...construction,
+        supersedesFactId: ids.fact
+      })
+    ).toThrow();
+    expect(() =>
+      constructAcceptedFactAtTrustedBoundary({
+        ...construction,
         claims: [
           {
             ...base,
@@ -328,7 +337,7 @@ describe("construction-controlled truth records", () => {
     expectTypeOf<Record<string, unknown>>().not.toMatchTypeOf<AcceptedFact>();
   });
 
-  it("pins lifecycle authority, audience-visible conflict, reconciliation, and snapshot types", () => {
+  it("pins lifecycle authority, audience-filtered review states, reconciliation, and snapshots", () => {
     type RoutineAuthority = Extract<
       FactLifecycleEvidence,
       { kind: "fact.accepted" | "fact.contested" | "fact.upheld" | "fact.superseded" }
@@ -340,23 +349,75 @@ describe("construction-controlled truth records", () => {
     expectTypeOf<RoutineAuthority>().toEqualTypeOf<"activity_owner" | "initiative_owner">();
     expectTypeOf<EmergencyAuthority>().toEqualTypeOf<"workspace_owner_emergency">();
     expectTypeOf<
-      Extract<
-        DeterministicTruthViewFactInput,
-        { status: "current" }
-      >["authorizedVisibleConflictIds"]
-    >().toEqualTypeOf<readonly []>();
+      Extract<DeterministicTruthViewFactInput, { status: "current" }>["reviewState"]["kind"]
+    >().toEqualTypeOf<"none">();
+
     expectTypeOf<
       Extract<
-        DeterministicTruthViewFactInput,
-        { status: "contested" }
-      >["authorizedVisibleConflictIds"]
+        Extract<DeterministicTruthViewFactInput, { status: "contested" }>["reviewState"],
+        { kind: "visible_claim_conflict" }
+      >["audienceFilteredConflictIds"]
     >().toEqualTypeOf<readonly [string, ...string[]]>();
+
+    expectTypeOf<
+      Extract<
+        Extract<DeterministicTruthViewFactInput, { status: "contested" }>["reviewState"],
+        { kind: "source_support_review" }
+      >["reason"]
+    >().toEqualTypeOf<"source_corrected" | "support_invalidated">();
+    type SourceSupportReviewState = Extract<
+      Extract<DeterministicTruthViewFactInput, { status: "contested" }>["reviewState"],
+      { kind: "source_support_review" }
+    >;
+    type SourceReviewHasChallengerClaimId =
+      "challengerClaimId" extends keyof SourceSupportReviewState ? true : false;
+    type SourceReviewHasConflictIds =
+      "audienceFilteredConflictIds" extends keyof SourceSupportReviewState ? true : false;
+    expectTypeOf<SourceReviewHasChallengerClaimId>().toEqualTypeOf<false>();
+    expectTypeOf<SourceReviewHasConflictIds>().toEqualTypeOf<false>();
+    type HasRawLifecycleVersion = "version" extends keyof DeterministicTruthViewFactInput
+      ? true
+      : false;
+    type HasHiddenConflictIds = "hiddenConflictIds" extends keyof DeterministicTruthViewFactInput
+      ? true
+      : false;
+    type HasUnfilteredConflicts = "conflicts" extends keyof DeterministicTruthViewInput
+      ? true
+      : false;
+    expectTypeOf<HasRawLifecycleVersion>().toEqualTypeOf<false>();
+    expectTypeOf<HasHiddenConflictIds>().toEqualTypeOf<false>();
+    expectTypeOf<HasUnfilteredConflicts>().toEqualTypeOf<false>();
+    expectTypeOf<{ visibleToAudience: false }>().not.toMatchTypeOf<
+      Pick<DeterministicTruthViewClaimInput, "visibleToAudience">
+    >();
+    expectTypeOf<{ visibleToAudience: false }>().not.toMatchTypeOf<
+      Pick<DeterministicTruthViewConflictInput, "visibleToAudience">
+    >();
     expectTypeOf<SourceReconciliationEvidence["kind"]>().toEqualTypeOf<
       | "fact.source_correction_review_required"
+      | "fact.source_support_review_required"
       | "fact.source_support_removed_independent_support"
       | "fact.source_revalidated_by_supersession"
       | "fact.source_removal_revoked"
     >();
+    expectTypeOf<
+      Extract<
+        SourceReconciliationEvidence,
+        { kind: "fact.source_support_review_required"; fromStatus: "current" }
+      >["reviewReasonAdded"]
+    >().toEqualTypeOf<false>();
+    expectTypeOf<
+      Extract<
+        SourceReconciliationEvidence,
+        { kind: "fact.source_support_review_required" }
+      >["supportAssessment"]["disposition"]
+    >().toEqualTypeOf<"review_required">();
+    expectTypeOf<
+      Extract<
+        SourceReconciliationEvidence,
+        { kind: "fact.source_support_review_required"; fromStatus: "contested" }
+      >["reviewReasonAdded"]
+    >().toEqualTypeOf<true>();
     expectTypeOf<DerivedViewSnapshot["modelProvider"]>().toEqualTypeOf<"deterministic">();
     expectTypeOf<DerivedViewSnapshot["modelId"]>().toEqualTypeOf<"none">();
     expectTypeOf<

@@ -10,7 +10,7 @@ export const B2_TRUTH_PREDICATES = Object.freeze([
 export type B2TruthPredicate = (typeof B2_TRUTH_PREDICATES)[number];
 
 export const B2_COMMAND_KINDS = Object.freeze([
-  "claim.propose",
+  "claim.create",
   "fact.accept",
   "fact.contest",
   "fact.uphold",
@@ -125,6 +125,7 @@ export interface ClaimSourceSpanCandidate {
   expectedChunkVersion: 1;
   normalizationVersion: "source-normalization.v1";
   chunkingVersion: "source-chunking.v1";
+  /** Unicode-scalar offsets local to the selected normalized SourceChunk, never artifact-global or UTF-16 offsets. */
   startOffset: number;
   endOffset: number;
   excerpt: string;
@@ -134,7 +135,7 @@ export interface ClaimSourceSpanCandidate {
   excerptHash: string;
 }
 
-export interface ProposeClaimPayload {
+export interface CreateClaimPayload {
   subject: B2SubjectVersionRef;
   predicate: B2TruthPredicate;
   valueJson: string;
@@ -214,7 +215,7 @@ export interface RegenerateDerivedViewPayload {
 }
 
 export interface B2CommandPayloadMap {
-  "claim.propose": ProposeClaimPayload;
+  "claim.create": CreateClaimPayload;
   "fact.accept": AcceptFactPayload;
   "fact.contest": ContestFactPayload;
   "fact.uphold": UpholdFactPayload;
@@ -230,7 +231,7 @@ export type B2AuthorizedDomainCommand<K extends B2CommandKind = B2CommandKind> =
 }[K];
 
 export interface B2CommandResultMap {
-  "claim.propose": { claimId: string; version: 1; status: "proposed" };
+  "claim.create": { claimId: string; version: 1; status: "proposed" };
   "fact.accept": {
     factId: string;
     version: 1;
