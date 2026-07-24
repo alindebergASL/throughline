@@ -107,6 +107,9 @@ importers:
       '@throughline/tenancy':
         specifier: workspace:*
         version: link:../../packages/tenancy
+      '@throughline/truth-ledger':
+        specifier: workspace:*
+        version: link:../../packages/truth-ledger
       '@throughline/work-graph':
         specifier: workspace:*
         version: link:../../packages/work-graph
@@ -306,9 +309,19 @@ importers:
 
   packages/truth-ledger:
     dependencies:
+      '@throughline/authorization':
+        specifier: workspace:*
+        version: link:../authorization
       '@throughline/core-types':
         specifier: workspace:*
         version: link:../core-types
+      '@throughline/db':
+        specifier: workspace:*
+        version: link:../db
+    devDependencies:
+      '@throughline/tenancy':
+        specifier: workspace:*
+        version: link:../tenancy
 
   packages/ui:
     dependencies:

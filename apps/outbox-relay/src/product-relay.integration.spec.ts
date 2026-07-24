@@ -147,6 +147,31 @@ maybeDescribe("B1.0 real PostgreSQL and LocalStack product relay", () => {
     ).toBe(true);
   });
 
+  it("retains canonical B1 claim and publish updates after B2 validator hardening", async () => {
+    const event = await createPendingEvent(91);
+    const handle = await claim(event);
+
+    await expect(
+      repository.publishClaimed(handle, {
+        publish: async () => ({ messageId: "b2-validator-b1-regression" })
+      })
+    ).resolves.toEqual({
+      status: "published",
+      eventId: event.eventId,
+      messageId: "b2-validator-b1-regression"
+    });
+    await expect(
+      ownerPool.query(
+        `SELECT publication_state, publication_attempt
+           FROM ops.product_outbox_events
+          WHERE id = $1`,
+        [event.eventId]
+      )
+    ).resolves.toMatchObject({
+      rows: [{ publication_state: "published", publication_attempt: 1 }]
+    });
+  });
+
   it("fails closed on a real wrong queue with zero claims/sends and disposes both resources", async () => {
     const event = await createPendingEvent(90);
     const queueName = `throughline-b1-test-wrong-retention-${Date.now()}`;

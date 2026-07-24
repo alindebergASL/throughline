@@ -2,7 +2,7 @@
   "name": "@throughline/truth-ledger",
   "version": "0.0.0",
   "private": true,
-  "description": "B2 Truth Ledger contracts, verified evidence admission, and pure trust rules.",
+  "description": "Durable, permission-aware B2 Claim and AcceptedFact write boundary.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
@@ -14,6 +14,11 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@throughline/core-types": "workspace:*"
+    "@throughline/authorization": "workspace:*",
+    "@throughline/core-types": "workspace:*",
+    "@throughline/db": "workspace:*"
+  },
+  "devDependencies": {
+    "@throughline/tenancy": "workspace:*"
   }
 }

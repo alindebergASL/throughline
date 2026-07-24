@@ -24,6 +24,7 @@
     "@throughline/domain-profiles": "workspace:*",
     "@throughline/observability": "workspace:*",
     "@throughline/tenancy": "workspace:*",
+    "@throughline/truth-ledger": "workspace:*",
     "@throughline/work-graph": "workspace:*",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"

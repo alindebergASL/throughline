@@ -9,12 +9,16 @@ export const B1_MIGRATION_IDS = [
 
 type B1MigrationId = (typeof B1_MIGRATION_IDS)[number];
 type MigrationSources = ReadonlyMap<string, string>;
+type AdditiveB2Phase = 0 | 1 | 2;
 
 const B1_PREDECESSOR_IDS = [
   "0001_wave_a2_identity_access_rls.sql",
   "0002_foundation_closure_async_isolation.sql",
   "0003_b1_0_canonical_product_outbox.sql"
 ] as const;
+
+const B2_SCHEMA_MIGRATION_ID = "0007_b2_slice1_truth_storage.sql";
+const B2_INTEGRITY_MIGRATION_ID = "0008_b2_slice1_command_integrity.sql";
 
 export async function validateMigrationJournal(
   client: PgPoolClient,
@@ -384,9 +388,14 @@ export async function assertB1MigrationStateAbsent(
 export async function validateB1CatalogContract(
   client: PgPoolClient,
   journal: ReadonlyMap<string, string>,
-  sources: MigrationSources
+  sources: MigrationSources,
+  options: { additiveB2Phase?: AdditiveB2Phase } = {}
 ): Promise<void> {
   const phase = deriveB1CatalogPhase(journal);
+  const additiveB2Phase = options.additiveB2Phase ?? 0;
+  if (additiveB2Phase > 0 && phase !== B1_MIGRATION_IDS.length) {
+    throw new Error("A staged B2 catalog requires the exact complete B1 predecessor");
+  }
   const installed = B1_MIGRATION_IDS.slice(0, phase);
   if (installed.length === 0) {
     try {
@@ -403,7 +412,12 @@ export async function validateB1CatalogContract(
   const integrityInstalled = phase === B1_MIGRATION_IDS.length;
   const expectedTables = expectedTableContracts(installed, sources);
   const expectedIndexes = expectedIndexContracts(installed, sources, expectedTables);
-  const expectedTriggers = expectedTriggerContracts(installed, sources, expectedTables);
+  const expectedTriggers = expectedTriggerContracts(
+    installed,
+    sources,
+    expectedTables,
+    additiveB2Phase
+  );
 
   await validateProtectedRoles(client);
   await withScratchCatalog(client, async (scratch) => {
@@ -445,11 +459,13 @@ export async function validateB1CatalogContract(
         client,
         scratch,
         sources.get(B1_PREDECESSOR_IDS[2])!,
-        sources.get(B1_MIGRATION_IDS[2])!
+        sources.get(B1_MIGRATION_IDS[2])!,
+        sources,
+        additiveB2Phase
       );
     }
   });
-  await validateIntegrityPredecessorAccess(client, integrityInstalled);
+  await validateIntegrityPredecessorAccess(client, integrityInstalled, additiveB2Phase);
 }
 
 function expectedTableContracts(
@@ -502,12 +518,27 @@ function expectedIndexContracts(
 function expectedTriggerContracts(
   installed: readonly B1MigrationId[],
   sources: MigrationSources,
-  tables: readonly ExpectedTable[]
+  tables: readonly ExpectedTable[],
+  additiveB2Phase: AdditiveB2Phase
 ): ExpectedTrigger[] {
   const tableMap = new Map(tables.map((table) => [table.actualName, table.scratchName]));
-  return installed
+  const triggerContracts = installed
     .filter((id) => id !== B1_MIGRATION_IDS[2])
-    .flatMap((id) => extractTriggerStatements(requireSource(sources, id)))
+    .flatMap((id) => extractTriggerStatements(requireSource(sources, id)));
+  if (additiveB2Phase >= 1) {
+    const statement = requireSource(sources, B2_SCHEMA_MIGRATION_ID).match(
+      /CREATE TRIGGER source_artifacts_truth_retention[\s\S]*?\bON content\.source_artifacts[\s\S]*?;/
+    )?.[0];
+    if (!statement) {
+      throw new Error("Fixed staged B2 source-retention trigger contract parser failed");
+    }
+    triggerContracts.push({
+      name: "source_artifacts_truth_retention",
+      tableName: "content.source_artifacts",
+      statement
+    });
+  }
+  return triggerContracts
     .filter(({ tableName }) => tableMap.has(tableName))
     .map(({ name, tableName, statement }) => ({
       name,
@@ -1058,7 +1089,7 @@ async function triggerCatalog(
               trigger_record.tginitdeferred AS initially_deferred,
               trigger_record.tgconstraint <> 0 AS is_constraint,
               trigger_record.tgattr::smallint[] AS columns,
-              pg_get_expr(trigger_record.tgqual, trigger_record.tgrelid) AS condition,
+              pg_get_triggerdef(trigger_record.oid, false) AS definition,
               procedure_record.oid::regprocedure::text AS function
        FROM pg_trigger trigger_record
        JOIN pg_proc procedure_record ON procedure_record.oid = trigger_record.tgfoid
@@ -1586,7 +1617,9 @@ async function validateCommandIntegrityObjects(
   client: PgPoolClient,
   scratch: ScratchCatalog,
   predecessorSource: string,
-  source: string
+  source: string,
+  migrationSources: MigrationSources,
+  additiveB2Phase: AdditiveB2Phase
 ): Promise<void> {
   const expectedTable = "b1_contract_domain_command_records";
   const expectedRelation = scratchRelation(scratch, expectedTable);
@@ -1630,6 +1663,43 @@ async function validateCommandIntegrityObjects(
     );
   }
 
+  if (additiveB2Phase === 2) {
+    const b2IntegritySource = requireSource(migrationSources, B2_INTEGRITY_MIGRATION_ID);
+    const productConstraintStatement = b2IntegritySource.match(
+      /ALTER TABLE ops\.domain_command_records\s+DROP CONSTRAINT domain_command_records_b1_shape_check,[\s\S]*?\n\s*\);/
+    )?.[0];
+    const dropB1TriggerStatement = b2IntegritySource.match(
+      /DROP TRIGGER domain_command_records_b1_atomicity_deferred[\s\S]*?;/
+    )?.[0];
+    const stagedTriggerStatements = [
+      "domain_command_records_b1_atomicity_deferred",
+      "domain_command_records_b2_slice1_atomicity_deferred"
+    ].map(
+      (triggerName) =>
+        b2IntegritySource.match(
+          new RegExp(`CREATE CONSTRAINT TRIGGER ${triggerName}[\\s\\S]*?;`)
+        )?.[0]
+    );
+    if (
+      !productConstraintStatement ||
+      !dropB1TriggerStatement ||
+      stagedTriggerStatements.some((statement) => !statement)
+    ) {
+      throw new Error("Fixed staged B2 command integrity contract parser failed");
+    }
+    await client.query(
+      productConstraintStatement.replace("ops.domain_command_records", expectedRelation)
+    );
+    await client.query(
+      dropB1TriggerStatement.replace("ops.domain_command_records", expectedRelation)
+    );
+    for (const triggerStatement of stagedTriggerStatements) {
+      await client.query(
+        triggerStatement!.replace("ON ops.domain_command_records", `ON ${expectedRelation}`)
+      );
+    }
+  }
+
   const constraintCatalog = async (relation: string) =>
     (
       await client.query<Record<string, unknown>>(
@@ -1657,10 +1727,21 @@ async function validateCommandIntegrityObjects(
 
   const actualTriggers = await triggerCatalog(client, "ops.domain_command_records");
   const expectedTriggers = await triggerCatalog(client, expectedRelation);
+  const domainCommandRelationAliases = [
+    {
+      canonicalName: "__DOMAIN_COMMAND_RECORDS__",
+      names: [
+        "ops.domain_command_records",
+        '"ops"."domain_command_records"',
+        `${scratch.schemaName}.${expectedTable}`,
+        `${quoteIdentifier(scratch.schemaName)}.${quoteIdentifier(expectedTable)}`
+      ]
+    }
+  ];
   assertCatalogEqual(
     "exact domain command user-trigger inventory",
-    normalizeRows(actualTriggers, "ops.domain_command_records"),
-    normalizeRows(expectedTriggers, expectedTable)
+    normalizeRows(actualTriggers, "ops.domain_command_records", domainCommandRelationAliases),
+    normalizeRows(expectedTriggers, expectedTable, domainCommandRelationAliases)
   );
 
   const rewriteRules = await client.query<Record<string, unknown>>(
@@ -1738,7 +1819,10 @@ function predecessorAclRows(
   );
 }
 
-function expectedPredecessorAcl(integrityInstalled: boolean): ExpectedPredecessorAcl[] {
+function expectedPredecessorAcl(
+  integrityInstalled: boolean,
+  additiveB2Phase: AdditiveB2Phase
+): ExpectedPredecessorAcl[] {
   const rows: ExpectedPredecessorAcl[] = [];
   for (const relation of [
     "access.access_relationships",
@@ -1835,6 +1919,23 @@ function expectedPredecessorAcl(integrityInstalled: boolean): ExpectedPredecesso
     ),
     ...predecessorAclRows("ops.audit_events", "table", [], "throughline_app", ["INSERT", "SELECT"])
   );
+  if (additiveB2Phase >= 1) {
+    rows.push(
+      ...predecessorAclRows(
+        "ops.domain_command_records",
+        "column",
+        [
+          "reservation_space_id",
+          "command_kind",
+          "actor_user_id",
+          "actor_membership_id",
+          "policy_version_id"
+        ],
+        "throughline_b1_0_integrity",
+        ["SELECT"]
+      )
+    );
+  }
   const productCommandColumns = [
     "id",
     "tenant_id",
@@ -1921,7 +2022,8 @@ function expectedPredecessorAcl(integrityInstalled: boolean): ExpectedPredecesso
 
 async function validateIntegrityPredecessorAccess(
   client: PgPoolClient,
-  integrityInstalled: boolean
+  integrityInstalled: boolean,
+  additiveB2Phase: AdditiveB2Phase
 ): Promise<void> {
   const policies = await client.query<Record<string, unknown>>(
     `SELECT namespace_record.nspname || '.' || relation_record.relname AS relation,
@@ -1938,7 +2040,15 @@ async function validateIntegrityPredecessorAccess(
      WHERE 'throughline_b1_0_integrity'::regrole = ANY(policy_record.polroles)
      ORDER BY 1, 2`
   );
-  const expectedPolicies = integrityPolicyContracts
+  const expectedPolicies: Array<{
+    relation: string;
+    name: string;
+    command: string;
+    permissive: boolean;
+    roles: string[];
+    using_expression: string;
+    check_expression: string | null;
+  }> = integrityPolicyContracts
     .filter(([relation]) => integrityInstalled || relation === "ops.domain_command_records")
     .map(([relation, name]) => ({
       relation,
@@ -1952,6 +2062,33 @@ async function validateIntegrityPredecessorAccess(
     .sort((left, right) =>
       `${left.relation}|${left.name}`.localeCompare(`${right.relation}|${right.name}`)
     );
+  if (additiveB2Phase >= 1) {
+    const additiveIntegrityPolicyContracts = [
+      ["truth.accepted_facts", "accepted_facts_integrity_select", "r"],
+      ["truth.accepted_facts", "accepted_facts_retention_update", "w"],
+      ["truth.claims", "claims_integrity_select", "r"],
+      ["truth.claims", "claims_retention_update", "w"],
+      ["truth.fact_claims", "fact_claims_integrity_select", "r"],
+      ["truth.fact_lifecycle_events", "fact_lifecycle_integrity_select", "r"],
+      ["truth.fact_lifecycle_events", "fact_lifecycle_retention_update", "w"],
+      ["truth.verified_evidence_spans", "verified_evidence_integrity_select", "r"],
+      ["truth.verified_evidence_spans", "verified_evidence_retention_update", "w"]
+    ] as const;
+    expectedPolicies.push(
+      ...additiveIntegrityPolicyContracts.map(([relation, name, command]) => ({
+        relation,
+        name,
+        command,
+        permissive: true,
+        roles: ["throughline_b1_0_integrity"],
+        using_expression: "true",
+        check_expression: command === "w" ? "true" : null
+      }))
+    );
+    expectedPolicies.sort((left, right) =>
+      `${left.relation}|${left.name}`.localeCompare(`${right.relation}|${right.name}`)
+    );
+  }
   assertCatalogEqual("B1 integrity policy capability boundary", policies.rows, expectedPolicies);
 
   const aclDiagnostics = await client.query<Record<string, unknown>>(
@@ -2024,7 +2161,10 @@ async function validateIntegrityPredecessorAccess(
      UNION ALL
      SELECT * FROM unexpected_diagnostic
      ORDER BY direction`,
-    [predecessorAclRelations, JSON.stringify(expectedPredecessorAcl(integrityInstalled))]
+    [
+      predecessorAclRelations,
+      JSON.stringify(expectedPredecessorAcl(integrityInstalled, additiveB2Phase))
+    ]
   );
   if (aclDiagnostics.rowCount !== 0) {
     throw new Error(
@@ -2044,13 +2184,14 @@ async function validateIntegrityPredecessorAccess(
   assertCatalogEqual(
     "B1 integrity schema grants",
     schemaPrivileges.rows,
-    (integrityInstalled ? ["access", "content", "identity", "ops", "work"] : ["ops"]).map(
-      (schema) => ({
-        schema,
-        privilege: "USAGE",
-        grantable: false
-      })
-    )
+    (integrityInstalled
+      ? ["access", "content", "identity", "ops", ...(additiveB2Phase >= 1 ? ["truth"] : []), "work"]
+      : ["ops"]
+    ).map((schema) => ({
+      schema,
+      privilege: "USAGE",
+      grantable: false
+    }))
   );
 
   const unexpectedCapabilities = await client.query(

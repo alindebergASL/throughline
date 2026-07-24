@@ -75,6 +75,10 @@ function payload(eventType: string): Record<string, unknown> {
         deletionPolicyRef: "policy:retention-v1",
         hashDisposition: "erased"
       };
+    case "claim.proposed":
+      return { claimId: ids.aggregate, evidenceSpanId: ids.source };
+    case "fact.accepted":
+      return { factId: ids.aggregate };
     default:
       throw new Error("test event is not allowlisted");
   }
@@ -93,7 +97,9 @@ describe("DomainNotificationEnvelope", () => {
       "content.revised",
       "source_artifact.captured",
       "source_artifact.corrected",
-      "source_artifact.tombstoned"
+      "source_artifact.tombstoned",
+      "claim.proposed",
+      "fact.accepted"
     ]);
     expect(DOMAIN_NOTIFICATION_AGGREGATE_TYPES).toEqual([
       "organization",
@@ -101,7 +107,9 @@ describe("DomainNotificationEnvelope", () => {
       "activity",
       "relationship",
       "content_item",
-      "source_artifact"
+      "source_artifact",
+      "claim",
+      "accepted_fact"
     ]);
     for (const eventType of DOMAIN_NOTIFICATION_EVENT_TYPES) {
       expect(parseDomainNotificationEnvelope(envelope(eventType))).toMatchObject({ eventType });

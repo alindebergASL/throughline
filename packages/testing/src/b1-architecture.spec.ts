@@ -7,7 +7,7 @@ import { describe, expect, it } from "vitest";
 const root = fileURLToPath(new URL("../../..", import.meta.url));
 
 describe("Wave B1 architecture boundaries", () => {
-  it("keeps migrations 0001-0003 byte-identical and adds only 0004-0006", async () => {
+  it("keeps migrations 0001-0003 byte-identical across later additive waves", async () => {
     const expected = {
       "0001_wave_a2_identity_access_rls.sql":
         "22b84fbeb36cfcfdd1f8270e6ffa03d819d5307c0aace86e69aa647d643b1ff7",
@@ -21,7 +21,9 @@ describe("Wave B1 architecture boundaries", () => {
       ...Object.keys(expected),
       "0004_b1_work_graph.sql",
       "0005_b1_content_sources.sql",
-      "0006_b1_command_integrity.sql"
+      "0006_b1_command_integrity.sql",
+      "0007_b2_slice1_truth_storage.sql",
+      "0008_b2_slice1_command_integrity.sql"
     ]);
     for (const [file, digest] of Object.entries(expected)) {
       const bytes = await readFile(join(root, "packages/db/migrations", file));

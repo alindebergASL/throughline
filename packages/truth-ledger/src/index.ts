@@ -35,7 +35,11 @@ export {
   type TruthLifecycleReasonKind,
   type TruthLifecycleReasonMap
 } from "./reasons.js";
-export type { VerifiedClaimSourceSpan } from "./source-span.js";
+export {
+  VerifiedClaimSourceSpanError,
+  VerifiedClaimSourceSpanOperationalError,
+  type VerifiedClaimSourceSpan
+} from "./source-span.js";
 export {
   ACCEPTED_FACT_STATUSES,
   CLAIM_STATUSES,
@@ -59,3 +63,5 @@ export {
   type VerifiedDerivedCitation,
   type SourceLifecycleEvidence
 } from "./types.js";
+export * from "./domain-command-bus.js";
+export { TruthLedgerConflictError } from "./repository.js";

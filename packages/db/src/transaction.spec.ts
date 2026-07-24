@@ -46,6 +46,10 @@ describe("withTenantTransaction", () => {
     expect(spaceSettingCalls).toEqual([
       ["SELECT set_config($1, $2, true)", ["app.space_id", expected]]
     ]);
+    expect(query).toHaveBeenCalledWith("SELECT set_config($1, $2, true)", [
+      "app.data_class_ceiling",
+      context.dataClassCeiling
+    ]);
 
     if (requestedSpaceIds.length > 1) {
       expect(spaceSettingCalls[0]?.[1]?.[1]).not.toBe(requestedSpaceIds[0]);

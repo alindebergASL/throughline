@@ -298,13 +298,19 @@ describe("construction-controlled truth records", () => {
     expect(Object.keys(publicApi).sort()).toEqual([
       "ACCEPTED_FACT_CONFIDENCE_RULE",
       "ACCEPTED_FACT_STATUSES",
+      "B2AuthorizationError",
       "B2CommandInvariantError",
       "B2CommandValidationError",
+      "B2IdempotencyConflictError",
       "CANONICAL_PREDICATE_TEXT_MAX_SCALARS",
       "CLAIM_STATUSES",
       "PredicateRegistryError",
       "TRUTH_PREDICATE_CATALOG_VERSION",
       "TRUTH_PREDICATE_REGISTRY",
+      "TruthLedgerConflictError",
+      "TruthLedgerDomainCommandBus",
+      "VerifiedClaimSourceSpanError",
+      "VerifiedClaimSourceSpanOperationalError",
       "assessRecordedConfidenceSupport",
       "calculateAcceptedFactConfidence",
       "canonicalB2CommandIdentity",
@@ -324,7 +330,6 @@ describe("construction-controlled truth records", () => {
     expect(Object.keys(publicApi)).not.toContain("isAcceptedFact");
     expect(Object.keys(publicApi)).not.toContain("isVerifiedClaimSourceSpan");
     expect(Object.keys(publicApi)).not.toContain("VerifiedClaimSourceSpanAdmission");
-    expect(Object.keys(publicApi)).not.toContain("VerifiedClaimSourceSpanError");
     expect(Object.keys(publicApi)).not.toContain("truthLedgerSkeleton");
     expect(Object.keys(publicApi).some((key) => /model|provider|agent|changeset/i.test(key))).toBe(
       false

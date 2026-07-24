@@ -130,6 +130,7 @@ async function assertTransactionContextCleared(client: PgPoolClient): Promise<vo
         AND COALESCE(current_setting('app.service_principal_id', true), '') = ''
         AND COALESCE(current_setting('app.agent_principal_id', true), '') = ''
         AND COALESCE(current_setting('app.policy_version', true), '') = ''
+        AND COALESCE(current_setting('app.data_class_ceiling', true), '') = ''
         AND COALESCE(current_setting('throughline.b1_child_scope_active', true), '') = ''
           AS settings_cleared`
   );
@@ -155,7 +156,8 @@ async function setTransactionContext(
     ["app.membership_id", context.actorMembershipId],
     ["app.service_principal_id", context.servicePrincipalId],
     ["app.agent_principal_id", context.agentPrincipalId],
-    ["app.policy_version", context.policyVersion]
+    ["app.policy_version", context.policyVersion],
+    ["app.data_class_ceiling", context.dataClassCeiling]
   ];
 
   for (const [key, value] of settings) {

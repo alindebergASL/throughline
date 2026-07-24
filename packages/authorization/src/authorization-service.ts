@@ -180,7 +180,16 @@ export class PostgresAuthorizationService implements RelationshipAuthorityBatchi
     }
 
     if (isB1Action(action)) {
-      return b1Decision(tx, context, membership.role, action, resource, options);
+      return b1Decision(
+        tx,
+        context,
+        membership.role,
+        action,
+        resource,
+        options,
+        undefined,
+        membership
+      );
     }
 
     if (action === "tenant.read") {
@@ -592,11 +601,114 @@ const b1Actions = new Set<AuthorizationAction>([
   "source.capture",
   "source.correct",
   "source.tombstone",
-  "source.read"
+  "source.read",
+  "claim.create",
+  "claim.read",
+  "fact.accept"
 ]);
 
 function isB1Action(action: AuthorizationAction): boolean {
   return b1Actions.has(action);
+}
+
+const truthMutationActions = new Set<AuthorizationAction>(["claim.create", "fact.accept"]);
+
+function isTruthMutationAction(action: AuthorizationAction): boolean {
+  return truthMutationActions.has(action);
+}
+
+async function truthMutationDecision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  role: MembershipRole,
+  action: AuthorizationAction,
+  resource: ResourceRef,
+  options: TransactionAuthorizationDecisionOptions,
+  membership: MembershipRecord | undefined
+): Promise<AuthorizationDecision> {
+  const actor = exactHumanAuthorityActor(context, membership);
+  if (!actor || context.actorDisplayPersonId !== actor.personId) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const target = await loadTruthAuthorityTarget(tx, context, action, resource, options);
+  if (!target || !canReadDataClass(context.dataClassCeiling, target.accessClass)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const readable = await canReadSpaceResource(tx, context, target.spaceId, role, {
+    lockAuthority: options.lockAuthority === true
+  });
+  if (!readable.allowed) return nonLeakingB1Deny(context.policyVersion);
+
+  if (action === "claim.create") {
+    const contributor = await contributorAuthority(
+      tx,
+      context,
+      target.spaceId,
+      role,
+      options.lockAuthority === true
+    );
+    return contributor.allowed
+      ? allow(context.policyVersion, "b2_live_contributor", undefined, [
+          ...readable.authorityTokens,
+          ...contributor.authorityTokens
+        ])
+      : nonLeakingB1Deny(context.policyVersion);
+  }
+
+  return target.ownerPersonId === actor.personId
+    ? allow(
+        context.policyVersion,
+        target.subjectType === "activity" ? "b2_activity_owner" : "b2_initiative_owner",
+        undefined,
+        readable.authorityTokens
+      )
+    : nonLeakingB1Deny(context.policyVersion);
+}
+
+async function loadTruthAuthorityTarget(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  action: AuthorizationAction,
+  resource: ResourceRef,
+  options: TransactionAuthorizationDecisionOptions
+): Promise<
+  | {
+      spaceId: string;
+      accessClass: AccessClass;
+      subjectType: "activity" | "initiative";
+      ownerPersonId: string;
+    }
+  | undefined
+> {
+  if (action !== "claim.create" && action !== "fact.accept") return undefined;
+  if (resource.type !== "activity" && resource.type !== "initiative") return undefined;
+  const subjectType = resource.type;
+  const subjectId = resource.id;
+  const table = subjectType === "activity" ? "work.activities" : "work.initiatives";
+  const subject = await tx.query<{
+    space_id: string;
+    owner_person_id: string;
+    access_class: AccessClass;
+  }>(
+    `SELECT subject.space_id, subject.owner_person_id, space.access_class
+     FROM ${table} subject
+     JOIN access.spaces space
+       ON space.tenant_id = subject.tenant_id
+      AND space.workspace_id = subject.workspace_id
+      AND space.id = subject.space_id
+     WHERE subject.tenant_id = $1 AND subject.workspace_id = $2
+       AND subject.id = $3 AND space.archived_at IS NULL
+     LIMIT 1 ${options.lockAuthority === true ? "FOR SHARE OF subject, space" : ""}`,
+    [context.tenantId, context.workspaceId, subjectId]
+  );
+  const row = subject.rows[0];
+  if (!row) return undefined;
+  return {
+    spaceId: row.space_id,
+    accessClass: row.access_class,
+    subjectType,
+    ownerPersonId: row.owner_person_id
+  };
 }
 
 async function b1Decision(
@@ -606,10 +718,14 @@ async function b1Decision(
   action: AuthorizationAction,
   resource: ResourceRef,
   options: TransactionAuthorizationDecisionOptions,
-  authorityDiscovery?: RelationshipAuthorityDiscovery
+  authorityDiscovery?: RelationshipAuthorityDiscovery,
+  membership?: MembershipRecord
 ): Promise<AuthorizationDecision> {
   if (action === "person.read") {
     return personReadDecision(tx, context, role, resource, options, authorityDiscovery);
+  }
+  if (isTruthMutationAction(action)) {
+    return truthMutationDecision(tx, context, role, action, resource, options, membership);
   }
 
   const createActions = new Set<AuthorizationAction>([
@@ -654,7 +770,8 @@ async function b1Decision(
     "activity.read",
     "relationship.read",
     "content.read",
-    "source.read"
+    "source.read",
+    "claim.read"
   ]);
   if (readActions.has(action)) {
     return allow(
@@ -709,6 +826,7 @@ async function loadB1ResourceScope(
     [table, expectedType] = ["content.content_items", "content_item"];
   else if (action.startsWith("source."))
     [table, expectedType] = ["content.source_artifacts", "source"];
+  else if (action.startsWith("claim.")) [table, expectedType] = ["truth.claims", "claim"];
   else return undefined;
   if (resource.type !== expectedType) return undefined;
   const result = await tx.query<{
@@ -726,8 +844,19 @@ async function loadB1ResourceScope(
            AND space.workspace_id = source.workspace_id AND space.id = source.space_id
          WHERE source.tenant_id = $1 AND source.workspace_id = $2 AND source.id = $3
          LIMIT 1`
-      : table === "content.content_items" && options.contentRevision !== undefined
+      : table.startsWith("truth.")
         ? `SELECT resource.space_id,
+             CASE GREATEST(
+               CASE space.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
+               CASE resource.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END
+             ) WHEN 0 THEN 'public' WHEN 1 THEN 'workspace' WHEN 2 THEN 'restricted' ELSE 'confidential' END AS access_class
+           FROM ${table} resource
+           JOIN access.spaces space ON space.tenant_id = resource.tenant_id
+             AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id
+           WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3
+           LIMIT 1`
+        : table === "content.content_items" && options.contentRevision !== undefined
+          ? `SELECT resource.space_id,
              CASE GREATEST(
                CASE space.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
                CASE resource.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
@@ -745,8 +874,8 @@ async function loadB1ResourceScope(
            WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3
              AND ($5::uuid IS NULL OR resource.space_id = $5)
            LIMIT 1`
-        : table === "content.content_items"
-          ? `SELECT resource.space_id,
+          : table === "content.content_items"
+            ? `SELECT resource.space_id,
                CASE GREATEST(
                  CASE space.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
                  CASE resource.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END
@@ -756,7 +885,7 @@ async function loadB1ResourceScope(
                AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id
              WHERE resource.tenant_id = $1 AND resource.workspace_id = $2 AND resource.id = $3
              LIMIT 1`
-          : `SELECT resource.space_id, space.access_class
+            : `SELECT resource.space_id, space.access_class
              FROM ${table} resource
              JOIN access.spaces space ON space.tenant_id = resource.tenant_id
                AND space.workspace_id = resource.workspace_id AND space.id = resource.space_id

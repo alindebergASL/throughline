@@ -1697,12 +1697,17 @@ function auditInput(
   } as Parameters<ProductDomainTransactionRepositories["audit"]["insert"]>[0];
 }
 
+type B1DomainNotificationEventType = Exclude<
+  DomainNotificationEventType,
+  "claim.proposed" | "fact.accepted"
+>;
+
 function notification(
   context: SecurityContext,
   trace: TraceCarrier,
   commandId: string,
   spaceId: string,
-  eventType: DomainNotificationEventType,
+  eventType: B1DomainNotificationEventType,
   aggregateId: string,
   aggregateVersion: number,
   payload: Record<string, unknown>
