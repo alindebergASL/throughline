@@ -13,7 +13,6 @@ import type {
   AuthorizedClaimEvidenceSnapshotLookup,
   VerifiedClaimSourceSpan
 } from "./source-span.js";
-import { generateUuidV7 } from "./uuid.js";
 
 export class TruthLedgerInvariantError extends Error {
   constructor() {
@@ -549,12 +548,14 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       `INSERT INTO truth.accepted_facts (
          id, tenant_id, workspace_id, space_id, subject_type, subject_id,
          predicate_catalog_version, predicate, value_json, value_hash, normalized_text,
-         confidence, valid_from, valid_to, recorded_at, status, access_class,
+         confidence, confidence_rule, strongest_supporting_confidence, human_lowered,
+         confidence_lowering_reason_code, confidence_lowering_rationale,
+         valid_from, valid_to, recorded_at, status, access_class,
          accepted_by_user_id, accepted_by_membership_id, acceptance_scope, authority_basis,
          acceptance_policy_version, last_causation_command_id, created_at, updated_at
        ) VALUES (
          $1,$2,$3,$4,$5,$6,'truth-predicate-catalog.v1',$7,$8::jsonb,$9,$10,
-         $11,$12,$13,$14,'current',$15,$16,$17,$18,$19,$20,$21,$22,$22
+         $11,$12,$13,$14,$15,$16,$17,$18,$19,'current',$20,$21,$22,$23,$24,$25,$26,$27,$27
        )`,
       [
         fact.id,
@@ -568,6 +569,11 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
         valueHash,
         fact.normalizedText,
         fact.confidence,
+        input.confidenceDecision.rule,
+        input.confidenceDecision.strongestSupportingConfidence,
+        input.confidenceDecision.humanLowered,
+        input.confidenceDecision.lowering?.reason.code ?? null,
+        input.confidenceDecision.lowering?.reason.rationale ?? null,
         fact.validFrom ?? null,
         fact.validTo ?? null,
         fact.recordedAt,
@@ -600,37 +606,6 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     if (changed.rows.length !== fact.supportingClaimIds.length) {
       throw new TruthLedgerConflictError();
     }
-    await this.tx.query(
-      `INSERT INTO truth.fact_lifecycle_events (
-         id, tenant_id, workspace_id, space_id, fact_id, event_type, to_status,
-         actor_user_id, actor_membership_id, authority_basis, policy_version,
-         confidence_rule, confidence, strongest_supporting_confidence, human_lowered,
-         confidence_lowering_reason_code, confidence_lowering_rationale,
-         causation_command_id, created_at
-       ) VALUES (
-         $1,$2,$3,$4,$5,'fact.accepted','current',$6,$7,$8,$9,$10,$11,$12,$13,
-         $14,$15,$16,$17
-       )`,
-      [
-        generateUuidV7(),
-        fact.tenantId,
-        fact.workspaceId,
-        fact.spaceId,
-        fact.id,
-        fact.acceptedByUserId,
-        fact.acceptedByMembershipId,
-        fact.authorityBasis,
-        fact.policyVersion,
-        input.confidenceDecision.rule,
-        input.confidenceDecision.confidence,
-        input.confidenceDecision.strongestSupportingConfidence,
-        input.confidenceDecision.humanLowered,
-        input.confidenceDecision.lowering?.reason.code ?? null,
-        input.confidenceDecision.lowering?.reason.rationale ?? null,
-        input.commandId,
-        fact.createdAt
-      ]
-    );
   }
 
   async relayPrincipalForSpace(

@@ -6,22 +6,6 @@ REVOKE ALL ON SCHEMA truth FROM PUBLIC;
 COMMENT ON SCHEMA truth IS
   'Throughline B2 Slice 1 durable Claim and AcceptedFact write ledger';
 
-CREATE FUNCTION truth.access_class_rank(value text)
-RETURNS integer
-LANGUAGE sql
-IMMUTABLE
-STRICT
-SET search_path = pg_catalog
-AS $function$
-  SELECT CASE value
-    WHEN 'public' THEN 0
-    WHEN 'workspace' THEN 1
-    WHEN 'restricted' THEN 2
-    WHEN 'confidential' THEN 3
-    ELSE NULL
-  END
-$function$;
-
 -- Database backstop for the centralized human Space-read and data-class policy.
 CREATE OR REPLACE FUNCTION access.can_read_space(
   requested_space_id uuid,
@@ -76,11 +60,11 @@ AS $function$
       AND CASE NULLIF(current_setting('app.data_class_ceiling', true), '')
         WHEN 'public' THEN 0 WHEN 'workspace' THEN 1
         WHEN 'restricted' THEN 2 WHEN 'confidential' THEN 3 ELSE -1
-      END >= truth.access_class_rank(target.access_class)
+      END >= content.access_class_rank(target.access_class)
       AND CASE NULLIF(current_setting('app.data_class_ceiling', true), '')
         WHEN 'public' THEN 0 WHEN 'workspace' THEN 1
         WHEN 'restricted' THEN 2 WHEN 'confidential' THEN 3 ELSE -1
-      END >= truth.access_class_rank(COALESCE(requested_access_class, target.access_class))
+      END >= content.access_class_rank(COALESCE(requested_access_class, target.access_class))
       AND (
         actor.role IN ('owner', 'admin')
         OR target.kind = 'workspace_root'
@@ -142,51 +126,20 @@ CREATE TABLE truth.verified_evidence_spans (
   chunking_version text NOT NULL CHECK (chunking_version = 'source-chunking.v1'),
   source_start_offset integer NOT NULL CHECK (source_start_offset >= 0),
   source_end_offset integer NOT NULL CHECK (source_end_offset > source_start_offset),
-  source_excerpt text,
-  source_content_hash text,
-  source_normalized_content_hash text,
-  chunk_content_hash text,
-  excerpt_hash text,
+  source_excerpt text NOT NULL CHECK (length(source_excerpt) > 0),
+  source_content_hash text NOT NULL CHECK (source_content_hash ~ '^[a-f0-9]{64}$'),
+  source_normalized_content_hash text NOT NULL
+    CHECK (source_normalized_content_hash ~ '^[a-f0-9]{64}$'),
+  chunk_content_hash text NOT NULL CHECK (chunk_content_hash ~ '^[a-f0-9]{64}$'),
+  excerpt_hash text NOT NULL CHECK (excerpt_hash ~ '^[a-f0-9]{64}$'),
   access_class text NOT NULL
     CHECK (access_class IN ('public','workspace','restricted','confidential')),
   created_by_user_id uuid NOT NULL REFERENCES identity.users(id),
   created_by_membership_id uuid NOT NULL,
   causation_command_id uuid NOT NULL,
-  redacted_at timestamptz,
-  redaction_command_id uuid,
-  hash_disposition text CHECK (hash_disposition IN ('retained','erased')),
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  version integer NOT NULL DEFAULT 1,
-  CHECK (
-    (
-      redacted_at IS NULL AND redaction_command_id IS NULL AND hash_disposition IS NULL
-      AND source_excerpt IS NOT NULL AND length(source_excerpt) > 0
-      AND source_content_hash ~ '^[a-f0-9]{64}$'
-      AND source_normalized_content_hash ~ '^[a-f0-9]{64}$'
-      AND chunk_content_hash ~ '^[a-f0-9]{64}$'
-      AND excerpt_hash ~ '^[a-f0-9]{64}$'
-      AND version = 1
-    )
-    OR (
-      redacted_at IS NOT NULL AND redaction_command_id IS NOT NULL
-      AND source_excerpt IS NULL AND version = 2
-      AND (
-        (
-          hash_disposition = 'retained'
-          AND source_content_hash ~ '^[a-f0-9]{64}$'
-          AND source_normalized_content_hash ~ '^[a-f0-9]{64}$'
-          AND chunk_content_hash ~ '^[a-f0-9]{64}$'
-          AND excerpt_hash ~ '^[a-f0-9]{64}$'
-        )
-        OR (
-          hash_disposition = 'erased'
-          AND source_content_hash IS NULL AND source_normalized_content_hash IS NULL
-          AND chunk_content_hash IS NULL AND excerpt_hash IS NULL
-        )
-      )
-    )
-  ),
+  version integer NOT NULL DEFAULT 1 CHECK (version = 1),
   UNIQUE (tenant_id, workspace_id, id),
   UNIQUE (tenant_id, workspace_id, space_id, id),
   FOREIGN KEY (tenant_id, workspace_id, space_id, source_artifact_id)
@@ -194,8 +147,6 @@ CREATE TABLE truth.verified_evidence_spans (
   FOREIGN KEY (tenant_id, workspace_id, created_by_membership_id, created_by_user_id)
     REFERENCES identity.memberships(tenant_id, workspace_id, id, user_id),
   FOREIGN KEY (tenant_id, workspace_id, causation_command_id)
-    REFERENCES ops.domain_command_records(tenant_id, workspace_id, id),
-  FOREIGN KEY (tenant_id, workspace_id, redaction_command_id)
     REFERENCES ops.domain_command_records(tenant_id, workspace_id, id)
 );
 
@@ -212,9 +163,9 @@ CREATE TABLE truth.claims (
     (subject_type = 'activity' AND predicate = 'activity.outcome')
     OR (subject_type = 'initiative' AND predicate = 'initiative.primary_objective')
   ),
-  value_json jsonb,
-  value_hash text,
-  normalized_text text,
+  value_json jsonb NOT NULL CHECK (jsonb_typeof(value_json) = 'string'),
+  value_hash text NOT NULL CHECK (value_hash ~ '^[a-f0-9]{64}$'),
+  normalized_text text NOT NULL,
   verified_evidence_span_id uuid NOT NULL,
   asserted_by_type text NOT NULL CHECK (asserted_by_type = 'person'),
   asserted_by_id uuid NOT NULL,
@@ -222,40 +173,22 @@ CREATE TABLE truth.claims (
   valid_from timestamptz,
   valid_to timestamptz,
   observed_at timestamptz,
-  status text NOT NULL CHECK (status IN ('proposed','accepted','rejected')),
+  status text NOT NULL CHECK (status IN ('proposed','accepted')),
   access_class text NOT NULL
     CHECK (access_class IN ('public','workspace','restricted','confidential')),
   created_by_user_id uuid NOT NULL REFERENCES identity.users(id),
   created_by_membership_id uuid NOT NULL,
   causation_command_id uuid NOT NULL,
-  redacted_at timestamptz,
-  redaction_command_id uuid,
-  hash_disposition text CHECK (hash_disposition IN ('retained','erased')),
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   version integer NOT NULL DEFAULT 1,
   CHECK (
-    (
-      redacted_at IS NULL AND redaction_command_id IS NULL AND hash_disposition IS NULL
-      AND value_json IS NOT NULL AND jsonb_typeof(value_json) = 'string'
-      AND value_hash ~ '^[a-f0-9]{64}$'
-      AND value_json #>> '{}' = normalized_text
-      AND normalized_text = normalize(normalized_text, NFC)
-      AND length(btrim(normalized_text)) BETWEEN 1 AND 2000
-      AND (
-        (status = 'proposed' AND version = 1)
-        OR (status = 'accepted' AND version = 2)
-      )
-    )
-    OR (
-      redacted_at IS NOT NULL AND redaction_command_id IS NOT NULL
-      AND hash_disposition IS NOT NULL
-      AND value_json IS NULL AND normalized_text IS NULL
-      AND status = 'rejected' AND version IN (2,3)
-      AND (
-        (hash_disposition = 'retained' AND value_hash ~ '^[a-f0-9]{64}$')
-        OR (hash_disposition = 'erased' AND value_hash IS NULL)
-      )
+    value_json #>> '{}' = normalized_text
+    AND normalized_text = normalize(normalized_text, NFC)
+    AND length(btrim(normalized_text)) BETWEEN 1 AND 2000
+    AND (
+      (status = 'proposed' AND version = 1)
+      OR (status = 'accepted' AND version = 2)
     )
   ),
   CHECK (valid_to IS NULL OR valid_from IS NULL OR valid_to >= valid_from),
@@ -268,8 +201,6 @@ CREATE TABLE truth.claims (
   FOREIGN KEY (tenant_id, workspace_id, created_by_membership_id, created_by_user_id)
     REFERENCES identity.memberships(tenant_id, workspace_id, id, user_id),
   FOREIGN KEY (tenant_id, workspace_id, causation_command_id)
-    REFERENCES ops.domain_command_records(tenant_id, workspace_id, id),
-  FOREIGN KEY (tenant_id, workspace_id, redaction_command_id)
     REFERENCES ops.domain_command_records(tenant_id, workspace_id, id)
 );
 
@@ -286,14 +217,22 @@ CREATE TABLE truth.accepted_facts (
     (subject_type = 'activity' AND predicate = 'activity.outcome')
     OR (subject_type = 'initiative' AND predicate = 'initiative.primary_objective')
   ),
-  value_json jsonb,
-  value_hash text,
-  normalized_text text,
+  value_json jsonb NOT NULL CHECK (jsonb_typeof(value_json) = 'string'),
+  value_hash text NOT NULL CHECK (value_hash ~ '^[a-f0-9]{64}$'),
+  normalized_text text NOT NULL,
   confidence text NOT NULL CHECK (confidence IN ('confirmed','strong','weak','unknown')),
+  confidence_rule text NOT NULL CHECK (
+    confidence_rule = 'strongest-selected-valid-claim.v1'
+  ),
+  strongest_supporting_confidence text NOT NULL
+    CHECK (strongest_supporting_confidence IN ('confirmed','strong','weak','unknown')),
+  human_lowered boolean NOT NULL,
+  confidence_lowering_reason_code text,
+  confidence_lowering_rationale text,
   valid_from timestamptz,
   valid_to timestamptz,
   recorded_at timestamptz NOT NULL,
-  status text NOT NULL CHECK (status IN ('current','revoked')),
+  status text NOT NULL CHECK (status = 'current'),
   access_class text NOT NULL
     CHECK (access_class IN ('public','workspace','restricted','confidential')),
   accepted_by_user_id uuid NOT NULL REFERENCES identity.users(id),
@@ -308,32 +247,29 @@ CREATE TABLE truth.accepted_facts (
   ),
   acceptance_policy_version text NOT NULL,
   last_causation_command_id uuid NOT NULL,
-  redacted_at timestamptz,
-  redaction_source_artifact_id uuid,
-  hash_disposition text CHECK (hash_disposition IN ('retained','erased')),
   created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  version integer NOT NULL DEFAULT 1,
+  version integer NOT NULL DEFAULT 1 CHECK (version = 1),
+  CHECK (
+    value_json #>> '{}' = normalized_text
+    AND normalized_text = normalize(normalized_text, NFC)
+    AND length(btrim(normalized_text)) BETWEEN 1 AND 2000
+  ),
   CHECK (
     (
-      status = 'current' AND version = 1
-      AND redacted_at IS NULL AND redaction_source_artifact_id IS NULL
-      AND hash_disposition IS NULL
-      AND value_json IS NOT NULL AND jsonb_typeof(value_json) = 'string'
-      AND value_hash ~ '^[a-f0-9]{64}$'
-      AND value_json #>> '{}' = normalized_text
-      AND normalized_text = normalize(normalized_text, NFC)
-      AND length(btrim(normalized_text)) BETWEEN 1 AND 2000
+      human_lowered
+      AND confidence_lowering_reason_code IN (
+        'conservative_human_judgment','evidence_quality','residual_uncertainty'
+      )
+      AND confidence_lowering_rationale IS NOT NULL
+      AND confidence_lowering_rationale = normalize(confidence_lowering_rationale, NFC)
+      AND confidence_lowering_rationale = btrim(confidence_lowering_rationale)
+      AND length(confidence_lowering_rationale) BETWEEN 1 AND 2000
     )
     OR (
-      status = 'revoked' AND version = 2
-      AND redacted_at IS NOT NULL AND redaction_source_artifact_id IS NOT NULL
-      AND hash_disposition IS NOT NULL
-      AND value_json IS NULL AND normalized_text IS NULL
-      AND (
-        (hash_disposition = 'retained' AND value_hash ~ '^[a-f0-9]{64}$')
-        OR (hash_disposition = 'erased' AND value_hash IS NULL)
-      )
+      NOT human_lowered
+      AND confidence_lowering_reason_code IS NULL
+      AND confidence_lowering_rationale IS NULL
     )
   ),
   CHECK (valid_to IS NULL OR valid_from IS NULL OR valid_to >= valid_from),
@@ -344,9 +280,7 @@ CREATE TABLE truth.accepted_facts (
   FOREIGN KEY (tenant_id, workspace_id, acceptance_policy_version)
     REFERENCES identity.policy_versions(tenant_id, workspace_id, id),
   FOREIGN KEY (tenant_id, workspace_id, last_causation_command_id)
-    REFERENCES ops.domain_command_records(tenant_id, workspace_id, id),
-  FOREIGN KEY (tenant_id, workspace_id, space_id, redaction_source_artifact_id)
-    REFERENCES content.source_artifacts(tenant_id, workspace_id, space_id, id)
+    REFERENCES ops.domain_command_records(tenant_id, workspace_id, id)
 );
 
 CREATE UNIQUE INDEX accepted_facts_one_current_slot
@@ -368,74 +302,6 @@ CREATE TABLE truth.fact_claims (
     REFERENCES truth.claims(tenant_id, workspace_id, space_id, id)
 );
 
-CREATE TABLE truth.fact_lifecycle_events (
-  id uuid PRIMARY KEY CHECK (ops.is_uuid_v7(id)),
-  tenant_id uuid NOT NULL,
-  workspace_id uuid NOT NULL,
-  space_id uuid NOT NULL,
-  fact_id uuid NOT NULL,
-  event_type text NOT NULL CHECK (event_type = 'fact.accepted'),
-  to_status text NOT NULL CHECK (to_status = 'current'),
-  actor_user_id uuid NOT NULL REFERENCES identity.users(id),
-  actor_membership_id uuid NOT NULL,
-  authority_basis text NOT NULL CHECK (authority_basis IN ('activity_owner','initiative_owner')),
-  policy_version text NOT NULL,
-  confidence_rule text NOT NULL CHECK (
-    confidence_rule = 'strongest-selected-valid-claim.v1'
-  ),
-  confidence text NOT NULL CHECK (confidence IN ('confirmed','strong','weak','unknown')),
-  strongest_supporting_confidence text NOT NULL
-    CHECK (strongest_supporting_confidence IN ('confirmed','strong','weak','unknown')),
-  human_lowered boolean NOT NULL,
-  confidence_lowering_reason_code text,
-  confidence_lowering_rationale text,
-  causation_command_id uuid NOT NULL,
-  redacted_at timestamptz,
-  redaction_command_id uuid,
-  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-  CHECK (
-    (
-      human_lowered
-      AND confidence_lowering_reason_code IS NOT NULL
-      AND confidence_lowering_reason_code IN (
-        'conservative_human_judgment','evidence_quality','residual_uncertainty'
-      )
-      AND (
-        (
-          redacted_at IS NULL AND redaction_command_id IS NULL
-          AND confidence_lowering_rationale IS NOT NULL
-          AND confidence_lowering_rationale = normalize(confidence_lowering_rationale, NFC)
-          AND confidence_lowering_rationale = btrim(confidence_lowering_rationale)
-          AND length(confidence_lowering_rationale) BETWEEN 1 AND 2000
-        )
-        OR (
-          redacted_at IS NOT NULL AND redaction_command_id IS NOT NULL
-          AND confidence_lowering_rationale IS NULL
-        )
-      )
-    )
-    OR (
-      NOT human_lowered
-      AND confidence_lowering_reason_code IS NULL
-      AND confidence_lowering_rationale IS NULL
-      AND redacted_at IS NULL
-      AND redaction_command_id IS NULL
-    )
-  ),
-  UNIQUE (tenant_id, workspace_id, id),
-  UNIQUE (tenant_id, workspace_id, fact_id, event_type),
-  FOREIGN KEY (tenant_id, workspace_id, space_id, fact_id)
-    REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id),
-  FOREIGN KEY (tenant_id, workspace_id, actor_membership_id, actor_user_id)
-    REFERENCES identity.memberships(tenant_id, workspace_id, id, user_id),
-  FOREIGN KEY (tenant_id, workspace_id, policy_version)
-    REFERENCES identity.policy_versions(tenant_id, workspace_id, id),
-  FOREIGN KEY (tenant_id, workspace_id, causation_command_id)
-    REFERENCES ops.domain_command_records(tenant_id, workspace_id, id),
-  FOREIGN KEY (tenant_id, workspace_id, redaction_command_id)
-    REFERENCES ops.domain_command_records(tenant_id, workspace_id, id)
-);
-
 CREATE INDEX evidence_spans_source_idx
   ON truth.verified_evidence_spans (
     tenant_id, workspace_id, source_artifact_id, created_at
@@ -444,9 +310,6 @@ CREATE INDEX claims_subject_predicate_idx
   ON truth.claims (
     tenant_id, workspace_id, space_id, subject_type, subject_id, predicate, created_at
   );
-CREATE INDEX fact_lifecycle_fact_idx
-  ON truth.fact_lifecycle_events (tenant_id, workspace_id, fact_id, created_at);
-
 CREATE FUNCTION truth.require_reserved_command()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -545,11 +408,11 @@ BEGIN
   END IF;
 
   required_access := GREATEST(
-    truth.access_class_rank(source_record.space_access_class),
-    truth.access_class_rank(source_record.access_class),
-    truth.access_class_rank(chunk_record.access_class)
+    content.access_class_rank(source_record.space_access_class),
+    content.access_class_rank(source_record.access_class),
+    content.access_class_rank(chunk_record.access_class)
   );
-  IF truth.access_class_rank(NEW.access_class) <> required_access THEN
+  IF content.access_class_rank(NEW.access_class) <> required_access THEN
     RAISE EXCEPTION 'source evidence access class is not propagated exactly';
   END IF;
   RETURN NEW;
@@ -667,6 +530,7 @@ DECLARE
   support_count integer;
   invalid_count integer;
   strongest_rank integer;
+  stored_strongest_rank integer;
   fact_rank integer;
   required_access integer;
 BEGIN
@@ -697,7 +561,7 @@ BEGIN
          max(CASE claim.confidence
            WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
            WHEN 'weak' THEN 1 ELSE 0 END),
-         max(truth.access_class_rank(claim.access_class))
+         max(content.access_class_rank(claim.access_class))
     INTO support_count, invalid_count, strongest_rank, required_access
   FROM truth.fact_claims support
   JOIN truth.claims claim
@@ -711,9 +575,15 @@ BEGIN
   fact_rank := CASE fact_record.confidence
     WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
     WHEN 'weak' THEN 1 ELSE 0 END;
+  stored_strongest_rank := CASE fact_record.strongest_supporting_confidence
+    WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
+    WHEN 'weak' THEN 1 ELSE 0 END;
   IF support_count < 1 OR invalid_count <> 0
     OR fact_rank > strongest_rank
-    OR truth.access_class_rank(fact_record.access_class) <> required_access
+    OR fact_record.confidence_rule <> 'strongest-selected-valid-claim.v1'
+    OR stored_strongest_rank <> strongest_rank
+    OR fact_record.human_lowered <> (fact_rank < strongest_rank)
+    OR content.access_class_rank(fact_record.access_class) <> required_access
   THEN
     RAISE EXCEPTION 'accepted fact support is invalid';
   END IF;
@@ -727,36 +597,6 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $function$
 BEGIN
-  IF NEW.redacted_at IS NOT NULL THEN
-    IF OLD.redacted_at IS NOT NULL
-      OR NEW.redaction_command_id::text
-         IS DISTINCT FROM NULLIF(current_setting('throughline.b2_retention_command', true), '')
-      OR NEW.status <> 'rejected' OR NEW.version <> OLD.version + 1
-      OR NEW.value_json IS NOT NULL OR NEW.normalized_text IS NOT NULL
-      OR NEW.updated_at < OLD.updated_at
-      OR (
-        NEW.hash_disposition = 'retained'
-        AND NEW.value_hash IS DISTINCT FROM OLD.value_hash
-      )
-      OR (
-        NEW.hash_disposition = 'erased'
-        AND NEW.value_hash IS NOT NULL
-      )
-      OR NEW.hash_disposition NOT IN ('retained','erased')
-      OR (to_jsonb(NEW) - ARRAY[
-           'value_json','value_hash','normalized_text','status','redacted_at',
-           'redaction_command_id','hash_disposition','updated_at','version'
-         ])
-         IS DISTINCT FROM
-         (to_jsonb(OLD) - ARRAY[
-           'value_json','value_hash','normalized_text','status','redacted_at',
-           'redaction_command_id','hash_disposition','updated_at','version'
-         ])
-    THEN
-      RAISE EXCEPTION 'claim retention redaction is not permitted';
-    END IF;
-    RETURN NEW;
-  END IF;
   IF OLD.status <> 'proposed' OR OLD.version <> 1
     OR NEW.status <> 'accepted' OR NEW.version <> 2
     OR NEW.updated_at < OLD.updated_at
@@ -795,310 +635,6 @@ BEGIN
 END
 $function$;
 
-CREATE FUNCTION truth.enforce_evidence_retention_redaction()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog
-AS $function$
-BEGIN
-  IF TG_OP = 'DELETE' OR OLD.redacted_at IS NOT NULL
-    OR NEW.redacted_at IS NULL
-    OR NEW.redaction_command_id::text
-       IS DISTINCT FROM NULLIF(current_setting('throughline.b2_retention_command', true), '')
-    OR NEW.source_excerpt IS NOT NULL OR NEW.version <> 2
-    OR NEW.updated_at < OLD.updated_at
-    OR (
-      NEW.hash_disposition = 'retained'
-      AND ROW(
-        NEW.source_content_hash, NEW.source_normalized_content_hash,
-        NEW.chunk_content_hash, NEW.excerpt_hash
-      ) IS DISTINCT FROM ROW(
-        OLD.source_content_hash, OLD.source_normalized_content_hash,
-        OLD.chunk_content_hash, OLD.excerpt_hash
-      )
-    )
-    OR (
-      NEW.hash_disposition = 'erased'
-      AND ROW(
-        NEW.source_content_hash, NEW.source_normalized_content_hash,
-        NEW.chunk_content_hash, NEW.excerpt_hash
-      ) IS DISTINCT FROM ROW(NULL, NULL, NULL, NULL)
-    )
-    OR NEW.hash_disposition NOT IN ('retained','erased')
-    OR (to_jsonb(NEW) - ARRAY[
-         'source_excerpt','source_content_hash','source_normalized_content_hash',
-         'chunk_content_hash','excerpt_hash','redacted_at','redaction_command_id',
-         'hash_disposition','updated_at','version'
-       ])
-       IS DISTINCT FROM
-       (to_jsonb(OLD) - ARRAY[
-         'source_excerpt','source_content_hash','source_normalized_content_hash',
-         'chunk_content_hash','excerpt_hash','redacted_at','redaction_command_id',
-         'hash_disposition','updated_at','version'
-       ])
-  THEN
-    RAISE EXCEPTION 'evidence retention redaction is not permitted';
-  END IF;
-  RETURN NEW;
-END
-$function$;
-
-CREATE FUNCTION truth.enforce_fact_retention_redaction()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog
-AS $function$
-BEGIN
-  IF TG_OP = 'DELETE' OR OLD.status <> 'current' OR OLD.version <> 1
-    OR NEW.status <> 'revoked' OR NEW.version <> 2
-    OR NEW.redacted_at IS NULL OR NEW.redaction_source_artifact_id IS NULL
-    OR NEW.last_causation_command_id::text
-       IS DISTINCT FROM NULLIF(current_setting('throughline.b2_retention_command', true), '')
-    OR NEW.value_json IS NOT NULL OR NEW.normalized_text IS NOT NULL
-    OR NEW.updated_at < OLD.updated_at
-    OR (
-      NEW.hash_disposition = 'retained'
-      AND NEW.value_hash IS DISTINCT FROM OLD.value_hash
-    )
-    OR (
-      NEW.hash_disposition = 'erased'
-      AND NEW.value_hash IS NOT NULL
-    )
-    OR NEW.hash_disposition NOT IN ('retained','erased')
-    OR (to_jsonb(NEW) - ARRAY[
-         'value_json','value_hash','normalized_text','status','last_causation_command_id',
-         'redacted_at','redaction_source_artifact_id','hash_disposition',
-         'updated_at','version'
-       ])
-       IS DISTINCT FROM
-       (to_jsonb(OLD) - ARRAY[
-         'value_json','value_hash','normalized_text','status','last_causation_command_id',
-         'redacted_at','redaction_source_artifact_id','hash_disposition',
-         'updated_at','version'
-       ])
-  THEN
-    RAISE EXCEPTION 'fact retention redaction is not permitted';
-  END IF;
-  RETURN NEW;
-END
-$function$;
-
-CREATE FUNCTION truth.enforce_lifecycle_retention_redaction()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog
-AS $function$
-BEGIN
-  IF TG_OP = 'DELETE' OR NOT OLD.human_lowered OR OLD.redacted_at IS NOT NULL
-    OR NEW.confidence_lowering_rationale IS NOT NULL
-    OR NEW.redacted_at IS NULL
-    OR NEW.redaction_command_id::text
-       IS DISTINCT FROM NULLIF(current_setting('throughline.b2_retention_command', true), '')
-    OR (to_jsonb(NEW) - ARRAY[
-         'confidence_lowering_rationale','redacted_at','redaction_command_id'
-       ])
-       IS DISTINCT FROM
-       (to_jsonb(OLD) - ARRAY[
-         'confidence_lowering_rationale','redacted_at','redaction_command_id'
-       ])
-  THEN
-    RAISE EXCEPTION 'fact lifecycle retention redaction is not permitted';
-  END IF;
-  RETURN NEW;
-END
-$function$;
-
-CREATE FUNCTION truth.reconcile_source_retention()
-RETURNS trigger
-LANGUAGE plpgsql
-SECURITY DEFINER
-SET search_path = pg_catalog
-AS $function$
-DECLARE
-  command_ids uuid[];
-  command_id uuid;
-BEGIN
-  IF OLD.deleted_at IS NOT NULL OR NEW.deleted_at IS NULL
-    OR NEW.hash_disposition IS NULL
-    OR NEW.hash_disposition NOT IN ('retained','erased')
-  THEN
-    RETURN NEW;
-  END IF;
-
-  SELECT array_agg(command.id ORDER BY command.id)
-    INTO command_ids
-  FROM ops.domain_command_records command
-  WHERE command.tenant_id = NEW.tenant_id
-    AND command.workspace_id = NEW.workspace_id
-    AND command.command_kind = 'source.tombstone.v1'
-    AND command.state = 'reserved'
-    AND command.reservation_space_id = NEW.space_id
-    AND command.actor_user_id = ops.current_user_id()
-    AND command.actor_membership_id = ops.current_membership_id()
-    AND command.policy_version_id = ops.current_policy_version();
-  IF cardinality(command_ids) IS DISTINCT FROM 1 THEN
-    RAISE EXCEPTION 'source retention reconciliation requires one reserved tombstone command';
-  END IF;
-  command_id := command_ids[1];
-  PERFORM set_config('throughline.b2_retention_command', command_id::text, true);
-
-  UPDATE truth.verified_evidence_spans evidence
-     SET source_excerpt = NULL,
-         source_content_hash = CASE
-           WHEN NEW.hash_disposition = 'retained' THEN evidence.source_content_hash
-           ELSE NULL
-         END,
-         source_normalized_content_hash = CASE
-           WHEN NEW.hash_disposition = 'retained' THEN evidence.source_normalized_content_hash
-           ELSE NULL
-         END,
-         chunk_content_hash = CASE
-           WHEN NEW.hash_disposition = 'retained' THEN evidence.chunk_content_hash
-           ELSE NULL
-         END,
-         excerpt_hash = CASE
-           WHEN NEW.hash_disposition = 'retained' THEN evidence.excerpt_hash
-           ELSE NULL
-         END,
-         redacted_at = NEW.deleted_at,
-         redaction_command_id = command_id,
-         hash_disposition = NEW.hash_disposition,
-         updated_at = NEW.updated_at,
-         version = 2
-   WHERE evidence.tenant_id = NEW.tenant_id
-     AND evidence.workspace_id = NEW.workspace_id
-     AND evidence.space_id = NEW.space_id
-     AND evidence.source_artifact_id = NEW.id
-     AND evidence.redacted_at IS NULL;
-
-  UPDATE truth.claims claim
-     SET value_json = NULL,
-         value_hash = CASE
-           WHEN NEW.hash_disposition = 'retained' THEN claim.value_hash
-           ELSE NULL
-         END,
-         normalized_text = NULL,
-         status = 'rejected',
-         redacted_at = NEW.deleted_at,
-         redaction_command_id = command_id,
-         hash_disposition = NEW.hash_disposition,
-         updated_at = NEW.updated_at,
-         version = claim.version + 1
-    FROM truth.verified_evidence_spans evidence
-   WHERE claim.tenant_id = evidence.tenant_id
-     AND claim.workspace_id = evidence.workspace_id
-     AND claim.space_id = evidence.space_id
-     AND claim.verified_evidence_span_id = evidence.id
-     AND evidence.tenant_id = NEW.tenant_id
-     AND evidence.workspace_id = NEW.workspace_id
-     AND evidence.space_id = NEW.space_id
-     AND evidence.source_artifact_id = NEW.id
-     AND claim.redacted_at IS NULL;
-
-  UPDATE truth.accepted_facts fact
-     SET value_json = NULL,
-         value_hash = CASE
-           WHEN NEW.hash_disposition = 'retained' THEN fact.value_hash
-           ELSE NULL
-         END,
-         normalized_text = NULL,
-         status = 'revoked',
-         last_causation_command_id = command_id,
-         redacted_at = NEW.deleted_at,
-         redaction_source_artifact_id = NEW.id,
-         hash_disposition = NEW.hash_disposition,
-         updated_at = NEW.updated_at,
-         version = 2
-   WHERE fact.tenant_id = NEW.tenant_id
-     AND fact.workspace_id = NEW.workspace_id
-     AND fact.space_id = NEW.space_id
-     AND fact.status = 'current'
-     AND EXISTS (
-       SELECT 1
-       FROM truth.fact_claims affected_support
-       JOIN truth.claims affected_claim
-         ON affected_claim.tenant_id = affected_support.tenant_id
-        AND affected_claim.workspace_id = affected_support.workspace_id
-        AND affected_claim.id = affected_support.claim_id
-       JOIN truth.verified_evidence_spans affected_evidence
-         ON affected_evidence.tenant_id = affected_claim.tenant_id
-        AND affected_evidence.workspace_id = affected_claim.workspace_id
-        AND affected_evidence.id = affected_claim.verified_evidence_span_id
-       WHERE affected_support.tenant_id = fact.tenant_id
-         AND affected_support.workspace_id = fact.workspace_id
-         AND affected_support.fact_id = fact.id
-         AND affected_evidence.source_artifact_id = NEW.id
-     )
-     AND NOT EXISTS (
-       SELECT 1
-       FROM truth.fact_claims surviving_support
-       JOIN truth.claims surviving_claim
-         ON surviving_claim.tenant_id = surviving_support.tenant_id
-        AND surviving_claim.workspace_id = surviving_support.workspace_id
-        AND surviving_claim.id = surviving_support.claim_id
-       JOIN truth.verified_evidence_spans surviving_evidence
-         ON surviving_evidence.tenant_id = surviving_claim.tenant_id
-        AND surviving_evidence.workspace_id = surviving_claim.workspace_id
-        AND surviving_evidence.id = surviving_claim.verified_evidence_span_id
-       JOIN content.source_artifacts surviving_source
-         ON surviving_source.tenant_id = surviving_evidence.tenant_id
-        AND surviving_source.workspace_id = surviving_evidence.workspace_id
-        AND surviving_source.id = surviving_evidence.source_artifact_id
-       WHERE surviving_support.tenant_id = fact.tenant_id
-         AND surviving_support.workspace_id = fact.workspace_id
-         AND surviving_support.fact_id = fact.id
-         AND surviving_claim.status = 'accepted'
-         AND surviving_claim.redacted_at IS NULL
-         AND surviving_source.deleted_at IS NULL
-         AND NOT EXISTS (
-           SELECT 1
-           FROM content.source_artifacts successor
-           WHERE successor.tenant_id = surviving_source.tenant_id
-             AND successor.workspace_id = surviving_source.workspace_id
-             AND successor.supersedes_source_id = surviving_source.id
-         )
-         AND CASE surviving_claim.confidence
-           WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
-           WHEN 'weak' THEN 1 ELSE 0
-         END >= CASE fact.confidence
-           WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
-           WHEN 'weak' THEN 1 ELSE 0
-         END
-     );
-
-  UPDATE truth.fact_lifecycle_events lifecycle
-     SET confidence_lowering_rationale = NULL,
-         redacted_at = NEW.deleted_at,
-         redaction_command_id = command_id
-    FROM truth.accepted_facts fact
-   WHERE lifecycle.tenant_id = fact.tenant_id
-     AND lifecycle.workspace_id = fact.workspace_id
-     AND lifecycle.fact_id = fact.id
-     AND fact.tenant_id = NEW.tenant_id
-     AND fact.workspace_id = NEW.workspace_id
-     AND fact.space_id = NEW.space_id
-     AND lifecycle.human_lowered
-     AND lifecycle.redacted_at IS NULL
-     AND EXISTS (
-       SELECT 1
-       FROM truth.fact_claims affected_support
-       JOIN truth.claims affected_claim
-         ON affected_claim.tenant_id = affected_support.tenant_id
-        AND affected_claim.workspace_id = affected_support.workspace_id
-        AND affected_claim.id = affected_support.claim_id
-       JOIN truth.verified_evidence_spans affected_evidence
-         ON affected_evidence.tenant_id = affected_claim.tenant_id
-        AND affected_evidence.workspace_id = affected_claim.workspace_id
-        AND affected_evidence.id = affected_claim.verified_evidence_span_id
-       WHERE affected_support.tenant_id = fact.tenant_id
-         AND affected_support.workspace_id = fact.workspace_id
-         AND affected_support.fact_id = fact.id
-         AND affected_evidence.source_artifact_id = NEW.id
-     );
-  RETURN NEW;
-END
-$function$;
-
 CREATE FUNCTION truth.require_fact_accept_reservation()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -1124,61 +660,6 @@ BEGIN
       AND command.policy_version_id = ops.current_policy_version()
   ) THEN
     RAISE EXCEPTION 'fact support requires its exact reserved fact.accept command';
-  END IF;
-  RETURN NEW;
-END
-$function$;
-
-CREATE FUNCTION truth.validate_fact_lifecycle_insert()
-RETURNS trigger
-LANGUAGE plpgsql
-SET search_path = pg_catalog
-AS $function$
-DECLARE
-  fact_record record;
-  strongest_confidence text;
-  strongest_rank integer;
-  fact_rank integer;
-BEGIN
-  SELECT fact.accepted_by_user_id, fact.accepted_by_membership_id,
-         fact.authority_basis, fact.acceptance_policy_version, fact.confidence
-    INTO fact_record
-  FROM truth.accepted_facts fact
-  WHERE fact.tenant_id = NEW.tenant_id
-    AND fact.workspace_id = NEW.workspace_id
-    AND fact.space_id = NEW.space_id
-    AND fact.id = NEW.fact_id
-  FOR SHARE;
-  SELECT claim.confidence,
-         CASE claim.confidence
-           WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
-           WHEN 'weak' THEN 1 ELSE 0 END
-    INTO strongest_confidence, strongest_rank
-  FROM truth.fact_claims support
-  JOIN truth.claims claim
-    ON claim.tenant_id = support.tenant_id
-   AND claim.workspace_id = support.workspace_id
-   AND claim.id = support.claim_id
-  WHERE support.tenant_id = NEW.tenant_id
-    AND support.workspace_id = NEW.workspace_id
-    AND support.fact_id = NEW.fact_id
-  ORDER BY CASE claim.confidence
-    WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
-    WHEN 'weak' THEN 1 ELSE 0 END DESC
-  LIMIT 1;
-  fact_rank := CASE fact_record.confidence
-    WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
-    WHEN 'weak' THEN 1 ELSE 0 END;
-  IF fact_record IS NULL OR strongest_confidence IS NULL
-    OR NEW.actor_user_id <> fact_record.accepted_by_user_id
-    OR NEW.actor_membership_id <> fact_record.accepted_by_membership_id
-    OR NEW.authority_basis <> fact_record.authority_basis
-    OR NEW.policy_version <> fact_record.acceptance_policy_version
-    OR NEW.confidence <> fact_record.confidence
-    OR NEW.strongest_supporting_confidence <> strongest_confidence
-    OR NEW.human_lowered <> (fact_rank < strongest_rank)
-  THEN
-    RAISE EXCEPTION 'fact acceptance lifecycle does not match its Fact and support';
   END IF;
   RETURN NEW;
 END
@@ -1215,12 +696,6 @@ FOR EACH ROW EXECUTE FUNCTION truth.validate_fact_insert();
 CREATE TRIGGER fact_claims_command_guard
 BEFORE INSERT ON truth.fact_claims
 FOR EACH ROW EXECUTE FUNCTION truth.require_fact_accept_reservation();
-CREATE TRIGGER fact_lifecycle_command_guard
-BEFORE INSERT ON truth.fact_lifecycle_events
-FOR EACH ROW EXECUTE FUNCTION truth.require_reserved_command('fact.accept.v1');
-CREATE TRIGGER fact_lifecycle_insert_guard
-BEFORE INSERT ON truth.fact_lifecycle_events
-FOR EACH ROW EXECUTE FUNCTION truth.validate_fact_lifecycle_insert();
 
 CREATE CONSTRAINT TRIGGER accepted_facts_support_deferred
 AFTER INSERT ON truth.accepted_facts
@@ -1231,28 +706,21 @@ AFTER INSERT ON truth.fact_claims
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW EXECUTE FUNCTION truth.validate_fact_support();
 
-CREATE TRIGGER verified_evidence_retention_guard
+CREATE TRIGGER verified_evidence_immutable
 BEFORE UPDATE OR DELETE ON truth.verified_evidence_spans
-FOR EACH ROW EXECUTE FUNCTION truth.enforce_evidence_retention_redaction();
+FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation();
 CREATE TRIGGER claims_transition_guard
 BEFORE UPDATE ON truth.claims
 FOR EACH ROW EXECUTE FUNCTION truth.enforce_claim_transition();
 CREATE TRIGGER claims_delete_guard
 BEFORE DELETE ON truth.claims
 FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation();
-CREATE TRIGGER accepted_facts_retention_guard
+CREATE TRIGGER accepted_facts_immutable
 BEFORE UPDATE OR DELETE ON truth.accepted_facts
-FOR EACH ROW EXECUTE FUNCTION truth.enforce_fact_retention_redaction();
+FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation();
 CREATE TRIGGER fact_claims_immutable
 BEFORE UPDATE OR DELETE ON truth.fact_claims
 FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation();
-CREATE TRIGGER fact_lifecycle_events_immutable
-BEFORE UPDATE OR DELETE ON truth.fact_lifecycle_events
-FOR EACH ROW EXECUTE FUNCTION truth.enforce_lifecycle_retention_redaction();
-
-CREATE TRIGGER source_artifacts_truth_retention
-AFTER UPDATE ON content.source_artifacts
-FOR EACH ROW EXECUTE FUNCTION truth.reconcile_source_retention();
 
 ALTER TABLE truth.verified_evidence_spans ENABLE ROW LEVEL SECURITY;
 ALTER TABLE truth.verified_evidence_spans FORCE ROW LEVEL SECURITY;
@@ -1262,8 +730,6 @@ ALTER TABLE truth.accepted_facts ENABLE ROW LEVEL SECURITY;
 ALTER TABLE truth.accepted_facts FORCE ROW LEVEL SECURITY;
 ALTER TABLE truth.fact_claims ENABLE ROW LEVEL SECURITY;
 ALTER TABLE truth.fact_claims FORCE ROW LEVEL SECURITY;
-ALTER TABLE truth.fact_lifecycle_events ENABLE ROW LEVEL SECURITY;
-ALTER TABLE truth.fact_lifecycle_events FORCE ROW LEVEL SECURITY;
 
 CREATE POLICY verified_evidence_select ON truth.verified_evidence_spans
 FOR SELECT TO throughline_app
@@ -1362,95 +828,9 @@ WITH CHECK (
   )
 );
 
-CREATE POLICY fact_lifecycle_select ON truth.fact_lifecycle_events
-FOR SELECT TO throughline_app
-USING (
-  tenant_id = ops.current_tenant_id()
-  AND workspace_id = ops.current_workspace_id()
-  AND access.can_read_space(
-    space_id,
-    (SELECT fact.access_class FROM truth.accepted_facts fact
-      WHERE fact.tenant_id = fact_lifecycle_events.tenant_id
-        AND fact.workspace_id = fact_lifecycle_events.workspace_id
-        AND fact.id = fact_lifecycle_events.fact_id)
-  )
-);
-CREATE POLICY fact_lifecycle_insert ON truth.fact_lifecycle_events
-FOR INSERT TO throughline_app
-WITH CHECK (
-  tenant_id = ops.current_tenant_id()
-  AND workspace_id = ops.current_workspace_id()
-  AND space_id = ops.current_space_id()
-  AND access.can_read_space(
-    space_id,
-    (SELECT fact.access_class FROM truth.accepted_facts fact
-      WHERE fact.tenant_id = fact_lifecycle_events.tenant_id
-        AND fact.workspace_id = fact_lifecycle_events.workspace_id
-        AND fact.id = fact_lifecycle_events.fact_id)
-  )
-  AND actor_user_id = ops.current_user_id()
-  AND actor_membership_id = ops.current_membership_id()
-  AND policy_version = ops.current_policy_version()
-);
-
-CREATE POLICY verified_evidence_retention_update ON truth.verified_evidence_spans
-FOR UPDATE TO throughline_b1_0_integrity
-USING (true)
-WITH CHECK (true);
-CREATE POLICY claims_retention_update ON truth.claims
-FOR UPDATE TO throughline_b1_0_integrity
-USING (true)
-WITH CHECK (true);
-CREATE POLICY accepted_facts_retention_update ON truth.accepted_facts
-FOR UPDATE TO throughline_b1_0_integrity
-USING (true)
-WITH CHECK (true);
-CREATE POLICY fact_lifecycle_retention_update ON truth.fact_lifecycle_events
-FOR UPDATE TO throughline_b1_0_integrity
-USING (true)
-WITH CHECK (true);
-CREATE POLICY verified_evidence_integrity_select ON truth.verified_evidence_spans
-FOR SELECT TO throughline_b1_0_integrity USING (true);
-CREATE POLICY claims_integrity_select ON truth.claims
-FOR SELECT TO throughline_b1_0_integrity USING (true);
-CREATE POLICY accepted_facts_integrity_select ON truth.accepted_facts
-FOR SELECT TO throughline_b1_0_integrity USING (true);
-CREATE POLICY fact_claims_integrity_select ON truth.fact_claims
-FOR SELECT TO throughline_b1_0_integrity USING (true);
-CREATE POLICY fact_lifecycle_integrity_select ON truth.fact_lifecycle_events
-FOR SELECT TO throughline_b1_0_integrity USING (true);
-
 GRANT USAGE ON SCHEMA truth TO throughline_app;
 GRANT SELECT, INSERT ON ALL TABLES IN SCHEMA truth TO throughline_app;
 GRANT UPDATE (status, updated_at, version) ON truth.claims TO throughline_app;
-
-GRANT USAGE ON SCHEMA truth TO throughline_b1_0_integrity;
-GRANT SELECT (
-  reservation_space_id, command_kind, actor_user_id,
-  actor_membership_id, policy_version_id
-) ON ops.domain_command_records TO throughline_b1_0_integrity;
-GRANT SELECT ON
-  truth.verified_evidence_spans, truth.claims, truth.accepted_facts,
-  truth.fact_claims, truth.fact_lifecycle_events
-TO throughline_b1_0_integrity;
-GRANT UPDATE (
-  source_excerpt, source_content_hash, source_normalized_content_hash,
-  chunk_content_hash, excerpt_hash, redacted_at, redaction_command_id,
-  hash_disposition, updated_at, version
-) ON truth.verified_evidence_spans TO throughline_b1_0_integrity;
-GRANT UPDATE (
-  value_json, value_hash, normalized_text, status, redacted_at,
-  redaction_command_id, hash_disposition, updated_at, version
-) ON truth.claims TO throughline_b1_0_integrity;
-GRANT UPDATE (
-  value_json, value_hash, normalized_text, status, last_causation_command_id,
-  redacted_at, redaction_source_artifact_id, hash_disposition, updated_at, version
-) ON truth.accepted_facts TO throughline_b1_0_integrity;
-GRANT UPDATE (
-  confidence_lowering_rationale, redacted_at, redaction_command_id
-) ON truth.fact_lifecycle_events TO throughline_b1_0_integrity;
-ALTER FUNCTION truth.reconcile_source_retention()
-  OWNER TO throughline_b1_0_integrity;
 
 REVOKE ALL ON ALL TABLES IN SCHEMA truth FROM PUBLIC;
 REVOKE ALL ON ALL FUNCTIONS IN SCHEMA truth FROM PUBLIC;

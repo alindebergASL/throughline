@@ -62,21 +62,28 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(query.mock.calls[1]?.[0]).toContain("ops.product_command_record_valid");
   });
 
-  it("pins only the five Slice 1 tables and two executable commands", async () => {
+  it("pins only the four Slice 1 tables and two executable commands", async () => {
     const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
-    for (const table of [
-      "accepted_facts",
-      "claims",
-      "fact_claims",
-      "fact_lifecycle_events",
-      "verified_evidence_spans"
-    ]) {
+    for (const table of ["accepted_facts", "claims", "fact_claims", "verified_evidence_spans"]) {
       expect(contract).toContain(`"${table}"`);
     }
     expect(contract).toContain('"claim.create.v1", "fact.accept.v1"');
     expect(contract).toContain("domain_command_records_b2_slice1_atomicity_deferred");
     expect(contract).not.toContain("command_effects_immutable");
     expect(contract).not.toContain("require_product_command_atomicity");
+  });
+
+  it("pins the 0007/0008 capability boundary and rejects Slice 2 catalog objects", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+
+    expect(contract).toContain("phase === 2");
+    expect(contract).toContain("throughline_b1_0_integrity");
+    expect(contract).toContain("B2 Slice 1 truth column inventory drifted");
+    expect(contract).toContain("B2 Slice 1 truth function inventory drifted");
+    expect(contract).toContain("source_truth_triggers");
+    expect(contract).toContain("truth.reconcile_source_retention()");
+    expect(contract).toContain("reconciliation_function !== null");
+    expect(contract).toContain("B2 Slice 1 truth table authority drifted");
   });
 
   it("inspects PUBLIC through expanded PostgreSQL ACLs instead of role-name helpers", async () => {
@@ -108,6 +115,29 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(contract).toContain("acl_record.grantee <> procedure.proowner");
     expect(contract).toContain('grantee: "throughline_product_relay"');
     expect(contract).toContain("B2 Slice 1 command function EXECUTE grants drifted");
+  });
+
+  it("closes the truth function inventory, source, security mode, search path, and ACLs", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+
+    for (const identity of [
+      "truth.enforce_claim_transition()",
+      "truth.reject_mutation()",
+      "truth.require_fact_accept_reservation()",
+      "truth.require_reserved_command()",
+      "truth.validate_claim_insert()",
+      "truth.validate_fact_insert()",
+      "truth.validate_fact_support()",
+      "truth.verify_evidence_snapshot()",
+      "access.can_read_space(uuid,text)"
+    ]) {
+      expect(contract).toContain(identity);
+    }
+    expect(contract).toContain("procedure.prosrc AS source");
+    expect(contract).toContain("security_definer: false");
+    expect(contract).toContain('configuration: ["search_path=pg_catalog"]');
+    expect(contract).toContain("B2 Slice 1 truth function EXECUTE grants drifted");
+    expect(contract).toContain("content.access_class_rank");
   });
 
   it("requires exact delegation to the immutable B1 catalog", async () => {

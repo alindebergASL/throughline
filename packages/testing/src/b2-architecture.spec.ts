@@ -27,20 +27,46 @@ describe("B2 Slice 1 architecture boundaries", () => {
     }
   });
 
-  it("adds only the five durable truth tables needed by Claim → Fact", async () => {
+  it("adds only the four durable truth tables needed by Claim → Fact", async () => {
     const schema = await source("packages/db/migrations/0007_b2_slice1_truth_storage.sql");
     expect([...schema.matchAll(/CREATE TABLE truth\.([a-z_]+)/g)].map((match) => match[1])).toEqual(
-      [
-        "verified_evidence_spans",
-        "claims",
-        "accepted_facts",
-        "fact_claims",
-        "fact_lifecycle_events"
-      ]
+      ["verified_evidence_spans", "claims", "accepted_facts", "fact_claims"]
     );
     expect(schema).toContain("accepted_facts_one_current_slot");
     expect(schema).toContain("accepted_facts_support_deferred");
     expect(schema).not.toMatch(/fact_supersessions|conflict_groups|derived_view|command_effects/);
+  });
+
+  it("contains no Slice 2 retention reconciliation or lifecycle execution", async () => {
+    const schema = await source("packages/db/migrations/0007_b2_slice1_truth_storage.sql");
+    const integrity = await source("packages/db/migrations/0008_b2_slice1_command_integrity.sql");
+
+    expect(schema).not.toMatch(
+      /fact_lifecycle|reconcile_source_retention|source_artifacts_truth_retention|b2_retention_command|retention_update|redacted_at|redaction_command_id|redaction_source_artifact_id|hash_disposition|status IN \('current','revoked'\)|status IN \('proposed','accepted','rejected'\)/
+    );
+    expect(schema).toContain("verified_evidence_immutable");
+    expect(schema).toContain("accepted_facts_immutable");
+    expect(schema).toContain("content.access_class_rank");
+    expect(schema).not.toContain("truth.access_class_rank");
+    expect(integrity).not.toMatch(/fact_lifecycle|Fact support and lifecycle/);
+    expect(integrity).toContain("durable Fact and support");
+  });
+
+  it("stores acceptance-confidence provenance directly on AcceptedFact", async () => {
+    const schema = await source("packages/db/migrations/0007_b2_slice1_truth_storage.sql");
+    const repository = await source("packages/truth-ledger/src/repository.ts");
+
+    for (const field of [
+      "confidence_rule",
+      "strongest_supporting_confidence",
+      "human_lowered",
+      "confidence_lowering_reason_code",
+      "confidence_lowering_rationale"
+    ]) {
+      expect(schema).toContain(field);
+      expect(repository).toContain(field);
+    }
+    expect(repository).not.toContain("fact_lifecycle_events");
   });
 
   it("executes only canonical claim.create and fact.accept", async () => {

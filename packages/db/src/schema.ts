@@ -893,18 +893,15 @@ export const verifiedEvidenceSpans = truth.table(
     chunkingVersion: text("chunking_version").notNull(),
     sourceStartOffset: integer("source_start_offset").notNull(),
     sourceEndOffset: integer("source_end_offset").notNull(),
-    sourceExcerpt: text("source_excerpt"),
-    sourceContentHash: text("source_content_hash"),
-    sourceNormalizedContentHash: text("source_normalized_content_hash"),
-    chunkContentHash: text("chunk_content_hash"),
-    excerptHash: text("excerpt_hash"),
+    sourceExcerpt: text("source_excerpt").notNull(),
+    sourceContentHash: text("source_content_hash").notNull(),
+    sourceNormalizedContentHash: text("source_normalized_content_hash").notNull(),
+    chunkContentHash: text("chunk_content_hash").notNull(),
+    excerptHash: text("excerpt_hash").notNull(),
     accessClass: text("access_class").notNull(),
     createdByUserId: uuid("created_by_user_id").notNull(),
     createdByMembershipId: uuid("created_by_membership_id").notNull(),
     causationCommandId: uuid("causation_command_id").notNull(),
-    redactedAt: timestamp("redacted_at", { withTimezone: true }),
-    redactionCommandId: uuid("redaction_command_id"),
-    hashDisposition: text("hash_disposition"),
     ...timestamps
   },
   (table) => [
@@ -928,9 +925,9 @@ export const claims = truth.table(
     subjectId: uuid("subject_id").notNull(),
     predicateCatalogVersion: text("predicate_catalog_version").notNull(),
     predicate: text("predicate").notNull(),
-    valueJson: jsonb("value_json"),
-    valueHash: text("value_hash"),
-    normalizedText: text("normalized_text"),
+    valueJson: jsonb("value_json").notNull(),
+    valueHash: text("value_hash").notNull(),
+    normalizedText: text("normalized_text").notNull(),
     verifiedEvidenceSpanId: uuid("verified_evidence_span_id").notNull(),
     assertedByType: text("asserted_by_type").notNull(),
     assertedById: uuid("asserted_by_id").notNull(),
@@ -943,9 +940,6 @@ export const claims = truth.table(
     createdByUserId: uuid("created_by_user_id").notNull(),
     createdByMembershipId: uuid("created_by_membership_id").notNull(),
     causationCommandId: uuid("causation_command_id").notNull(),
-    redactedAt: timestamp("redacted_at", { withTimezone: true }),
-    redactionCommandId: uuid("redaction_command_id"),
-    hashDisposition: text("hash_disposition"),
     ...timestamps
   },
   (table) => [
@@ -972,10 +966,15 @@ export const acceptedFacts = truth.table(
     subjectId: uuid("subject_id").notNull(),
     predicateCatalogVersion: text("predicate_catalog_version").notNull(),
     predicate: text("predicate").notNull(),
-    valueJson: jsonb("value_json"),
-    valueHash: text("value_hash"),
-    normalizedText: text("normalized_text"),
+    valueJson: jsonb("value_json").notNull(),
+    valueHash: text("value_hash").notNull(),
+    normalizedText: text("normalized_text").notNull(),
     confidence: text("confidence").notNull(),
+    confidenceRule: text("confidence_rule").notNull(),
+    strongestSupportingConfidence: text("strongest_supporting_confidence").notNull(),
+    humanLowered: boolean("human_lowered").notNull(),
+    confidenceLoweringReasonCode: text("confidence_lowering_reason_code"),
+    confidenceLoweringRationale: text("confidence_lowering_rationale"),
     validFrom: timestamp("valid_from", { withTimezone: true }),
     validTo: timestamp("valid_to", { withTimezone: true }),
     recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull(),
@@ -987,9 +986,6 @@ export const acceptedFacts = truth.table(
     authorityBasis: text("authority_basis").notNull(),
     acceptancePolicyVersion: text("acceptance_policy_version").notNull(),
     lastCausationCommandId: uuid("last_causation_command_id").notNull(),
-    redactedAt: timestamp("redacted_at", { withTimezone: true }),
-    redactionSourceArtifactId: uuid("redaction_source_artifact_id"),
-    hashDisposition: text("hash_disposition"),
     ...timestamps
   },
   (table) => [
@@ -1008,34 +1004,5 @@ export const factClaims = truth.table(
   },
   (table) => [
     primaryKey({ columns: [table.tenantId, table.workspaceId, table.factId, table.claimId] })
-  ]
-);
-
-export const factLifecycleEvents = truth.table(
-  "fact_lifecycle_events",
-  {
-    id: uuid("id").primaryKey(),
-    ...truthScope,
-    factId: uuid("fact_id").notNull(),
-    eventType: text("event_type").notNull(),
-    toStatus: text("to_status").notNull(),
-    actorUserId: uuid("actor_user_id").notNull(),
-    actorMembershipId: uuid("actor_membership_id").notNull(),
-    authorityBasis: text("authority_basis").notNull(),
-    policyVersion: text("policy_version").notNull(),
-    confidenceRule: text("confidence_rule").notNull(),
-    confidence: text("confidence").notNull(),
-    strongestSupportingConfidence: text("strongest_supporting_confidence").notNull(),
-    humanLowered: boolean("human_lowered").notNull(),
-    confidenceLoweringReasonCode: text("confidence_lowering_reason_code"),
-    confidenceLoweringRationale: text("confidence_lowering_rationale"),
-    causationCommandId: uuid("causation_command_id").notNull(),
-    redactedAt: timestamp("redacted_at", { withTimezone: true }),
-    redactionCommandId: uuid("redaction_command_id"),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
-  },
-  (table) => [
-    unique().on(table.tenantId, table.workspaceId, table.id),
-    unique().on(table.tenantId, table.workspaceId, table.factId, table.eventType)
   ]
 );

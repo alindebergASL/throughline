@@ -8,18 +8,22 @@ const integrityUrl = new URL(
 );
 
 describe("B2 Slice 1 PostgreSQL truth invariants", () => {
-  it("pins exact evidence, Claim, Fact, support, and lifecycle persistence", async () => {
+  it("pins exact evidence, Claim, Fact, support, and acceptance provenance persistence", async () => {
     const sql = await readFile(schemaUrl, "utf8");
     expect([...sql.matchAll(/CREATE TABLE truth\.([a-z_]+)/g)].map((match) => match[1])).toEqual([
       "verified_evidence_spans",
       "claims",
       "accepted_facts",
-      "fact_claims",
-      "fact_lifecycle_events"
+      "fact_claims"
     ]);
     expect(sql).toContain("accepted_facts_one_current_slot");
-    expect(sql).toContain("status text NOT NULL CHECK (status IN ('current','revoked'))");
-    expect(sql).toContain("event_type text NOT NULL CHECK (event_type = 'fact.accepted')");
+    expect(sql).toContain("status text NOT NULL CHECK (status = 'current')");
+    expect(sql).toContain("confidence_rule text NOT NULL");
+    expect(sql).toContain("strongest_supporting_confidence text NOT NULL");
+    expect(sql).toContain("human_lowered boolean NOT NULL");
+    expect(sql).toContain("confidence_lowering_reason_code text");
+    expect(sql).toContain("confidence_lowering_rationale text");
+    expect(sql).not.toMatch(/fact_lifecycle|redacted_at|redaction_|hash_disposition/);
     expect(sql).not.toMatch(/conflict_groups|fact_supersessions|derived_view|command_effects/);
   });
 
@@ -39,13 +43,7 @@ describe("B2 Slice 1 PostgreSQL truth invariants", () => {
   it("pins forced RLS, exact command guards, immutable lineage, audit, and outbox", async () => {
     const schema = await readFile(schemaUrl, "utf8");
     const integrity = await readFile(integrityUrl, "utf8");
-    for (const table of [
-      "verified_evidence_spans",
-      "claims",
-      "accepted_facts",
-      "fact_claims",
-      "fact_lifecycle_events"
-    ]) {
+    for (const table of ["verified_evidence_spans", "claims", "accepted_facts", "fact_claims"]) {
       expect(schema).toContain(`ALTER TABLE truth.${table} ENABLE ROW LEVEL SECURITY`);
       expect(schema).toContain(`ALTER TABLE truth.${table} FORCE ROW LEVEL SECURITY`);
     }
@@ -54,25 +52,19 @@ describe("B2 Slice 1 PostgreSQL truth invariants", () => {
     expect(integrity).toContain(
       "claim.create result does not match its durable Claim and evidence"
     );
-    expect(integrity).toContain(
-      "fact.accept result does not match its durable Fact support and lifecycle"
-    );
+    expect(integrity).toContain("fact.accept result does not match its durable Fact and support");
     expect(integrity).toContain("audit.safe_detail = expected_audit_detail");
     expect(integrity).toContain("event.payload = expected_event_payload");
     expect(integrity).toContain("truth command requires exact audit and product outbox rows");
   });
 
-  it("pins governed retention redaction without exposing a general revoke command", async () => {
+  it("keeps source reconciliation and lifecycle execution out of Slice 1", async () => {
     const schema = await readFile(schemaUrl, "utf8");
     const integrity = await readFile(integrityUrl, "utf8");
-    expect(schema).toContain("source_artifacts_truth_retention");
-    expect(schema).toContain("truth.reconcile_source_retention()");
-    expect(schema).toContain("source_excerpt = NULL");
-    expect(schema).toContain("value_json = NULL");
-    expect(schema).toContain("confidence_lowering_rationale = NULL");
-    expect(schema).toContain("fact lifecycle retention redaction is not permitted");
-    expect(schema).toContain("NEW.hash_disposition = 'erased'");
-    expect(schema).toContain("status = 'revoked'");
+    expect(schema).not.toMatch(
+      /source_artifacts_truth_retention|reconcile_source_retention|fact_lifecycle|b2_retention_command|redacted_at|redaction_|hash_disposition|status = 'revoked'|status = 'rejected'/
+    );
+    expect(integrity).not.toMatch(/fact_lifecycle|Fact support and lifecycle/);
     expect(integrity).not.toContain("fact.revoke.v1");
     expect(integrity).not.toMatch(/'valueHash'|'supportingClaimsHash'/);
   });

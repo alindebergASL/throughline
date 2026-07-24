@@ -2,8 +2,6 @@ import "reflect-metadata";
 import { createHash } from "node:crypto";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
-import { AccountOperationsDomainCommandBus } from "@throughline/account-operations";
-import { PostgresAuthorizationService } from "@throughline/authorization";
 import {
   applyMigrations,
   createPgPool,
@@ -13,7 +11,7 @@ import {
   type PgPool,
   type TenantDbTransaction
 } from "@throughline/db";
-import { createDevSecurityContext, devFixtures } from "@throughline/tenancy";
+import { devFixtures } from "@throughline/tenancy";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AppModule } from "../app.module.js";
 
@@ -357,7 +355,6 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
     const counts = await ownerPool.query<{
       claims: string;
       facts: string;
-      lifecycle: string;
       audits: string;
       outbox: string;
       truthCommands: string;
@@ -365,7 +362,6 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
       `SELECT
         (SELECT count(*)::text FROM truth.claims WHERE id = $1) AS claims,
         (SELECT count(*)::text FROM truth.accepted_facts WHERE id = $2) AS facts,
-        (SELECT count(*)::text FROM truth.fact_lifecycle_events WHERE fact_id = $2) AS lifecycle,
         (SELECT count(*)::text FROM ops.audit_events
           WHERE action IN ('claim.create','fact.accept')
             AND resource_id IN ($1,$2)) AS audits,
@@ -379,7 +375,6 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
     expect(counts.rows[0]).toEqual({
       claims: "1",
       facts: "1",
-      lifecycle: "1",
       audits: "2",
       outbox: "2",
       truthCommands: "3"
@@ -428,10 +423,11 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
       source_artifact_id: string;
       source_excerpt: string;
       evidence_access_class: string;
-      lifecycle_event_type: string;
-      lifecycle_confidence: string;
-      lifecycle_strongest_confidence: string;
-      lifecycle_human_lowered: boolean;
+      fact_confidence_rule: string;
+      fact_strongest_confidence: string;
+      fact_human_lowered: boolean;
+      fact_lowering_reason: string | null;
+      fact_lowering_rationale: string | null;
       audits: string;
       outbox: string;
     }>(
@@ -441,10 +437,11 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
          claim.confidence AS claim_confidence, claim.access_class AS claim_access_class,
          evidence.source_artifact_id, evidence.source_excerpt,
          evidence.access_class AS evidence_access_class,
-         lifecycle.event_type AS lifecycle_event_type,
-         lifecycle.confidence AS lifecycle_confidence,
-         lifecycle.strongest_supporting_confidence AS lifecycle_strongest_confidence,
-         lifecycle.human_lowered AS lifecycle_human_lowered,
+         fact.confidence_rule AS fact_confidence_rule,
+         fact.strongest_supporting_confidence AS fact_strongest_confidence,
+         fact.human_lowered AS fact_human_lowered,
+         fact.confidence_lowering_reason_code AS fact_lowering_reason,
+         fact.confidence_lowering_rationale AS fact_lowering_rationale,
          (SELECT count(*)::text FROM ops.audit_events audit
            WHERE audit.action = 'fact.accept' AND audit.resource_id = fact.id) AS audits,
          (SELECT count(*)::text FROM ops.product_outbox_events event
@@ -463,10 +460,6 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
          ON evidence.tenant_id = claim.tenant_id
         AND evidence.workspace_id = claim.workspace_id
         AND evidence.id = claim.verified_evidence_span_id
-       JOIN truth.fact_lifecycle_events lifecycle
-         ON lifecycle.tenant_id = fact.tenant_id
-        AND lifecycle.workspace_id = fact.workspace_id
-        AND lifecycle.fact_id = fact.id
        WHERE fact.id = $1 AND claim.id = $2`,
       [factId, claimId]
     );
@@ -485,119 +478,20 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
         source_artifact_id: sourceArtifactId,
         source_excerpt: "😀 agreed",
         evidence_access_class: "workspace",
-        lifecycle_event_type: "fact.accepted",
-        lifecycle_confidence: "strong",
-        lifecycle_strongest_confidence: "strong",
-        lifecycle_human_lowered: false,
+        fact_confidence_rule: "strongest-selected-valid-claim.v1",
+        fact_strongest_confidence: "strong",
+        fact_human_lowered: false,
+        fact_lowering_reason: null,
+        fact_lowering_rationale: null,
         audits: "1",
         outbox: "1"
       }
     ]);
   }, 60_000);
 
-  it("redacts retained source content through the canonical tombstone transaction", async () => {
-    const result = await new AccountOperationsDomainCommandBus(
-      appPool,
-      new PostgresAuthorizationService(appPool)
-    ).execute(
-      {
-        kind: "source.tombstone",
-        idempotencyKey: "b2-retain-tombstone",
-        payload: {
-          sourceArtifactId,
-          expectedVersion: 1,
-          deletionReasonCategory: "retention",
-          deletionPolicyRef: "policy:b2-retain-test"
-        }
-      },
-      createDevSecurityContext("tenant-a-owner")
-    );
-    expect(result).toMatchObject({ version: 2, hashDisposition: "retained" });
-
-    const redacted = await ownerPool.query<{
-      source_text: string | null;
-      source_hash: string | null;
-      chunks: string;
-      evidence_excerpt: string | null;
-      evidence_hash: string | null;
-      evidence_disposition: string;
-      claim_value: string | null;
-      claim_hash: string | null;
-      claim_status: string;
-      claim_version: number;
-      fact_value: string | null;
-      fact_hash: string | null;
-      fact_status: string;
-      fact_version: number;
-    }>(
-      `SELECT source.immutable_text AS source_text, source.content_hash AS source_hash,
-         (SELECT count(*)::text FROM content.source_chunks chunk
-           WHERE chunk.source_artifact_id = source.id) AS chunks,
-         evidence.source_excerpt AS evidence_excerpt,
-         evidence.excerpt_hash AS evidence_hash,
-         evidence.hash_disposition AS evidence_disposition,
-         claim.normalized_text AS claim_value, claim.value_hash AS claim_hash,
-         claim.status AS claim_status, claim.version AS claim_version,
-         fact.normalized_text AS fact_value, fact.value_hash AS fact_hash,
-         fact.status AS fact_status, fact.version AS fact_version
-       FROM content.source_artifacts source
-       JOIN truth.verified_evidence_spans evidence
-         ON evidence.tenant_id = source.tenant_id
-        AND evidence.workspace_id = source.workspace_id
-        AND evidence.source_artifact_id = source.id
-       JOIN truth.claims claim
-         ON claim.tenant_id = evidence.tenant_id
-        AND claim.workspace_id = evidence.workspace_id
-        AND claim.verified_evidence_span_id = evidence.id
-       JOIN truth.fact_claims support
-         ON support.tenant_id = claim.tenant_id
-        AND support.workspace_id = claim.workspace_id
-        AND support.claim_id = claim.id
-       JOIN truth.accepted_facts fact
-         ON fact.tenant_id = support.tenant_id
-        AND fact.workspace_id = support.workspace_id
-        AND fact.id = support.fact_id
-       WHERE source.id = $1 AND claim.id = $2 AND fact.id = $3`,
-      [sourceArtifactId, claimId, factId]
-    );
-    expect(redacted.rows).toEqual([
-      {
-        source_text: null,
-        source_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
-        chunks: "0",
-        evidence_excerpt: null,
-        evidence_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
-        evidence_disposition: "retained",
-        claim_value: null,
-        claim_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
-        claim_status: "rejected",
-        claim_version: 3,
-        fact_value: null,
-        fact_hash: expect.stringMatching(/^[a-f0-9]{64}$/),
-        fact_status: "revoked",
-        fact_version: 2
-      }
-    ]);
-    const protectedMetadata = await ownerPool.query<{ disclosures: string }>(
-      `SELECT (
-         (SELECT count(*) FROM ops.audit_events
-           WHERE safe_detail::text LIKE '%Outcome agreed with the customer%')
-         +
-         (SELECT count(*) FROM ops.product_outbox_events
-           WHERE payload::text LIKE '%Outcome agreed with the customer%')
-       )::text AS disclosures`
-    );
-    expect(protectedMetadata.rows[0]).toEqual({ disclosures: "0" });
-  }, 60_000);
-
-  it("cryptographically erases source, evidence, Claim, and Fact hashes", async () => {
-    await ownerPool.query(
-      `UPDATE identity.workspaces SET retention_policy_id = 'erase_on_tombstone:b2-test'
-       WHERE tenant_id = $1 AND id = $2`,
-      [devFixtures.tenantA, devFixtures.workspaceA]
-    );
-    const activity = await post("/v1/activities", "b2-erase-activity", {
-      title: "Erasure proof",
+  it("persists human confidence lowering on the AcceptedFact", async () => {
+    const activity = await post("/v1/activities", "b2-lowered-activity", {
+      title: "Confidence review",
       profileTemplateKey: "ai_workshop",
       status: "captured",
       governingInitiativeId: initiativeId,
@@ -606,16 +500,16 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
       attendeePersonIds: [devFixtures.externalPersonA]
     });
     expect(activity.statusCode, activity.body).toBe(201);
-    const eraseActivityId = activity.json<{ activityId: string }>().activityId;
-    const erasedText = "Erase me exactly after acceptance.";
-    const source = await post(`/v1/activities/${eraseActivityId}/sources`, "b2-erase-source", {
+    const loweredActivityId = activity.json<{ activityId: string }>().activityId;
+    const sourceText = "Confidence should be lowered despite strong source support.";
+    const source = await post(`/v1/activities/${loweredActivityId}/sources`, "b2-lowered-source", {
       sourceType: "note",
-      title: "Erasure evidence",
-      text: erasedText
+      title: "Confidence evidence",
+      text: sourceText
     });
     expect(source.statusCode, source.body).toBe(201);
-    const eraseSourceId = source.json<{ sourceArtifactId: string }>().sourceArtifactId;
-    const sourceRead = await get(`/v1/sources/${eraseSourceId}`);
+    const loweredSourceId = source.json<{ sourceArtifactId: string }>().sourceArtifactId;
+    const sourceRead = await get(`/v1/sources/${loweredSourceId}`);
     expect(sourceRead.statusCode, sourceRead.body).toBe(200);
     const snapshot = sourceRead.json<{
       version: number;
@@ -630,15 +524,15 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
       }>;
     }>();
     const chunk = snapshot.chunks[0]!;
-    const excerpt = "Erase me exactly";
-    const claim = await post("/internal/v1/claims", "b2-erase-claim", {
-      subject: { type: "activity", id: eraseActivityId, expectedVersion: 1 },
+    const excerpt = "Confidence should be lowered";
+    const claim = await post("/internal/v1/claims", "b2-lowered-claim", {
+      subject: { type: "activity", id: loweredActivityId, expectedVersion: 1 },
       predicate: "activity.outcome",
-      valueJson: "Erase accepted truth",
-      normalizedText: "Erase accepted truth",
+      valueJson: "Confidence reviewed",
+      normalizedText: "Confidence reviewed",
       confidence: "strong",
       evidence: {
-        sourceArtifactId: eraseSourceId,
+        sourceArtifactId: loweredSourceId,
         sourceChunkId: chunk.id,
         expectedSourceVersion: snapshot.version,
         expectedChunkVersion: 1,
@@ -654,119 +548,46 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
       }
     });
     expect(claim.statusCode, claim.body).toBe(201);
-    const eraseClaimId = claim.json<{ claimId: string }>().claimId;
-    const fact = await post("/internal/v1/facts", "b2-erase-fact", {
-      subject: { type: "activity", id: eraseActivityId, expectedVersion: 1 },
-      claims: [{ claimId: eraseClaimId, expectedVersion: 1 }],
+    const loweredClaimId = claim.json<{ claimId: string }>().claimId;
+    const loweringRationale = "Residual uncertainty remains after review.";
+    const fact = await post("/internal/v1/facts", "b2-lowered-fact", {
+      subject: { type: "activity", id: loweredActivityId, expectedVersion: 1 },
+      claims: [{ claimId: loweredClaimId, expectedVersion: 1 }],
       expectedCurrentFactId: null,
       acceptanceScope: "engagement",
       confidenceLowering: {
         confidence: "weak",
         reason: {
           code: "residual_uncertainty",
-          rationale: erasedText
+          rationale: loweringRationale
         }
       }
     });
     expect(fact.statusCode, fact.body).toBe(201);
-    const eraseFactId = fact.json<{ factId: string }>().factId;
-    await ownerPool.query(
-      `UPDATE identity.workspaces SET retention_policy_id = NULL
-       WHERE tenant_id = $1 AND id = $2`,
-      [devFixtures.tenantA, devFixtures.workspaceA]
-    );
-    const erased = await new AccountOperationsDomainCommandBus(
-      appPool,
-      new PostgresAuthorizationService(appPool)
-    ).execute(
-      {
-        kind: "source.tombstone",
-        idempotencyKey: "b2-erase-tombstone",
-        payload: {
-          sourceArtifactId: eraseSourceId,
-          expectedVersion: 1,
-          deletionReasonCategory: "lawful-erasure",
-          deletionPolicyRef: "policy:b2-erasure-test"
-        }
-      },
-      createDevSecurityContext("tenant-a-owner")
-    );
-    expect(erased).toMatchObject({ version: 2, hashDisposition: "erased" });
-
-    const state = await ownerPool.query<{
-      source_text: string | null;
-      source_hash: string | null;
-      chunks: string;
-      evidence_excerpt: string | null;
-      evidence_hash: string | null;
-      claim_value: string | null;
-      claim_hash: string | null;
-      claim_status: string;
-      fact_value: string | null;
-      fact_hash: string | null;
-      fact_status: string;
-      lifecycle_rationale: string | null;
-      lifecycle_redacted_at: Date | null;
-      disclosures: string;
+    const loweredFactId = fact.json<{ factId: string }>().factId;
+    const persisted = await ownerPool.query<{
+      confidence: string;
+      confidence_rule: string;
+      strongest_supporting_confidence: string;
+      human_lowered: boolean;
+      confidence_lowering_reason_code: string;
+      confidence_lowering_rationale: string;
     }>(
-      `SELECT source.immutable_text AS source_text, source.content_hash AS source_hash,
-         (SELECT count(*)::text FROM content.source_chunks chunk
-           WHERE chunk.source_artifact_id = source.id) AS chunks,
-         evidence.source_excerpt AS evidence_excerpt,
-         evidence.excerpt_hash AS evidence_hash,
-         claim.normalized_text AS claim_value, claim.value_hash AS claim_hash,
-         claim.status AS claim_status,
-         fact.normalized_text AS fact_value, fact.value_hash AS fact_hash,
-         fact.status AS fact_status,
-         lifecycle.confidence_lowering_rationale AS lifecycle_rationale,
-         lifecycle.redacted_at AS lifecycle_redacted_at,
-         (
-           (SELECT count(*) FROM ops.audit_events
-             WHERE safe_detail::text LIKE '%' || $4 || '%')
-           +
-           (SELECT count(*) FROM ops.product_outbox_events
-             WHERE payload::text LIKE '%' || $4 || '%')
-         )::text AS disclosures
-       FROM content.source_artifacts source
-       JOIN truth.verified_evidence_spans evidence
-         ON evidence.tenant_id = source.tenant_id
-        AND evidence.workspace_id = source.workspace_id
-        AND evidence.source_artifact_id = source.id
-       JOIN truth.claims claim
-         ON claim.tenant_id = evidence.tenant_id
-        AND claim.workspace_id = evidence.workspace_id
-        AND claim.verified_evidence_span_id = evidence.id
-       JOIN truth.fact_claims support
-         ON support.tenant_id = claim.tenant_id
-        AND support.workspace_id = claim.workspace_id
-        AND support.claim_id = claim.id
-       JOIN truth.accepted_facts fact
-         ON fact.tenant_id = support.tenant_id
-        AND fact.workspace_id = support.workspace_id
-        AND fact.id = support.fact_id
-       JOIN truth.fact_lifecycle_events lifecycle
-         ON lifecycle.tenant_id = fact.tenant_id
-        AND lifecycle.workspace_id = fact.workspace_id
-        AND lifecycle.fact_id = fact.id
-       WHERE source.id = $1 AND claim.id = $2 AND fact.id = $3`,
-      [eraseSourceId, eraseClaimId, eraseFactId, erasedText]
+      `SELECT confidence, confidence_rule, strongest_supporting_confidence,
+              human_lowered, confidence_lowering_reason_code,
+              confidence_lowering_rationale
+         FROM truth.accepted_facts
+        WHERE id = $1`,
+      [loweredFactId]
     );
-    expect(state.rows).toEqual([
+    expect(persisted.rows).toEqual([
       {
-        source_text: null,
-        source_hash: null,
-        chunks: "0",
-        evidence_excerpt: null,
-        evidence_hash: null,
-        claim_value: null,
-        claim_hash: null,
-        claim_status: "rejected",
-        fact_value: null,
-        fact_hash: null,
-        fact_status: "revoked",
-        lifecycle_rationale: null,
-        lifecycle_redacted_at: expect.any(Date),
-        disclosures: "0"
+        confidence: "weak",
+        confidence_rule: "strongest-selected-valid-claim.v1",
+        strongest_supporting_confidence: "strong",
+        human_lowered: true,
+        confidence_lowering_reason_code: "residual_uncertainty",
+        confidence_lowering_rationale: loweringRationale
       }
     ]);
   }, 60_000);

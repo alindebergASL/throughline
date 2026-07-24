@@ -44,31 +44,29 @@ describe("B2 Slice 1 additive migration contract", () => {
     );
     const b1Contract = await readFile(new URL("./b1-catalog-contract.ts", import.meta.url), "utf8");
     expect(b1Contract).toContain("A staged B2 catalog requires the exact complete B1 predecessor");
-    expect(b1Contract).toContain("source_artifacts_truth_retention");
+    expect(b1Contract).not.toContain("source_artifacts_truth_retention");
     expect(b1Contract).toContain("Fixed staged B2 command integrity contract parser failed");
   });
 
   it("creates exactly the durable Claim-to-Fact persistence surface", async () => {
     const sql = await readFile(schemaUrl, "utf8");
     const tables = [...sql.matchAll(/CREATE TABLE truth\.([a-z_]+)/g)].map((match) => match[1]);
-    expect(tables).toEqual([
-      "verified_evidence_spans",
-      "claims",
-      "accepted_facts",
-      "fact_claims",
-      "fact_lifecycle_events"
-    ]);
+    expect(tables).toEqual(["verified_evidence_spans", "claims", "accepted_facts", "fact_claims"]);
     expect(sql).toContain("accepted_facts_one_current_slot");
     expect(sql).toContain("accepted_facts_support_deferred");
     expect(sql).toContain("fact_claims_support_deferred");
     expect(sql).toContain("source evidence snapshot is unavailable or invalid");
     expect(sql).toContain("substring(");
     expect(sql).toContain("source_start_offset + 1");
+    expect(sql).toContain("confidence_rule");
+    expect(sql).toContain("strongest_supporting_confidence");
+    expect(sql).toContain("human_lowered");
     expect(sql).toContain("confidence_lowering_reason_code");
     expect(sql).toContain("confidence_lowering_rationale");
-    expect(sql).toContain("source_artifacts_truth_retention");
-    expect(sql).toContain("hash_disposition = 'erased'");
-    expect(sql).toContain("confidence_lowering_rationale = NULL");
+    expect(sql).toContain("content.access_class_rank");
+    expect(sql).not.toMatch(
+      /fact_lifecycle|reconcile_source_retention|source_artifacts_truth_retention|b2_retention_command|redacted_at|redaction_|hash_disposition|status IN \('current','revoked'\)|status IN \('proposed','accepted','rejected'\)/
+    );
     expect(sql).not.toMatch(/conflict|supersession|derived_view|command_effect/);
   });
 
@@ -78,6 +76,8 @@ describe("B2 Slice 1 additive migration contract", () => {
     expect(sql).toContain("'claim.create.v1','fact.accept.v1'");
     expect(sql).toContain("domain_command_records_b2_slice1_atomicity_deferred");
     expect(sql).toContain("exact audit and product outbox rows");
+    expect(sql).toContain("durable Fact and support");
+    expect(sql).not.toMatch(/fact_lifecycle|Fact support and lifecycle/);
     expect(sql).not.toMatch(/'valueHash'|'supportingClaimsHash'/);
     for (const future of [
       "fact.contest.v1",

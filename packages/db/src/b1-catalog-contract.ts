@@ -17,7 +17,6 @@ const B1_PREDECESSOR_IDS = [
   "0003_b1_0_canonical_product_outbox.sql"
 ] as const;
 
-const B2_SCHEMA_MIGRATION_ID = "0007_b2_slice1_truth_storage.sql";
 const B2_INTEGRITY_MIGRATION_ID = "0008_b2_slice1_command_integrity.sql";
 
 export async function validateMigrationJournal(
@@ -412,12 +411,7 @@ export async function validateB1CatalogContract(
   const integrityInstalled = phase === B1_MIGRATION_IDS.length;
   const expectedTables = expectedTableContracts(installed, sources);
   const expectedIndexes = expectedIndexContracts(installed, sources, expectedTables);
-  const expectedTriggers = expectedTriggerContracts(
-    installed,
-    sources,
-    expectedTables,
-    additiveB2Phase
-  );
+  const expectedTriggers = expectedTriggerContracts(installed, sources, expectedTables);
 
   await validateProtectedRoles(client);
   await withScratchCatalog(client, async (scratch) => {
@@ -518,26 +512,12 @@ function expectedIndexContracts(
 function expectedTriggerContracts(
   installed: readonly B1MigrationId[],
   sources: MigrationSources,
-  tables: readonly ExpectedTable[],
-  additiveB2Phase: AdditiveB2Phase
+  tables: readonly ExpectedTable[]
 ): ExpectedTrigger[] {
   const tableMap = new Map(tables.map((table) => [table.actualName, table.scratchName]));
   const triggerContracts = installed
     .filter((id) => id !== B1_MIGRATION_IDS[2])
     .flatMap((id) => extractTriggerStatements(requireSource(sources, id)));
-  if (additiveB2Phase >= 1) {
-    const statement = requireSource(sources, B2_SCHEMA_MIGRATION_ID).match(
-      /CREATE TRIGGER source_artifacts_truth_retention[\s\S]*?\bON content\.source_artifacts[\s\S]*?;/
-    )?.[0];
-    if (!statement) {
-      throw new Error("Fixed staged B2 source-retention trigger contract parser failed");
-    }
-    triggerContracts.push({
-      name: "source_artifacts_truth_retention",
-      tableName: "content.source_artifacts",
-      statement
-    });
-  }
   return triggerContracts
     .filter(({ tableName }) => tableMap.has(tableName))
     .map(({ name, tableName, statement }) => ({
@@ -1819,10 +1799,7 @@ function predecessorAclRows(
   );
 }
 
-function expectedPredecessorAcl(
-  integrityInstalled: boolean,
-  additiveB2Phase: AdditiveB2Phase
-): ExpectedPredecessorAcl[] {
+function expectedPredecessorAcl(integrityInstalled: boolean): ExpectedPredecessorAcl[] {
   const rows: ExpectedPredecessorAcl[] = [];
   for (const relation of [
     "access.access_relationships",
@@ -1919,23 +1896,6 @@ function expectedPredecessorAcl(
     ),
     ...predecessorAclRows("ops.audit_events", "table", [], "throughline_app", ["INSERT", "SELECT"])
   );
-  if (additiveB2Phase >= 1) {
-    rows.push(
-      ...predecessorAclRows(
-        "ops.domain_command_records",
-        "column",
-        [
-          "reservation_space_id",
-          "command_kind",
-          "actor_user_id",
-          "actor_membership_id",
-          "policy_version_id"
-        ],
-        "throughline_b1_0_integrity",
-        ["SELECT"]
-      )
-    );
-  }
   const productCommandColumns = [
     "id",
     "tenant_id",
@@ -2062,17 +2022,12 @@ async function validateIntegrityPredecessorAccess(
     .sort((left, right) =>
       `${left.relation}|${left.name}`.localeCompare(`${right.relation}|${right.name}`)
     );
-  if (additiveB2Phase >= 1) {
+  if (additiveB2Phase === 2) {
     const additiveIntegrityPolicyContracts = [
       ["truth.accepted_facts", "accepted_facts_integrity_select", "r"],
-      ["truth.accepted_facts", "accepted_facts_retention_update", "w"],
       ["truth.claims", "claims_integrity_select", "r"],
-      ["truth.claims", "claims_retention_update", "w"],
       ["truth.fact_claims", "fact_claims_integrity_select", "r"],
-      ["truth.fact_lifecycle_events", "fact_lifecycle_integrity_select", "r"],
-      ["truth.fact_lifecycle_events", "fact_lifecycle_retention_update", "w"],
-      ["truth.verified_evidence_spans", "verified_evidence_integrity_select", "r"],
-      ["truth.verified_evidence_spans", "verified_evidence_retention_update", "w"]
+      ["truth.verified_evidence_spans", "verified_evidence_integrity_select", "r"]
     ] as const;
     expectedPolicies.push(
       ...additiveIntegrityPolicyContracts.map(([relation, name, command]) => ({
@@ -2082,7 +2037,7 @@ async function validateIntegrityPredecessorAccess(
         permissive: true,
         roles: ["throughline_b1_0_integrity"],
         using_expression: "true",
-        check_expression: command === "w" ? "true" : null
+        check_expression: null
       }))
     );
     expectedPolicies.sort((left, right) =>
@@ -2161,10 +2116,7 @@ async function validateIntegrityPredecessorAccess(
      UNION ALL
      SELECT * FROM unexpected_diagnostic
      ORDER BY direction`,
-    [
-      predecessorAclRelations,
-      JSON.stringify(expectedPredecessorAcl(integrityInstalled, additiveB2Phase))
-    ]
+    [predecessorAclRelations, JSON.stringify(expectedPredecessorAcl(integrityInstalled))]
   );
   if (aclDiagnostics.rowCount !== 0) {
     throw new Error(
@@ -2185,7 +2137,14 @@ async function validateIntegrityPredecessorAccess(
     "B1 integrity schema grants",
     schemaPrivileges.rows,
     (integrityInstalled
-      ? ["access", "content", "identity", "ops", ...(additiveB2Phase >= 1 ? ["truth"] : []), "work"]
+      ? [
+          "access",
+          "content",
+          "identity",
+          "ops",
+          ...(additiveB2Phase === 2 ? ["truth"] : []),
+          "work"
+        ]
       : ["ops"]
     ).map((schema) => ({
       schema,

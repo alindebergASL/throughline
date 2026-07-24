@@ -16,12 +16,108 @@ const fixedPredecessors = [
   "0006_b1_command_integrity.sql"
 ] as const;
 
-const truthTables = [
-  "accepted_facts",
-  "claims",
-  "fact_claims",
-  "fact_lifecycle_events",
-  "verified_evidence_spans"
+const truthTables = ["accepted_facts", "claims", "fact_claims", "verified_evidence_spans"] as const;
+
+const truthColumns = {
+  accepted_facts: [
+    "id",
+    "tenant_id",
+    "workspace_id",
+    "space_id",
+    "subject_type",
+    "subject_id",
+    "predicate_catalog_version",
+    "predicate",
+    "value_json",
+    "value_hash",
+    "normalized_text",
+    "confidence",
+    "confidence_rule",
+    "strongest_supporting_confidence",
+    "human_lowered",
+    "confidence_lowering_reason_code",
+    "confidence_lowering_rationale",
+    "valid_from",
+    "valid_to",
+    "recorded_at",
+    "status",
+    "access_class",
+    "accepted_by_user_id",
+    "accepted_by_membership_id",
+    "acceptance_scope",
+    "authority_basis",
+    "acceptance_policy_version",
+    "last_causation_command_id",
+    "created_at",
+    "updated_at",
+    "version"
+  ],
+  claims: [
+    "id",
+    "tenant_id",
+    "workspace_id",
+    "space_id",
+    "subject_type",
+    "subject_id",
+    "predicate_catalog_version",
+    "predicate",
+    "value_json",
+    "value_hash",
+    "normalized_text",
+    "verified_evidence_span_id",
+    "asserted_by_type",
+    "asserted_by_id",
+    "confidence",
+    "valid_from",
+    "valid_to",
+    "observed_at",
+    "status",
+    "access_class",
+    "created_by_user_id",
+    "created_by_membership_id",
+    "causation_command_id",
+    "created_at",
+    "updated_at",
+    "version"
+  ],
+  fact_claims: ["tenant_id", "workspace_id", "space_id", "fact_id", "claim_id", "created_at"],
+  verified_evidence_spans: [
+    "id",
+    "tenant_id",
+    "workspace_id",
+    "space_id",
+    "source_artifact_id",
+    "source_chunk_id",
+    "source_version",
+    "chunk_version",
+    "normalization_version",
+    "chunking_version",
+    "source_start_offset",
+    "source_end_offset",
+    "source_excerpt",
+    "source_content_hash",
+    "source_normalized_content_hash",
+    "chunk_content_hash",
+    "excerpt_hash",
+    "access_class",
+    "created_by_user_id",
+    "created_by_membership_id",
+    "causation_command_id",
+    "created_at",
+    "updated_at",
+    "version"
+  ]
+} as const;
+
+const truthFunctionIdentities = [
+  "truth.enforce_claim_transition()",
+  "truth.reject_mutation()",
+  "truth.require_fact_accept_reservation()",
+  "truth.require_reserved_command()",
+  "truth.validate_claim_insert()",
+  "truth.validate_fact_insert()",
+  "truth.validate_fact_support()",
+  "truth.verify_evidence_snapshot()"
 ] as const;
 
 const b1CommandKinds = [
@@ -72,8 +168,10 @@ export async function validateB2CatalogContract(
 
   assertNarrowMigrationSources(migrationSources, phase);
   await validateTruthTables(client);
-  await validateTruthPolicies(client);
-  await validateTruthSecurity(client);
+  await validateTruthColumnsAndConstraints(client);
+  await validateTruthPolicies(client, phase);
+  await validateTruthSecurity(client, phase);
+  await validateTruthFunctions(client, migrationSources.get(B2_MIGRATION_IDS[0])!);
   await validateTruthConstraintsAndTriggers(client);
   await validateCommandBoundary(client, phase);
 }
@@ -94,11 +192,25 @@ function assertNarrowMigrationSources(
     "fact_supersessions",
     "conflict_groups",
     "derived_view",
-    "command_effects"
+    "command_effects",
+    "fact_lifecycle_events",
+    "reconcile_source_retention",
+    "source_artifacts_truth_retention",
+    "b2_retention_command",
+    "retention_update",
+    "redacted_at",
+    "redaction_command_id",
+    "redaction_source_artifact_id",
+    "hash_disposition",
+    "status IN ('proposed','accepted','rejected')",
+    "status IN ('current','revoked')"
   ]) {
     if (schema.includes(forbidden) || integrity.includes(forbidden)) {
       throw new Error(`B2 Slice 1 migration contains future persistence: ${forbidden}`);
     }
+  }
+  if (schema.includes("truth.access_class_rank") || !schema.includes("content.access_class_rank")) {
+    throw new Error("B2 Slice 1 must reuse the sealed canonical access-class lattice");
   }
   if (phase === 2) {
     for (const kind of b2Slice1CommandKinds) {
@@ -148,155 +260,417 @@ async function validateTruthTables(client: PgPoolClient): Promise<void> {
   }
 }
 
-async function validateTruthPolicies(client: PgPoolClient): Promise<void> {
-  const result = await client.query<{
-    table_name: string;
-    operation: string;
-    using_expression: string | null;
-    check_expression: string | null;
-  }>(
-    `SELECT tablename AS table_name, cmd AS operation, qual AS using_expression,
-            with_check AS check_expression
-       FROM pg_policies
-      WHERE schemaname = 'truth' AND roles = '{throughline_app}'
-      ORDER BY tablename, cmd`
+async function validateTruthColumnsAndConstraints(client: PgPoolClient): Promise<void> {
+  const columns = await client.query<{ table_name: string; columns: string[] }>(
+    `SELECT relation.relname AS table_name,
+            array_agg(attribute.attname ORDER BY attribute.attnum) AS columns
+       FROM pg_class relation
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+       JOIN pg_attribute attribute ON attribute.attrelid = relation.oid
+      WHERE namespace.nspname = 'truth'
+        AND relation.relkind = 'r'
+        AND attribute.attnum > 0
+        AND NOT attribute.attisdropped
+      GROUP BY relation.relname
+      ORDER BY relation.relname`
   );
-  for (const table of truthTables) {
-    const select = result.rows.find(
-      (policy) => policy.table_name === table && policy.operation === "SELECT"
-    );
-    const insert = result.rows.find(
-      (policy) => policy.table_name === table && policy.operation === "INSERT"
-    );
-    if (
-      !select?.using_expression?.includes("access.can_read_space") ||
-      !insert?.check_expression?.includes("access.can_read_space") ||
-      !insert.check_expression.includes("space_id = ops.current_space_id()")
-    ) {
-      throw new Error(`B2 Slice 1 truth policy is incomplete for ${table}`);
+  const expectedColumns = truthTables.map((table_name) => ({
+    table_name,
+    columns: [...truthColumns[table_name]]
+  }));
+  if (JSON.stringify(columns.rows) !== JSON.stringify(expectedColumns)) {
+    throw new Error("B2 Slice 1 truth column inventory drifted");
+  }
+
+  const constraints = await client.query<{ definition: string }>(
+    `SELECT pg_get_constraintdef(constraint_record.oid, false) AS definition
+       FROM pg_constraint constraint_record
+       JOIN pg_class relation ON relation.oid = constraint_record.conrelid
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'truth'
+      ORDER BY relation.relname, constraint_record.conname`
+  );
+  const definitions = constraints.rows.map(({ definition }) => definition).join("\n");
+  for (const forbidden of ["rejected", "revoked", "redacted", "hash_disposition"]) {
+    if (definitions.includes(forbidden)) {
+      throw new Error(`B2 Slice 1 truth constraint contains future state ${forbidden}`);
+    }
+  }
+  for (const required of [
+    "strongest-selected-valid-claim.v1",
+    "conservative_human_judgment",
+    "evidence_quality",
+    "residual_uncertainty",
+    "'proposed'::text",
+    "'accepted'::text",
+    "status = 'current'::text"
+  ]) {
+    if (!definitions.includes(required)) {
+      throw new Error(`B2 Slice 1 truth constraint omits ${required}`);
     }
   }
 }
 
-async function validateTruthSecurity(client: PgPoolClient): Promise<void> {
+async function validateTruthPolicies(client: PgPoolClient, phase: number): Promise<void> {
   const result = await client.query<{
-    public_table_privileges: string;
-    public_schema_privileges: string;
-    relay_read: boolean;
-    worker_read: boolean;
-    product_relay_read: boolean;
-    app_can_read_space: boolean;
-    public_can_read_space: boolean;
+    policy_name: string;
+    table_name: string;
+    operation: string;
+    permissive: boolean;
+    roles: string[];
+    using_expression: string | null;
+    check_expression: string | null;
   }>(
-    `WITH public_table_privileges AS (
-       SELECT 1
+    `SELECT policy.polname AS policy_name, relation.relname AS table_name,
+            policy.polcmd::text AS operation, policy.polpermissive AS permissive,
+            ARRAY(
+              SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC' ELSE role_oid::regrole::text END
+                FROM unnest(policy.polroles) role_oid
+               ORDER BY 1
+            ) AS roles,
+            pg_get_expr(policy.polqual, policy.polrelid) AS using_expression,
+            pg_get_expr(policy.polwithcheck, policy.polrelid) AS check_expression
+       FROM pg_policy policy
+       JOIN pg_class relation ON relation.oid = policy.polrelid
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'truth'
+      ORDER BY relation.relname, policy.polname`
+  );
+  const expectedPolicies = [
+    ["accepted_facts_insert", "accepted_facts", "a", "throughline_app"],
+    ["accepted_facts_select", "accepted_facts", "r", "throughline_app"],
+    ...(phase === 2
+      ? [["accepted_facts_integrity_select", "accepted_facts", "r", "throughline_b1_0_integrity"]]
+      : []),
+    ["claims_insert", "claims", "a", "throughline_app"],
+    ["claims_select", "claims", "r", "throughline_app"],
+    ["claims_update", "claims", "w", "throughline_app"],
+    ...(phase === 2
+      ? [["claims_integrity_select", "claims", "r", "throughline_b1_0_integrity"]]
+      : []),
+    ["fact_claims_insert", "fact_claims", "a", "throughline_app"],
+    ["fact_claims_select", "fact_claims", "r", "throughline_app"],
+    ...(phase === 2
+      ? [["fact_claims_integrity_select", "fact_claims", "r", "throughline_b1_0_integrity"]]
+      : []),
+    ["verified_evidence_insert", "verified_evidence_spans", "a", "throughline_app"],
+    ["verified_evidence_select", "verified_evidence_spans", "r", "throughline_app"],
+    ...(phase === 2
+      ? [
+          [
+            "verified_evidence_integrity_select",
+            "verified_evidence_spans",
+            "r",
+            "throughline_b1_0_integrity"
+          ]
+        ]
+      : [])
+  ]
+    .map(([policy_name, table_name, operation, role]) => ({
+      policy_name,
+      table_name,
+      operation,
+      permissive: true,
+      roles: [role]
+    }))
+    .sort((left, right) =>
+      `${left.table_name}|${left.policy_name}`.localeCompare(
+        `${right.table_name}|${right.policy_name}`
+      )
+    );
+  const actualPolicies = result.rows.map((policy) => ({
+    policy_name: policy.policy_name,
+    table_name: policy.table_name,
+    operation: policy.operation,
+    permissive: policy.permissive,
+    roles: policy.roles
+  }));
+  if (JSON.stringify(actualPolicies) !== JSON.stringify(expectedPolicies)) {
+    throw new Error("B2 Slice 1 truth policy inventory drifted");
+  }
+  for (const policy of result.rows) {
+    if (policy.roles[0] === "throughline_b1_0_integrity") {
+      if (policy.using_expression !== "true" || policy.check_expression !== null) {
+        throw new Error("B2 Slice 1 integrity truth policy is not read-only");
+      }
+      continue;
+    }
+    const expression = policy.operation === "r" ? policy.using_expression : policy.check_expression;
+    if (
+      !expression?.includes("tenant_id = ops.current_tenant_id()") ||
+      !expression.includes("workspace_id = ops.current_workspace_id()") ||
+      !expression.includes("access.can_read_space")
+    ) {
+      throw new Error(`B2 Slice 1 truth policy is incomplete for ${policy.policy_name}`);
+    }
+    if (policy.operation !== "r" && !expression.includes("space_id = ops.current_space_id()")) {
+      throw new Error(`B2 Slice 1 truth write policy lost its current Space binding`);
+    }
+  }
+}
+
+async function validateTruthSecurity(client: PgPoolClient, phase: number): Promise<void> {
+  const schemaPrivileges = await client.query<Record<string, unknown>>(
+    `SELECT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                 ELSE pg_get_userbyid(acl.grantee) END AS grantee,
+            acl.privilege_type AS privilege,
+            acl.is_grantable AS grantable
+       FROM pg_namespace namespace
+       CROSS JOIN LATERAL aclexplode(COALESCE(
+         namespace.nspacl, acldefault('n', namespace.nspowner)
+       )) acl
+      WHERE namespace.nspname = 'truth'
+        AND acl.grantee <> namespace.nspowner
+      ORDER BY grantee, privilege, grantable`
+  );
+  const expectedSchemaPrivileges = [
+    { grantee: "throughline_app", privilege: "USAGE", grantable: false },
+    ...(phase === 2
+      ? [{ grantee: "throughline_b1_0_integrity", privilege: "USAGE", grantable: false }]
+      : [])
+  ].sort((left, right) => left.grantee.localeCompare(right.grantee));
+  if (JSON.stringify(schemaPrivileges.rows) !== JSON.stringify(expectedSchemaPrivileges)) {
+    throw new Error("B2 Slice 1 truth schema authority drifted");
+  }
+
+  const tablePrivileges = await client.query<Record<string, unknown>>(
+    `SELECT relation.relname AS table_name, 'table'::text AS scope,
+            NULL::text AS column_name,
+            CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                 ELSE pg_get_userbyid(acl.grantee) END AS grantee,
+            acl.privilege_type AS privilege,
+            acl.is_grantable AS grantable
        FROM pg_class relation
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
        CROSS JOIN LATERAL aclexplode(COALESCE(
          relation.relacl, acldefault('r', relation.relowner)
-       )) acl_record
-       WHERE namespace.nspname = 'truth'
-         AND relation.relkind = 'r'
-         AND acl_record.grantee = 0
-       UNION ALL
-       SELECT 1
+       )) acl
+      WHERE namespace.nspname = 'truth'
+        AND relation.relkind = 'r'
+        AND acl.grantee <> relation.relowner
+      UNION ALL
+     SELECT relation.relname AS table_name, 'column'::text AS scope,
+            attribute.attname AS column_name,
+            CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                 ELSE pg_get_userbyid(acl.grantee) END AS grantee,
+            acl.privilege_type AS privilege,
+            acl.is_grantable AS grantable
        FROM pg_attribute attribute
        JOIN pg_class relation ON relation.oid = attribute.attrelid
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
        CROSS JOIN LATERAL aclexplode(COALESCE(
          attribute.attacl, acldefault('c', relation.relowner)
-       )) acl_record
-       WHERE namespace.nspname = 'truth'
-         AND relation.relkind = 'r'
-         AND attribute.attnum > 0
-         AND NOT attribute.attisdropped
-         AND acl_record.grantee = 0
-     )
-     SELECT
-       (SELECT count(*)::text FROM public_table_privileges) AS public_table_privileges,
-       (SELECT count(*)::text
-          FROM pg_namespace namespace
-          CROSS JOIN LATERAL aclexplode(COALESCE(
-            namespace.nspacl, acldefault('n', namespace.nspowner)
-          )) acl_record
-         WHERE namespace.nspname = 'truth'
-           AND acl_record.grantee = 0) AS public_schema_privileges,
-       has_table_privilege(
-         'throughline_relay','truth.accepted_facts','SELECT'
-       ) AS relay_read,
-       has_table_privilege(
-         'throughline_worker','truth.accepted_facts','SELECT'
-       ) AS worker_read,
-       has_table_privilege(
-         'throughline_product_relay','truth.claims','SELECT'
-       ) AS product_relay_read,
-       has_function_privilege(
-         'throughline_app','access.can_read_space(uuid,text)','EXECUTE'
-       ) AS app_can_read_space,
-       EXISTS (
-         SELECT 1
-         FROM pg_proc procedure
-         CROSS JOIN LATERAL aclexplode(COALESCE(
-           procedure.proacl, acldefault('f', procedure.proowner)
-         )) acl_record
-         WHERE procedure.oid = to_regprocedure('access.can_read_space(uuid,text)')
-           AND acl_record.grantee = 0
-           AND acl_record.privilege_type = 'EXECUTE'
-       ) AS public_can_read_space`
+       )) acl
+      WHERE namespace.nspname = 'truth'
+        AND relation.relkind = 'r'
+        AND attribute.attnum > 0
+        AND NOT attribute.attisdropped
+        AND acl.grantee <> relation.relowner
+      ORDER BY table_name, scope, column_name NULLS FIRST, grantee, privilege, grantable`
   );
-  const row = result.rows[0];
+  const expectedTablePrivileges: Array<Record<string, unknown>> = [];
+  for (const table_name of truthTables) {
+    for (const privilege of ["INSERT", "SELECT"]) {
+      expectedTablePrivileges.push({
+        table_name,
+        scope: "table",
+        column_name: null,
+        grantee: "throughline_app",
+        privilege,
+        grantable: false
+      });
+    }
+    if (phase === 2) {
+      expectedTablePrivileges.push({
+        table_name,
+        scope: "table",
+        column_name: null,
+        grantee: "throughline_b1_0_integrity",
+        privilege: "SELECT",
+        grantable: false
+      });
+    }
+  }
+  for (const column_name of ["status", "updated_at", "version"]) {
+    expectedTablePrivileges.push({
+      table_name: "claims",
+      scope: "column",
+      column_name,
+      grantee: "throughline_app",
+      privilege: "UPDATE",
+      grantable: false
+    });
+  }
+  expectedTablePrivileges.sort((left, right) =>
+    `${left.table_name}|${left.scope}|${left.column_name ?? ""}|${left.grantee}|${left.privilege}`.localeCompare(
+      `${right.table_name}|${right.scope}|${right.column_name ?? ""}|${right.grantee}|${right.privilege}`
+    )
+  );
+  if (JSON.stringify(tablePrivileges.rows) !== JSON.stringify(expectedTablePrivileges)) {
+    throw new Error("B2 Slice 1 truth table authority drifted");
+  }
+}
+
+async function validateTruthFunctions(client: PgPoolClient, schemaSource: string): Promise<void> {
+  const inventory = await client.query<{ identity: string }>(
+    `SELECT procedure.oid::regprocedure::text AS identity
+       FROM pg_proc procedure
+       JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+      WHERE namespace.nspname = 'truth'
+      ORDER BY procedure.oid::regprocedure::text`
+  );
   if (
-    !row ||
-    row.public_table_privileges !== "0" ||
-    row.public_schema_privileges !== "0" ||
-    row.relay_read ||
-    row.worker_read ||
-    row.product_relay_read ||
-    !row.app_can_read_space ||
-    row.public_can_read_space
+    JSON.stringify(inventory.rows.map(({ identity }) => identity)) !==
+    JSON.stringify(truthFunctionIdentities)
   ) {
-    throw new Error("B2 Slice 1 truth role isolation drifted");
+    throw new Error("B2 Slice 1 truth function inventory drifted");
+  }
+
+  const inspectedIdentities = [...truthFunctionIdentities, "access.can_read_space(uuid,text)"];
+  const functions = await client.query<Record<string, unknown>>(
+    `SELECT procedure.oid::regprocedure::text AS identity,
+            pg_get_function_result(procedure.oid) AS result,
+            language.lanname AS language,
+            CASE WHEN procedure.proowner = current_user::regrole THEN 'migration_owner'
+                 ELSE pg_get_userbyid(procedure.proowner) END AS owner,
+            procedure.prosecdef AS security_definer,
+            procedure.proisstrict AS strict,
+            procedure.provolatile::text AS volatility,
+            procedure.proleakproof AS leakproof,
+            procedure.proparallel::text AS parallel,
+            procedure.prokind::text AS kind,
+            COALESCE(procedure.proconfig, ARRAY[]::text[]) AS configuration,
+            procedure.prosrc AS source
+       FROM pg_proc procedure
+       JOIN pg_language language ON language.oid = procedure.prolang
+      WHERE procedure.oid = ANY($1::regprocedure[])
+      ORDER BY procedure.oid::regprocedure::text`,
+    [inspectedIdentities]
+  );
+  const expectedFunctions = inspectedIdentities
+    .map((identity) => {
+      const accessFunction = identity === "access.can_read_space(uuid,text)";
+      return {
+        identity,
+        result: accessFunction ? "boolean" : "trigger",
+        language: accessFunction ? "sql" : "plpgsql",
+        owner: "migration_owner",
+        security_definer: false,
+        strict: false,
+        volatility: accessFunction ? "s" : "v",
+        leakproof: false,
+        parallel: "u",
+        kind: "f",
+        configuration: ["search_path=pg_catalog"],
+        source: migrationFunctionSource(
+          schemaSource,
+          accessFunction ? "access.can_read_space" : identity.slice(0, -2)
+        )
+      };
+    })
+    .sort((left, right) => left.identity.localeCompare(right.identity));
+  if (JSON.stringify(functions.rows) !== JSON.stringify(expectedFunctions)) {
+    throw new Error("B2 Slice 1 truth function execution shape or source drifted");
+  }
+
+  const privileges = await client.query<Record<string, unknown>>(
+    `SELECT procedure.oid::regprocedure::text AS identity,
+            CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                 ELSE pg_get_userbyid(acl.grantee) END AS grantee,
+            acl.privilege_type AS privilege,
+            acl.is_grantable AS grantable,
+            CASE WHEN acl.grantor = current_user::regrole THEN 'migration_owner'
+                 ELSE pg_get_userbyid(acl.grantor) END AS grantor
+       FROM pg_proc procedure
+       CROSS JOIN LATERAL aclexplode(COALESCE(
+         procedure.proacl, acldefault('f', procedure.proowner)
+       )) acl
+      WHERE procedure.oid = ANY($1::regprocedure[])
+        AND acl.grantee <> procedure.proowner
+      ORDER BY procedure.oid::regprocedure::text, grantee, privilege, grantable, grantor`,
+    [inspectedIdentities]
+  );
+  if (
+    JSON.stringify(privileges.rows) !==
+    JSON.stringify([
+      {
+        identity: "access.can_read_space(uuid,text)",
+        grantee: "throughline_app",
+        privilege: "EXECUTE",
+        grantable: false,
+        grantor: "migration_owner"
+      }
+    ])
+  ) {
+    throw new Error("B2 Slice 1 truth function EXECUTE grants drifted");
+  }
+
+  const accessSource = functions.rows.find(
+    (row) => row.identity === "access.can_read_space(uuid,text)"
+  )?.source;
+  if (
+    typeof accessSource !== "string" ||
+    !accessSource.includes("content.access_class_rank") ||
+    accessSource.includes("truth.access_class_rank")
+  ) {
+    throw new Error("B2 Slice 1 access policy does not use the sealed canonical lattice");
   }
 }
 
 async function validateTruthConstraintsAndTriggers(client: PgPoolClient): Promise<void> {
   const expectedTriggers = [
-    "accepted_facts_command_guard",
-    "accepted_facts_insert_guard",
-    "accepted_facts_retention_guard",
-    "accepted_facts_support_deferred",
-    "claims_command_guard",
-    "claims_delete_guard",
-    "claims_insert_guard",
-    "claims_transition_guard",
-    "fact_claims_command_guard",
-    "fact_claims_immutable",
-    "fact_claims_support_deferred",
-    "fact_lifecycle_command_guard",
-    "fact_lifecycle_events_immutable",
-    "fact_lifecycle_insert_guard",
-    "verified_evidence_command_guard",
-    "verified_evidence_retention_guard",
-    "verified_evidence_snapshot_guard"
-  ];
-  const triggers = await client.query<{ name: string }>(
-    `SELECT trigger_record.tgname AS name
+    ["accepted_facts_command_guard", "accepted_facts", "truth.require_reserved_command()", false],
+    ["accepted_facts_immutable", "accepted_facts", "truth.reject_mutation()", false],
+    ["accepted_facts_insert_guard", "accepted_facts", "truth.validate_fact_insert()", false],
+    ["accepted_facts_support_deferred", "accepted_facts", "truth.validate_fact_support()", true],
+    ["claims_command_guard", "claims", "truth.require_reserved_command()", false],
+    ["claims_delete_guard", "claims", "truth.reject_mutation()", false],
+    ["claims_insert_guard", "claims", "truth.validate_claim_insert()", false],
+    ["claims_transition_guard", "claims", "truth.enforce_claim_transition()", false],
+    ["fact_claims_command_guard", "fact_claims", "truth.require_fact_accept_reservation()", false],
+    ["fact_claims_immutable", "fact_claims", "truth.reject_mutation()", false],
+    ["fact_claims_support_deferred", "fact_claims", "truth.validate_fact_support()", true],
+    [
+      "verified_evidence_command_guard",
+      "verified_evidence_spans",
+      "truth.require_reserved_command()",
+      false
+    ],
+    ["verified_evidence_immutable", "verified_evidence_spans", "truth.reject_mutation()", false],
+    [
+      "verified_evidence_snapshot_guard",
+      "verified_evidence_spans",
+      "truth.verify_evidence_snapshot()",
+      false
+    ]
+  ].map(([name, table_name, function_identity, deferred]) => ({
+    name,
+    table_name,
+    function_identity,
+    deferrable: deferred,
+    initially_deferred: deferred
+  }));
+  const triggers = await client.query<Record<string, unknown>>(
+    `SELECT trigger_record.tgname AS name, relation.relname AS table_name,
+            procedure.oid::regprocedure::text AS function_identity,
+            trigger_record.tgdeferrable AS deferrable,
+            trigger_record.tginitdeferred AS initially_deferred
        FROM pg_trigger trigger_record
        JOIN pg_class relation ON relation.oid = trigger_record.tgrelid
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+       JOIN pg_proc procedure ON procedure.oid = trigger_record.tgfoid
       WHERE namespace.nspname = 'truth' AND NOT trigger_record.tgisinternal
       ORDER BY trigger_record.tgname`
   );
-  if (
-    triggers.rows.length !== expectedTriggers.length ||
-    triggers.rows.some((row, index) => row.name !== expectedTriggers[index])
-  ) {
+  if (JSON.stringify(triggers.rows) !== JSON.stringify(expectedTriggers)) {
     throw new Error("B2 Slice 1 truth trigger inventory drifted");
   }
   const constraints = await client.query<{
     current_slot: string | null;
     fact_support_deferred: boolean;
     claim_support_deferred: boolean;
+    source_truth_triggers: string;
+    reconciliation_function: string | null;
   }>(
     `SELECT
        to_regclass('truth.accepted_facts_one_current_slot')::text AS current_slot,
@@ -311,67 +685,25 @@ async function validateTruthConstraintsAndTriggers(client: PgPoolClient): Promis
           WHERE tgrelid = to_regclass('truth.fact_claims')
             AND tgname = 'fact_claims_support_deferred'
             AND tgdeferrable AND tginitdeferred
-       ) AS claim_support_deferred`
+       ) AS claim_support_deferred,
+       (SELECT count(*)::text
+          FROM pg_trigger trigger_record
+          JOIN pg_proc procedure ON procedure.oid = trigger_record.tgfoid
+          JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+         WHERE trigger_record.tgrelid = to_regclass('content.source_artifacts')
+           AND NOT trigger_record.tgisinternal
+           AND namespace.nspname = 'truth') AS source_truth_triggers,
+       to_regprocedure('truth.reconcile_source_retention()')::text
+         AS reconciliation_function`
   );
   if (
     !constraints.rows[0]?.current_slot ||
     !constraints.rows[0].fact_support_deferred ||
-    !constraints.rows[0].claim_support_deferred
+    !constraints.rows[0].claim_support_deferred ||
+    constraints.rows[0].source_truth_triggers !== "0" ||
+    constraints.rows[0].reconciliation_function !== null
   ) {
-    throw new Error("B2 Slice 1 current-slot or support constraint drifted");
-  }
-
-  const retention = await client.query<{
-    trigger_name: string | null;
-    function_owner: string | null;
-    command_context_read: boolean;
-    public_execute: boolean;
-  }>(
-    `SELECT
-       (SELECT trigger_record.tgname
-          FROM pg_trigger trigger_record
-         WHERE trigger_record.tgrelid = to_regclass('content.source_artifacts')
-           AND trigger_record.tgname = 'source_artifacts_truth_retention'
-           AND NOT trigger_record.tgisinternal) AS trigger_name,
-       (SELECT pg_get_userbyid(procedure.proowner)
-          FROM pg_proc procedure
-         WHERE procedure.oid = to_regprocedure(
-           'truth.reconcile_source_retention()'
-         )) AS function_owner,
-       has_column_privilege(
-         'throughline_b1_0_integrity','ops.domain_command_records',
-         'reservation_space_id','SELECT'
-       ) AND has_column_privilege(
-         'throughline_b1_0_integrity','ops.domain_command_records',
-         'command_kind','SELECT'
-       ) AND has_column_privilege(
-         'throughline_b1_0_integrity','ops.domain_command_records',
-         'actor_user_id','SELECT'
-       ) AND has_column_privilege(
-         'throughline_b1_0_integrity','ops.domain_command_records',
-         'actor_membership_id','SELECT'
-       ) AND has_column_privilege(
-         'throughline_b1_0_integrity','ops.domain_command_records',
-         'policy_version_id','SELECT'
-       ) AS command_context_read,
-       EXISTS (
-         SELECT 1
-         FROM pg_proc procedure
-         CROSS JOIN LATERAL aclexplode(COALESCE(
-           procedure.proacl, acldefault('f', procedure.proowner)
-         )) acl_record
-         WHERE procedure.oid = to_regprocedure('truth.reconcile_source_retention()')
-           AND acl_record.grantee = 0
-           AND acl_record.privilege_type = 'EXECUTE'
-       ) AS public_execute`
-  );
-  if (
-    retention.rows[0]?.trigger_name !== "source_artifacts_truth_retention" ||
-    retention.rows[0].function_owner !== "throughline_b1_0_integrity" ||
-    !retention.rows[0].command_context_read ||
-    retention.rows[0].public_execute
-  ) {
-    throw new Error("B2 Slice 1 source-retention reconciliation boundary drifted");
+    throw new Error("B2 Slice 1 current-slot, support, or no-reconciliation boundary drifted");
   }
 }
 
@@ -626,6 +958,19 @@ async function validateCommandFunctionSecurity(client: PgPoolClient): Promise<vo
   if (JSON.stringify(privileges.rows) !== JSON.stringify(expectedPrivileges)) {
     throw new Error("B2 Slice 1 command function EXECUTE grants drifted");
   }
+}
+
+function migrationFunctionSource(migrationSource: string, qualifiedName: string): string {
+  const escapedName = qualifiedName.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const source = migrationSource.match(
+    new RegExp(
+      `CREATE (?:OR REPLACE )?FUNCTION ${escapedName}\\([\\s\\S]*?AS \\$function\\$([\\s\\S]*?)\\$function\\$;`
+    )
+  )?.[1];
+  if (source === undefined) {
+    throw new Error(`Fixed B2 truth function source parser failed for ${qualifiedName}`);
+  }
+  return source;
 }
 
 export function assertProductValidatorDelegatesExactB1Kinds(definition: string): void {

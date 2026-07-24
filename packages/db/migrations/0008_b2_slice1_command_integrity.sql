@@ -3,8 +3,17 @@ SET LOCAL search_path TO pg_catalog;
 GRANT USAGE ON SCHEMA truth TO throughline_b1_0_integrity;
 GRANT SELECT ON
   truth.verified_evidence_spans, truth.claims, truth.accepted_facts,
-  truth.fact_claims, truth.fact_lifecycle_events
+  truth.fact_claims
 TO throughline_b1_0_integrity;
+
+CREATE POLICY verified_evidence_integrity_select ON truth.verified_evidence_spans
+FOR SELECT TO throughline_b1_0_integrity USING (true);
+CREATE POLICY claims_integrity_select ON truth.claims
+FOR SELECT TO throughline_b1_0_integrity USING (true);
+CREATE POLICY accepted_facts_integrity_select ON truth.accepted_facts
+FOR SELECT TO throughline_b1_0_integrity USING (true);
+CREATE POLICY fact_claims_integrity_select ON truth.fact_claims
+FOR SELECT TO throughline_b1_0_integrity USING (true);
 
 CREATE FUNCTION ops.b2_slice1_event_payload_valid(
   event_type_value text,
@@ -353,13 +362,6 @@ BEGIN
         OR aggregate_command_id <> NEW.id
         OR aggregate_version <> 1
         OR accepted_claim_ids IS DISTINCT FROM NEW.safe_response -> 'acceptedClaimIds'
-        OR (SELECT count(*)
-          FROM truth.fact_lifecycle_events lifecycle
-          WHERE lifecycle.tenant_id = NEW.tenant_id
-            AND lifecycle.workspace_id = NEW.workspace_id
-            AND lifecycle.fact_id = NEW.result_resource_id
-            AND lifecycle.event_type = 'fact.accepted'
-            AND lifecycle.causation_command_id = NEW.id) <> 1
         OR EXISTS (
           SELECT 1
           FROM truth.fact_claims support
@@ -373,7 +375,7 @@ BEGIN
             AND (claim.status <> 'accepted' OR claim.version <> 2)
         )
       THEN
-        RAISE EXCEPTION 'fact.accept result does not match its durable Fact support and lifecycle';
+        RAISE EXCEPTION 'fact.accept result does not match its durable Fact and support';
       END IF;
       expected_audit_detail := jsonb_build_object('factId', NEW.result_resource_id);
       expected_event_payload := expected_audit_detail;

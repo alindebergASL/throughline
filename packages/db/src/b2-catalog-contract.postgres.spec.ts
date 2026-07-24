@@ -18,13 +18,7 @@ const allMigrationIds = [
   "0007_b2_slice1_truth_storage.sql",
   "0008_b2_slice1_command_integrity.sql"
 ] as const;
-const truthTables = [
-  "accepted_facts",
-  "claims",
-  "fact_claims",
-  "fact_lifecycle_events",
-  "verified_evidence_spans"
-] as const;
+const truthTables = ["accepted_facts", "claims", "fact_claims", "verified_evidence_spans"] as const;
 
 maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
   if (!ownerUrl || !appUrl) {
@@ -108,6 +102,22 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         through: "0007_b2_slice1_truth_storage.sql"
       });
       expect(initial.applied).toEqual(allMigrationIds.slice(0, 7));
+      const phaseOneCapability = await ownerPool.query<{
+        schema_usage: boolean;
+        table_select: boolean;
+      }>(
+        `SELECT
+           has_schema_privilege(
+             'throughline_b1_0_integrity','truth','USAGE'
+           ) AS schema_usage,
+           has_table_privilege(
+             'throughline_b1_0_integrity','truth.accepted_facts','SELECT'
+           ) AS table_select`
+      );
+      expect(phaseOneCapability.rows[0]).toEqual({
+        schema_usage: false,
+        table_select: false
+      });
       await expect(
         applyMigrations(ownerPool, { through: "0007_b2_slice1_truth_storage.sql" })
       ).resolves.toEqual({
@@ -355,6 +365,63 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
               ) AS product_relay`
     );
     expect(raw.rows[0]).toEqual({ relay: false, worker: false, product_relay: false });
+
+    const integrity = await ownerPool.query<{
+      table_name: string;
+      can_select: boolean;
+      can_insert: boolean;
+      can_update: boolean;
+      can_delete: boolean;
+    }>(
+      `SELECT table_name,
+              has_table_privilege(
+                'throughline_b1_0_integrity', 'truth.' || table_name, 'SELECT'
+              ) AS can_select,
+              has_table_privilege(
+                'throughline_b1_0_integrity', 'truth.' || table_name, 'INSERT'
+              ) AS can_insert,
+              has_table_privilege(
+                'throughline_b1_0_integrity', 'truth.' || table_name, 'UPDATE'
+              ) AS can_update,
+              has_table_privilege(
+                'throughline_b1_0_integrity', 'truth.' || table_name, 'DELETE'
+              ) AS can_delete
+         FROM unnest($1::text[]) table_name
+        ORDER BY table_name`,
+      [[...truthTables]]
+    );
+    expect(integrity.rows).toEqual(
+      [...truthTables].sort().map((table_name) => ({
+        table_name,
+        can_select: true,
+        can_insert: false,
+        can_update: false,
+        can_delete: false
+      }))
+    );
+
+    const excluded = await ownerPool.query<{
+      lifecycle_table: string | null;
+      reconciliation_function: string | null;
+      source_truth_triggers: string;
+    }>(
+      `SELECT
+         to_regclass('truth.fact_lifecycle_events')::text AS lifecycle_table,
+         to_regprocedure('truth.reconcile_source_retention()')::text
+           AS reconciliation_function,
+         (SELECT count(*)::text
+            FROM pg_trigger trigger_record
+            JOIN pg_proc procedure ON procedure.oid = trigger_record.tgfoid
+            JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+           WHERE trigger_record.tgrelid = 'content.source_artifacts'::regclass
+             AND NOT trigger_record.tgisinternal
+             AND namespace.nspname = 'truth') AS source_truth_triggers`
+    );
+    expect(excluded.rows[0]).toEqual({
+      lifecycle_table: null,
+      reconciliation_function: null,
+      source_truth_triggers: "0"
+    });
   });
 
   it("accepts the clean PUBLIC ACLs and rejects a deliberate PUBLIC truth-table grant", async () => {
@@ -384,7 +451,9 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         `INSERT INTO truth.accepted_facts (
         id, tenant_id, workspace_id, space_id, subject_type, subject_id,
         predicate_catalog_version, predicate,
-        value_json, value_hash, normalized_text, confidence, recorded_at, status, access_class,
+        value_json, value_hash, normalized_text, confidence,
+        confidence_rule, strongest_supporting_confidence, human_lowered,
+        recorded_at, status, access_class,
         accepted_by_user_id, accepted_by_membership_id, acceptance_scope, authority_basis,
         acceptance_policy_version, last_causation_command_id
       ) VALUES (
@@ -392,7 +461,9 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         '0190a000-0000-7000-8000-000000000093','0190a000-0000-7000-8000-000000000094',
         'activity','0190a000-0000-7000-8000-000000000095',
         'truth-predicate-catalog.v1','activity.outcome',
-        '"forged"'::jsonb,repeat('a',64),'forged','confirmed',clock_timestamp(),'current','workspace',
+        '"forged"'::jsonb,repeat('a',64),'forged','confirmed',
+        'strongest-selected-valid-claim.v1','confirmed',false,
+        clock_timestamp(),'current','workspace',
         '0190a000-0000-7000-8000-000000000096','0190a000-0000-7000-8000-000000000097',
         'engagement','activity_owner','default-v1',
         '0190a000-0000-7000-8000-000000000098'
