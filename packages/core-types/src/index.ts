@@ -2,6 +2,8 @@ export type AccessClass = "public" | "workspace" | "restricted" | "confidential"
 
 export * from "./domain-notification.js";
 export * from "./b1.js";
+export * from "./b2.js";
+export * from "./trust-primitives.js";
 
 export type Confidence = "confirmed" | "strong" | "weak" | "unknown";
 
@@ -35,7 +37,10 @@ export interface ResourceRef {
     | "relationship"
     | "content_item"
     | "source"
-    | "source_chunk";
+    | "source_chunk"
+    | "claim"
+    | "fact"
+    | "derived_view";
   id: string;
   spaceId?: string;
 }

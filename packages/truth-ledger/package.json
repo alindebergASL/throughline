@@ -2,7 +2,7 @@
   "name": "@throughline/truth-ledger",
   "version": "0.0.0",
   "private": true,
-  "description": "Truth pipeline package placeholder; Claim/AcceptedFact behavior is deferred.",
+  "description": "B2 Truth Ledger contracts, verified evidence admission, and pure trust rules.",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

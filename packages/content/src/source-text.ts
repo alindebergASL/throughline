@@ -1,16 +1,20 @@
-import type { AccessClass } from "@throughline/core-types";
+import {
+  SOURCE_CHUNKING_VERSION,
+  SOURCE_CHUNK_MAX_SCALARS,
+  SOURCE_NORMALIZATION_VERSION,
+  normalizeStoredSourceText,
+  sliceUnicodeScalarSpan
+} from "@throughline/core-types";
 import { createHash } from "node:crypto";
 
-export const SOURCE_NORMALIZATION_VERSION = "source-normalization.v1" as const;
-export const SOURCE_CHUNKING_VERSION = "source-chunking.v1" as const;
-export const SOURCE_CHUNK_MAX_SCALARS = 2_000 as const;
-
-export const ACCESS_CLASS_RANK = {
-  public: 0,
-  workspace: 1,
-  restricted: 2,
-  confidential: 3
-} as const satisfies Record<AccessClass, number>;
+export {
+  ACCESS_CLASS_RANK,
+  SOURCE_CHUNKING_VERSION,
+  SOURCE_CHUNK_MAX_SCALARS,
+  SOURCE_NORMALIZATION_VERSION,
+  canReadAccessClass,
+  maxAccessClass
+} from "@throughline/core-types";
 
 export interface NormalizedSourceText {
   capturedText: string;
@@ -48,10 +52,12 @@ export function normalizeSourceText(input: string | Uint8Array): NormalizedSourc
   } catch {
     throw new SourceTextValidationError();
   }
-  if (capturedText.includes("\0")) throw new SourceTextValidationError();
-  const withoutBom = capturedText.startsWith("\uFEFF") ? capturedText.slice(1) : capturedText;
-  const normalizedText = withoutBom.replace(/\r\n?/g, "\n").normalize("NFC");
-  if (normalizedText.trim().length === 0) throw new SourceTextValidationError();
+  let normalizedText: string;
+  try {
+    normalizedText = normalizeStoredSourceText(capturedText);
+  } catch {
+    throw new SourceTextValidationError();
+  }
   return {
     capturedText,
     normalizedText,
@@ -98,28 +104,11 @@ export function normalizeAndChunkSource(input: string | Uint8Array): {
 }
 
 export function sliceByScalarOffsets(text: string, startOffset: number, endOffset: number): string {
-  const scalars = Array.from(text);
-  if (
-    !Number.isSafeInteger(startOffset) ||
-    !Number.isSafeInteger(endOffset) ||
-    startOffset < 0 ||
-    endOffset <= startOffset ||
-    endOffset > scalars.length
-  ) {
+  try {
+    return sliceUnicodeScalarSpan(text, startOffset, endOffset);
+  } catch {
     throw new SourceTextValidationError("Unicode scalar offsets are invalid");
   }
-  return scalars.slice(startOffset, endOffset).join("");
-}
-
-export function maxAccessClass(...values: readonly AccessClass[]): AccessClass {
-  if (values.length === 0) throw new Error("At least one access class is required");
-  return values.reduce((maximum, current) =>
-    ACCESS_CLASS_RANK[current] > ACCESS_CLASS_RANK[maximum] ? current : maximum
-  );
-}
-
-export function canReadAccessClass(ceiling: AccessClass, resourceClass: AccessClass): boolean {
-  return ACCESS_CLASS_RANK[resourceClass] <= ACCESS_CLASS_RANK[ceiling];
 }
 
 export function assertChunkReconstruction(
