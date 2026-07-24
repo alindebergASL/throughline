@@ -589,6 +589,13 @@ export interface VerifiedDerivedCitation {
   readonly excerptHash: string;
 }
 
+declare const audienceFilteredConflictIdsBrand: unique symbol;
+
+/** Conflict identifiers admitted only after audience filtering; plain or raw ID arrays are invalid. */
+export type AudienceFilteredConflictIds = readonly string[] & {
+  readonly [audienceFilteredConflictIdsBrand]: true;
+};
+
 /** Stored shape only; PR 1 defines no renderer or persistence implementation. */
 export interface DerivedViewSnapshot {
   readonly id: string;
@@ -603,7 +610,7 @@ export interface DerivedViewSnapshot {
   readonly inputRevisionHash: string;
   readonly content: string;
   readonly citations: readonly VerifiedDerivedCitation[];
-  readonly unresolvedConflictIds: readonly string[];
+  readonly unresolvedConflictIds: AudienceFilteredConflictIds;
   readonly accessClass: AccessClass;
   readonly policyVersion: string;
   readonly modelProvider: "deterministic";

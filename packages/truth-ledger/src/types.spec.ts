@@ -14,6 +14,7 @@ import {
   constructAcceptedFactAtTrustedBoundary,
   isAcceptedFact,
   type AcceptedFact,
+  type AudienceFilteredConflictIds,
   type Claim,
   type DerivedViewSnapshot,
   type DeterministicTruthViewClaimInput,
@@ -424,6 +425,15 @@ describe("construction-controlled truth records", () => {
       DerivedViewSnapshot["skillId"]
     >().toEqualTypeOf<"truth-ledger.cited-current-truth">();
     expectTypeOf<DerivedViewSnapshot["skillVersion"]>().toEqualTypeOf<"v1">();
+    expectTypeOf<
+      DerivedViewSnapshot["unresolvedConflictIds"]
+    >().toEqualTypeOf<AudienceFilteredConflictIds>();
+    expectTypeOf<AudienceFilteredConflictIds>().toMatchTypeOf<readonly string[]>();
+    expectTypeOf<readonly string[]>().not.toMatchTypeOf<AudienceFilteredConflictIds>();
+    type RawConflictIdSnapshotInput = Omit<DerivedViewSnapshot, "unresolvedConflictIds"> & {
+      readonly unresolvedConflictIds: readonly string[];
+    };
+    expectTypeOf<RawConflictIdSnapshotInput>().not.toMatchTypeOf<DerivedViewSnapshot>();
     expect(Object.isFrozen(CLAIM_STATUSES)).toBe(true);
     expect(Object.isFrozen(ACCEPTED_FACT_STATUSES)).toBe(true);
   });

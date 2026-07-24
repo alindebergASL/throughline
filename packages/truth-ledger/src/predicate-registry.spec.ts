@@ -23,7 +23,20 @@ describe("truth-predicate-catalog.v1", () => {
         viewType: "initiative_summary",
         section: "activity_outcomes",
         includeStatuses: ["current", "contested"],
-        contestedVisibility: "only_when_challenger_is_authorized",
+        reviewVisibilityByBasis: {
+          claimConflict: {
+            visibleWhen: "challenger_and_conflict_are_authorized_for_audience",
+            challengerRequired: true
+          },
+          sourceCorrection: {
+            visibleWhen: "review_basis_is_authorized_for_audience",
+            challengerRequired: false
+          },
+          supportInvalidation: {
+            visibleWhen: "review_basis_is_authorized_for_audience",
+            challengerRequired: false
+          }
+        },
         excludeStatuses: ["superseded", "revoked"]
       }
     });
@@ -41,6 +54,14 @@ describe("truth-predicate-catalog.v1", () => {
       expect(Object.isFrozen(definition)).toBe(true);
       expect(Object.isFrozen(definition.deterministicViewTreatment)).toBe(true);
       expect(Object.isFrozen(definition.deterministicViewTreatment.includeStatuses)).toBe(true);
+      expect(Object.isFrozen(definition.deterministicViewTreatment.reviewVisibilityByBasis)).toBe(
+        true
+      );
+      expect(
+        Object.values(definition.deterministicViewTreatment.reviewVisibilityByBasis).every(
+          Object.isFrozen
+        )
+      ).toBe(true);
       expect(Object.isFrozen(definition.deterministicViewTreatment.excludeStatuses)).toBe(true);
     }
   });

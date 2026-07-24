@@ -41,6 +41,7 @@ export {
   CLAIM_STATUSES,
   type AcceptedFact,
   type AcceptedFactStatus,
+  type AudienceFilteredConflictIds,
   type Claim,
   type ClaimStatus,
   type DeterministicTruthViewClaimInput,

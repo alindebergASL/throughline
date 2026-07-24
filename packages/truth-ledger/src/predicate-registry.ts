@@ -31,7 +31,20 @@ export interface PredicateDefinition {
     readonly viewType: "initiative_summary";
     readonly section: "activity_outcomes" | "primary_objective";
     readonly includeStatuses: readonly ["current", "contested"];
-    readonly contestedVisibility: "only_when_challenger_is_authorized";
+    readonly reviewVisibilityByBasis: {
+      readonly claimConflict: {
+        readonly visibleWhen: "challenger_and_conflict_are_authorized_for_audience";
+        readonly challengerRequired: true;
+      };
+      readonly sourceCorrection: {
+        readonly visibleWhen: "review_basis_is_authorized_for_audience";
+        readonly challengerRequired: false;
+      };
+      readonly supportInvalidation: {
+        readonly visibleWhen: "review_basis_is_authorized_for_audience";
+        readonly challengerRequired: false;
+      };
+    };
     readonly excludeStatuses: readonly ["superseded", "revoked"];
   };
 }
@@ -83,11 +96,25 @@ function textConflicts(left: string, right: string): boolean {
 
 const includedViewStatuses = Object.freeze(["current", "contested"] as const);
 const excludedViewStatuses = Object.freeze(["superseded", "revoked"] as const);
+const reviewVisibilityByBasis = Object.freeze({
+  claimConflict: Object.freeze({
+    visibleWhen: "challenger_and_conflict_are_authorized_for_audience",
+    challengerRequired: true
+  }),
+  sourceCorrection: Object.freeze({
+    visibleWhen: "review_basis_is_authorized_for_audience",
+    challengerRequired: false
+  }),
+  supportInvalidation: Object.freeze({
+    visibleWhen: "review_basis_is_authorized_for_audience",
+    challengerRequired: false
+  })
+} as const);
 
 const sharedViewTreatment = Object.freeze({
   viewType: "initiative_summary",
   includeStatuses: includedViewStatuses,
-  contestedVisibility: "only_when_challenger_is_authorized",
+  reviewVisibilityByBasis,
   excludeStatuses: excludedViewStatuses
 } as const);
 
