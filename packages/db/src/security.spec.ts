@@ -18,7 +18,10 @@ const migrationIds = [
   "0003_b1_0_canonical_product_outbox.sql",
   "0004_b1_work_graph.sql",
   "0005_b1_content_sources.sql",
-  "0006_b1_command_integrity.sql"
+  "0006_b1_command_integrity.sql",
+  "0007_b2_slice1_truth_storage.sql",
+  "0008_b2_slice1_command_integrity.sql",
+  "0009_b2_source_truth_lifecycle_interlock.sql"
 ];
 const foundationMigrationId = migrationIds[1]!;
 const exactPrefixError =

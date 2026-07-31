@@ -32,10 +32,10 @@ describe("Wave B1 additive migration contract", () => {
       contract.indexOf("const b1Rows")
     );
     expect(runner).toMatch(
-      /if \(recordedChecksum\)[\s\S]*?validateB1CatalogContract[\s\S]*?result\.skipped\.push/
+      /if \(recordedChecksum\)[\s\S]*?validateInstalledProductCatalog[\s\S]*?result\.skipped\.push/
     );
     expect(runner).toMatch(
-      /BEGIN[\s\S]*?validateB1CatalogContract[\s\S]*?assertB1MigrationStateAbsent[\s\S]*?client\.query\(sql\)[\s\S]*?validateB1CatalogContract[\s\S]*?INSERT INTO throughline_migrations\.journal/
+      /BEGIN[\s\S]*?validateInstalledProductCatalog[\s\S]*?assertB1MigrationStateAbsent[\s\S]*?client\.query\(sql\)[\s\S]*?validateInstalledProductCatalog[\s\S]*?INSERT INTO throughline_migrations\.journal/
     );
     for (const closedSurface of [
       "Unexpected migration journal id",
@@ -142,6 +142,8 @@ describe("Wave B1 additive migration contract", () => {
     expect(commandSecurity).not.toContain("startsWith");
     expect(commandSecurity).toContain("rewrite_record.rulename <> '_RETURN'");
     expect(commandSecurity).toContain('triggerCatalog(client, "ops.domain_command_records")');
+    expect(contract).toContain("pg_get_triggerdef(trigger_record.oid, false) AS definition");
+    expect(contract).not.toContain("pg_get_expr(trigger_record.tgqual, trigger_record.tgrelid)");
   });
 
   it("compares the explicit predecessor table and column authority contract in both directions", async () => {

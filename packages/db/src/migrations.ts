@@ -9,6 +9,11 @@ import {
   validateB1CatalogContract,
   validateMigrationJournal
 } from "./b1-catalog-contract.js";
+import {
+  assertB2MigrationStateAbsent,
+  B2_MIGRATION_IDS,
+  validateB2CatalogContract
+} from "./b2-catalog-contract.js";
 
 const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 const migrationsDir = join(packageRoot, "migrations");
@@ -35,6 +40,7 @@ export async function applyMigrations(
       await client.query("BEGIN");
       try {
         await client.query("DROP SCHEMA IF EXISTS content CASCADE");
+        await client.query("DROP SCHEMA IF EXISTS truth CASCADE");
         await client.query("DROP SCHEMA IF EXISTS work CASCADE");
         await client.query("DROP SCHEMA IF EXISTS access CASCADE");
         await client.query("DROP SCHEMA IF EXISTS identity CASCADE");
@@ -65,12 +71,13 @@ export async function applyMigrations(
       const checksum = migrationChecksums.get(file)!;
       const recordedChecksum = journal.get(file);
       const isB1Migration = B1_MIGRATION_IDS.includes(file as (typeof B1_MIGRATION_IDS)[number]);
+      const isB2Migration = B2_MIGRATION_IDS.includes(file as (typeof B2_MIGRATION_IDS)[number]);
 
       if (recordedChecksum) {
-        if (isB1Migration) {
+        if (isB1Migration || isB2Migration) {
           await client.query("BEGIN");
           try {
-            await validateB1CatalogContract(client, journal, migrationSources);
+            await validateInstalledProductCatalog(client, journal, migrationSources);
             await client.query("ROLLBACK");
           } catch (error) {
             await client.query("ROLLBACK");
@@ -83,18 +90,22 @@ export async function applyMigrations(
 
       await client.query("BEGIN");
       try {
+        if (isB1Migration || isB2Migration) {
+          await validateInstalledProductCatalog(client, journal, migrationSources);
+        }
         if (isB1Migration) {
-          await validateB1CatalogContract(client, journal, migrationSources);
           await assertB1MigrationStateAbsent(client, file as (typeof B1_MIGRATION_IDS)[number]);
+        } else if (isB2Migration) {
+          await assertB2MigrationStateAbsent(client, file as (typeof B2_MIGRATION_IDS)[number]);
         }
         await client.query("SELECT set_config('throughline.migration_batch_applied', $1, true)", [
           result.applied.join(",")
         ]);
         await client.query(sql);
-        if (isB1Migration) {
+        if (isB1Migration || isB2Migration) {
           const nextJournal = new Map(journal);
           nextJournal.set(file, checksum);
-          await validateB1CatalogContract(client, nextJournal, migrationSources);
+          await validateInstalledProductCatalog(client, nextJournal, migrationSources);
         }
         await client.query(
           `
@@ -121,6 +132,37 @@ export async function applyMigrations(
     } finally {
       client.release();
     }
+  }
+}
+
+async function validateInstalledProductCatalog(
+  client: PgPoolClient,
+  journal: ReadonlyMap<string, string>,
+  migrationSources: ReadonlyMap<string, string>
+): Promise<void> {
+  const b2Phase = B2_MIGRATION_IDS.filter((id) => journal.has(id)).length;
+  switch (b2Phase) {
+    case 0:
+      await validateB1CatalogContract(client, journal, migrationSources);
+      return;
+    case 1:
+      await validateB1CatalogContract(client, journal, migrationSources, {
+        additiveB2Phase: 1
+      });
+      await validateB2CatalogContract(client, journal, migrationSources);
+      return;
+    case 2:
+      await validateB1CatalogContract(client, journal, migrationSources, {
+        additiveB2Phase: 2
+      });
+      await validateB2CatalogContract(client, journal, migrationSources);
+      return;
+    case 3:
+      await validateB1CatalogContract(client, journal, migrationSources, {
+        additiveB2Phase: 3
+      });
+      await validateB2CatalogContract(client, journal, migrationSources);
+      return;
   }
 }
 

@@ -17,6 +17,7 @@ export const access = pgSchema("access");
 export const ops = pgSchema("ops");
 export const work = pgSchema("work");
 export const content = pgSchema("content");
+export const truth = pgSchema("truth");
 
 const timestamps = {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
@@ -870,5 +871,138 @@ export const activitySources = work.table(
       columns: [table.tenantId, table.workspaceId, table.activityId, table.relatedId]
     }),
     unique().on(table.tenantId, table.workspaceId, table.relatedId)
+  ]
+);
+
+const truthScope = {
+  tenantId: uuid("tenant_id").notNull(),
+  workspaceId: uuid("workspace_id").notNull(),
+  spaceId: uuid("space_id").notNull()
+};
+
+export const verifiedEvidenceSpans = truth.table(
+  "verified_evidence_spans",
+  {
+    id: uuid("id").primaryKey(),
+    ...truthScope,
+    sourceArtifactId: uuid("source_artifact_id").notNull(),
+    sourceChunkId: uuid("source_chunk_id").notNull(),
+    sourceVersion: integer("source_version").notNull(),
+    chunkVersion: integer("chunk_version").notNull(),
+    normalizationVersion: text("normalization_version").notNull(),
+    chunkingVersion: text("chunking_version").notNull(),
+    sourceStartOffset: integer("source_start_offset").notNull(),
+    sourceEndOffset: integer("source_end_offset").notNull(),
+    sourceExcerpt: text("source_excerpt").notNull(),
+    sourceContentHash: text("source_content_hash").notNull(),
+    sourceNormalizedContentHash: text("source_normalized_content_hash").notNull(),
+    chunkContentHash: text("chunk_content_hash").notNull(),
+    excerptHash: text("excerpt_hash").notNull(),
+    accessClass: text("access_class").notNull(),
+    createdByUserId: uuid("created_by_user_id").notNull(),
+    createdByMembershipId: uuid("created_by_membership_id").notNull(),
+    causationCommandId: uuid("causation_command_id").notNull(),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id),
+    index("evidence_spans_source_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.sourceArtifactId,
+      table.createdAt
+    )
+  ]
+);
+
+export const claims = truth.table(
+  "claims",
+  {
+    id: uuid("id").primaryKey(),
+    ...truthScope,
+    subjectType: text("subject_type").notNull(),
+    subjectId: uuid("subject_id").notNull(),
+    predicateCatalogVersion: text("predicate_catalog_version").notNull(),
+    predicate: text("predicate").notNull(),
+    canonicalValue: text("canonical_value_text").notNull(),
+    valueHash: text("value_hash").notNull(),
+    normalizedText: text("normalized_text").notNull(),
+    verifiedEvidenceSpanId: uuid("verified_evidence_span_id").notNull(),
+    assertedByType: text("asserted_by_type").notNull(),
+    assertedById: uuid("asserted_by_id").notNull(),
+    confidence: text("confidence").notNull(),
+    validFrom: timestamp("valid_from", { withTimezone: true }),
+    validTo: timestamp("valid_to", { withTimezone: true }),
+    observedAt: timestamp("observed_at", { withTimezone: true }),
+    status: text("status").notNull(),
+    accessClass: text("access_class").notNull(),
+    createdByUserId: uuid("created_by_user_id").notNull(),
+    createdByMembershipId: uuid("created_by_membership_id").notNull(),
+    causationCommandId: uuid("causation_command_id").notNull(),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id),
+    index("claims_subject_predicate_idx").on(
+      table.tenantId,
+      table.workspaceId,
+      table.spaceId,
+      table.subjectType,
+      table.subjectId,
+      table.predicate,
+      table.createdAt
+    )
+  ]
+);
+
+export const acceptedFacts = truth.table(
+  "accepted_facts",
+  {
+    id: uuid("id").primaryKey(),
+    ...truthScope,
+    subjectType: text("subject_type").notNull(),
+    subjectId: uuid("subject_id").notNull(),
+    predicateCatalogVersion: text("predicate_catalog_version").notNull(),
+    predicate: text("predicate").notNull(),
+    canonicalValue: text("canonical_value_text").notNull(),
+    valueHash: text("value_hash").notNull(),
+    normalizedText: text("normalized_text").notNull(),
+    confidence: text("confidence").notNull(),
+    confidenceRule: text("confidence_rule").notNull(),
+    strongestSupportingConfidence: text("strongest_supporting_confidence").notNull(),
+    humanLowered: boolean("human_lowered").notNull(),
+    confidenceLoweringReasonCode: text("confidence_lowering_reason_code"),
+    confidenceLoweringRationale: text("confidence_lowering_rationale"),
+    validFrom: timestamp("valid_from", { withTimezone: true }),
+    validTo: timestamp("valid_to", { withTimezone: true }),
+    recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull(),
+    status: text("status").notNull(),
+    accessClass: text("access_class").notNull(),
+    acceptedByUserId: uuid("accepted_by_user_id").notNull(),
+    acceptedByMembershipId: uuid("accepted_by_membership_id").notNull(),
+    acceptanceScope: text("acceptance_scope").notNull(),
+    authorityBasis: text("authority_basis").notNull(),
+    acceptancePolicyVersion: text("acceptance_policy_version").notNull(),
+    lastCausationCommandId: uuid("last_causation_command_id").notNull(),
+    ...timestamps
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id)
+  ]
+);
+
+export const factClaims = truth.table(
+  "fact_claims",
+  {
+    ...truthScope,
+    factId: uuid("fact_id").notNull(),
+    claimId: uuid("claim_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow()
+  },
+  (table) => [
+    primaryKey({ columns: [table.tenantId, table.workspaceId, table.factId, table.claimId] })
   ]
 );

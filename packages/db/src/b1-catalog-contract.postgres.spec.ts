@@ -1,6 +1,6 @@
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { applyMigrations } from "./migrations.js";
+import { applyMigrations as applyRepositoryMigrations } from "./migrations.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const authoritative = process.env.B1_AUTHORITATIVE_GATE === "1";
@@ -16,6 +16,13 @@ const migrationIds = [
   "0003_b1_0_canonical_product_outbox.sql",
   ...b1MigrationIds
 ] as const;
+
+function applyMigrations(pool: pg.Pool, options: { reset?: boolean; through?: string } = {}) {
+  return applyRepositoryMigrations(pool, {
+    ...options,
+    through: options.through ?? migrationIds.at(-1)!
+  });
+}
 
 maybeDescribe("B1 fail-closed migration catalog contract", () => {
   const ownerPool = new pg.Pool({ connectionString: ownerUrl });

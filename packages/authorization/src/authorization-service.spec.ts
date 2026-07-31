@@ -1394,7 +1394,7 @@ maybeDescribe("AuthorizationService database decisions", () => {
     appPool = createPgPool(appUrl);
     service = new PostgresAuthorizationService(appPool);
     await seedWaveA2DeterministicData(ownerPool);
-  });
+  }, 30_000);
 
   afterAll(async () => {
     await appPool?.end();

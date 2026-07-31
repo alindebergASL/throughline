@@ -9,7 +9,9 @@ export const DOMAIN_NOTIFICATION_EVENT_TYPES = [
   "content.revised",
   "source_artifact.captured",
   "source_artifact.corrected",
-  "source_artifact.tombstoned"
+  "source_artifact.tombstoned",
+  "claim.proposed",
+  "fact.accepted"
 ] as const;
 
 export type DomainNotificationEventType = (typeof DOMAIN_NOTIFICATION_EVENT_TYPES)[number];
@@ -20,7 +22,9 @@ export const DOMAIN_NOTIFICATION_AGGREGATE_TYPES = [
   "activity",
   "relationship",
   "content_item",
-  "source_artifact"
+  "source_artifact",
+  "claim",
+  "accepted_fact"
 ] as const;
 
 export type DomainNotificationAggregateType = (typeof DOMAIN_NOTIFICATION_AGGREGATE_TYPES)[number];
@@ -36,7 +40,9 @@ export const DOMAIN_NOTIFICATION_EVENT_AGGREGATE_PAIRS = {
   "content.revised": "content_item",
   "source_artifact.captured": "source_artifact",
   "source_artifact.corrected": "source_artifact",
-  "source_artifact.tombstoned": "source_artifact"
+  "source_artifact.tombstoned": "source_artifact",
+  "claim.proposed": "claim",
+  "fact.accepted": "accepted_fact"
 } as const satisfies Record<DomainNotificationEventType, DomainNotificationAggregateType>;
 
 export interface DomainNotificationPayloadMap {
@@ -59,6 +65,8 @@ export interface DomainNotificationPayloadMap {
     deletionPolicyRef: string;
     hashDisposition: "retained" | "erased";
   };
+  "claim.proposed": { claimId: string; evidenceSpanId: string };
+  "fact.accepted": { factId: string };
 }
 
 export type DomainNotificationEnvelopeFor<T extends DomainNotificationEventType> = {
@@ -259,6 +267,31 @@ export function parseDomainNotificationEnvelope(input: unknown): DomainNotificat
           deletionPolicyRef: requireSafeReference(payload.deletionPolicyRef),
           hashDisposition: requireEnum(payload.hashDisposition, ["retained", "erased"] as const)
         }
+      };
+    }
+    case "claim.proposed": {
+      const payload = requireExactObject(envelope.payload, ["claimId", "evidenceSpanId"]);
+      const claimId = requireUuidV7(payload.claimId);
+      if (claimId !== aggregateId) fail();
+      return {
+        ...base,
+        eventType,
+        aggregateType: "claim",
+        payload: {
+          claimId,
+          evidenceSpanId: requireUuidV7(payload.evidenceSpanId)
+        }
+      };
+    }
+    case "fact.accepted": {
+      const payload = requireExactObject(envelope.payload, ["factId"]);
+      const factId = requireUuidV7(payload.factId);
+      if (factId !== aggregateId) fail();
+      return {
+        ...base,
+        eventType,
+        aggregateType: "accepted_fact",
+        payload: { factId }
       };
     }
   }

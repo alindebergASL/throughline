@@ -52,6 +52,14 @@ export interface ProductAuditDetailMap {
       hashDisposition: "retained" | "erased";
     };
   };
+  "claim.create": {
+    resourceType: "claim";
+    detail: { claimId: string; evidenceSpanId: string };
+  };
+  "fact.accept": {
+    resourceType: "accepted_fact";
+    detail: { factId: string };
+  };
 }
 
 export type ProductAuditAction = keyof ProductAuditDetailMap;
@@ -158,6 +166,23 @@ export function parseProductAuditSafeDetail(
         deletionReasonCategory: requireSafeReference(detail.deletionReasonCategory),
         hashDisposition
       };
+    }
+    case "claim.create": {
+      requireResourceType(resourceType, "claim");
+      const detail = requireExactObject(safeDetail, ["claimId", "evidenceSpanId"]);
+      const claimId = requireUuidV7(detail.claimId);
+      if (claimId !== resourceId) fail();
+      return {
+        claimId,
+        evidenceSpanId: requireUuidV7(detail.evidenceSpanId)
+      };
+    }
+    case "fact.accept": {
+      requireResourceType(resourceType, "accepted_fact");
+      const detail = requireExactObject(safeDetail, ["factId"]);
+      const factId = requireUuidV7(detail.factId);
+      if (factId !== resourceId) fail();
+      return { factId };
     }
   }
 

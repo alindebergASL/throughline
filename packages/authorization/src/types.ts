@@ -35,7 +35,10 @@ export type AuthorizationAction =
   | "source.capture"
   | "source.correct"
   | "source.tombstone"
-  | "source.read";
+  | "source.read"
+  | "claim.create"
+  | "claim.read"
+  | "fact.accept";
 
 export interface WorkerAuthorizationBinding {
   referenceId: string;

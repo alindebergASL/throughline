@@ -59,7 +59,7 @@ const commands = {
       evidence: {
         sourceArtifactId: ids.source,
         sourceChunkId: ids.chunk,
-        expectedSourceVersion: 2,
+        expectedSourceVersion: 1,
         expectedChunkVersion: 1,
         normalizationVersion: "source-normalization.v1",
         chunkingVersion: "source-chunking.v1",
@@ -341,6 +341,15 @@ describe("B2 strict command contracts", () => {
         ...commands["claim.create"],
         payload: {
           ...commands["claim.create"].payload,
+          canonicalValue: commands["claim.create"].payload.valueJson
+        }
+      })
+    ).toThrow();
+    expect(() =>
+      parseB2Command({
+        ...commands["claim.create"],
+        payload: {
+          ...commands["claim.create"].payload,
           subject: {
             type: "activity",
             id: "00000000-0000-4000-8000-000000000000",
@@ -585,7 +594,7 @@ describe("B2 strict command contracts", () => {
       B2_COMMAND_KINDS.map((kind) => [kind, hashB2CommandIdentity(commands[kind])])
     );
     expect(goldenHashes).toEqual({
-      "claim.create": "66c8f793b462cfcb99913845c7301a8e2ecc851db880d7aeda0326b8e363dd8f",
+      "claim.create": "e0090b2ddb41bb906cf50e58400a129aad33b384097ee9d941dc180e017fb142",
       "fact.accept": "f794d35986417e2f26d519172a2cd2434e86da12122b68c67f3018c96be56691",
       "fact.contest": "fdd9683d7ddb66727dd5a9cf9457d6e8bb87902ed24a0fa7c88f46c117bb6753",
       "fact.uphold": "f71ba178ad3f3b6c033e4438697263932c598fd7db42bda7184d6c51e1587900",

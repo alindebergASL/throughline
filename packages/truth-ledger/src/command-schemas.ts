@@ -142,7 +142,7 @@ function parseCreateClaim(input: unknown): B2CommandPayloadMap["claim.create"] {
   const assertion = parsePredicateAssertion({
     predicate: value.predicate,
     subjectKind: subject.type,
-    valueJson: value.valueJson,
+    canonicalValue: value.valueJson,
     normalizedText: value.normalizedText
   });
   const validFrom = value.validFrom === undefined ? undefined : requireTimestamp(value.validFrom);

@@ -8,6 +8,7 @@ import { DomainCommandRepository, type PgPool, type PgPoolClient } from "@throug
 import { WorkGraphRepository } from "@throughline/work-graph";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AccountOperationsDomainCommandBus, B1AuthorizationError } from "./domain-command-bus.js";
+import { B1CommandInvariantError } from "./command-schemas.js";
 
 const tenantId = "70000000-0000-7000-8000-000000000001";
 const workspaceId = "70000000-0000-7000-8000-000000000002";
@@ -377,6 +378,88 @@ describe.sequential("AccountOperationsDomainCommandBus authorization ordering", 
     expect(client.query).toHaveBeenCalledWith("ROLLBACK");
     expect(client.release).toHaveBeenLastCalledWith(false);
   });
+
+  it.each(["source.correct", "source.tombstone"] as const)(
+    "maps only the dedicated lifecycle SQLSTATE and generic message for %s",
+    async (kind) => {
+      const exact = Object.assign(new Error("Source lifecycle transition is unavailable"), {
+        code: "TLB21"
+      });
+      const { pool } = transactionPool();
+      vi.spyOn(ContentRepository.prototype, "getSourceScope").mockResolvedValue({
+        id: sourceId,
+        spaceId
+      });
+      if (kind === "source.correct") {
+        vi.spyOn(
+          ContentRepository.prototype,
+          "resolveSourceActivityLinkForCorrection"
+        ).mockRejectedValue(exact);
+      } else {
+        vi.spyOn(ContentRepository.prototype, "lockSource").mockRejectedValue(exact);
+      }
+
+      const command =
+        kind === "source.correct"
+          ? {
+              kind,
+              idempotencyKey: "exact-lifecycle-correction",
+              payload: {
+                predecessorSourceArtifactId: sourceId,
+                sourceType: "human" as const,
+                text: "Rejected correction."
+              }
+            }
+          : {
+              kind,
+              idempotencyKey: "exact-lifecycle-tombstone",
+              payload: {
+                sourceArtifactId: sourceId,
+                expectedVersion: 1 as const,
+                deletionReasonCategory: "retention",
+                deletionPolicyRef: "policy:test"
+              }
+            };
+
+      await expect(
+        new AccountOperationsDomainCommandBus(pool, orderedAuthorization([])).execute(
+          command,
+          context()
+        )
+      ).rejects.toBeInstanceOf(B1CommandInvariantError);
+    }
+  );
+
+  it.each([
+    Object.assign(new Error("Source lifecycle transition is unavailable"), { code: "P0001" }),
+    Object.assign(new Error("Different database failure"), { code: "TLB21" }),
+    new Error("Source lifecycle transition is unavailable")
+  ])("does not map a partial lifecycle database-error match", async (databaseError) => {
+    const { pool } = transactionPool();
+    vi.spyOn(ContentRepository.prototype, "getSourceScope").mockResolvedValue({
+      id: sourceId,
+      spaceId
+    });
+    vi.spyOn(
+      ContentRepository.prototype,
+      "resolveSourceActivityLinkForCorrection"
+    ).mockRejectedValue(databaseError);
+
+    await expect(
+      new AccountOperationsDomainCommandBus(pool, orderedAuthorization([])).execute(
+        {
+          kind: "source.correct",
+          idempotencyKey: "partial-lifecycle-error",
+          payload: {
+            predecessorSourceArtifactId: sourceId,
+            sourceType: "human",
+            text: "Database error must surface."
+          }
+        },
+        context()
+      )
+    ).rejects.toBe(databaseError);
+  });
 });
 
 async function unavailableSourceExecution(
@@ -528,7 +611,8 @@ function transactionPool(): { pool: PgPool; client: PgPoolClient } {
       return { rows: [{ current_user: "throughline_app" }] };
     }
     if (sql.includes("AS settings_cleared")) return { rows: [{ settings_cleared: true }] };
-    if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
+    if (sql === "BEGIN ISOLATION LEVEL READ COMMITTED" || sql === "COMMIT" || sql === "ROLLBACK")
+      return { rows: [] };
     if (sql.startsWith("SELECT ")) return { rows: [] };
     throw new Error(`Unexpected transaction query: ${sql}`);
   });

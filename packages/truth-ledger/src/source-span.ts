@@ -12,6 +12,7 @@ import {
   type B2SubjectVersionRef,
   type ClaimSourceSpanCandidate
 } from "@throughline/core-types";
+import type { TenantDbTransaction } from "@throughline/db";
 import { createHash } from "node:crypto";
 import {
   exactObject,
@@ -27,6 +28,8 @@ import {
 
 const verifiedClaimSourceSpanBrand = Symbol("VerifiedClaimSourceSpan");
 const admittedVerifiedSpans = new WeakSet<object>();
+const CANONICAL_UUID_REFERENCE_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 export interface AuthorizedClaimSourceChunkSnapshot {
   readonly id: string;
@@ -86,6 +89,7 @@ export interface AuthorizedClaimEvidenceSnapshot {
 }
 
 export interface AuthorizedClaimEvidenceSnapshotLookup {
+  readonly transaction: TenantDbTransaction;
   getAuthorizedClaimEvidenceSnapshot(input: {
     tenantId: string;
     workspaceId: string;
@@ -94,6 +98,40 @@ export interface AuthorizedClaimEvidenceSnapshotLookup {
     sourceArtifactId: string;
     sourceChunkId: string;
   }): Promise<AuthorizedClaimEvidenceSnapshot | null>;
+}
+
+const transactionScopedLookupBrand = Symbol("TransactionScopedClaimEvidenceSnapshotLookup");
+
+export type TransactionScopedClaimEvidenceSnapshotLookup = Readonly<{
+  transaction: TenantDbTransaction;
+  getAuthorizedClaimEvidenceSnapshot: AuthorizedClaimEvidenceSnapshotLookup["getAuthorizedClaimEvidenceSnapshot"];
+  [transactionScopedLookupBrand]: true;
+}>;
+
+/**
+ * Explicitly binds authoritative evidence reads to the transaction that owns the truth mutation.
+ * Admission rejects a lookup whose transaction identity differs from the mutation transaction.
+ */
+export function bindClaimEvidenceSnapshotLookupToTransaction(
+  transaction: TenantDbTransaction,
+  lookup: AuthorizedClaimEvidenceSnapshotLookup
+): TransactionScopedClaimEvidenceSnapshotLookup {
+  if (lookup.transaction !== transaction) {
+    throw new VerifiedClaimSourceSpanOperationalError(
+      new Error("Claim evidence lookup is detached from the mutation transaction")
+    );
+  }
+  const scoped = {
+    transaction,
+    getAuthorizedClaimEvidenceSnapshot: lookup.getAuthorizedClaimEvidenceSnapshot.bind(lookup)
+  };
+  Object.defineProperty(scoped, transactionScopedLookupBrand, {
+    value: true,
+    enumerable: false,
+    writable: false,
+    configurable: false
+  });
+  return Object.freeze(scoped) as TransactionScopedClaimEvidenceSnapshotLookup;
 }
 
 export type VerifiedClaimSourceSpan = Readonly<{
@@ -134,9 +172,16 @@ export class VerifiedClaimSourceSpanOperationalError extends Error {
 
 export class VerifiedClaimSourceSpanAdmission {
   constructor(
-    private readonly snapshots: AuthorizedClaimEvidenceSnapshotLookup,
+    private readonly transaction: TenantDbTransaction,
+    private readonly snapshots: TransactionScopedClaimEvidenceSnapshotLookup,
     private readonly authorizedScope: { readonly tenantId: string; readonly workspaceId: string }
-  ) {}
+  ) {
+    if (snapshots.transaction !== transaction || snapshots[transactionScopedLookupBrand] !== true) {
+      throw new VerifiedClaimSourceSpanOperationalError(
+        new Error("Claim evidence lookup is detached from the mutation transaction")
+      );
+    }
+  }
 
   async admit(input: unknown): Promise<VerifiedClaimSourceSpan> {
     let candidate: ReturnType<typeof parseAdmissionCandidate>;
@@ -152,8 +197,8 @@ export class VerifiedClaimSourceSpanAdmission {
     let tenantId: string;
     let workspaceId: string;
     try {
-      tenantId = requireUuidV7(this.authorizedScope.tenantId);
-      workspaceId = requireUuidV7(this.authorizedScope.workspaceId);
+      tenantId = requireCanonicalUuidReference(this.authorizedScope.tenantId);
+      workspaceId = requireCanonicalUuidReference(this.authorizedScope.workspaceId);
     } catch (cause) {
       throw new VerifiedClaimSourceSpanOperationalError(cause);
     }
@@ -252,25 +297,27 @@ function verifySnapshot(
   subject: B2SubjectVersionRef,
   candidate: ClaimSourceSpanCandidate
 ): VerifiedClaimSourceSpan {
-  const scopeIds = [snapshot.tenantId, snapshot.workspaceId, snapshot.spaceId].map(requireUuidV7);
+  const scopeIds = [snapshot.tenantId, snapshot.workspaceId, snapshot.spaceId].map(
+    requireCanonicalUuidReference
+  );
   const [tenantId, workspaceId, spaceId] = scopeIds as [string, string, string];
   const source = snapshot.source;
   const link = snapshot.sourceActivityLink;
   const projectedSubject = snapshot.subject;
   requireUuidV7(projectedSubject.id);
-  requireUuidV7(projectedSubject.tenantId);
-  requireUuidV7(projectedSubject.workspaceId);
-  requireUuidV7(projectedSubject.spaceId);
-  requireUuidV7(link.tenantId);
-  requireUuidV7(link.workspaceId);
-  requireUuidV7(link.spaceId);
+  requireCanonicalUuidReference(projectedSubject.tenantId);
+  requireCanonicalUuidReference(projectedSubject.workspaceId);
+  requireCanonicalUuidReference(projectedSubject.spaceId);
+  requireCanonicalUuidReference(link.tenantId);
+  requireCanonicalUuidReference(link.workspaceId);
+  requireCanonicalUuidReference(link.spaceId);
   requireUuidV7(link.sourceArtifactId);
   requireUuidV7(link.activityId);
   if (link.governingInitiativeId !== null) requireUuidV7(link.governingInitiativeId);
   requireUuidV7(source.id);
-  requireUuidV7(source.tenantId);
-  requireUuidV7(source.workspaceId);
-  requireUuidV7(source.spaceId);
+  requireCanonicalUuidReference(source.tenantId);
+  requireCanonicalUuidReference(source.workspaceId);
+  requireCanonicalUuidReference(source.spaceId);
 
   if (
     tenantId !== authorizedScope.tenantId ||
@@ -313,6 +360,10 @@ function verifySnapshot(
   for (const [index, chunk] of chunks.entries()) {
     const scalarLength = unicodeScalarLength(chunk.normalizedText);
     const chunkId = requireUuidV7(chunk.id);
+    requireCanonicalUuidReference(chunk.tenantId);
+    requireCanonicalUuidReference(chunk.workspaceId);
+    requireCanonicalUuidReference(chunk.spaceId);
+    requireUuidV7(chunk.sourceArtifactId);
     if (
       seenChunkIds.has(chunkId) ||
       chunk.tenantId !== tenantId ||
@@ -410,6 +461,13 @@ function verifySnapshot(
 
 function requireAccessClass(input: unknown): AccessClass {
   return requireEnum(input, ["public", "workspace", "restricted", "confidential"] as const);
+}
+
+function requireCanonicalUuidReference(input: unknown): string {
+  if (typeof input !== "string" || !CANONICAL_UUID_REFERENCE_PATTERN.test(input)) {
+    throw new TruthContractValidationError();
+  }
+  return input;
 }
 
 function sha256Utf8(input: string): string {
