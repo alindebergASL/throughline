@@ -91,6 +91,32 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(contract).toContain("B2 source/truth lifecycle interlock trigger inventory drifted");
   });
 
+  it("inspects the exact installed current-Fact unique-slot index instead of its name alone", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+
+    for (const catalogField of [
+      "index_state.indisunique",
+      "index_state.indisready",
+      "index_state.indisvalid",
+      "index_state.indnkeyatts",
+      "index_state.indnatts",
+      "index_state.indpred",
+      "index_relation.relam"
+    ]) {
+      expect(contract).toContain(catalogField);
+    }
+    expect(contract).toContain('access_method: "btree"');
+    expect(contract).toContain("predicate: \"(status = 'current'::text)\"");
+    expect(contract).toContain("JSON.stringify(currentSlotIndex)");
+    expect(contract).not.toContain("normalizePartialIndexPredicate");
+    expect(contract).toContain(
+      'throw new Error("B2 Slice 1 current-Fact unique-slot index definition drifted")'
+    );
+    expect(contract).not.toContain(
+      "to_regclass('truth.accepted_facts_one_current_slot')::text AS current_slot"
+    );
+  });
+
   it("casts PostgreSQL name columns to text before aggregating the exact inventory", async () => {
     const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
 

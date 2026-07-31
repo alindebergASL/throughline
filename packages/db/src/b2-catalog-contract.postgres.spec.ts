@@ -180,6 +180,23 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
       "SELECT id FROM throughline_migrations.journal ORDER BY id"
     );
     expect(journal.rows.map(({ id }) => id)).toEqual(allMigrationIds);
+    const currentSlotIndex = await ownerPool.query<{
+      definition: string;
+      predicate: string;
+    }>(
+      `SELECT pg_get_indexdef(index_state.indexrelid, 0, false) AS definition,
+              pg_get_expr(index_state.indpred, index_state.indrelid, false) AS predicate
+         FROM pg_index index_state
+        WHERE index_state.indexrelid =
+              'truth.accepted_facts_one_current_slot'::regclass`
+    );
+    expect(currentSlotIndex.rows).toEqual([
+      {
+        definition:
+          "CREATE UNIQUE INDEX accepted_facts_one_current_slot ON truth.accepted_facts USING btree (tenant_id, workspace_id, space_id, subject_type, subject_id, predicate) WHERE (status = 'current'::text)",
+        predicate: "(status = 'current'::text)"
+      }
+    ]);
     await expectExactCommandFunctionPrivileges();
   }, 60_000);
 
@@ -214,6 +231,28 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     ]);
     expect(qualifiedTriggers.rows.every(({ definition }) => definition.includes(" WHEN "))).toBe(
       true
+    );
+
+    await expectCatalogContractRejected(
+      `
+        DROP INDEX truth.accepted_facts_one_current_slot;
+        CREATE UNIQUE INDEX accepted_facts_one_current_slot
+          ON truth.accepted_facts (
+            tenant_id, workspace_id, space_id, subject_type, subject_id
+          ) WHERE status = 'current'
+      `,
+      "B2 Slice 1 current-Fact unique-slot index definition drifted"
+    );
+
+    await expectCatalogContractRejected(
+      `
+        DROP INDEX truth.accepted_facts_one_current_slot;
+        CREATE UNIQUE INDEX accepted_facts_one_current_slot
+          ON truth.accepted_facts (
+            tenant_id, workspace_id, space_id, subject_type, subject_id, predicate
+          ) WHERE status = 'cur(rent)'
+      `,
+      "B2 Slice 1 current-Fact unique-slot index definition drifted"
     );
 
     await expectCatalogContractRejected(

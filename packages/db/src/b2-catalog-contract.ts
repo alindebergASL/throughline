@@ -741,15 +741,100 @@ async function validateTruthConstraintsAndTriggers(client: PgPoolClient): Promis
   if (JSON.stringify(triggers.rows) !== JSON.stringify(expectedTriggers)) {
     throw new Error("B2 Slice 1 truth trigger inventory drifted");
   }
+
+  const currentSlotIndexes = await client.query<{
+    index_schema: string;
+    index_name: string;
+    table_schema: string;
+    table_name: string;
+    access_method: string;
+    unique: boolean;
+    ready: boolean;
+    valid: boolean;
+    immediate: boolean;
+    primary: boolean;
+    exclusion: boolean;
+    nulls_not_distinct: boolean;
+    key_attribute_count: number;
+    attribute_count: number;
+    key_columns: string[];
+    predicate: string | null;
+  }>(
+    `SELECT index_namespace.nspname AS index_schema,
+            index_relation.relname AS index_name,
+            table_namespace.nspname AS table_schema,
+            table_relation.relname AS table_name,
+            access_method.amname AS access_method,
+            index_state.indisunique AS unique,
+            index_state.indisready AS ready,
+            index_state.indisvalid AS valid,
+            index_state.indimmediate AS immediate,
+            index_state.indisprimary AS primary,
+            index_state.indisexclusion AS exclusion,
+            index_state.indnullsnotdistinct AS nulls_not_distinct,
+            index_state.indnkeyatts AS key_attribute_count,
+            index_state.indnatts AS attribute_count,
+            ARRAY(
+              SELECT attribute.attname::text
+                FROM unnest(index_state.indkey::smallint[]) WITH ORDINALITY
+                  AS key_column(attribute_number, position)
+                JOIN pg_attribute attribute
+                  ON attribute.attrelid = index_state.indrelid
+                 AND attribute.attnum = key_column.attribute_number
+               WHERE key_column.position <= index_state.indnkeyatts
+               ORDER BY key_column.position
+            ) AS key_columns,
+            pg_get_expr(index_state.indpred, index_state.indrelid, false) AS predicate
+       FROM pg_index index_state
+       JOIN pg_class index_relation ON index_relation.oid = index_state.indexrelid
+       JOIN pg_namespace index_namespace ON index_namespace.oid = index_relation.relnamespace
+       JOIN pg_class table_relation ON table_relation.oid = index_state.indrelid
+       JOIN pg_namespace table_namespace ON table_namespace.oid = table_relation.relnamespace
+       JOIN pg_am access_method ON access_method.oid = index_relation.relam
+      WHERE index_namespace.nspname = 'truth'
+        AND index_relation.relname = 'accepted_facts_one_current_slot'`
+  );
+  const currentSlotIndex = currentSlotIndexes.rows[0];
+  if (
+    currentSlotIndexes.rows.length !== 1 ||
+    !currentSlotIndex ||
+    JSON.stringify(currentSlotIndex) !==
+      JSON.stringify({
+        index_schema: "truth",
+        index_name: "accepted_facts_one_current_slot",
+        table_schema: "truth",
+        table_name: "accepted_facts",
+        access_method: "btree",
+        unique: true,
+        ready: true,
+        valid: true,
+        immediate: true,
+        primary: false,
+        exclusion: false,
+        nulls_not_distinct: false,
+        key_attribute_count: 6,
+        attribute_count: 6,
+        key_columns: [
+          "tenant_id",
+          "workspace_id",
+          "space_id",
+          "subject_type",
+          "subject_id",
+          "predicate"
+        ],
+        predicate: "(status = 'current'::text)"
+      })
+  ) {
+    throw new Error("B2 Slice 1 current-Fact unique-slot index definition drifted");
+  }
+
   const constraints = await client.query<{
-    current_slot: string | null;
     fact_support_deferred: boolean;
     claim_support_deferred: boolean;
     source_truth_triggers: string;
     reconciliation_function: string | null;
   }>(
     `SELECT
-       to_regclass('truth.accepted_facts_one_current_slot')::text AS current_slot,
        EXISTS (
          SELECT 1 FROM pg_trigger
           WHERE tgrelid = to_regclass('truth.accepted_facts')
@@ -773,8 +858,7 @@ async function validateTruthConstraintsAndTriggers(client: PgPoolClient): Promis
          AS reconciliation_function`
   );
   if (
-    !constraints.rows[0]?.current_slot ||
-    !constraints.rows[0].fact_support_deferred ||
+    !constraints.rows[0]?.fact_support_deferred ||
     !constraints.rows[0].claim_support_deferred ||
     constraints.rows[0].source_truth_triggers !== "0" ||
     constraints.rows[0].reconciliation_function !== null

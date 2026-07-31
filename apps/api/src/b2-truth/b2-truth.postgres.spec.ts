@@ -410,6 +410,222 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
     ]);
   }, 60_000);
 
+  it("serializes two distinct first acceptances for one current-Fact slot without loser residue", async () => {
+    const key = "b2-concurrent-first-acceptance";
+    const firstCandidate = await createClaimCandidateSource(
+      `${key}-first`,
+      "The first independent source supports one proposed outcome."
+    );
+    const secondCandidate = await createClaimCandidateForActivity(
+      firstCandidate.activityId,
+      `${key}-second`,
+      "The second independent source supports a competing proposed outcome."
+    );
+    const firstClaimResponse = await post(
+      "/internal/v1/claims",
+      `${key}-first-claim`,
+      firstCandidate.claimPayload
+    );
+    const secondClaimResponse = await post(
+      "/internal/v1/claims",
+      `${key}-second-claim`,
+      secondCandidate.claimPayload
+    );
+    expect(firstClaimResponse.statusCode, firstClaimResponse.body).toBe(201);
+    expect(secondClaimResponse.statusCode, secondClaimResponse.body).toBe(201);
+    const claimIds = [
+      firstClaimResponse.json<{ claimId: string }>().claimId,
+      secondClaimResponse.json<{ claimId: string }>().claimId
+    ] as const;
+    const factKeys = [`${key}-first-fact`, `${key}-second-fact`] as const;
+    const factPayloads = claimIds.map((candidateClaimId) => ({
+      subject: { type: "activity" as const, id: firstCandidate.activityId, expectedVersion: 1 },
+      claims: [{ claimId: candidateClaimId, expectedVersion: 1 }],
+      expectedCurrentFactId: null,
+      acceptanceScope: "engagement" as const
+    }));
+    const subjectScope = await ownerPool.query<{ space_id: string }>(
+      `SELECT space_id
+         FROM work.activities
+        WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+      [devFixtures.tenantA, devFixtures.workspaceA, firstCandidate.activityId]
+    );
+    const spaceId = subjectScope.rows[0]!.space_id;
+    const slotKey = [
+      devFixtures.tenantA,
+      devFixtures.workspaceA,
+      spaceId,
+      "activity",
+      firstCandidate.activityId,
+      "activity.outcome"
+    ].join("/");
+
+    const barrier = await ownerPool.connect();
+    let barrierOpen = false;
+    const inFlight: Promise<unknown>[] = [];
+    const cleanupBarrierAndRequests = async () => {
+      const cleanupErrors: unknown[] = [];
+      try {
+        if (barrierOpen) await barrier.query("ROLLBACK");
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        barrier.release();
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      try {
+        await withDeadline(Promise.allSettled(inFlight), 15_000);
+      } catch (error) {
+        cleanupErrors.push(error);
+      }
+      if (cleanupErrors.length === 1) throw cleanupErrors[0];
+      if (cleanupErrors.length > 1) {
+        throw new AggregateError(cleanupErrors, "Concurrent first-acceptance cleanup failed");
+      }
+    };
+    try {
+      await barrier.query("BEGIN");
+      barrierOpen = true;
+      const barrierPid = (await barrier.query<{ pid: number }>("SELECT pg_backend_pid() AS pid"))
+        .rows[0]!.pid;
+      await barrier.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [slotKey]);
+
+      const firstAcceptance = post("/internal/v1/facts", factKeys[0], factPayloads[0]!);
+      void firstAcceptance.catch(() => undefined);
+      inFlight.push(firstAcceptance);
+      const firstWaiters = await waitForAdvisoryBackendsBlockedBy(ownerPool, barrierPid, 1, 10_000);
+      expect(await observeStillPending(firstAcceptance, 50)).toBe(true);
+
+      const secondAcceptance = post("/internal/v1/facts", factKeys[1], factPayloads[1]!);
+      void secondAcceptance.catch(() => undefined);
+      inFlight.push(secondAcceptance);
+      const bothWaiters = await waitForAdvisoryBackendsBlockedBy(ownerPool, barrierPid, 2, 10_000);
+      expect(bothWaiters).toContain(firstWaiters[0]);
+      expect(new Set(bothWaiters).size).toBe(2);
+      expect(await observeStillPending(firstAcceptance, 50)).toBe(true);
+      expect(await observeStillPending(secondAcceptance, 50)).toBe(true);
+
+      await barrier.query("COMMIT");
+      barrierOpen = false;
+      const responses = await withDeadline(
+        Promise.all([firstAcceptance, secondAcceptance]),
+        15_000
+      );
+      expect(responses.map(({ statusCode }) => statusCode).sort()).toEqual([201, 409]);
+      const winnerIndex = responses.findIndex(({ statusCode }) => statusCode === 201);
+      const loserIndex = winnerIndex === 0 ? 1 : 0;
+      const winnerResponse = responses[winnerIndex]!;
+      const loserResponse = responses[loserIndex]!;
+      const winnerClaimId = claimIds[winnerIndex]!;
+      const loserClaimId = claimIds[loserIndex]!;
+      const winnerKey = factKeys[winnerIndex]!;
+      const winnerFactId = winnerResponse.json<{ factId: string }>().factId;
+
+      expect(winnerResponse.json()).toEqual({
+        factId: winnerFactId,
+        version: 1,
+        status: "current",
+        acceptedClaimIds: [winnerClaimId]
+      });
+      expect(loserResponse.json()).toEqual({
+        message: "Command precondition failed",
+        error: "Conflict",
+        statusCode: 409
+      });
+
+      const claims = await ownerPool.query<{ id: string; status: string }>(
+        "SELECT id, status FROM truth.claims WHERE id = ANY($1::uuid[]) ORDER BY id",
+        [[...claimIds]]
+      );
+      expect(Object.fromEntries(claims.rows.map(({ id, status }) => [id, status]))).toEqual({
+        [winnerClaimId]: "accepted",
+        [loserClaimId]: "proposed"
+      });
+      const facts = await ownerPool.query<{
+        id: string;
+        status: string;
+        supporting_claim_ids: string[];
+      }>(
+        `SELECT fact.id, fact.status,
+                array_agg(support.claim_id::text ORDER BY support.claim_id) AS supporting_claim_ids
+           FROM truth.accepted_facts fact
+           JOIN truth.fact_claims support
+             ON support.tenant_id = fact.tenant_id
+            AND support.workspace_id = fact.workspace_id
+            AND support.fact_id = fact.id
+          WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.space_id = $3
+            AND fact.subject_type = 'activity' AND fact.subject_id = $4
+            AND fact.predicate = 'activity.outcome' AND fact.status = 'current'
+          GROUP BY fact.id, fact.status`,
+        [devFixtures.tenantA, devFixtures.workspaceA, spaceId, firstCandidate.activityId]
+      );
+      expect(facts.rows).toEqual([
+        { id: winnerFactId, status: "current", supporting_claim_ids: [winnerClaimId] }
+      ]);
+
+      const commands = await ownerPool.query<{
+        id: string;
+        idempotency_key: string;
+        state: string;
+        result_resource_id: string;
+      }>(
+        `SELECT id, idempotency_key, state, result_resource_id
+           FROM ops.domain_command_records
+          WHERE idempotency_key = ANY($1::text[])
+          ORDER BY idempotency_key`,
+        [[...factKeys]]
+      );
+      expect(commands.rows).toEqual([
+        {
+          id: expect.any(String),
+          idempotency_key: winnerKey,
+          state: "completed",
+          result_resource_id: winnerFactId
+        }
+      ]);
+      const audits = await ownerPool.query<{
+        idempotency_key: string;
+        action: string;
+        resource_id: string;
+      }>(
+        `SELECT command.idempotency_key, audit.action, audit.resource_id
+           FROM ops.audit_events audit
+           JOIN ops.domain_command_records command
+             ON command.tenant_id = audit.tenant_id
+            AND command.workspace_id = audit.workspace_id
+            AND command.id = audit.causation_command_id
+          WHERE command.idempotency_key = ANY($1::text[])
+          ORDER BY command.idempotency_key`,
+        [[...factKeys]]
+      );
+      expect(audits.rows).toEqual([
+        { idempotency_key: winnerKey, action: "fact.accept", resource_id: winnerFactId }
+      ]);
+      const outbox = await ownerPool.query<{
+        idempotency_key: string;
+        event_type: string;
+        aggregate_id: string;
+      }>(
+        `SELECT command.idempotency_key, event.event_type, event.aggregate_id
+           FROM ops.product_outbox_events event
+           JOIN ops.domain_command_records command
+             ON command.tenant_id = event.tenant_id
+            AND command.workspace_id = event.workspace_id
+            AND command.id = event.causation_command_id
+          WHERE command.idempotency_key = ANY($1::text[])
+          ORDER BY command.idempotency_key`,
+        [[...factKeys]]
+      );
+      expect(outbox.rows).toEqual([
+        { idempotency_key: winnerKey, event_type: "fact.accepted", aggregate_id: winnerFactId }
+      ]);
+    } finally {
+      await cleanupBarrierAndRequests();
+    }
+  }, 60_000);
+
   it("rejects correction and retained-hash tombstone generically and rolls back every row", async () => {
     const bus = new AccountOperationsDomainCommandBus(appPool);
     const context = createDevSecurityContext("tenant-a-owner");
@@ -1407,6 +1623,14 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
     });
     expect(activity.statusCode, activity.body).toBe(201);
     const createdActivityId = activity.json<{ activityId: string }>().activityId;
+    return createClaimCandidateForActivity(createdActivityId, key, text);
+  }
+
+  async function createClaimCandidateForActivity(
+    createdActivityId: string,
+    key: string,
+    text: string
+  ) {
     const source = await post(`/v1/activities/${createdActivityId}/sources`, `${key}-source`, {
       sourceType: "note",
       title: `Evidence ${key}`,
@@ -1699,6 +1923,38 @@ async function waitForBackendBlockedBy(
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   throw new Error(`Timed out waiting for a backend blocked by PID ${blockerPid}`);
+}
+
+async function waitForAdvisoryBackendsBlockedBy(
+  pool: PgPool,
+  blockerPid: number,
+  expectedCount: number,
+  timeoutMs: number
+): Promise<number[]> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const result = await pool.query<{ pid: number }>(
+      `SELECT DISTINCT activity.pid
+         FROM pg_stat_activity activity
+         JOIN pg_locks waiting_lock
+           ON waiting_lock.pid = activity.pid
+          AND waiting_lock.locktype = 'advisory'
+          AND NOT waiting_lock.granted
+        WHERE activity.datname = current_database()
+          AND activity.pid <> pg_backend_pid()
+          AND $1 = ANY(pg_blocking_pids(activity.pid))
+        ORDER BY activity.pid`,
+      [blockerPid]
+    );
+    if (result.rows.length === expectedCount) return result.rows.map(({ pid }) => pid);
+    if (result.rows.length > expectedCount) {
+      throw new Error(`Expected ${expectedCount} advisory backends blocked by PID ${blockerPid}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(
+    `Timed out waiting for ${expectedCount} advisory backends blocked by PID ${blockerPid}`
+  );
 }
 
 async function observeStillPending(
