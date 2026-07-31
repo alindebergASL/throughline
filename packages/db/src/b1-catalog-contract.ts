@@ -9,7 +9,7 @@ export const B1_MIGRATION_IDS = [
 
 type B1MigrationId = (typeof B1_MIGRATION_IDS)[number];
 type MigrationSources = ReadonlyMap<string, string>;
-type AdditiveB2Phase = 0 | 1 | 2;
+type AdditiveB2Phase = 0 | 1 | 2 | 3;
 
 const B1_PREDECESSOR_IDS = [
   "0001_wave_a2_identity_access_rls.sql",
@@ -18,6 +18,7 @@ const B1_PREDECESSOR_IDS = [
 ] as const;
 
 const B2_INTEGRITY_MIGRATION_ID = "0008_b2_slice1_command_integrity.sql";
+const B2_LIFECYCLE_MIGRATION_ID = "0009_b2_source_truth_lifecycle_interlock.sql";
 
 export async function validateMigrationJournal(
   client: PgPoolClient,
@@ -411,7 +412,12 @@ export async function validateB1CatalogContract(
   const integrityInstalled = phase === B1_MIGRATION_IDS.length;
   const expectedTables = expectedTableContracts(installed, sources);
   const expectedIndexes = expectedIndexContracts(installed, sources, expectedTables);
-  const expectedTriggers = expectedTriggerContracts(installed, sources, expectedTables);
+  const expectedTriggers = expectedTriggerContracts(
+    installed,
+    sources,
+    expectedTables,
+    additiveB2Phase
+  );
 
   await validateProtectedRoles(client);
   await withScratchCatalog(client, async (scratch) => {
@@ -512,12 +518,18 @@ function expectedIndexContracts(
 function expectedTriggerContracts(
   installed: readonly B1MigrationId[],
   sources: MigrationSources,
-  tables: readonly ExpectedTable[]
+  tables: readonly ExpectedTable[],
+  additiveB2Phase: AdditiveB2Phase
 ): ExpectedTrigger[] {
   const tableMap = new Map(tables.map((table) => [table.actualName, table.scratchName]));
   const triggerContracts = installed
     .filter((id) => id !== B1_MIGRATION_IDS[2])
     .flatMap((id) => extractTriggerStatements(requireSource(sources, id)));
+  if (additiveB2Phase === 3) {
+    triggerContracts.push(
+      ...approvedB2LifecycleTriggerContracts(requireSource(sources, B2_LIFECYCLE_MIGRATION_ID))
+    );
+  }
   return triggerContracts
     .filter(({ tableName }) => tableMap.has(tableName))
     .map(({ name, tableName, statement }) => ({
@@ -618,9 +630,63 @@ function extractTriggerStatements(source: string): Array<{
 }> {
   return [
     ...source.matchAll(
-      /CREATE (?:CONSTRAINT )?TRIGGER ([a-z_]+)[\s\S]*?\bON ((?:work|content)\.[a-z_]+)[\s\S]*?;/g
+      /CREATE (?:CONSTRAINT )?TRIGGER ([a-z][a-z0-9_]*)[\s\S]*?\bON ([a-z][a-z0-9_]*\.[a-z][a-z0-9_]*)[\s\S]*?;/g
     )
   ].map((match) => ({ name: match[1]!, tableName: match[2]!, statement: match[0] }));
+}
+
+export function approvedB2LifecycleTriggerContracts(source: string): Array<{
+  name: string;
+  tableName: string;
+  statement: string;
+}> {
+  const expected = [
+    {
+      name: "source_artifacts_z_b2_correction_interlock",
+      tableName: "content.source_artifacts",
+      statement: `CREATE TRIGGER source_artifacts_z_b2_correction_interlock
+        BEFORE INSERT ON content.source_artifacts
+        FOR EACH ROW
+        WHEN (NEW.supersedes_source_id IS NOT NULL)
+        EXECUTE FUNCTION ops.enforce_b2_source_truth_lifecycle_interlock();`
+    },
+    {
+      name: "source_artifacts_z_b2_tombstone_interlock",
+      tableName: "content.source_artifacts",
+      statement: `CREATE TRIGGER source_artifacts_z_b2_tombstone_interlock
+        BEFORE UPDATE ON content.source_artifacts
+        FOR EACH ROW
+        WHEN (OLD.deleted_at IS NULL AND NEW.deleted_at IS NOT NULL)
+        EXECUTE FUNCTION ops.enforce_b2_source_truth_lifecycle_interlock();`
+    },
+    {
+      name: "source_chunks_z_b2_delete_interlock",
+      tableName: "content.source_chunks",
+      statement: `CREATE TRIGGER source_chunks_z_b2_delete_interlock
+        BEFORE DELETE ON content.source_chunks
+        FOR EACH ROW
+        EXECUTE FUNCTION ops.enforce_b2_source_truth_lifecycle_interlock();`
+    }
+  ];
+  const actual = extractTriggerStatements(source);
+  if (
+    actual.length !== expected.length ||
+    actual.some((trigger, index) => {
+      const contract = expected[index]!;
+      return (
+        trigger.name !== contract.name ||
+        trigger.tableName !== contract.tableName ||
+        normalizeSql(trigger.statement) !== normalizeSql(contract.statement)
+      );
+    })
+  ) {
+    throw new Error("Approved B2 lifecycle trigger source drifted");
+  }
+  return actual;
+}
+
+function normalizeSql(source: string): string {
+  return source.replaceAll(/\s+/g, " ").trim();
 }
 
 function rewriteB1TableRelations(
@@ -1643,7 +1709,7 @@ async function validateCommandIntegrityObjects(
     );
   }
 
-  if (additiveB2Phase === 2) {
+  if (additiveB2Phase >= 2) {
     const b2IntegritySource = requireSource(migrationSources, B2_INTEGRITY_MIGRATION_ID);
     const productConstraintStatement = b2IntegritySource.match(
       /ALTER TABLE ops\.domain_command_records\s+DROP CONSTRAINT domain_command_records_b1_shape_check,[\s\S]*?\n\s*\);/
@@ -2022,7 +2088,7 @@ async function validateIntegrityPredecessorAccess(
     .sort((left, right) =>
       `${left.relation}|${left.name}`.localeCompare(`${right.relation}|${right.name}`)
     );
-  if (additiveB2Phase === 2) {
+  if (additiveB2Phase >= 2) {
     const additiveIntegrityPolicyContracts = [
       ["truth.accepted_facts", "accepted_facts_integrity_select", "r"],
       ["truth.claims", "claims_integrity_select", "r"],
@@ -2137,14 +2203,7 @@ async function validateIntegrityPredecessorAccess(
     "B1 integrity schema grants",
     schemaPrivileges.rows,
     (integrityInstalled
-      ? [
-          "access",
-          "content",
-          "identity",
-          "ops",
-          ...(additiveB2Phase === 2 ? ["truth"] : []),
-          "work"
-        ]
+      ? ["access", "content", "identity", "ops", ...(additiveB2Phase >= 2 ? ["truth"] : []), "work"]
       : ["ops"]
     ).map((schema) => ({
       schema,

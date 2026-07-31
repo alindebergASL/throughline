@@ -7,19 +7,21 @@ import {
 } from "@throughline/core-types";
 import { createHash } from "node:crypto";
 import { describe, expect, it } from "vitest";
+import type { TenantDbTransaction } from "@throughline/db";
 import {
   VerifiedClaimSourceSpanAdmission,
   VerifiedClaimSourceSpanError,
   VerifiedClaimSourceSpanOperationalError,
+  bindClaimEvidenceSnapshotLookupToTransaction,
   isVerifiedClaimSourceSpan,
   type AuthorizedClaimEvidenceSnapshot,
   type AuthorizedClaimEvidenceSnapshotLookup
 } from "./source-span.js";
 
 const ids = {
-  tenant: "018f0000-0000-7000-8000-000000000001",
-  workspace: "018f0000-0000-7000-8000-000000000002",
-  space: "018f0000-0000-7000-8000-000000000003",
+  tenant: "11111111-1111-4111-8111-111111111111",
+  workspace: "11111111-1111-4111-8111-111111111112",
+  space: "11111111-1111-4111-8111-111111111114",
   activity: "018f0000-0000-7000-8000-000000000004",
   initiative: "018f0000-0000-7000-8000-000000000005",
   source: "018f0000-0000-7000-8000-000000000006",
@@ -108,7 +110,7 @@ function fixture(input?: {
         tenantId: ids.tenant,
         workspaceId: ids.workspace,
         spaceId: ids.space,
-        version: 2,
+        version: 1,
         immutableText: raw,
         contentHash: sha256(raw),
         normalizedContentHash: sha256(normalized),
@@ -126,7 +128,7 @@ function fixture(input?: {
       evidence: {
         sourceArtifactId: ids.source,
         sourceChunkId: selected.id,
-        expectedSourceVersion: 2,
+        expectedSourceVersion: 1,
         expectedChunkVersion: 1,
         normalizationVersion: SOURCE_NORMALIZATION_VERSION,
         chunkingVersion: SOURCE_CHUNKING_VERSION,
@@ -142,17 +144,27 @@ function fixture(input?: {
   };
 }
 
-function admission(snapshot: AuthorizedClaimEvidenceSnapshot | null, requests?: unknown[]) {
+function admission(
+  snapshot: AuthorizedClaimEvidenceSnapshot | null,
+  requests?: unknown[],
+  authorizedScope: { tenantId: string; workspaceId: string } = {
+    tenantId: ids.tenant,
+    workspaceId: ids.workspace
+  }
+) {
+  const tx = transaction();
   const lookup: AuthorizedClaimEvidenceSnapshotLookup = {
+    transaction: tx,
     async getAuthorizedClaimEvidenceSnapshot(input) {
       requests?.push(input);
       return snapshot;
     }
   };
-  return new VerifiedClaimSourceSpanAdmission(lookup, {
-    tenantId: ids.tenant,
-    workspaceId: ids.workspace
-  });
+  return new VerifiedClaimSourceSpanAdmission(
+    tx,
+    bindClaimEvidenceSnapshotLookupToTransaction(tx, lookup),
+    authorizedScope
+  );
 }
 
 function cloneFixture(value = fixture()): Fixture {
@@ -160,7 +172,30 @@ function cloneFixture(value = fixture()): Fixture {
 }
 
 describe("VerifiedClaimSourceSpan admission", () => {
-  it("uses the authoritative lookup and admits an exact CRLF-normalized, NFC, emoji span", async () => {
+  it("rejects a lookup bound to a different transaction identity", () => {
+    const first = transaction();
+    const second = transaction();
+    const lookup: AuthorizedClaimEvidenceSnapshotLookup = {
+      transaction: second,
+      async getAuthorizedClaimEvidenceSnapshot() {
+        return fixture().snapshot;
+      }
+    };
+
+    expect(
+      () =>
+        new VerifiedClaimSourceSpanAdmission(
+          first,
+          bindClaimEvidenceSnapshotLookupToTransaction(second, lookup),
+          {
+            tenantId: ids.tenant,
+            workspaceId: ids.workspace
+          }
+        )
+    ).toThrow("Trusted claim evidence lookup or verification failed");
+  });
+
+  it("admits exact evidence under the canonical UUIDv4 dev tenant, workspace, and Space", async () => {
     const value = fixture();
     const requests: unknown[] = [];
     const verified = await admission(value.snapshot, requests).admit(value.candidate);
@@ -181,7 +216,7 @@ describe("VerifiedClaimSourceSpan admission", () => {
       spaceId: ids.space,
       sourceArtifactId: ids.source,
       sourceChunkId: ids.chunk1,
-      sourceVersion: 2,
+      sourceVersion: 1,
       chunkVersion: 1,
       startOffset: 1,
       endOffset: 3,
@@ -191,6 +226,90 @@ describe("VerifiedClaimSourceSpan admission", () => {
     expect(isVerifiedClaimSourceSpan(verified)).toBe(true);
     expect(Object.isFrozen(verified)).toBe(true);
     expect(Object.keys(verified)).not.toContain("verifiedClaimSourceSpanBrand");
+  });
+
+  it("rejects malformed and noncanonical scope references without weakening v7 entity IDs", async () => {
+    const malformedScopeIds = [
+      "not-a-uuid",
+      "11111111-1111-0111-8111-111111111111",
+      "11111111-1111-4111-7111-111111111111",
+      "11111111-1111-4111-8111-11111111111A"
+    ];
+    for (const tenantId of malformedScopeIds) {
+      const value = fixture();
+      await expect(
+        admission(value.snapshot, undefined, {
+          tenantId,
+          workspaceId: ids.workspace
+        }).admit(value.candidate)
+      ).rejects.toBeInstanceOf(VerifiedClaimSourceSpanOperationalError);
+    }
+
+    const malformedProjections: Array<(value: Fixture) => void> = [
+      (value) => {
+        (value.snapshot as { spaceId: string }).spaceId = "not-a-uuid";
+      },
+      (value) => {
+        (value.snapshot.subject as { workspaceId: string }).workspaceId =
+          "11111111-1111-0111-8111-111111111112";
+      },
+      (value) => {
+        (value.snapshot.sourceActivityLink as { spaceId: string }).spaceId =
+          "11111111-1111-4111-7111-111111111114";
+      },
+      (value) => {
+        (value.snapshot.source as { tenantId: string }).tenantId =
+          "11111111-1111-4111-8111-11111111111A";
+      },
+      (value) => {
+        (value.snapshot.chunks[0] as { workspaceId: string }).workspaceId = "not-a-uuid";
+      }
+    ];
+    for (const mutate of malformedProjections) {
+      const value = fixture();
+      mutate(value);
+      await expect(admission(value.snapshot).admit(value.candidate)).rejects.toBeInstanceOf(
+        VerifiedClaimSourceSpanError
+      );
+    }
+
+    const v4EntityMutations: Array<(value: Fixture) => void> = [
+      (value) => {
+        value.candidate.subject.id = ids.tenant;
+      },
+      (value) => {
+        value.candidate.evidence.sourceArtifactId = ids.tenant;
+      },
+      (value) => {
+        value.candidate.evidence.sourceChunkId = ids.tenant;
+      },
+      (value) => {
+        (value.snapshot.subject as { id: string }).id = ids.tenant;
+      },
+      (value) => {
+        (value.snapshot.source as { id: string }).id = ids.tenant;
+      },
+      (value) => {
+        (value.snapshot.chunks[0] as { id: string }).id = ids.tenant;
+      }
+    ];
+    for (const mutate of v4EntityMutations) {
+      const value = fixture();
+      mutate(value);
+      await expect(admission(value.snapshot).admit(value.candidate)).rejects.toBeInstanceOf(
+        VerifiedClaimSourceSpanError
+      );
+    }
+  });
+
+  it("classifies a fabricated excerpt mismatch as an evidence error", async () => {
+    const value = fixture();
+    value.candidate.evidence.excerpt = "fabricated";
+    value.candidate.evidence.excerptHash = sha256("fabricated");
+
+    await expect(admission(value.snapshot).admit(value.candidate)).rejects.toBeInstanceOf(
+      VerifiedClaimSourceSpanError
+    );
   });
 
   it("supports ASCII and exact start/end boundaries at the B1 maximum", async () => {
@@ -253,12 +372,15 @@ describe("VerifiedClaimSourceSpan admission", () => {
   it("preserves a trusted lookup failure as one internal operational error with its cause", async () => {
     const value = fixture();
     const sentinel = new Error("sentinel trusted lookup failure");
+    const tx = transaction();
     const failingAdmission = new VerifiedClaimSourceSpanAdmission(
-      {
+      tx,
+      bindClaimEvidenceSnapshotLookupToTransaction(tx, {
+        transaction: tx,
         async getAuthorizedClaimEvidenceSnapshot() {
           throw sentinel;
         }
-      },
+      }),
       { tenantId: ids.tenant, workspaceId: ids.workspace }
     );
 
@@ -278,23 +400,29 @@ describe("VerifiedClaimSourceSpan admission", () => {
     await expect(admission(null).admit(base.candidate)).rejects.toThrow(
       "Claim evidence is unavailable or invalid"
     );
+    const wrongTenantTx = transaction();
     await expect(
       new VerifiedClaimSourceSpanAdmission(
-        {
+        wrongTenantTx,
+        bindClaimEvidenceSnapshotLookupToTransaction(wrongTenantTx, {
+          transaction: wrongTenantTx,
           async getAuthorizedClaimEvidenceSnapshot() {
             return base.snapshot;
           }
-        },
+        }),
         { tenantId: ids.other, workspaceId: ids.workspace }
       ).admit(base.candidate)
     ).rejects.toThrow("Claim evidence is unavailable or invalid");
+    const wrongWorkspaceTx = transaction();
     await expect(
       new VerifiedClaimSourceSpanAdmission(
-        {
+        wrongWorkspaceTx,
+        bindClaimEvidenceSnapshotLookupToTransaction(wrongWorkspaceTx, {
+          transaction: wrongWorkspaceTx,
           async getAuthorizedClaimEvidenceSnapshot() {
             return base.snapshot;
           }
-        },
+        }),
         { tenantId: ids.tenant, workspaceId: ids.other }
       ).admit(base.candidate)
     ).rejects.toThrow("Claim evidence is unavailable or invalid");
@@ -572,3 +700,13 @@ describe("VerifiedClaimSourceSpan admission", () => {
     ).rejects.toThrow();
   });
 });
+
+function transaction(): TenantDbTransaction {
+  const client = {} as TenantDbTransaction["client"];
+  return {
+    client,
+    async query() {
+      return { rows: [] };
+    }
+  } as unknown as TenantDbTransaction;
+}

@@ -98,16 +98,32 @@ export class AccountOperationsDomainCommandBus {
     } as ParsedCommand;
     const reservationSpaceId = await this.resolveReservationSpace(trustedCommand, context);
     const mutationContext = { ...context, requestedSpaceIds: [reservationSpaceId] };
-    return withTenantTransaction({ pool: this.pool, context: mutationContext }, async (tx) => {
-      await assertApplicationRole(tx);
-      const result = await this.executeInTransaction(
-        trustedCommand,
-        mutationContext,
-        reservationSpaceId,
-        tx
+    try {
+      return await withTenantTransaction(
+        { pool: this.pool, context: mutationContext },
+        async (tx) => {
+          await assertApplicationRole(tx);
+          const result = await this.executeInTransaction(
+            trustedCommand,
+            mutationContext,
+            reservationSpaceId,
+            tx
+          );
+          return result as B1CommandResultMap[K];
+        }
       );
-      return result as B1CommandResultMap[K];
-    });
+    } catch (error) {
+      if (
+        (trustedCommand.kind === "source.correct" || trustedCommand.kind === "source.tombstone") &&
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "TLB21" &&
+        error.message === "Source lifecycle transition is unavailable"
+      ) {
+        throw new B1CommandInvariantError();
+      }
+      throw error;
+    }
   }
 
   private async resolveReservationSpace(

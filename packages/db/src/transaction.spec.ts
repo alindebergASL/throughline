@@ -40,6 +40,7 @@ describe("withTenantTransaction", () => {
 
     await withTenantTransaction({ pool, context }, async () => undefined);
 
+    expect(query.mock.calls[0]).toEqual(["BEGIN ISOLATION LEVEL READ COMMITTED"]);
     const spaceSettingCalls = query.mock.calls.filter(
       ([sql, values]) => sql === "SELECT set_config($1, $2, true)" && values?.[0] === "app.space_id"
     );

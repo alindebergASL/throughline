@@ -5,6 +5,10 @@ import { assertProductValidatorDelegatesExactB1Kinds } from "./b2-catalog-contra
 
 const schemaUrl = new URL("../migrations/0007_b2_slice1_truth_storage.sql", import.meta.url);
 const integrityUrl = new URL("../migrations/0008_b2_slice1_command_integrity.sql", import.meta.url);
+const lifecycleUrl = new URL(
+  "../migrations/0009_b2_source_truth_lifecycle_interlock.sql",
+  import.meta.url
+);
 
 describe("B2 Slice 1 additive migration contract", () => {
   it("pins exact immutable predecessors and the journal-aware validation phases", async () => {
@@ -32,6 +36,14 @@ describe("B2 Slice 1 additive migration contract", () => {
       [
         "0006_b1_command_integrity.sql",
         "cf2cd1c20e27cad0526f5896090fdf797ff748b90a02b994c2f5c2894b762897"
+      ],
+      [
+        "0007_b2_slice1_truth_storage.sql",
+        "0e51a502b084e23677c1a0832fc3943a6da33266eae517af2641c61452a9dba8"
+      ],
+      [
+        "0008_b2_slice1_command_integrity.sql",
+        "84bcc710743c1850a0995763765b9dbb8506b040d965d33557459fd6eb472fcc"
       ]
     ] as const;
     for (const [file, digest] of expected) {
@@ -40,7 +52,7 @@ describe("B2 Slice 1 additive migration contract", () => {
     }
     const runner = await readFile(new URL("./migrations.ts", import.meta.url), "utf8");
     expect(runner).toMatch(
-      /case 0:[\s\S]*?validateB1CatalogContract[\s\S]*?case 1:[\s\S]*?validateB1CatalogContract[\s\S]*?additiveB2Phase: 1[\s\S]*?validateB2CatalogContract[\s\S]*?case 2:[\s\S]*?validateB1CatalogContract[\s\S]*?additiveB2Phase: 2[\s\S]*?validateB2CatalogContract/
+      /case 0:[\s\S]*?validateB1CatalogContract[\s\S]*?case 1:[\s\S]*?additiveB2Phase: 1[\s\S]*?case 2:[\s\S]*?additiveB2Phase: 2[\s\S]*?case 3:[\s\S]*?additiveB2Phase: 3[\s\S]*?validateB2CatalogContract/
     );
     const b1Contract = await readFile(new URL("./b1-catalog-contract.ts", import.meta.url), "utf8");
     expect(b1Contract).toContain("A staged B2 catalog requires the exact complete B1 predecessor");
@@ -64,10 +76,70 @@ describe("B2 Slice 1 additive migration contract", () => {
     expect(sql).toContain("confidence_lowering_reason_code");
     expect(sql).toContain("confidence_lowering_rationale");
     expect(sql).toContain("content.access_class_rank");
+    expect(sql).toContain("value_json jsonb NOT NULL");
+    expect(sql).not.toContain("canonical_value_text");
     expect(sql).not.toMatch(
       /fact_lifecycle|reconcile_source_retention|source_artifacts_truth_retention|b2_retention_command|redacted_at|redaction_|hash_disposition|status IN \('current','revoked'\)|status IN \('proposed','accepted','rejected'\)/
     );
     expect(sql).not.toMatch(/conflict|supersession|derived_view|command_effect/);
+  });
+
+  it("adds only the fail-closed Stage 1 source/truth lifecycle interlock", async () => {
+    const sql = await readFile(lifecycleUrl, "utf8");
+    expect(sql).toContain("ops.enforce_b2_source_truth_lifecycle_interlock()");
+    expect(sql).toContain("SECURITY DEFINER");
+    expect(sql).toContain("SET search_path = pg_catalog");
+    expect(sql).toContain("OWNER TO throughline_b1_0_integrity");
+    expect(sql).toContain("REVOKE ALL ON FUNCTION");
+    expect(sql).toContain("truth.verified_evidence_spans");
+    expect(sql).toContain("Source lifecycle transition is unavailable");
+    expect(sql).toContain("ERRCODE = 'TLB21'");
+    expect(sql).toContain("ERRCODE = 'TLB22'");
+    expect(sql).toContain("LOCK TABLE content.source_artifacts, content.source_chunks");
+    expect(sql).toContain("RENAME COLUMN value_json TO canonical_value_text");
+    expect(sql).toContain("ALTER COLUMN canonical_value_text TYPE text");
+    expect(sql).toContain("CREATE OR REPLACE FUNCTION truth.require_reserved_command()");
+    expect(sql).toContain("row_data jsonb := to_jsonb(NEW)");
+    expect(sql).toContain("source_artifacts_z_b2_correction_interlock");
+    expect(sql).toContain("source_artifacts_z_b2_tombstone_interlock");
+    expect(sql).toContain("source_chunks_z_b2_delete_interlock");
+    expect([...sql.matchAll(/UPDATE\s+truth\.([a-z_]+)/gi)].map((match) => match[1])).toEqual([
+      "claims",
+      "accepted_facts"
+    ]);
+    expect(sql).not.toMatch(/DELETE\s+FROM\s+truth\.|fact_lifecycle|redact/i);
+  });
+
+  it("serializes evidence admission and lifecycle lookup with one exact per-source lock", async () => {
+    const sql = await readFile(lifecycleUrl, "utf8");
+    const functionSource = (qualifiedName: string) =>
+      sql.match(
+        new RegExp(
+          `CREATE OR REPLACE FUNCTION ${qualifiedName.replaceAll(".", "\\.")}\\(\\)[\\s\\S]*?AS \\$function\\$([\\s\\S]*?)\\$function\\$;`
+        )
+      )?.[1];
+    const evidenceSource = functionSource("truth.verify_evidence_snapshot");
+    const lifecycleSource = functionSource("ops.enforce_b2_source_truth_lifecycle_interlock");
+    const advisoryLock = evidenceSource?.match(
+      /PERFORM pg_catalog\.pg_advisory_xact_lock\([\s\S]*?\n {2}\);/
+    )?.[0];
+
+    expect(evidenceSource).toBeDefined();
+    expect(lifecycleSource).toBeDefined();
+    expect(advisoryLock).toContain("'throughline:b2:source-truth:'");
+    expect(lifecycleSource).toContain(advisoryLock);
+    expect(evidenceSource!.indexOf(advisoryLock!)).toBeLessThan(
+      evidenceSource!.indexOf("SELECT source.version")
+    );
+    expect(lifecycleSource!.indexOf(advisoryLock!)).toBeLessThan(
+      lifecycleSource!.indexOf("EXISTS (")
+    );
+    expect(sql.match(/'throughline:b2:source-truth:'/g)).toHaveLength(2);
+    const chunkRead = evidenceSource!.slice(
+      evidenceSource!.indexOf("SELECT chunk.source_artifact_id"),
+      evidenceSource!.indexOf("IF source_record IS NULL")
+    );
+    expect(chunkRead).not.toMatch(/\bFOR (?:UPDATE|SHARE)\b/);
   });
 
   it("closes executable persistence over only claim.create and fact.accept", async () => {
@@ -99,6 +171,42 @@ describe("B2 Slice 1 additive migration contract", () => {
     expect(sql).toContain("ops.require_b1_command_atomicity()");
     expect(sql).toContain("ops.require_b2_slice1_command_atomicity()");
     expect(sql).not.toMatch(/CREATE TABLE\s+ops\.domain_events/i);
+  });
+
+  it("replaces the immutable 0008 atomicity function without a PL/pgSQL name collision", async () => {
+    const immutableIntegrity = await readFile(integrityUrl, "utf8");
+    const additiveLifecycle = await readFile(lifecycleUrl, "utf8");
+
+    expect(immutableIntegrity).toContain("event.aggregate_version = aggregate_version");
+    expect(additiveLifecycle).toContain(
+      "CREATE OR REPLACE FUNCTION ops.require_b2_slice1_command_atomicity()"
+    );
+    expect(additiveLifecycle).toContain("expected_aggregate_version integer");
+    expect(additiveLifecycle).toContain("event.aggregate_version = expected_aggregate_version");
+    expect(additiveLifecycle).not.toMatch(/\bevent\.aggregate_version\s*=\s*aggregate_version\b/);
+    expect(additiveLifecycle).toContain("SECURITY DEFINER");
+    expect(additiveLifecycle).toContain("SET search_path = pg_catalog");
+    expect(additiveLifecycle).toContain(
+      "ALTER FUNCTION ops.require_b2_slice1_command_atomicity()\n  OWNER TO throughline_b1_0_integrity"
+    );
+    expect(additiveLifecycle).toContain(
+      "REVOKE ALL ON FUNCTION ops.require_b2_slice1_command_atomicity() FROM PUBLIC"
+    );
+  });
+
+  it("replaces shared Fact-support trigger field selection with relation-agnostic row data", async () => {
+    const additiveLifecycle = await readFile(lifecycleUrl, "utf8");
+    const functionDefinition = additiveLifecycle.match(
+      /CREATE OR REPLACE FUNCTION truth\.validate_fact_support\(\)[\s\S]*?AS \$function\$([\s\S]*?)\$function\$;/
+    );
+    const functionSource = functionDefinition?.[1];
+
+    expect(functionSource).toBeDefined();
+    expect(functionSource).toContain("row_data jsonb := to_jsonb(NEW)");
+    expect(functionSource).toContain("WHEN 'accepted_facts' THEN row_data ->> 'id'");
+    expect(functionSource).toContain("WHEN 'fact_claims' THEN row_data ->> 'fact_id'");
+    expect(functionSource).not.toMatch(/\bNEW\.(?:id|fact_id)\b/);
+    expect(functionDefinition?.[0]).toContain("SET search_path = pg_catalog");
   });
 
   it("grants each B2 command validator only to the runtime role that invokes it", async () => {

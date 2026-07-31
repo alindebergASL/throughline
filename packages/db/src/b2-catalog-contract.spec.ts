@@ -57,9 +57,11 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
 
     await assertB2MigrationStateAbsent(client, "0007_b2_slice1_truth_storage.sql");
     await assertB2MigrationStateAbsent(client, "0008_b2_slice1_command_integrity.sql");
+    await assertB2MigrationStateAbsent(client, "0009_b2_source_truth_lifecycle_interlock.sql");
 
     expect(query.mock.calls[0]?.[0]).toContain("to_regnamespace('truth')");
     expect(query.mock.calls[1]?.[0]).toContain("ops.product_command_record_valid");
+    expect(query.mock.calls[2]?.[0]).toContain("ops.enforce_b2_source_truth_lifecycle_interlock");
   });
 
   it("pins only the four Slice 1 tables and two executable commands", async () => {
@@ -73,10 +75,10 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(contract).not.toContain("require_product_command_atomicity");
   });
 
-  it("pins the 0007/0008 capability boundary and rejects Slice 2 catalog objects", async () => {
+  it("pins the staged B2 capability boundary and rejects full lifecycle objects", async () => {
     const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
 
-    expect(contract).toContain("phase === 2");
+    expect(contract).toContain("phase >= 2");
     expect(contract).toContain("throughline_b1_0_integrity");
     expect(contract).toContain("B2 Slice 1 truth column inventory drifted");
     expect(contract).toContain("B2 Slice 1 truth function inventory drifted");
@@ -84,6 +86,9 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(contract).toContain("truth.reconcile_source_retention()");
     expect(contract).toContain("reconciliation_function !== null");
     expect(contract).toContain("B2 Slice 1 truth table authority drifted");
+    expect(contract).toContain("ops.enforce_b2_source_truth_lifecycle_interlock()");
+    expect(contract).toContain("ERRCODE = 'TLB21'");
+    expect(contract).toContain("B2 source/truth lifecycle interlock trigger inventory drifted");
   });
 
   it("casts PostgreSQL name columns to text before aggregating the exact inventory", async () => {
@@ -122,6 +127,9 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
       expect(contract).toContain(identity);
     }
     expect(contract).toContain("procedure.proowner = current_user::regrole");
+    expect(contract).toContain("procedure.prosrc AS source");
+    expect(contract).toContain("phase >= 3 ? lifecycleSource! : integritySource");
+    expect(contract).toContain('"ops.require_b2_slice1_command_atomicity"');
     expect(contract).toContain("procedure.proacl, acldefault('f', procedure.proowner)");
     expect(contract).toContain("acl_record.grantee <> procedure.proowner");
     expect(contract).toContain('grantee: "throughline_product_relay"');

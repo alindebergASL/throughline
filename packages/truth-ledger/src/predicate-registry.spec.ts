@@ -104,12 +104,12 @@ describe("truth-predicate-catalog.v1", () => {
     expect(() => definition.equals("Outcome agreed", " Outcome agreed")).toThrow();
   });
 
-  it("requires valueJson and normalizedText to be the same canonical assertion", () => {
+  it("requires canonicalValue and normalizedText to be the same canonical assertion", () => {
     expect(
       parsePredicateAssertion({
         predicate: "initiative.primary_objective",
         subjectKind: "initiative",
-        valueJson: "Reduce response time",
+        canonicalValue: "Reduce response time",
         normalizedText: "Reduce response time"
       })
     ).toEqual({
@@ -121,7 +121,7 @@ describe("truth-predicate-catalog.v1", () => {
       parsePredicateAssertion({
         predicate: "initiative.primary_objective",
         subjectKind: "initiative",
-        valueJson: "Reduce response time",
+        canonicalValue: "Reduce response time",
         normalizedText: "Increase throughput"
       })
     ).toThrow();

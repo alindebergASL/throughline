@@ -1,9 +1,4 @@
-import {
-  canonicalJsonStringify,
-  type AccessClass,
-  type ClaimSourceSpanCandidate,
-  type Confidence
-} from "@throughline/core-types";
+import type { AccessClass, ClaimSourceSpanCandidate, Confidence } from "@throughline/core-types";
 import type { TenantDbTransaction } from "@throughline/db";
 import { createHash } from "node:crypto";
 import type { AcceptedFactConfidenceResult } from "./confidence.js";
@@ -87,7 +82,7 @@ interface AcceptanceRow {
   subject_type: "activity" | "initiative";
   subject_id: string;
   predicate: "activity.outcome" | "initiative.primary_objective";
-  value_json: string;
+  canonical_value_text: string;
   normalized_text: string;
   asserted_by_id: string;
   confidence: Confidence;
@@ -115,7 +110,11 @@ interface AcceptanceRow {
 }
 
 export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLookup {
-  constructor(private readonly tx: TenantDbTransaction) {}
+  readonly transaction: TenantDbTransaction;
+
+  constructor(private readonly tx: TenantDbTransaction) {
+    this.transaction = tx;
+  }
 
   async transactionTimestamp(): Promise<string> {
     const result = await this.tx.query<{ now: Date }>(
@@ -200,7 +199,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
        WHERE source.tenant_id = $1 AND source.workspace_id = $2
          AND source.id = $3 AND space.archived_at IS NULL
        LIMIT 1
-       FOR SHARE OF source, activity_source, activity, space`,
+       FOR SHARE OF source, activity, space`,
       [input.tenantId, input.workspaceId, input.sourceArtifactId]
     );
     const sourceRow = source.rows[0];
@@ -222,8 +221,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
               normalized_text, content_hash, access_class
        FROM content.source_chunks
        WHERE tenant_id = $1 AND workspace_id = $2 AND source_artifact_id = $3
-       ORDER BY chunk_index
-       FOR SHARE`,
+       ORDER BY chunk_index`,
       [input.tenantId, input.workspaceId, input.sourceArtifactId]
     );
     if (!chunks.rows.some(({ id }) => id === input.sourceChunkId)) return null;
@@ -298,7 +296,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     actorMembershipId: string;
     assertedById: string;
     predicate: "activity.outcome" | "initiative.primary_objective";
-    valueJson: string;
+    canonicalValue: string;
     normalizedText: string;
     confidence: Confidence;
     validFrom?: string;
@@ -306,7 +304,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     observedAt?: string;
     evidence: VerifiedClaimSourceSpan;
   }): Promise<void> {
-    const valueHash = sha256Canonical(input.valueJson);
+    const valueHash = sha256CanonicalText(input.canonicalValue);
     const evidence = input.evidence;
     await this.tx.query(
       `INSERT INTO truth.verified_evidence_spans (
@@ -345,12 +343,12 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     await this.tx.query(
       `INSERT INTO truth.claims (
          id, tenant_id, workspace_id, space_id, subject_type, subject_id,
-         predicate_catalog_version, predicate, value_json, value_hash, normalized_text,
+         predicate_catalog_version, predicate, canonical_value_text, value_hash, normalized_text,
          verified_evidence_span_id, asserted_by_type, asserted_by_id, confidence,
          valid_from, valid_to, observed_at, status, access_class,
          created_by_user_id, created_by_membership_id, causation_command_id
        ) VALUES (
-         $1,$2,$3,$4,$5,$6,'truth-predicate-catalog.v1',$7,$8::jsonb,$9,$10,
+         $1,$2,$3,$4,$5,$6,'truth-predicate-catalog.v1',$7,$8,$9,$10,
          $11,'person',$12,$13,$14,$15,$16,'proposed',$17,$18,$19,$20
        )`,
       [
@@ -361,7 +359,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
         evidence.subject.type,
         evidence.subject.id,
         input.predicate,
-        canonicalJsonStringify(input.valueJson),
+        input.canonicalValue,
         valueHash,
         input.normalizedText,
         input.evidenceSpanId,
@@ -400,7 +398,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
        WHERE claim.tenant_id = $1 AND claim.workspace_id = $2
          AND claim.id = ANY($3::uuid[])
        ORDER BY claim.id
-       FOR SHARE OF claim, span`,
+       FOR SHARE OF claim`,
       [tenantId, workspaceId, [...claimIds].sort()]
     );
     if (result.rows.length !== claimIds.length) throw new TruthLedgerInvariantError();
@@ -419,7 +417,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
   ): Promise<PersistedClaimForAcceptance[]> {
     const result = await this.tx.query<AcceptanceRow>(
       `SELECT claim.id, claim.space_id, claim.subject_type, claim.subject_id,
-              claim.predicate, claim.value_json #>> '{}' AS value_json,
+              claim.predicate, claim.canonical_value_text,
               claim.normalized_text, claim.asserted_by_id, claim.confidence,
               claim.valid_from, claim.valid_to, claim.observed_at, claim.status,
               claim.access_class, claim.created_at, claim.version AS claim_version,
@@ -459,7 +457,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
          )
        ORDER BY claim.id
        FOR UPDATE OF claim
-       FOR SHARE OF span, source, chunk`,
+       FOR SHARE OF source`,
       [tenantId, workspaceId, [...claimIds].sort()]
     );
     if (result.rows.length !== claimIds.length) throw new TruthLedgerConflictError();
@@ -473,7 +471,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
         subjectType: row.subject_type,
         subjectId: row.subject_id,
         predicate: row.predicate,
-        valueJson: row.value_json,
+        canonicalValue: row.canonical_value_text,
         normalizedText: row.normalized_text,
         assertedByType: "person",
         assertedById: row.asserted_by_id,
@@ -522,8 +520,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
        FROM truth.accepted_facts
        WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
          AND subject_type = $4 AND subject_id = $5 AND predicate = $6
-       LIMIT 1
-       FOR UPDATE`,
+       LIMIT 1`,
       [
         input.tenantId,
         input.workspaceId,
@@ -543,18 +540,18 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
   }): Promise<void> {
     if (!isAcceptedFact(input.fact)) throw new TruthLedgerInvariantError();
     const fact = input.fact;
-    const valueHash = sha256Canonical(fact.valueJson);
+    const valueHash = sha256CanonicalText(fact.canonicalValue);
     await this.tx.query(
       `INSERT INTO truth.accepted_facts (
          id, tenant_id, workspace_id, space_id, subject_type, subject_id,
-         predicate_catalog_version, predicate, value_json, value_hash, normalized_text,
+         predicate_catalog_version, predicate, canonical_value_text, value_hash, normalized_text,
          confidence, confidence_rule, strongest_supporting_confidence, human_lowered,
          confidence_lowering_reason_code, confidence_lowering_rationale,
          valid_from, valid_to, recorded_at, status, access_class,
          accepted_by_user_id, accepted_by_membership_id, acceptance_scope, authority_basis,
          acceptance_policy_version, last_causation_command_id, created_at, updated_at
        ) VALUES (
-         $1,$2,$3,$4,$5,$6,'truth-predicate-catalog.v1',$7,$8::jsonb,$9,$10,
+         $1,$2,$3,$4,$5,$6,'truth-predicate-catalog.v1',$7,$8,$9,$10,
          $11,$12,$13,$14,$15,$16,$17,$18,$19,'current',$20,$21,$22,$23,$24,$25,$26,$27,$27
        )`,
       [
@@ -565,7 +562,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
         fact.subjectType,
         fact.subjectId,
         fact.predicate,
-        canonicalJsonStringify(fact.valueJson),
+        fact.canonicalValue,
         valueHash,
         fact.normalizedText,
         fact.confidence,
@@ -636,6 +633,6 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
   }
 }
 
-export function sha256Canonical(value: unknown): string {
-  return createHash("sha256").update(canonicalJsonStringify(value), "utf8").digest("hex");
+export function sha256CanonicalText(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
 }

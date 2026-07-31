@@ -6,6 +6,10 @@ const integrityUrl = new URL(
   "../../db/migrations/0008_b2_slice1_command_integrity.sql",
   import.meta.url
 );
+const lifecycleUrl = new URL(
+  "../../db/migrations/0009_b2_source_truth_lifecycle_interlock.sql",
+  import.meta.url
+);
 
 describe("B2 Slice 1 PostgreSQL truth invariants", () => {
   it("pins exact evidence, Claim, Fact, support, and acceptance provenance persistence", async () => {
@@ -23,6 +27,11 @@ describe("B2 Slice 1 PostgreSQL truth invariants", () => {
     expect(sql).toContain("human_lowered boolean NOT NULL");
     expect(sql).toContain("confidence_lowering_reason_code text");
     expect(sql).toContain("confidence_lowering_rationale text");
+    expect(sql).toContain("value_json jsonb NOT NULL");
+    expect(sql).not.toContain("canonical_value_text");
+    const lifecycle = await readFile(lifecycleUrl, "utf8");
+    expect(lifecycle).toContain("RENAME COLUMN value_json TO canonical_value_text");
+    expect(lifecycle).toContain("ALTER COLUMN canonical_value_text TYPE text");
     expect(sql).not.toMatch(/fact_lifecycle|redacted_at|redaction_|hash_disposition/);
     expect(sql).not.toMatch(/conflict_groups|fact_supersessions|derived_view|command_effects/);
   });
@@ -58,14 +67,23 @@ describe("B2 Slice 1 PostgreSQL truth invariants", () => {
     expect(integrity).toContain("truth command requires exact audit and product outbox rows");
   });
 
-  it("keeps source reconciliation and lifecycle execution out of Slice 1", async () => {
+  it("fails source lifecycle closed without implementing Stage 3 reconciliation", async () => {
     const schema = await readFile(schemaUrl, "utf8");
     const integrity = await readFile(integrityUrl, "utf8");
+    const lifecycle = await readFile(lifecycleUrl, "utf8");
     expect(schema).not.toMatch(
       /source_artifacts_truth_retention|reconcile_source_retention|fact_lifecycle|b2_retention_command|redacted_at|redaction_|hash_disposition|status = 'revoked'|status = 'rejected'/
     );
     expect(integrity).not.toMatch(/fact_lifecycle|Fact support and lifecycle/);
     expect(integrity).not.toContain("fact.revoke.v1");
     expect(integrity).not.toMatch(/'valueHash'|'supportingClaimsHash'/);
+    expect(lifecycle).toContain("truth.verified_evidence_spans");
+    expect(lifecycle).toContain("Source lifecycle transition is unavailable");
+    expect(lifecycle).toContain("ERRCODE = 'TLB21'");
+    expect(lifecycle).toContain("SECURITY DEFINER");
+    expect([...lifecycle.matchAll(/UPDATE\s+truth\.([a-z_]+)/gi)].map((match) => match[1])).toEqual(
+      ["claims", "accepted_facts"]
+    );
+    expect(lifecycle).not.toMatch(/DELETE\s+FROM\s+truth\./i);
   });
 });

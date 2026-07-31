@@ -2,7 +2,8 @@ import type { PgPoolClient } from "./client.js";
 
 export const B2_MIGRATION_IDS = [
   "0007_b2_slice1_truth_storage.sql",
-  "0008_b2_slice1_command_integrity.sql"
+  "0008_b2_slice1_command_integrity.sql",
+  "0009_b2_source_truth_lifecycle_interlock.sql"
 ] as const;
 
 export type B2MigrationId = (typeof B2_MIGRATION_IDS)[number];
@@ -28,7 +29,7 @@ const truthColumns = {
     "subject_id",
     "predicate_catalog_version",
     "predicate",
-    "value_json",
+    "canonical_value_text",
     "value_hash",
     "normalized_text",
     "confidence",
@@ -61,7 +62,7 @@ const truthColumns = {
     "subject_id",
     "predicate_catalog_version",
     "predicate",
-    "value_json",
+    "canonical_value_text",
     "value_hash",
     "normalized_text",
     "verified_evidence_span_id",
@@ -142,9 +143,13 @@ export async function assertB2MigrationStateAbsent(
   const installed =
     migrationId === "0007_b2_slice1_truth_storage.sql"
       ? await client.query("SELECT to_regnamespace('truth')::text AS installed")
-      : await client.query(
-          "SELECT to_regprocedure('ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)')::text AS installed"
-        );
+      : migrationId === "0008_b2_slice1_command_integrity.sql"
+        ? await client.query(
+            "SELECT to_regprocedure('ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)')::text AS installed"
+          )
+        : await client.query(
+            "SELECT to_regprocedure('ops.enforce_b2_source_truth_lifecycle_interlock()')::text AS installed"
+          );
   if (installed.rows[0]?.installed) {
     throw new Error(`B2 migration state already exists without journal row for ${migrationId}`);
   }
@@ -168,12 +173,28 @@ export async function validateB2CatalogContract(
 
   assertNarrowMigrationSources(migrationSources, phase);
   await validateTruthTables(client);
-  await validateTruthColumnsAndConstraints(client);
+  await validateTruthColumnsAndConstraints(client, phase);
   await validateTruthPolicies(client, phase);
   await validateTruthSecurity(client, phase);
-  await validateTruthFunctions(client, migrationSources.get(B2_MIGRATION_IDS[0])!);
+  await validateTruthFunctions(
+    client,
+    migrationSources.get(B2_MIGRATION_IDS[0])!,
+    migrationSources.get(B2_MIGRATION_IDS[2]),
+    phase
+  );
   await validateTruthConstraintsAndTriggers(client);
-  await validateCommandBoundary(client, phase);
+  await validateCommandBoundary(
+    client,
+    migrationSources.get("0008_b2_slice1_command_integrity.sql")!,
+    migrationSources.get("0009_b2_source_truth_lifecycle_interlock.sql"),
+    phase
+  );
+  if (phase >= 3) {
+    await validateSourceTruthLifecycleInterlock(
+      client,
+      migrationSources.get("0009_b2_source_truth_lifecycle_interlock.sql")!
+    );
+  }
 }
 
 function assertNarrowMigrationSources(
@@ -182,7 +203,11 @@ function assertNarrowMigrationSources(
 ): void {
   const schema = migrationSources.get("0007_b2_slice1_truth_storage.sql");
   const integrity = migrationSources.get("0008_b2_slice1_command_integrity.sql");
+  const lifecycle = migrationSources.get("0009_b2_source_truth_lifecycle_interlock.sql");
   if (!schema || !integrity) throw new Error("Missing fixed B2 migration source");
+  if (phase >= 3 && !lifecycle) {
+    throw new Error("Missing fixed B2 lifecycle migration source");
+  }
   for (const table of truthTables) {
     if (!schema.includes(`CREATE TABLE truth.${table}`)) {
       throw new Error(`B2 truth schema omits ${table}`);
@@ -212,7 +237,7 @@ function assertNarrowMigrationSources(
   if (schema.includes("truth.access_class_rank") || !schema.includes("content.access_class_rank")) {
     throw new Error("B2 Slice 1 must reuse the sealed canonical access-class lattice");
   }
-  if (phase === 2) {
+  if (phase >= 2) {
     for (const kind of b2Slice1CommandKinds) {
       if (!integrity.includes(`'${kind}'`)) {
         throw new Error(`B2 Slice 1 command catalog omits ${kind}`);
@@ -231,6 +256,16 @@ function assertNarrowMigrationSources(
         throw new Error(`B2 Slice 1 command catalog executes future kind ${forbidden}`);
       }
     }
+  }
+  if (
+    phase >= 3 &&
+    (!lifecycle!.includes("SECURITY DEFINER") ||
+      !lifecycle!.includes("SET search_path = pg_catalog") ||
+      !lifecycle!.includes("FROM truth.verified_evidence_spans") ||
+      !lifecycle!.includes("ERRCODE = 'TLB21'") ||
+      !lifecycle!.includes("MESSAGE = 'Source lifecycle transition is unavailable'"))
+  ) {
+    throw new Error("B2 lifecycle migration omits its fixed fail-closed boundary");
   }
 }
 
@@ -260,7 +295,10 @@ async function validateTruthTables(client: PgPoolClient): Promise<void> {
   }
 }
 
-async function validateTruthColumnsAndConstraints(client: PgPoolClient): Promise<void> {
+async function validateTruthColumnsAndConstraints(
+  client: PgPoolClient,
+  phase: number
+): Promise<void> {
   const columns = await client.query<{ table_name: string; columns: string[] }>(
     `SELECT relation.relname AS table_name,
             array_agg(attribute.attname::text ORDER BY attribute.attnum) AS columns
@@ -276,10 +314,41 @@ async function validateTruthColumnsAndConstraints(client: PgPoolClient): Promise
   );
   const expectedColumns = truthTables.map((table_name) => ({
     table_name,
-    columns: [...truthColumns[table_name]]
+    columns: truthColumns[table_name].map((column) =>
+      phase >= 3 || column !== "canonical_value_text" ? column : "value_json"
+    )
   }));
   if (JSON.stringify(columns.rows) !== JSON.stringify(expectedColumns)) {
     throw new Error("B2 Slice 1 truth column inventory drifted");
+  }
+  const canonicalValues = await client.query<{
+    table_name: string;
+    data_type: string;
+  }>(
+    `SELECT relation.relname AS table_name, format_type(attribute.atttypid, NULL) AS data_type
+       FROM pg_attribute attribute
+       JOIN pg_class relation ON relation.oid = attribute.attrelid
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'truth'
+        AND relation.relname IN ('claims','accepted_facts')
+        AND attribute.attname = $1
+        AND attribute.attnum > 0
+        AND NOT attribute.attisdropped
+      ORDER BY relation.relname`,
+    [phase >= 3 ? "canonical_value_text" : "value_json"]
+  );
+  if (
+    JSON.stringify(canonicalValues.rows) !==
+    JSON.stringify([
+      { table_name: "accepted_facts", data_type: phase >= 3 ? "text" : "jsonb" },
+      { table_name: "claims", data_type: phase >= 3 ? "text" : "jsonb" }
+    ])
+  ) {
+    throw new Error(
+      phase >= 3
+        ? "B2 canonical truth values are not stored as text"
+        : "B2 v1 truth values are not stored as JSON strings"
+    );
   }
 
   const constraints = await client.query<{ definition: string }>(
@@ -339,23 +408,23 @@ async function validateTruthPolicies(client: PgPoolClient, phase: number): Promi
   const expectedPolicies = [
     ["accepted_facts_insert", "accepted_facts", "a", "throughline_app"],
     ["accepted_facts_select", "accepted_facts", "r", "throughline_app"],
-    ...(phase === 2
+    ...(phase >= 2
       ? [["accepted_facts_integrity_select", "accepted_facts", "r", "throughline_b1_0_integrity"]]
       : []),
     ["claims_insert", "claims", "a", "throughline_app"],
     ["claims_select", "claims", "r", "throughline_app"],
     ["claims_update", "claims", "w", "throughline_app"],
-    ...(phase === 2
+    ...(phase >= 2
       ? [["claims_integrity_select", "claims", "r", "throughline_b1_0_integrity"]]
       : []),
     ["fact_claims_insert", "fact_claims", "a", "throughline_app"],
     ["fact_claims_select", "fact_claims", "r", "throughline_app"],
-    ...(phase === 2
+    ...(phase >= 2
       ? [["fact_claims_integrity_select", "fact_claims", "r", "throughline_b1_0_integrity"]]
       : []),
     ["verified_evidence_insert", "verified_evidence_spans", "a", "throughline_app"],
     ["verified_evidence_select", "verified_evidence_spans", "r", "throughline_app"],
-    ...(phase === 2
+    ...(phase >= 2
       ? [
           [
             "verified_evidence_integrity_select",
@@ -425,7 +494,7 @@ async function validateTruthSecurity(client: PgPoolClient, phase: number): Promi
   );
   const expectedSchemaPrivileges = [
     { grantee: "throughline_app", privilege: "USAGE", grantable: false },
-    ...(phase === 2
+    ...(phase >= 2
       ? [{ grantee: "throughline_b1_0_integrity", privilege: "USAGE", grantable: false }]
       : [])
   ].sort((left, right) => left.grantee.localeCompare(right.grantee));
@@ -480,7 +549,7 @@ async function validateTruthSecurity(client: PgPoolClient, phase: number): Promi
         grantable: false
       });
     }
-    if (phase === 2) {
+    if (phase >= 2) {
       expectedTablePrivileges.push({
         table_name,
         scope: "table",
@@ -511,7 +580,12 @@ async function validateTruthSecurity(client: PgPoolClient, phase: number): Promi
   }
 }
 
-async function validateTruthFunctions(client: PgPoolClient, schemaSource: string): Promise<void> {
+async function validateTruthFunctions(
+  client: PgPoolClient,
+  schemaSource: string,
+  lifecycleSource: string | undefined,
+  phase: number
+): Promise<void> {
   const inventory = await client.query<{ identity: string }>(
     `SELECT procedure.oid::regprocedure::text AS identity
        FROM pg_proc procedure
@@ -563,7 +637,7 @@ async function validateTruthFunctions(client: PgPoolClient, schemaSource: string
         kind: "f",
         configuration: ["search_path=pg_catalog"],
         source: migrationFunctionSource(
-          schemaSource,
+          phase >= 3 && !accessFunction ? lifecycleSource! : schemaSource,
           accessFunction ? "access.can_read_space" : identity.slice(0, -2)
         )
       };
@@ -647,12 +721,14 @@ async function validateTruthConstraintsAndTriggers(client: PgPoolClient): Promis
     name,
     table_name,
     function_identity,
+    enabled: true,
     deferrable: deferred,
     initially_deferred: deferred
   }));
   const triggers = await client.query<Record<string, unknown>>(
     `SELECT trigger_record.tgname AS name, relation.relname AS table_name,
             procedure.oid::regprocedure::text AS function_identity,
+            trigger_record.tgenabled = 'O' AS enabled,
             trigger_record.tgdeferrable AS deferrable,
             trigger_record.tginitdeferred AS initially_deferred
        FROM pg_trigger trigger_record
@@ -707,7 +783,12 @@ async function validateTruthConstraintsAndTriggers(client: PgPoolClient): Promis
   }
 }
 
-async function validateCommandBoundary(client: PgPoolClient, phase: number): Promise<void> {
+async function validateCommandBoundary(
+  client: PgPoolClient,
+  integritySource: string,
+  lifecycleSource: string | undefined,
+  phase: number
+): Promise<void> {
   const boundary = await client.query<{
     b1_constraint: string | null;
     product_constraint: string | null;
@@ -767,7 +848,7 @@ async function validateCommandBoundary(client: PgPoolClient, phase: number): Pro
      ) AS definition`
   );
   assertProductValidatorDelegatesExactB1Kinds(validator.rows[0]?.definition ?? "");
-  await validateCommandFunctionSecurity(client);
+  await validateCommandFunctionSecurity(client, integritySource, lifecycleSource, phase);
   const probes = await client.query<{
     b1_valid: boolean;
     claim_valid: boolean;
@@ -817,7 +898,12 @@ async function validateCommandBoundary(client: PgPoolClient, phase: number): Pro
   }
 }
 
-async function validateCommandFunctionSecurity(client: PgPoolClient): Promise<void> {
+async function validateCommandFunctionSecurity(
+  client: PgPoolClient,
+  integritySource: string,
+  lifecycleSource: string | undefined,
+  phase: number
+): Promise<void> {
   const functionIdentities = [
     "ops.b2_slice1_audit_detail_valid(text,text,integer,uuid,jsonb)",
     "ops.b2_slice1_event_payload_valid(text,integer,uuid,jsonb)",
@@ -838,7 +924,8 @@ async function validateCommandFunctionSecurity(client: PgPoolClient): Promise<vo
             procedure.proleakproof AS leakproof,
             procedure.proparallel::text AS parallel,
             procedure.prokind::text AS kind,
-            COALESCE(procedure.proconfig, ARRAY[]::text[]) AS configuration
+            COALESCE(procedure.proconfig, ARRAY[]::text[]) AS configuration,
+            procedure.prosrc AS source
        FROM pg_proc procedure
        JOIN pg_language language ON language.oid = procedure.prolang
       WHERE procedure.oid = ANY($1::regprocedure[])
@@ -858,7 +945,8 @@ async function validateCommandFunctionSecurity(client: PgPoolClient): Promise<vo
       leakproof: false,
       parallel: "u",
       kind: "f",
-      configuration: searchPath
+      configuration: searchPath,
+      source: migrationFunctionSource(integritySource, "ops.b2_slice1_audit_detail_valid")
     },
     {
       identity: functionIdentities[1],
@@ -871,7 +959,8 @@ async function validateCommandFunctionSecurity(client: PgPoolClient): Promise<vo
       leakproof: false,
       parallel: "u",
       kind: "f",
-      configuration: searchPath
+      configuration: searchPath,
+      source: migrationFunctionSource(integritySource, "ops.b2_slice1_event_payload_valid")
     },
     {
       identity: functionIdentities[2],
@@ -884,7 +973,8 @@ async function validateCommandFunctionSecurity(client: PgPoolClient): Promise<vo
       leakproof: false,
       parallel: "u",
       kind: "f",
-      configuration: searchPath
+      configuration: searchPath,
+      source: migrationFunctionSource(integritySource, "ops.product_command_record_valid")
     },
     {
       identity: functionIdentities[3],
@@ -897,7 +987,11 @@ async function validateCommandFunctionSecurity(client: PgPoolClient): Promise<vo
       leakproof: false,
       parallel: "u",
       kind: "f",
-      configuration: searchPath
+      configuration: searchPath,
+      source: migrationFunctionSource(
+        phase >= 3 ? lifecycleSource! : integritySource,
+        "ops.require_b2_slice1_command_atomicity"
+      )
     }
   ];
   if (JSON.stringify(functions.rows) !== JSON.stringify(expectedFunctions)) {
@@ -957,6 +1051,114 @@ async function validateCommandFunctionSecurity(client: PgPoolClient): Promise<vo
   ];
   if (JSON.stringify(privileges.rows) !== JSON.stringify(expectedPrivileges)) {
     throw new Error("B2 Slice 1 command function EXECUTE grants drifted");
+  }
+}
+
+async function validateSourceTruthLifecycleInterlock(
+  client: PgPoolClient,
+  migrationSource: string
+): Promise<void> {
+  const identity = "ops.enforce_b2_source_truth_lifecycle_interlock()" as const;
+  const functionShape = await client.query<Record<string, unknown>>(
+    `SELECT procedure.oid::regprocedure::text AS identity,
+            pg_get_function_result(procedure.oid) AS result,
+            language.lanname AS language,
+            pg_get_userbyid(procedure.proowner) AS owner,
+            procedure.prosecdef AS security_definer,
+            procedure.provolatile::text AS volatility,
+            COALESCE(procedure.proconfig, ARRAY[]::text[]) AS configuration,
+            procedure.prosrc AS source
+       FROM pg_proc procedure
+       JOIN pg_language language ON language.oid = procedure.prolang
+      WHERE procedure.oid = $1::regprocedure`,
+    [identity]
+  );
+  if (
+    JSON.stringify(functionShape.rows) !==
+    JSON.stringify([
+      {
+        identity,
+        result: "trigger",
+        language: "plpgsql",
+        owner: "throughline_b1_0_integrity",
+        security_definer: true,
+        volatility: "v",
+        configuration: ["search_path=pg_catalog"],
+        source: migrationFunctionSource(
+          migrationSource,
+          "ops.enforce_b2_source_truth_lifecycle_interlock"
+        )
+      }
+    ])
+  ) {
+    throw new Error("B2 source/truth lifecycle interlock function drifted");
+  }
+
+  const privileges = await client.query<Record<string, unknown>>(
+    `SELECT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                 ELSE pg_get_userbyid(acl.grantee) END AS grantee,
+            acl.privilege_type AS privilege,
+            acl.is_grantable AS grantable
+       FROM pg_proc procedure
+       CROSS JOIN LATERAL aclexplode(COALESCE(
+         procedure.proacl, acldefault('f', procedure.proowner)
+       )) acl
+      WHERE procedure.oid = $1::regprocedure
+        AND acl.grantee <> procedure.proowner
+      ORDER BY grantee, privilege, grantable`,
+    [identity]
+  );
+  if (privileges.rows.length !== 0) {
+    throw new Error("B2 source/truth lifecycle interlock is directly callable");
+  }
+
+  const triggers = await client.query<Record<string, unknown>>(
+    `SELECT trigger_record.tgname AS name,
+            trigger_record.tgrelid::regclass::text AS relation,
+            procedure.oid::regprocedure::text AS function_identity,
+            pg_get_triggerdef(trigger_record.oid, false) AS definition
+       FROM pg_trigger trigger_record
+       JOIN pg_proc procedure ON procedure.oid = trigger_record.tgfoid
+      WHERE procedure.oid = $1::regprocedure
+        AND NOT trigger_record.tgisinternal
+      ORDER BY trigger_record.tgname`,
+    [identity]
+  );
+  const expected = [
+    {
+      name: "source_artifacts_z_b2_correction_interlock",
+      relation: "content.source_artifacts",
+      event: "BEFORE INSERT",
+      conditions: ["new.supersedes_source_id is not null"]
+    },
+    {
+      name: "source_artifacts_z_b2_tombstone_interlock",
+      relation: "content.source_artifacts",
+      event: "BEFORE UPDATE",
+      conditions: ["old.deleted_at is null", "new.deleted_at is not null"]
+    },
+    {
+      name: "source_chunks_z_b2_delete_interlock",
+      relation: "content.source_chunks",
+      event: "BEFORE DELETE",
+      conditions: []
+    }
+  ];
+  if (
+    triggers.rows.length !== expected.length ||
+    triggers.rows.some((row, index) => {
+      const wanted = expected[index]!;
+      const definition = String(row.definition).toLowerCase().replaceAll(/[()"]/g, "");
+      return (
+        row.name !== wanted.name ||
+        row.relation !== wanted.relation ||
+        row.function_identity !== identity ||
+        !definition.includes(wanted.event.toLowerCase()) ||
+        wanted.conditions.some((condition) => !definition.includes(condition))
+      );
+    })
+  ) {
+    throw new Error("B2 source/truth lifecycle interlock trigger inventory drifted");
   }
 }
 

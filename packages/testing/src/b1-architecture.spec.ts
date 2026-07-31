@@ -23,7 +23,8 @@ describe("Wave B1 architecture boundaries", () => {
       "0005_b1_content_sources.sql",
       "0006_b1_command_integrity.sql",
       "0007_b2_slice1_truth_storage.sql",
-      "0008_b2_slice1_command_integrity.sql"
+      "0008_b2_slice1_command_integrity.sql",
+      "0009_b2_source_truth_lifecycle_interlock.sql"
     ]);
     for (const [file, digest] of Object.entries(expected)) {
       const bytes = await readFile(join(root, "packages/db/migrations", file));

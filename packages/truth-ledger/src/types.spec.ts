@@ -1,10 +1,12 @@
 import { SOURCE_CHUNKING_VERSION, SOURCE_NORMALIZATION_VERSION } from "@throughline/core-types";
+import type { TenantDbTransaction } from "@throughline/db";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { describe, expect, expectTypeOf, it } from "vitest";
 import * as publicApi from "./index.js";
 import {
   VerifiedClaimSourceSpanAdmission,
+  bindClaimEvidenceSnapshotLookupToTransaction,
   type AuthorizedClaimEvidenceSnapshot,
   type VerifiedClaimSourceSpan
 } from "./source-span.js";
@@ -42,41 +44,66 @@ const ids = {
   initiative: "018f0000-0000-7000-8000-00000000000d"
 } as const;
 
+interface ScopeReferences {
+  tenant: string;
+  workspace: string;
+  space: string;
+}
+
+const generatedScopeReferences: ScopeReferences = {
+  tenant: ids.tenant,
+  workspace: ids.workspace,
+  space: ids.space
+};
+
+const establishedUuidV4ScopeReferences: ScopeReferences = {
+  tenant: "11111111-1111-4111-8111-111111111111",
+  workspace: "11111111-1111-4111-8111-111111111112",
+  space: "11111111-1111-4111-8111-111111111113"
+};
+
+const establishedUuidV4IdentityReferences = {
+  person: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
+  user: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1",
+  membership: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5"
+} as const;
+
 function hash(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
 }
 
 async function verifiedSpan(
-  subjectType: "activity" | "initiative" = "activity"
+  subjectType: "activity" | "initiative" = "activity",
+  scope: ScopeReferences = generatedScopeReferences
 ): Promise<VerifiedClaimSourceSpan> {
   const text = "Outcome agreed";
   const subjectId = subjectType === "activity" ? ids.activity : ids.initiative;
   const snapshot: AuthorizedClaimEvidenceSnapshot = {
-    tenantId: ids.tenant,
-    workspaceId: ids.workspace,
-    spaceId: ids.space,
+    tenantId: scope.tenant,
+    workspaceId: scope.workspace,
+    spaceId: scope.space,
     subject: {
       type: subjectType,
       id: subjectId,
-      tenantId: ids.tenant,
-      workspaceId: ids.workspace,
-      spaceId: ids.space,
+      tenantId: scope.tenant,
+      workspaceId: scope.workspace,
+      spaceId: scope.space,
       version: 2,
       accessClass: "workspace"
     },
     sourceActivityLink: {
-      tenantId: ids.tenant,
-      workspaceId: ids.workspace,
-      spaceId: ids.space,
+      tenantId: scope.tenant,
+      workspaceId: scope.workspace,
+      spaceId: scope.space,
       sourceArtifactId: ids.source,
       activityId: ids.activity,
       governingInitiativeId: ids.initiative
     },
     source: {
       id: ids.source,
-      tenantId: ids.tenant,
-      workspaceId: ids.workspace,
-      spaceId: ids.space,
+      tenantId: scope.tenant,
+      workspaceId: scope.workspace,
+      spaceId: scope.space,
       version: 1,
       immutableText: text,
       contentHash: hash(text),
@@ -90,9 +117,9 @@ async function verifiedSpan(
     chunks: [
       {
         id: ids.chunk,
-        tenantId: ids.tenant,
-        workspaceId: ids.workspace,
-        spaceId: ids.space,
+        tenantId: scope.tenant,
+        workspaceId: scope.workspace,
+        spaceId: scope.space,
         sourceArtifactId: ids.source,
         version: 1,
         normalizationVersion: SOURCE_NORMALIZATION_VERSION,
@@ -107,15 +134,23 @@ async function verifiedSpan(
     ],
     explicitPolicyAccessClass: "workspace"
   };
+  const transaction = {
+    client: {} as TenantDbTransaction["client"],
+    async query() {
+      return { rows: [] };
+    }
+  } as unknown as TenantDbTransaction;
   return new VerifiedClaimSourceSpanAdmission(
-    {
+    transaction,
+    bindClaimEvidenceSnapshotLookupToTransaction(transaction, {
+      transaction,
       async getAuthorizedClaimEvidenceSnapshot() {
         return snapshot;
       }
-    },
+    }),
     {
-      tenantId: ids.tenant,
-      workspaceId: ids.workspace
+      tenantId: scope.tenant,
+      workspaceId: scope.workspace
     }
   ).admit({
     subject: { type: subjectType, id: subjectId, expectedVersion: 2 },
@@ -141,19 +176,20 @@ function claim(
   id: string,
   sourceSpan: VerifiedClaimSourceSpan,
   confidence: "strong" | "weak",
-  subjectType: "activity" | "initiative" = "activity"
+  subjectType: "activity" | "initiative" = "activity",
+  scope: ScopeReferences = generatedScopeReferences
 ): Claim {
   const subjectId = subjectType === "activity" ? ids.activity : ids.initiative;
   return {
     id,
     version: 1,
-    tenantId: ids.tenant,
-    workspaceId: ids.workspace,
-    spaceId: ids.space,
+    tenantId: scope.tenant,
+    workspaceId: scope.workspace,
+    spaceId: scope.space,
     subjectType,
     subjectId,
     predicate: subjectType === "activity" ? "activity.outcome" : "initiative.primary_objective",
-    valueJson: "Outcome agreed",
+    canonicalValue: "Outcome agreed",
     normalizedText: "Outcome agreed",
     sourceSpan,
     assertedByType: "person",
@@ -220,6 +256,147 @@ describe("construction-controlled truth records", () => {
     });
   });
 
+  it("accepts established UUIDv4 scope references while retaining UUIDv7 entity IDs", async () => {
+    const span = await verifiedSpan("activity", establishedUuidV4ScopeReferences);
+    const fact = constructAcceptedFactAtTrustedBoundary({
+      id: ids.fact,
+      claims: [claim(ids.claim1, span, "strong", "activity", establishedUuidV4ScopeReferences)],
+      subjectAccessClass: "workspace",
+      explicitPolicyAccessClass: "workspace",
+      acceptedByUserId: ids.user,
+      acceptedByMembershipId: ids.membership,
+      acceptanceScope: "engagement",
+      authorityBasis: "activity_owner",
+      policyVersion: "policy-v7",
+      recordedAt: "2026-07-23T00:24:04Z",
+      createdAt: "2026-07-23T00:24:04Z"
+    });
+
+    expect(fact).toMatchObject({
+      id: ids.fact,
+      tenantId: establishedUuidV4ScopeReferences.tenant,
+      workspaceId: establishedUuidV4ScopeReferences.workspace,
+      spaceId: establishedUuidV4ScopeReferences.space,
+      supportingClaimIds: [ids.claim1]
+    });
+  });
+
+  it("accepts established UUIDv4 identity references at the trusted Fact boundary", async () => {
+    const span = await verifiedSpan();
+    const fact = constructAcceptedFactAtTrustedBoundary({
+      id: ids.fact,
+      claims: [
+        {
+          ...claim(ids.claim1, span, "strong"),
+          assertedById: establishedUuidV4IdentityReferences.person
+        }
+      ],
+      subjectAccessClass: "workspace",
+      explicitPolicyAccessClass: "workspace",
+      acceptedByUserId: establishedUuidV4IdentityReferences.user,
+      acceptedByMembershipId: establishedUuidV4IdentityReferences.membership,
+      acceptanceScope: "engagement",
+      authorityBasis: "activity_owner",
+      policyVersion: "policy-v7",
+      recordedAt: "2026-07-23T00:24:04Z",
+      createdAt: "2026-07-23T00:24:04Z"
+    });
+
+    expect(fact).toMatchObject({
+      id: ids.fact,
+      acceptedByUserId: establishedUuidV4IdentityReferences.user,
+      acceptedByMembershipId: establishedUuidV4IdentityReferences.membership,
+      supportingClaimIds: [ids.claim1]
+    });
+  });
+
+  it("rejects malformed or noncanonical identity references without loosening entity UUIDv7", async () => {
+    const span = await verifiedSpan();
+    const base = claim(ids.claim1, span, "strong");
+    const construction = {
+      id: ids.fact,
+      claims: [base],
+      subjectAccessClass: "workspace" as const,
+      explicitPolicyAccessClass: "workspace" as const,
+      acceptedByUserId: ids.user,
+      acceptedByMembershipId: ids.membership,
+      acceptanceScope: "engagement" as const,
+      authorityBasis: "activity_owner" as const,
+      policyVersion: "policy-v7",
+      recordedAt: "2026-07-23T00:24:04Z",
+      createdAt: "2026-07-23T00:24:04Z"
+    };
+
+    for (const input of [
+      { ...construction, claims: [{ ...base, assertedById: "not-a-uuid" }] },
+      {
+        ...construction,
+        acceptedByUserId: "aaaaaaaa-aaaa-0aaa-8aaa-aaaaaaaaaaa1"
+      },
+      {
+        ...construction,
+        acceptedByMembershipId: "aaaaaaaa-aaaa-4aaa-7aaa-aaaaaaaaaaa5"
+      },
+      {
+        ...construction,
+        claims: [{ ...base, assertedById: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAA3" }]
+      }
+    ]) {
+      expect(() => constructAcceptedFactAtTrustedBoundary(input)).toThrow();
+    }
+    expect(() =>
+      constructAcceptedFactAtTrustedBoundary({
+        ...construction,
+        id: establishedUuidV4IdentityReferences.user
+      })
+    ).toThrow();
+    expect(() =>
+      constructAcceptedFactAtTrustedBoundary({
+        ...construction,
+        claims: [{ ...base, id: establishedUuidV4IdentityReferences.person }]
+      })
+    ).toThrow();
+  });
+
+  it("rejects malformed or noncanonical scope references without loosening entity UUIDv7", async () => {
+    const span = await verifiedSpan();
+    const base = claim(ids.claim1, span, "strong");
+    const construction = {
+      id: ids.fact,
+      claims: [base],
+      subjectAccessClass: "workspace" as const,
+      explicitPolicyAccessClass: "workspace" as const,
+      acceptedByUserId: ids.user,
+      acceptedByMembershipId: ids.membership,
+      acceptanceScope: "engagement" as const,
+      authorityBasis: "activity_owner" as const,
+      policyVersion: "policy-v7",
+      recordedAt: "2026-07-23T00:24:04Z",
+      createdAt: "2026-07-23T00:24:04Z"
+    };
+
+    for (const claims of [
+      [{ ...base, tenantId: "not-a-uuid" }],
+      [{ ...base, workspaceId: "11111111-1111-0111-8111-111111111112" }],
+      [{ ...base, spaceId: "11111111-1111-4111-7111-111111111113" }],
+      [{ ...base, tenantId: "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA" }]
+    ]) {
+      expect(() => constructAcceptedFactAtTrustedBoundary({ ...construction, claims })).toThrow();
+    }
+    expect(() =>
+      constructAcceptedFactAtTrustedBoundary({
+        ...construction,
+        id: establishedUuidV4ScopeReferences.tenant
+      })
+    ).toThrow();
+    expect(() =>
+      constructAcceptedFactAtTrustedBoundary({
+        ...construction,
+        claims: [{ ...base, id: establishedUuidV4ScopeReferences.tenant }]
+      })
+    ).toThrow();
+  });
+
   it("rejects forged evidence, incompatible supports, and non-owner authority shape", async () => {
     const span = await verifiedSpan();
     const base = claim(ids.claim1, span, "strong");
@@ -261,7 +438,7 @@ describe("construction-controlled truth records", () => {
     expect(() =>
       constructAcceptedFactAtTrustedBoundary({
         ...construction,
-        claims: [base, { ...claim(ids.claim2, span, "weak"), valueJson: "Different outcome" }]
+        claims: [base, { ...claim(ids.claim2, span, "weak"), canonicalValue: "Different outcome" }]
       })
     ).toThrow();
     expect(() =>

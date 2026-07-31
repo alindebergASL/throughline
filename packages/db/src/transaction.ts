@@ -83,7 +83,7 @@ export async function withTenantTransaction<T>(
   let destroyConnection = false;
 
   try {
-    await client.query("BEGIN");
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
     await setTransactionContext(client, context);
 
     const tx: TenantDbTransaction = {

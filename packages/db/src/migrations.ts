@@ -157,6 +157,12 @@ async function validateInstalledProductCatalog(
       });
       await validateB2CatalogContract(client, journal, migrationSources);
       return;
+    case 3:
+      await validateB1CatalogContract(client, journal, migrationSources, {
+        additiveB2Phase: 3
+      });
+      await validateB2CatalogContract(client, journal, migrationSources);
+      return;
   }
 }
 

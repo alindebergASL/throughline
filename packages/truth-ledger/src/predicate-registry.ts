@@ -172,11 +172,11 @@ export function resolvePredicateDefinition(
 export function parsePredicateAssertion(input: {
   predicate: unknown;
   subjectKind: unknown;
-  valueJson: unknown;
+  canonicalValue: unknown;
   normalizedText: unknown;
 }): { predicate: B2TruthPredicate; canonicalValue: string; normalizedText: string } {
   const definition = resolvePredicateDefinition(input.predicate, input.subjectKind);
-  const canonicalValue = definition.valueSchema.parse(input.valueJson);
+  const canonicalValue = definition.valueSchema.parse(input.canonicalValue);
   const normalizedText = definition.valueSchema.parse(input.normalizedText);
   if (!definition.equals(canonicalValue, normalizedText)) throw new PredicateRegistryError();
   return { predicate: definition.predicate, canonicalValue, normalizedText };

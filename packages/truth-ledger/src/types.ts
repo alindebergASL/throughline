@@ -48,6 +48,9 @@ export const ACCEPTED_FACT_STATUSES = Object.freeze([
 ] as const);
 export type AcceptedFactStatus = (typeof ACCEPTED_FACT_STATUSES)[number];
 
+const CANONICAL_ESTABLISHED_UUID_REFERENCE_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
 export interface Claim {
   readonly id: string;
   readonly version: number;
@@ -57,7 +60,7 @@ export interface Claim {
   readonly subjectType: TruthSubjectKind;
   readonly subjectId: string;
   readonly predicate: B2TruthPredicate;
-  readonly valueJson: string;
+  readonly canonicalValue: string;
   readonly normalizedText: string;
   readonly sourceSpan: VerifiedClaimSourceSpan;
   readonly assertedByType: "person";
@@ -84,7 +87,7 @@ export type AcceptedFact = Readonly<{
   subjectType: TruthSubjectKind;
   subjectId: string;
   predicate: B2TruthPredicate;
-  valueJson: string;
+  canonicalValue: string;
   normalizedText: string;
   supportingClaimIds: readonly string[];
   confidence: Confidence;
@@ -126,6 +129,13 @@ export interface AcceptedFactConstructionInput {
   readonly confidenceLowering?: ConfidenceLoweringRequest;
 }
 
+function requireCanonicalEstablishedUuidReference(input: unknown): string {
+  if (typeof input !== "string" || !CANONICAL_ESTABLISHED_UUID_REFERENCE_PATTERN.test(input)) {
+    return failContract();
+  }
+  return input;
+}
+
 /** Package-internal trusted construction boundary; intentionally omitted from the root export. */
 export function constructAcceptedFactAtTrustedBoundary(
   input: AcceptedFactConstructionInput
@@ -140,19 +150,19 @@ export function constructAcceptedFactAtTrustedBoundary(
   if (supersedesFactId === factId) return failContract();
   const first = claims[0]!;
   const definition = resolvePredicateDefinition(first.predicate, first.subjectType);
-  definition.valueSchema.parse(first.valueJson);
+  definition.valueSchema.parse(first.canonicalValue);
   definition.valueSchema.parse(first.normalizedText);
-  if (!definition.equals(first.valueJson, first.normalizedText)) return failContract();
+  if (!definition.equals(first.canonicalValue, first.normalizedText)) return failContract();
 
   const seen = new Set<string>();
   for (const claim of claims) {
     const claimId = requireUuidV7(claim.id);
     requirePositiveInteger(claim.version);
-    requireUuidV7(claim.tenantId);
-    requireUuidV7(claim.workspaceId);
-    requireUuidV7(claim.spaceId);
+    requireCanonicalEstablishedUuidReference(claim.tenantId);
+    requireCanonicalEstablishedUuidReference(claim.workspaceId);
+    requireCanonicalEstablishedUuidReference(claim.spaceId);
     requireUuidV7(claim.subjectId);
-    requireUuidV7(claim.assertedById);
+    requireCanonicalEstablishedUuidReference(claim.assertedById);
     requireTimestamp(claim.createdAt);
     requireEnum(claim.accessClass, ["public", "workspace", "restricted", "confidential"] as const);
     requireEnum(claim.status, CLAIM_STATUSES);
@@ -167,7 +177,7 @@ export function constructAcceptedFactAtTrustedBoundary(
       claim.subjectType !== first.subjectType ||
       claim.subjectId !== first.subjectId ||
       claim.predicate !== first.predicate ||
-      !definition.equals(claim.valueJson, first.valueJson) ||
+      !definition.equals(claim.canonicalValue, first.canonicalValue) ||
       !definition.equals(claim.normalizedText, first.normalizedText) ||
       claim.validFrom !== first.validFrom ||
       claim.validTo !== first.validTo ||
@@ -235,13 +245,13 @@ export function constructAcceptedFactAtTrustedBoundary(
   const fact = {
     id: factId,
     version: 1 as const,
-    tenantId: requireUuidV7(first.tenantId),
-    workspaceId: requireUuidV7(first.workspaceId),
-    spaceId: requireUuidV7(first.spaceId),
+    tenantId: requireCanonicalEstablishedUuidReference(first.tenantId),
+    workspaceId: requireCanonicalEstablishedUuidReference(first.workspaceId),
+    spaceId: requireCanonicalEstablishedUuidReference(first.spaceId),
     subjectType: first.subjectType,
     subjectId: requireUuidV7(first.subjectId),
     predicate: first.predicate,
-    valueJson: first.valueJson,
+    canonicalValue: first.canonicalValue,
     normalizedText: first.normalizedText,
     supportingClaimIds: Object.freeze(supportingClaimIds),
     confidence: confidenceDecision.confidence,
@@ -252,8 +262,8 @@ export function constructAcceptedFactAtTrustedBoundary(
     status: "current" as const,
     ...(supersedesFactId === undefined ? {} : { supersedesFactId }),
     accessClass,
-    acceptedByUserId: requireUuidV7(input.acceptedByUserId),
-    acceptedByMembershipId: requireUuidV7(input.acceptedByMembershipId),
+    acceptedByUserId: requireCanonicalEstablishedUuidReference(input.acceptedByUserId),
+    acceptedByMembershipId: requireCanonicalEstablishedUuidReference(input.acceptedByMembershipId),
     acceptanceScope,
     authorityBasis,
     policyVersion: requireSafeReference(input.policyVersion),

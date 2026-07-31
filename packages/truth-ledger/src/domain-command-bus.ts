@@ -28,7 +28,10 @@ import {
   parseB2CommandResult
 } from "./command-schemas.js";
 import { TruthLedgerConflictError, TruthLedgerRepository } from "./repository.js";
-import { VerifiedClaimSourceSpanAdmission } from "./source-span.js";
+import {
+  VerifiedClaimSourceSpanAdmission,
+  bindClaimEvidenceSnapshotLookupToTransaction
+} from "./source-span.js";
 import { constructAcceptedFactAtTrustedBoundary, type Claim } from "./types.js";
 import { generateUuidV7 } from "./uuid.js";
 
@@ -36,7 +39,12 @@ const APP_ROLE = "throughline_app";
 const COMMAND_SCHEMA_VERSION = 1;
 
 export type DurableTruthCommandKind = "claim.create" | "fact.accept";
-type DurableTruthCommand = B2AuthorizedDomainCommand<DurableTruthCommandKind>;
+type InternalCreateClaimCommand = Omit<B2AuthorizedDomainCommand<"claim.create">, "payload"> & {
+  payload: Omit<B2CommandPayloadMap["claim.create"], "valueJson"> & {
+    canonicalValue: string;
+  };
+};
+type DurableTruthCommand = InternalCreateClaimCommand | B2AuthorizedDomainCommand<"fact.accept">;
 type DurableTruthResult = B2CommandResultMap[DurableTruthCommandKind];
 
 export class B2AuthorizationError extends Error {
@@ -71,7 +79,8 @@ export class TruthLedgerDomainCommandBus {
     if (parsed.kind !== "claim.create" && parsed.kind !== "fact.accept") {
       throw new B2CommandValidationError();
     }
-    const command = parsed as DurableTruthCommand;
+    const requestHash = hashB2CommandIdentity(parsed);
+    const command = toDurableTruthCommand(parsed);
     requireHumanActor(context);
     const reservationSpaceId = await this.resolveReservationSpace(command, context);
     const mutationContext = { ...context, requestedSpaceIds: [reservationSpaceId] };
@@ -79,7 +88,13 @@ export class TruthLedgerDomainCommandBus {
       { pool: this.pool, context: mutationContext },
       async (tx) => {
         await assertApplicationRole(tx);
-        return this.executeInTransaction(tx, command, mutationContext, reservationSpaceId);
+        return this.executeInTransaction(
+          tx,
+          command,
+          requestHash,
+          mutationContext,
+          reservationSpaceId
+        );
       }
     );
     return parseB2CommandResult(command.kind, result) as B2CommandResultMap[K];
@@ -109,6 +124,7 @@ export class TruthLedgerDomainCommandBus {
   private async executeInTransaction(
     tx: TenantDbTransaction,
     command: DurableTruthCommand,
+    requestHash: string,
     context: SecurityContext,
     reservationSpaceId: string
   ): Promise<DurableTruthResult> {
@@ -116,7 +132,6 @@ export class TruthLedgerDomainCommandBus {
     const ledger = new TruthLedgerRepository(tx);
     const domain = new ProductDomainTransactionRepositories(tx);
     const traceparent = traceparentFor(context);
-    const requestHash = hashB2CommandIdentity(command);
     const subject = await ledger
       .getSubjectScope(
         context.tenantId,
@@ -150,10 +165,14 @@ export class TruthLedgerDomainCommandBus {
         { type: "source", id: command.payload.evidence.sourceArtifactId },
         true
       );
-      const verified = await new VerifiedClaimSourceSpanAdmission(ledger, {
-        tenantId: context.tenantId,
-        workspaceId: context.workspaceId
-      }).admit({
+      const verified = await new VerifiedClaimSourceSpanAdmission(
+        tx,
+        bindClaimEvidenceSnapshotLookupToTransaction(tx, ledger),
+        {
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId
+        }
+      ).admit({
         subject: command.payload.subject,
         evidence: command.payload.evidence
       });
@@ -181,7 +200,7 @@ export class TruthLedgerDomainCommandBus {
         actorMembershipId: actor.membershipId,
         assertedById: actor.displayPersonId,
         predicate: command.payload.predicate,
-        valueJson: command.payload.valueJson,
+        canonicalValue: command.payload.canonicalValue,
         normalizedText: command.payload.normalizedText,
         confidence: command.payload.confidence,
         ...(command.payload.validFrom === undefined
@@ -231,6 +250,16 @@ export class TruthLedgerDomainCommandBus {
       { type: command.payload.subject.type, id: command.payload.subject.id },
       true
     );
+    const reservation = await reserveCommand(
+      domain.commands,
+      command,
+      context,
+      requestHash,
+      traceparent,
+      reservationSpaceId
+    );
+    if (reservation.replay) return reservation.result;
+
     const claimIds = command.payload.claims.map(({ claimId }) => claimId);
     const headers = await ledger
       .lockClaimSupportHeaders(context.tenantId, context.workspaceId, claimIds)
@@ -266,25 +295,19 @@ export class TruthLedgerDomainCommandBus {
 
     const admittedClaims: Claim[] = [];
     for (const persisted of persistedClaims) {
-      const sourceSpan = await new VerifiedClaimSourceSpanAdmission(ledger, {
-        tenantId: context.tenantId,
-        workspaceId: context.workspaceId
-      }).admit({
+      const sourceSpan = await new VerifiedClaimSourceSpanAdmission(
+        tx,
+        bindClaimEvidenceSnapshotLookupToTransaction(tx, ledger),
+        {
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId
+        }
+      ).admit({
         subject: command.payload.subject,
         evidence: persisted.evidence
       });
       admittedClaims.push(Object.freeze({ ...persisted.claim, sourceSpan }));
     }
-
-    const reservation = await reserveCommand(
-      domain.commands,
-      command,
-      context,
-      requestHash,
-      traceparent,
-      reservationSpaceId
-    );
-    if (reservation.replay) return reservation.result;
 
     const expectedVersions = new Map(
       command.payload.claims.map(({ claimId, expectedVersion }) => [claimId, expectedVersion])
@@ -376,6 +399,17 @@ export class TruthLedgerDomainCommandBus {
     });
     if (!decision.allowed) throw new B2AuthorizationError();
   }
+}
+
+function toDurableTruthCommand(
+  command: B2AuthorizedDomainCommand<DurableTruthCommandKind>
+): DurableTruthCommand {
+  if (command.kind === "fact.accept") return command;
+  const { valueJson, ...payload } = command.payload;
+  return {
+    ...command,
+    payload: { ...payload, canonicalValue: valueJson }
+  };
 }
 
 async function reserveCommand(
