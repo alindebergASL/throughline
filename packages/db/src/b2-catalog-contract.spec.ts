@@ -2,6 +2,7 @@ import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
 import type { PgPoolClient } from "./client.js";
 import {
+  assertB2InitiativeLockMigrationSource,
   assertB2MigrationStateAbsent,
   assertProductValidatorDelegatesExactB1Kinds,
   validateB2CatalogContract
@@ -58,10 +59,66 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     await assertB2MigrationStateAbsent(client, "0007_b2_slice1_truth_storage.sql");
     await assertB2MigrationStateAbsent(client, "0008_b2_slice1_command_integrity.sql");
     await assertB2MigrationStateAbsent(client, "0009_b2_source_truth_lifecycle_interlock.sql");
+    await assertB2MigrationStateAbsent(client, "0010_b2_trusted_objective_initiative_lock.sql");
 
     expect(query.mock.calls[0]?.[0]).toContain("to_regnamespace('truth')");
     expect(query.mock.calls[1]?.[0]).toContain("ops.product_command_record_valid");
     expect(query.mock.calls[2]?.[0]).toContain("ops.enforce_b2_source_truth_lifecycle_interlock");
+    expect(query.mock.calls[3]?.[0]).toContain("has_column_privilege");
+    expect(query.mock.calls[3]?.[0]).toContain("work.initiatives");
+    expect(query.mock.calls[3]?.[0]).toContain("'id','UPDATE'");
+    expect(query.mock.calls[3]?.[0]).toContain("FROM pg_policy");
+    expect(query.mock.calls[3]?.[0]).toContain("to_regclass('work.initiatives')");
+    expect(query.mock.calls[3]?.[1]).toEqual([
+      ["initiatives_app_truth_lock", "initiatives_app_permanent_no_write"]
+    ]);
+  });
+
+  it("rejects an unjournaled Initiative lock capability", async () => {
+    const query = vi.fn().mockResolvedValue({ rows: [{ installed: true }], rowCount: 1 });
+    const client = { query } as unknown as PgPoolClient;
+
+    await expect(
+      assertB2MigrationStateAbsent(client, "0010_b2_trusted_objective_initiative_lock.sql")
+    ).rejects.toThrow(
+      "B2 migration state already exists without journal row for 0010_b2_trusted_objective_initiative_lock.sql"
+    );
+  });
+
+  it("accepts only the exact phase-4 Initiative lock migration source", async () => {
+    const source = await readFile(
+      new URL("../migrations/0010_b2_trusted_objective_initiative_lock.sql", import.meta.url),
+      "utf8"
+    );
+
+    expect(() => assertB2InitiativeLockMigrationSource(source)).not.toThrow();
+    for (const mutation of [
+      `${source}GRANT SELECT ON work.initiatives TO throughline_worker;\n`,
+      source.replace("UPDATE (id)", "UPDATE (id, title)"),
+      source.replace("UPDATE (id)", "UPDATE"),
+      source.replaceAll("throughline_app", "PUBLIC"),
+      source.replace(
+        "GRANT UPDATE (id) ON work.initiatives TO throughline_app;",
+        "GRANT UPDATE (id) ON work.initiatives TO throughline_app WITH GRANT OPTION;"
+      ),
+      source.replace("tenant_id = ops.current_tenant_id() AND ", ""),
+      source.replace("workspace_id = ops.current_workspace_id()\n", "true\n"),
+      source.replace("AND space_id = ops.current_space_id()\n", ""),
+      source.replace("AND governing_space.archived_at IS NULL\n", ""),
+      source.replace("WITH CHECK (false);", "WITH CHECK (true);"),
+      source.replace(
+        /CREATE POLICY initiatives_app_permanent_no_write[\s\S]*?WITH CHECK \(false\);\n\n/,
+        ""
+      ),
+      source.replace("AS RESTRICTIVE FOR UPDATE", "AS PERMISSIVE FOR UPDATE"),
+      source.replace("FOR UPDATE TO throughline_app", "FOR ALL TO throughline_app"),
+      `${source}CREATE TABLE truth.future_store (id uuid);\n`,
+      `${source}-- fact_lifecycle future work\n`
+    ]) {
+      expect(() => assertB2InitiativeLockMigrationSource(mutation)).toThrow(
+        "B2 Initiative lock migration source drifted"
+      );
+    }
   });
 
   it("pins only the four Slice 1 tables and two executable commands", async () => {

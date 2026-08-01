@@ -41,7 +41,12 @@ const leaves: readonly GateLeaf[] = [
   },
   {
     workspace: "@throughline/api",
-    files: ["src/b2-truth/b2-truth.controller.spec.ts", "src/b2-truth/b2-truth.postgres.spec.ts"],
+    files: [
+      "src/b2-truth/b2-truth.controller.spec.ts",
+      "src/b2-truth/b2-truth.postgres.spec.ts",
+      "src/trusted-objective/trusted-objective.controller.spec.ts",
+      "src/trusted-objective/trusted-objective.postgres.spec.ts"
+    ],
     env: { AUTH_ADAPTER: "dev", NODE_ENV: "test" }
   }
 ] as const;

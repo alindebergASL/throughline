@@ -9,7 +9,7 @@ export const B1_MIGRATION_IDS = [
 
 type B1MigrationId = (typeof B1_MIGRATION_IDS)[number];
 type MigrationSources = ReadonlyMap<string, string>;
-type AdditiveB2Phase = 0 | 1 | 2 | 3;
+type AdditiveB2Phase = 0 | 1 | 2 | 3 | 4;
 
 const B1_PREDECESSOR_IDS = [
   "0001_wave_a2_identity_access_rls.sql",
@@ -424,7 +424,13 @@ export async function validateB1CatalogContract(
     await createScratchTables(client, scratch, expectedTables, sources);
     await createScratchIndexes(client, scratch, expectedIndexes, sources, expectedTables);
     await createScratchTriggers(client, scratch, expectedTriggers);
-    await createScratchPolicies(client, scratch, expectedTables, integrityInstalled);
+    await createScratchPolicies(
+      client,
+      scratch,
+      expectedTables,
+      integrityInstalled,
+      additiveB2Phase
+    );
 
     for (const table of expectedTables) {
       await validateTable(client, scratch, expectedTables, table);
@@ -443,7 +449,7 @@ export async function validateB1CatalogContract(
         expectedTriggers.filter((trigger) => trigger.tableName === table.actualName)
       );
       await validatePolicies(client, scratch, expectedTables, table);
-      await validateTablePrivileges(client, table.actualName, integrityInstalled);
+      await validateTablePrivileges(client, table.actualName, integrityInstalled, additiveB2Phase);
     }
 
     await validateSchemaSecurity(
@@ -525,7 +531,7 @@ function expectedTriggerContracts(
   const triggerContracts = installed
     .filter((id) => id !== B1_MIGRATION_IDS[2])
     .flatMap((id) => extractTriggerStatements(requireSource(sources, id)));
-  if (additiveB2Phase === 3) {
+  if (additiveB2Phase >= 3) {
     triggerContracts.push(
       ...approvedB2LifecycleTriggerContracts(requireSource(sources, B2_LIFECYCLE_MIGRATION_ID))
     );
@@ -788,7 +794,8 @@ async function createScratchPolicies(
   client: PgPoolClient,
   scratch: ScratchCatalog,
   tables: readonly ExpectedTable[],
-  integrityInstalled: boolean
+  integrityInstalled: boolean,
+  additiveB2Phase: AdditiveB2Phase
 ): Promise<void> {
   for (const table of tables) {
     const relation = scratchRelation(scratch, table.scratchName);
@@ -826,6 +833,19 @@ async function createScratchPolicies(
               AND governing_space.id = ${quoteIdentifier(table.scratchName)}.space_id
               AND governing_space.archived_at IS NULL)) WITH CHECK (false)`);
       await client.query(`CREATE POLICY activities_app_permanent_no_write ON ${relation}
+        AS RESTRICTIVE FOR UPDATE TO throughline_app USING (true) WITH CHECK (false)`);
+    }
+    if (table.actualName === "work.initiatives" && additiveB2Phase >= 4) {
+      await client.query(`CREATE POLICY initiatives_app_truth_lock ON ${relation}
+        AS PERMISSIVE FOR UPDATE TO throughline_app
+        USING (tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id()
+          AND space_id = ops.current_space_id()
+          AND EXISTS (SELECT 1 FROM access.spaces governing_space
+            WHERE governing_space.tenant_id = ${quoteIdentifier(table.scratchName)}.tenant_id
+              AND governing_space.workspace_id = ${quoteIdentifier(table.scratchName)}.workspace_id
+              AND governing_space.id = ${quoteIdentifier(table.scratchName)}.space_id
+              AND governing_space.archived_at IS NULL)) WITH CHECK (false)`);
+      await client.query(`CREATE POLICY initiatives_app_permanent_no_write ON ${relation}
         AS RESTRICTIVE FOR UPDATE TO throughline_app USING (true) WITH CHECK (false)`);
     }
     if (table.actualName === "content.content_items") {
@@ -1260,7 +1280,8 @@ function tablePrivilege(
 
 function expectedTablePrivileges(
   tableName: string,
-  integrityInstalled: boolean
+  integrityInstalled: boolean,
+  additiveB2Phase: AdditiveB2Phase
 ): PrivilegeContract[] {
   const privileges: PrivilegeContract[] = [
     tablePrivilege(tableName, "throughline_app", "INSERT"),
@@ -1271,6 +1292,7 @@ function expectedTablePrivileges(
       privileges.push(tablePrivilege(tableName, "throughline_app", privilege, column));
     }
   };
+  if (tableName === "work.initiatives" && additiveB2Phase >= 4) addColumns("UPDATE", ["id"]);
   if (tableName === "work.activities") addColumns("UPDATE", ["id"]);
   if (tableName === "work.relationships") {
     addColumns("UPDATE", ["updated_at", "valid_to", "version"]);
@@ -1304,7 +1326,8 @@ function expectedTablePrivileges(
 async function validateTablePrivileges(
   client: PgPoolClient,
   tableName: string,
-  integrityInstalled: boolean
+  integrityInstalled: boolean,
+  additiveB2Phase: AdditiveB2Phase
 ): Promise<void> {
   const diagnostics = await client.query<PrivilegeDiagnostic>(
     `WITH relation AS (
@@ -1372,7 +1395,10 @@ async function validateTablePrivileges(
      UNION ALL
      SELECT * FROM unexpected_diagnostic
      ORDER BY direction`,
-    [tableName, JSON.stringify(expectedTablePrivileges(tableName, integrityInstalled))]
+    [
+      tableName,
+      JSON.stringify(expectedTablePrivileges(tableName, integrityInstalled, additiveB2Phase))
+    ]
   );
   if (diagnostics.rowCount !== 0) {
     throw new Error(

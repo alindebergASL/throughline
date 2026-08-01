@@ -90,6 +90,14 @@ EXECUTE FUNCTION ops.enforce_b2_source_truth_lifecycle_interlock();
     const runner = await readFile(new URL("./migrations.ts", import.meta.url), "utf8");
 
     expect(runner).toContain("additiveB2Phase: 3");
+    expect(runner).toContain("additiveB2Phase: 4");
+    const contract = await readFile(new URL("./b1-catalog-contract.ts", import.meta.url), "utf8");
+    expect(contract).toContain("if (additiveB2Phase >= 3)");
+    expect(contract).toContain('tableName === "work.initiatives" && additiveB2Phase >= 4');
+    expect(contract).toContain("initiatives_app_truth_lock");
+    expect(contract).toContain("initiatives_app_permanent_no_write");
+    expect(contract).toContain("AS PERMISSIVE FOR UPDATE TO throughline_app");
+    expect(contract).toContain("AS RESTRICTIVE FOR UPDATE TO throughline_app");
     expect(runner).not.toContain("b1SourcesWithApprovedB2LifecycleInterlock");
     expect(runner).not.toContain("`${b1Content}\\n${lifecycle}`");
   });

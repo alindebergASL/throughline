@@ -38,6 +38,7 @@ export type AuthorizationAction =
   | "source.read"
   | "claim.create"
   | "claim.read"
+  | "fact.read"
   | "fact.accept";
 
 export interface WorkerAuthorizationBinding {

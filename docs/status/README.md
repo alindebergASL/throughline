@@ -16,3 +16,6 @@ WAVE_<id>_RESULT.md
 Use the templates in `docs/status/templates/`.
 
 Do not treat these files as product documentation. They are operational build records.
+
+Current implementation status: B2 Slice 1 is merged. The active branch is the bounded B2 Slice 2
+trusted-objective browser walking slice; no human usability-testing completion is claimed.

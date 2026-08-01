@@ -4,10 +4,11 @@ Throughline is an AI-native Work OS identified by active, trusted organizational
 first product is Account & Partner Operations, the first domain profile is AI Solutions, and the
 first loop is Engagement -> Memory -> Action.
 
-Wave A2, Foundation Closure, B1.0, and B1 are merged. B1 has not been deployed. B2 Truth Ledger is
-the next implementation wave and has not started. ChangeSets and governed runtime behavior, model
-extraction, Account Research MCP adapters, semantic retrieval, and production UI remain deferred
-to their later planned waves.
+Wave A2, Foundation Closure, B1.0, B1, and B2 Slice 1 are merged. None has been deployed. The
+current branch is the bounded B2 Slice 2 trusted-objective walking slice: one Initiative turns a
+manually captured engagement excerpt into a proposed Claim and an explicitly accepted Fact through
+the canonical durable command buses. General ChangeSets, model extraction, Account Research MCP,
+search, production auth, and broader product UI remain deferred.
 
 ## Start here
 
@@ -55,6 +56,92 @@ pnpm --filter @throughline/agent-worker dev
 pnpm --filter @throughline/connector-worker dev
 pnpm --filter @throughline/outbox-relay dev
 ```
+
+## B2 Slice 2 local browser demo
+
+The demo identity seam is development-only and controlled only by the Next server process. Set
+`TRUSTED_OBJECTIVE_DEMO_PERSONA` to exactly `owner` or `unavailable` before starting that server.
+The BFF alone maps those values to the existing `AUTH_ADAPTER=dev` identities. Missing, blank, or
+any other value fails closed without contacting the API. Browser requests contain only the
+Initiative identifier and action data; they contain no identity, tenant, workspace, membership,
+role, permission, policy, visibility, evidence-offset/hash, or acceptance-authority fields. Both
+the API dev adapter and the BFF fail closed in production.
+
+Start the local PostgreSQL service, choose a URL-safe local-only password without committing it,
+and explicitly reset the fixed disposable `throughline_demo` database:
+
+```bash
+docker compose up -d postgres
+export DEMO_ADMIN_DATABASE_URL="postgres://throughline:throughline_dev@localhost:5432/throughline"
+export DEMO_APP_ROLE_PASSWORD="choose-a-local-demo-password"
+pnpm demo:trusted-objective
+```
+
+The setup command refuses to run without `--reset` (included by the package script), accepts only a
+loopback admin URL outside `throughline_demo`, drops and recreates only that fixed demo database,
+applies current migrations, provisions the existing least-privilege `throughline_app` login, and
+seeds only tenant/workspace/Space/person/membership/organization/Initiative/Engagement
+prerequisites. It never seeds a SourceArtifact, Claim, or AcceptedFact.
+
+Start the API in one terminal:
+
+```bash
+export AUTH_ADAPTER=dev
+export DATABASE_URL="postgres://throughline_app:${DEMO_APP_ROLE_PASSWORD}@localhost:5432/throughline_demo"
+pnpm --filter @throughline/api dev
+```
+
+Start the same-origin web app for the representative owner flow in another terminal:
+
+```bash
+export THROUGHLINE_API_ORIGIN="http://127.0.0.1:3001"
+export TRUSTED_OBJECTIVE_DEMO_PERSONA=owner
+pnpm --filter @throughline/web dev
+```
+
+Open the fixed URL reported by setup, or:
+
+```text
+http://localhost:3000/organizations/initiatives/70000000-0000-7000-8000-000000000204
+```
+
+After the database and two servers are running, the normal owner walking flow below needs no CLI
+or direct API assistance. Every capture, proposal, acceptance, and draft action is completed in the
+product UI.
+
+### Five-minute representative-user script
+
+1. Paste this realistic note and choose **Capture engagement note**:
+
+   ```text
+   Maya: The primary objective is to reduce average resident-service response time from twelve business days to five while preserving human review.
+   Erin: Human review remains mandatory before any response is sent to a resident.
+   Luis: The source systems are ServiceNow, SharePoint, and the legacy case database.
+   ```
+
+2. In the read-only source, select the complete Maya sentence and choose **Use selected excerpt**.
+3. Enter `Reduce average resident-service response time from twelve business days to five while preserving human review.` and choose **Propose trusted objective**.
+4. Confirm the page says **Proposed, not accepted.**, open the exact evidence, then choose **Accept objective**.
+5. Inspect the complete Accepted memory: objective, excerpt/source, reason, transition, actor/time,
+   and effective visibility. Choose **Draft confirmation question** and confirm **Not sent** and
+   `sent: false`.
+
+Validate unauthorized behavior in a separately configured web-server session. Stop the owner web
+server, start a new web server with the server-only value below, and open the same fixed URL in a
+separate browser context:
+
+```bash
+export THROUGHLINE_API_ORIGIN="http://127.0.0.1:3001"
+export TRUSTED_OBJECTIVE_DEMO_PERSONA=unavailable
+pnpm --filter @throughline/web dev
+```
+
+The page must show only the generic unavailable state. There is no in-product identity control and
+no browser URL or request field that can select either behavior.
+
+The owner-review screenshots, browser proof, accessibility checklist, and success criteria are in
+[`docs/qa/b2-slice2-trusted-objective/`](docs/qa/b2-slice2-trusted-objective/README.md).
+This is deterministic engineering/demo coverage, not completed human usability testing.
 
 Check the API health endpoint:
 
@@ -128,7 +215,7 @@ runtime SecurityContext validation, and a small Fastify helmet plugin for defaul
 Local S3/SQS placeholders use LocalStack in Docker Compose and are not required for compile or unit
 tests.
 
-## First proof
+## Current proof
 
 ```text
 Untrusted engagement source

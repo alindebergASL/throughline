@@ -188,6 +188,18 @@ export class TruthLedgerDomainCommandBus {
       );
       if (reservation.replay) return reservation.result;
 
+      if (
+        command.payload.subject.type === "initiative" &&
+        command.payload.predicate === "initiative.primary_objective"
+      ) {
+        await ledger.lockPrimaryObjectiveProposalSlot({
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId,
+          spaceId: subject.spaceId,
+          subjectId: subject.subjectId
+        });
+      }
+
       const claimId = generateUuidV7();
       const evidenceSpanId = generateUuidV7();
       await ledger.insertEvidenceAndClaim({
@@ -292,6 +304,27 @@ export class TruthLedgerDomainCommandBus {
     ) {
       throw new TruthLedgerConflictError();
     }
+    const acceptedCoordinate = persistedClaims[0]?.claim;
+    if (
+      !acceptedCoordinate ||
+      persistedClaims.some(
+        ({ claim }) =>
+          claim.subjectType !== acceptedCoordinate.subjectType ||
+          claim.subjectId !== acceptedCoordinate.subjectId ||
+          claim.spaceId !== acceptedCoordinate.spaceId ||
+          claim.predicate !== acceptedCoordinate.predicate
+      )
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+    await ledger.lockFirstAcceptanceSlot({
+      tenantId: context.tenantId,
+      workspaceId: context.workspaceId,
+      spaceId: acceptedCoordinate.spaceId,
+      subjectType: acceptedCoordinate.subjectType,
+      subjectId: acceptedCoordinate.subjectId,
+      predicate: acceptedCoordinate.predicate
+    });
 
     const admittedClaims: Claim[] = [];
     for (const persisted of persistedClaims) {
@@ -337,14 +370,6 @@ export class TruthLedgerDomainCommandBus {
       ...(command.payload.confidenceLowering === undefined
         ? {}
         : { confidenceLowering: command.payload.confidenceLowering })
-    });
-    await ledger.lockFirstAcceptanceSlot({
-      tenantId: context.tenantId,
-      workspaceId: context.workspaceId,
-      spaceId: fact.spaceId,
-      subjectType: fact.subjectType,
-      subjectId: fact.subjectId,
-      predicate: fact.predicate
     });
     await ledger.insertAcceptedFact({
       fact,

@@ -3,7 +3,8 @@ import type { PgPoolClient } from "./client.js";
 export const B2_MIGRATION_IDS = [
   "0007_b2_slice1_truth_storage.sql",
   "0008_b2_slice1_command_integrity.sql",
-  "0009_b2_source_truth_lifecycle_interlock.sql"
+  "0009_b2_source_truth_lifecycle_interlock.sql",
+  "0010_b2_trusted_objective_initiative_lock.sql"
 ] as const;
 
 export type B2MigrationId = (typeof B2_MIGRATION_IDS)[number];
@@ -136,6 +137,28 @@ const b1CommandKinds = [
 
 const b2Slice1CommandKinds = ["claim.create.v1", "fact.accept.v1"] as const;
 
+const initiativeLockMigrationSource =
+  "-- Established row-lock capability for durable Initiative truth mutations.\n" +
+  "CREATE POLICY initiatives_app_truth_lock ON work.initiatives\n" +
+  "AS PERMISSIVE FOR UPDATE TO throughline_app\n" +
+  "USING (\n" +
+  "  tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id()\n" +
+  "  AND space_id = ops.current_space_id()\n" +
+  "  AND EXISTS (\n" +
+  "    SELECT 1 FROM access.spaces governing_space\n" +
+  "    WHERE governing_space.tenant_id = work.initiatives.tenant_id\n" +
+  "      AND governing_space.workspace_id = work.initiatives.workspace_id\n" +
+  "      AND governing_space.id = work.initiatives.space_id\n" +
+  "      AND governing_space.archived_at IS NULL\n" +
+  "  )\n" +
+  ")\n" +
+  "WITH CHECK (false);\n\n" +
+  "CREATE POLICY initiatives_app_permanent_no_write ON work.initiatives\n" +
+  "AS RESTRICTIVE FOR UPDATE TO throughline_app\n" +
+  "USING (true)\n" +
+  "WITH CHECK (false);\n\n" +
+  "GRANT UPDATE (id) ON work.initiatives TO throughline_app;\n";
+
 export async function assertB2MigrationStateAbsent(
   client: PgPoolClient,
   migrationId: B2MigrationId
@@ -147,9 +170,21 @@ export async function assertB2MigrationStateAbsent(
         ? await client.query(
             "SELECT to_regprocedure('ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)')::text AS installed"
           )
-        : await client.query(
-            "SELECT to_regprocedure('ops.enforce_b2_source_truth_lifecycle_interlock()')::text AS installed"
-          );
+        : migrationId === "0009_b2_source_truth_lifecycle_interlock.sql"
+          ? await client.query(
+              "SELECT to_regprocedure('ops.enforce_b2_source_truth_lifecycle_interlock()')::text AS installed"
+            )
+          : await client.query(
+              `SELECT
+                 has_column_privilege(
+                   'throughline_app','work.initiatives','id','UPDATE'
+                 ) OR EXISTS (
+                   SELECT 1 FROM pg_policy policy
+                    WHERE policy.polrelid = to_regclass('work.initiatives')
+                      AND policy.polname = ANY($1::text[])
+                 ) AS installed`,
+              [["initiatives_app_truth_lock", "initiatives_app_permanent_no_write"]]
+            );
   if (installed.rows[0]?.installed) {
     throw new Error(`B2 migration state already exists without journal row for ${migrationId}`);
   }
@@ -197,6 +232,12 @@ export async function validateB2CatalogContract(
   }
 }
 
+export function assertB2InitiativeLockMigrationSource(source: string): void {
+  if (source !== initiativeLockMigrationSource) {
+    throw new Error("B2 Initiative lock migration source drifted");
+  }
+}
+
 function assertNarrowMigrationSources(
   migrationSources: ReadonlyMap<string, string>,
   phase: number
@@ -204,9 +245,14 @@ function assertNarrowMigrationSources(
   const schema = migrationSources.get("0007_b2_slice1_truth_storage.sql");
   const integrity = migrationSources.get("0008_b2_slice1_command_integrity.sql");
   const lifecycle = migrationSources.get("0009_b2_source_truth_lifecycle_interlock.sql");
+  const initiativeLock = migrationSources.get("0010_b2_trusted_objective_initiative_lock.sql");
   if (!schema || !integrity) throw new Error("Missing fixed B2 migration source");
   if (phase >= 3 && !lifecycle) {
     throw new Error("Missing fixed B2 lifecycle migration source");
+  }
+  if (phase >= 4) {
+    if (!initiativeLock) throw new Error("Missing fixed B2 Initiative lock migration source");
+    assertB2InitiativeLockMigrationSource(initiativeLock);
   }
   for (const table of truthTables) {
     if (!schema.includes(`CREATE TABLE truth.${table}`)) {

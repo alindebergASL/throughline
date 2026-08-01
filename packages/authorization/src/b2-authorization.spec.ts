@@ -69,6 +69,18 @@ describe("central B2 Slice 1 authorization", () => {
       ).resolves.toMatchObject({ allowed: false, reasonCode: "principal_default_denied" });
     }
   );
+
+  it("authorizes Fact reads through the same Space and data-class path as Claim reads", async () => {
+    const service = new PostgresAuthorizationService({} as never);
+    await expect(
+      service.canInTransaction(
+        createDevSecurityContext("tenant-a-owner"),
+        "fact.read",
+        { type: "fact", id: claimId },
+        executor().tx as never
+      )
+    ).resolves.toMatchObject({ allowed: true, reasonCode: "b1_resource_read" });
+  });
 });
 
 function executor(
@@ -127,7 +139,10 @@ function executor(
     if (sql.includes("SELECT id") && sql.includes("FROM access.spaces")) {
       return { rows: present ? [{ id: devFixtures.rootSpaceA }] : [] };
     }
-    if (sql.includes("FROM truth.claims resource")) {
+    if (
+      sql.includes("FROM truth.claims resource") ||
+      sql.includes("FROM truth.accepted_facts resource")
+    ) {
       return {
         rows: present ? [{ space_id: devFixtures.rootSpaceA, access_class: accessClass }] : []
       };

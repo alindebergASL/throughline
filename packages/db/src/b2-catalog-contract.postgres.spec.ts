@@ -1,5 +1,6 @@
 import pg from "pg";
 import { afterAll, describe, expect, it } from "vitest";
+import { devFixtures } from "@throughline/tenancy";
 import { applyMigrations } from "./migrations.js";
 import { seedWaveA2DeterministicData } from "./seed.js";
 import { provisionTestAppRole } from "./test-database.js";
@@ -18,7 +19,8 @@ const allMigrationIds = [
   "0006_b1_command_integrity.sql",
   "0007_b2_slice1_truth_storage.sql",
   "0008_b2_slice1_command_integrity.sql",
-  "0009_b2_source_truth_lifecycle_interlock.sql"
+  "0009_b2_source_truth_lifecycle_interlock.sql",
+  "0010_b2_trusted_objective_initiative_lock.sql"
 ] as const;
 const truthTables = ["accepted_facts", "claims", "fact_claims", "verified_evidence_spans"] as const;
 
@@ -88,6 +90,15 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
   };
 
   const resetToLatest = () => applyMigrations(ownerPool, { reset: true });
+
+  const expectCatalogContractRejected = async (mutation: string, expectedDiagnostic: string) => {
+    try {
+      await ownerPool.query(mutation);
+      await expect(applyMigrations(ownerPool)).rejects.toThrow(expectedDiagnostic);
+    } finally {
+      await resetToLatest();
+    }
+  };
 
   const restoreProductionAppRole = () =>
     ownerPool.query(`
@@ -170,7 +181,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     }
   }, 60_000);
 
-  it("boots fresh and reapplies the exact post-0009 nine-migration checkpoint", async () => {
+  it("boots fresh and reapplies the exact post-0010 ten-migration checkpoint", async () => {
     await resetToLatest();
     await expect(applyMigrations(ownerPool)).resolves.toEqual({
       applied: [],
@@ -200,16 +211,250 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     await expectExactCommandFunctionPrivileges();
   }, 60_000);
 
+  it("adds the exact Initiative lock policies and id privilege only at 0010", async () => {
+    await applyMigrations(ownerPool, {
+      reset: true,
+      through: "0009_b2_source_truth_lifecycle_interlock.sql"
+    });
+    const policiesBefore = await ownerPool.query(
+      `SELECT policy_record.polname
+         FROM pg_policy policy_record
+        WHERE policy_record.polrelid = 'work.initiatives'::regclass
+          AND policy_record.polname = ANY($1::text[])
+        ORDER BY policy_record.polname`,
+      [["initiatives_app_permanent_no_write", "initiatives_app_truth_lock"]]
+    );
+    expect(policiesBefore.rows).toEqual([]);
+    const privilegeBefore = await ownerPool.query(
+      `SELECT has_column_privilege(
+         'throughline_app','work.initiatives','id','UPDATE'
+       ) AS installed`
+    );
+    expect(privilegeBefore.rows).toEqual([{ installed: false }]);
+
+    await expect(applyMigrations(ownerPool)).resolves.toMatchObject({
+      applied: ["0010_b2_trusted_objective_initiative_lock.sql"]
+    });
+    const policies = await ownerPool.query<{
+      name: string;
+      command: string;
+      permissive: boolean;
+      roles: string[];
+      using_expression: string;
+      check_expression: string;
+    }>(
+      `SELECT policy_record.polname AS name,
+              policy_record.polcmd::text AS command,
+              policy_record.polpermissive AS permissive,
+              ARRAY(
+                SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC' ELSE role_oid::regrole::text END
+                  FROM unnest(policy_record.polroles) role_oid
+                 ORDER BY 1
+              ) AS roles,
+              pg_get_expr(policy_record.polqual, policy_record.polrelid) AS using_expression,
+              pg_get_expr(policy_record.polwithcheck, policy_record.polrelid) AS check_expression
+         FROM pg_policy policy_record
+        WHERE policy_record.polrelid = 'work.initiatives'::regclass
+          AND policy_record.polname = ANY($1::text[])
+        ORDER BY policy_record.polname`,
+      [["initiatives_app_permanent_no_write", "initiatives_app_truth_lock"]]
+    );
+    expect(policies.rows).toEqual([
+      {
+        name: "initiatives_app_permanent_no_write",
+        command: "w",
+        permissive: false,
+        roles: ["throughline_app"],
+        using_expression: "true",
+        check_expression: "false"
+      },
+      {
+        name: "initiatives_app_truth_lock",
+        command: "w",
+        permissive: true,
+        roles: ["throughline_app"],
+        using_expression: expect.stringMatching(
+          /tenant_id = ops\.current_tenant_id\(\)[\s\S]*workspace_id = ops\.current_workspace_id\(\)[\s\S]*space_id = ops\.current_space_id\(\)[\s\S]*governing_space\.tenant_id = initiatives\.tenant_id[\s\S]*governing_space\.workspace_id = initiatives\.workspace_id[\s\S]*governing_space\.id = initiatives\.space_id[\s\S]*governing_space\.archived_at IS NULL/
+        ),
+        check_expression: "false"
+      }
+    ]);
+
+    const privileges = await ownerPool.query<{
+      scope: string;
+      column_name: string | null;
+      grantee: string;
+      privilege: string;
+      grantable: boolean;
+    }>(
+      `WITH relation AS (
+         SELECT relation_record.oid, relation_record.relowner, relation_record.relacl
+           FROM pg_class relation_record
+          WHERE relation_record.oid = 'work.initiatives'::regclass
+       )
+       SELECT 'table'::text AS scope, NULL::text AS column_name,
+              CASE WHEN acl_record.grantee = 0 THEN 'PUBLIC'
+                   ELSE pg_get_userbyid(acl_record.grantee) END AS grantee,
+              acl_record.privilege_type AS privilege,
+              acl_record.is_grantable AS grantable
+         FROM relation
+         CROSS JOIN LATERAL aclexplode(relation.relacl) acl_record
+        WHERE acl_record.grantee <> relation.relowner
+          AND acl_record.privilege_type = 'UPDATE'
+       UNION ALL
+       SELECT 'column', attribute_record.attname::text,
+              CASE WHEN acl_record.grantee = 0 THEN 'PUBLIC'
+                   ELSE pg_get_userbyid(acl_record.grantee) END,
+              acl_record.privilege_type,
+              acl_record.is_grantable
+         FROM relation
+         JOIN pg_attribute attribute_record ON attribute_record.attrelid = relation.oid
+         CROSS JOIN LATERAL aclexplode(attribute_record.attacl) acl_record
+        WHERE attribute_record.attnum > 0 AND NOT attribute_record.attisdropped
+          AND acl_record.grantee <> relation.relowner
+          AND acl_record.privilege_type = 'UPDATE'
+        ORDER BY scope, column_name NULLS FIRST, grantee`
+    );
+
+    expect(privileges.rows).toEqual([
+      {
+        scope: "column",
+        column_name: "id",
+        grantee: "throughline_app",
+        privilege: "UPDATE",
+        grantable: false
+      }
+    ]);
+  }, 60_000);
+
+  it("rejects missing or widened Initiative lock privileges", async () => {
+    for (const mutation of [
+      "REVOKE UPDATE (id) ON work.initiatives FROM throughline_app",
+      "GRANT UPDATE ON work.initiatives TO throughline_app",
+      "GRANT UPDATE (title) ON work.initiatives TO throughline_app",
+      "GRANT UPDATE (id) ON work.initiatives TO PUBLIC",
+      "GRANT UPDATE (id) ON work.initiatives TO throughline_worker",
+      "GRANT UPDATE (id) ON work.initiatives TO throughline_app WITH GRANT OPTION"
+    ]) {
+      await expectCatalogContractRejected(
+        mutation,
+        "Installed B1 catalog does not match work.initiatives direct, PUBLIC, column, and grant-option privileges"
+      );
+    }
+  }, 240_000);
+
+  it("rejects missing, widened, wrong-role, or rogue Initiative lock policies", async () => {
+    for (const mutation of [
+      "DROP POLICY initiatives_app_truth_lock ON work.initiatives",
+      "DROP POLICY initiatives_app_permanent_no_write ON work.initiatives",
+      `DROP POLICY initiatives_app_truth_lock ON work.initiatives;
+       CREATE POLICY initiatives_app_truth_lock ON work.initiatives
+       AS PERMISSIVE FOR UPDATE TO throughline_app
+       USING (true) WITH CHECK (false)`,
+      "ALTER POLICY initiatives_app_truth_lock ON work.initiatives TO throughline_worker",
+      `CREATE POLICY initiatives_app_rogue_update ON work.initiatives
+       AS PERMISSIVE FOR UPDATE TO throughline_app
+       USING (true) WITH CHECK (true)`
+    ]) {
+      await expectCatalogContractRejected(
+        mutation,
+        "Installed B1 catalog does not match work.initiatives policies"
+      );
+    }
+  }, 240_000);
+
+  it("allows FOR SHARE visibility but no Initiative data mutation", async () => {
+    await resetToLatest();
+    await seedWaveA2DeterministicData(ownerPool);
+    const organizationId = "70000000-0000-7000-8000-000000000101";
+    const initiativeId = "70000000-0000-7000-8000-000000000102";
+    const fixtureClient = await ownerPool.connect();
+    try {
+      await fixtureClient.query("BEGIN");
+      await fixtureClient.query(
+        `INSERT INTO work.organizations (
+           id, tenant_id, workspace_id, space_id, name, normalized_name
+         ) VALUES ($1, $2, $3, $4, 'Lock Test Organization', 'lock test organization')`,
+        [organizationId, devFixtures.tenantA, devFixtures.workspaceA, devFixtures.rootSpaceA]
+      );
+      await fixtureClient.query(
+        `INSERT INTO work.initiatives (
+           id, tenant_id, workspace_id, space_id, title, type_key, stage_key, health,
+           owner_person_id, profile_id, profile_version
+         ) VALUES ($1, $2, $3, $4, 'Immutable lock test', 'application', 'workshop',
+                   'active', $5, 'ai-solutions', '1.0.0')`,
+        [
+          initiativeId,
+          devFixtures.tenantA,
+          devFixtures.workspaceA,
+          devFixtures.rootSpaceA,
+          devFixtures.personA
+        ]
+      );
+      await fixtureClient.query(
+        `INSERT INTO work.initiative_organizations (
+           tenant_id, workspace_id, space_id, initiative_id, organization_id, association_role
+         ) VALUES ($1, $2, $3, $4, $5, 'primary')`,
+        [
+          devFixtures.tenantA,
+          devFixtures.workspaceA,
+          devFixtures.rootSpaceA,
+          initiativeId,
+          organizationId
+        ]
+      );
+      await fixtureClient.query("COMMIT");
+    } catch (error) {
+      await fixtureClient.query("ROLLBACK");
+      throw error;
+    } finally {
+      fixtureClient.release();
+    }
+
+    await withTestAppPool(async (pool) => {
+      const client = await pool.connect();
+      const setScope = async () => {
+        await client.query("SELECT set_config('app.tenant_id', $1, true)", [devFixtures.tenantA]);
+        await client.query("SELECT set_config('app.workspace_id', $1, true)", [
+          devFixtures.workspaceA
+        ]);
+        await client.query("SELECT set_config('app.space_id', $1, true)", [devFixtures.rootSpaceA]);
+      };
+      try {
+        await client.query("BEGIN");
+        await setScope();
+        const locked = await client.query(
+          "SELECT id FROM work.initiatives WHERE id = $1 FOR SHARE",
+          [initiativeId]
+        );
+        expect(locked.rows).toEqual([{ id: initiativeId }]);
+        await expect(
+          client.query("UPDATE work.initiatives SET id = id WHERE id = $1", [initiativeId])
+        ).rejects.toThrow(/row-level security policy/);
+        await client.query("ROLLBACK");
+
+        await client.query("BEGIN");
+        await setScope();
+        await expect(
+          client.query("UPDATE work.initiatives SET title = 'Mutated' WHERE id = $1", [
+            initiativeId
+          ])
+        ).rejects.toThrow(/permission denied/);
+        await client.query("ROLLBACK");
+      } finally {
+        client.release();
+      }
+    });
+
+    const unchanged = await ownerPool.query(
+      "SELECT title, version FROM work.initiatives WHERE id = $1",
+      [initiativeId]
+    );
+    expect(unchanged.rows).toEqual([{ title: "Immutable lock test", version: 1 }]);
+  }, 60_000);
+
   it("rejects post-0009 trigger, function-source, and deferrability drift", async () => {
     await resetToLatest();
-    const expectCatalogContractRejected = async (mutation: string, expectedDiagnostic: string) => {
-      try {
-        await ownerPool.query(mutation);
-        await expect(applyMigrations(ownerPool)).rejects.toThrow(expectedDiagnostic);
-      } finally {
-        await resetToLatest();
-      }
-    };
 
     const qualifiedTriggers = await ownerPool.query<{ name: string; definition: string }>(
       `SELECT trigger_record.tgname AS name,
@@ -340,7 +585,8 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     expect(upgraded.applied).toEqual([
       "0007_b2_slice1_truth_storage.sql",
       "0008_b2_slice1_command_integrity.sql",
-      "0009_b2_source_truth_lifecycle_interlock.sql"
+      "0009_b2_source_truth_lifecycle_interlock.sql",
+      "0010_b2_trusted_objective_initiative_lock.sql"
     ]);
     const after = await ownerPool.query<{ id: string; checksum: string }>(
       "SELECT id, checksum FROM throughline_migrations.journal ORDER BY id LIMIT 6"
@@ -402,7 +648,10 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     );
 
     await expect(applyMigrations(ownerPool)).resolves.toMatchObject({
-      applied: ["0009_b2_source_truth_lifecycle_interlock.sql"]
+      applied: [
+        "0009_b2_source_truth_lifecycle_interlock.sql",
+        "0010_b2_trusted_objective_initiative_lock.sql"
+      ]
     });
 
     const values = await ownerPool.query<{
@@ -429,8 +678,13 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     ]);
     expect(await exact0008RowCounts(ownerPool)).toEqual(beforeCounts);
     const afterJournal = await ownerPool.query<{ id: string; checksum: string }>(
-      "SELECT id, checksum FROM throughline_migrations.journal WHERE id <> $1 ORDER BY id",
-      ["0009_b2_source_truth_lifecycle_interlock.sql"]
+      "SELECT id, checksum FROM throughline_migrations.journal WHERE id <> ALL($1::text[]) ORDER BY id",
+      [
+        [
+          "0009_b2_source_truth_lifecycle_interlock.sql",
+          "0010_b2_trusted_objective_initiative_lock.sql"
+        ]
+      ]
     );
     expect(afterJournal.rows).toEqual(beforeJournal.rows);
   }, 120_000);

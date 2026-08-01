@@ -9,6 +9,33 @@ const lifecycleUrl = new URL(
   "../migrations/0009_b2_source_truth_lifecycle_interlock.sql",
   import.meta.url
 );
+const initiativeLockUrl = new URL(
+  "../migrations/0010_b2_trusted_objective_initiative_lock.sql",
+  import.meta.url
+);
+const initiativeLockSql = `-- Established row-lock capability for durable Initiative truth mutations.
+CREATE POLICY initiatives_app_truth_lock ON work.initiatives
+AS PERMISSIVE FOR UPDATE TO throughline_app
+USING (
+  tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id()
+  AND space_id = ops.current_space_id()
+  AND EXISTS (
+    SELECT 1 FROM access.spaces governing_space
+    WHERE governing_space.tenant_id = work.initiatives.tenant_id
+      AND governing_space.workspace_id = work.initiatives.workspace_id
+      AND governing_space.id = work.initiatives.space_id
+      AND governing_space.archived_at IS NULL
+  )
+)
+WITH CHECK (false);
+
+CREATE POLICY initiatives_app_permanent_no_write ON work.initiatives
+AS RESTRICTIVE FOR UPDATE TO throughline_app
+USING (true)
+WITH CHECK (false);
+
+GRANT UPDATE (id) ON work.initiatives TO throughline_app;
+`;
 
 describe("B2 Slice 1 additive migration contract", () => {
   it("pins exact immutable predecessors and the journal-aware validation phases", async () => {
@@ -44,6 +71,10 @@ describe("B2 Slice 1 additive migration contract", () => {
       [
         "0008_b2_slice1_command_integrity.sql",
         "84bcc710743c1850a0995763765b9dbb8506b040d965d33557459fd6eb472fcc"
+      ],
+      [
+        "0009_b2_source_truth_lifecycle_interlock.sql",
+        "0463ee762f2af1b4fc61d551398424740f3927e7a31b478717de03c3c88e29f1"
       ]
     ] as const;
     for (const [file, digest] of expected) {
@@ -52,12 +83,29 @@ describe("B2 Slice 1 additive migration contract", () => {
     }
     const runner = await readFile(new URL("./migrations.ts", import.meta.url), "utf8");
     expect(runner).toMatch(
-      /case 0:[\s\S]*?validateB1CatalogContract[\s\S]*?case 1:[\s\S]*?additiveB2Phase: 1[\s\S]*?case 2:[\s\S]*?additiveB2Phase: 2[\s\S]*?case 3:[\s\S]*?additiveB2Phase: 3[\s\S]*?validateB2CatalogContract/
+      /case 0:[\s\S]*?validateB1CatalogContract[\s\S]*?case 1:[\s\S]*?additiveB2Phase: 1[\s\S]*?case 2:[\s\S]*?additiveB2Phase: 2[\s\S]*?case 3:[\s\S]*?additiveB2Phase: 3[\s\S]*?case 4:[\s\S]*?additiveB2Phase: 4[\s\S]*?validateB2CatalogContract/
     );
     const b1Contract = await readFile(new URL("./b1-catalog-contract.ts", import.meta.url), "utf8");
     expect(b1Contract).toContain("A staged B2 catalog requires the exact complete B1 predecessor");
     expect(b1Contract).not.toContain("source_artifacts_truth_retention");
     expect(b1Contract).toContain("Fixed staged B2 command integrity contract parser failed");
+  });
+
+  it("adds only the established Initiative row-lock capability", async () => {
+    const sql = await readFile(initiativeLockUrl, "utf8");
+
+    expect(sql).toBe(initiativeLockSql);
+    expect([...sql.matchAll(/\bGRANT\b/gi)]).toHaveLength(1);
+    expect([...sql.matchAll(/CREATE POLICY/gi)]).toHaveLength(2);
+    expect(sql).toMatch(
+      /CREATE POLICY initiatives_app_truth_lock ON work\.initiatives\s+AS PERMISSIVE FOR UPDATE TO throughline_app[\s\S]*?WITH CHECK \(false\);/
+    );
+    expect(sql).toMatch(
+      /CREATE POLICY initiatives_app_permanent_no_write ON work\.initiatives\s+AS RESTRICTIVE FOR UPDATE TO throughline_app\s+USING \(true\)\s+WITH CHECK \(false\);/
+    );
+    expect(sql).not.toMatch(
+      /GRANT\s+UPDATE\s+ON|UPDATE\s*\([^)]*,|\b(?:PUBLIC|throughline_worker|throughline_product_relay)\b|WITH\s+GRANT\s+OPTION|\b(?:ALTER|DROP|INSERT|DELETE|TRUNCATE)\b|truth\.|fact_lifecycle|derived_view|reconcile_source_retention/i
+    );
   });
 
   it("creates exactly the durable Claim-to-Fact persistence surface", async () => {
