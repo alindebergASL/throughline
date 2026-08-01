@@ -211,6 +211,20 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     await expectExactCommandFunctionPrivileges();
   }, 60_000);
 
+  it("rejects an installed 0010 state whose final journal row was deleted without changing the database", async () => {
+    await resetToLatest();
+    await ownerPool.query(
+      "DELETE FROM throughline_migrations.journal WHERE id = '0010_b2_trusted_objective_initiative_lock.sql'"
+    );
+    const before = await exact0010CatalogSnapshot(ownerPool);
+
+    await expect(applyMigrations(ownerPool)).rejects.toThrow(
+      "B2 migration state already exists without journal row for 0010_b2_trusted_objective_initiative_lock.sql"
+    );
+
+    expect(await exact0010CatalogSnapshot(ownerPool)).toBe(before);
+  }, 60_000);
+
   it("adds the exact Initiative lock policies and id privilege only at 0010", async () => {
     await applyMigrations(ownerPool, {
       reset: true,
@@ -1191,6 +1205,42 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     ).rejects.toThrow();
   }, 60_000);
 });
+
+async function exact0010CatalogSnapshot(pool: pg.Pool): Promise<string> {
+  const snapshot = await pool.query<{
+    journal: unknown;
+    policies: unknown;
+    relation_oid: string;
+    privileges: unknown;
+    catalog: unknown;
+  }>(
+    `SELECT
+       (SELECT jsonb_agg(to_jsonb(entry) ORDER BY entry.id)
+          FROM throughline_migrations.journal entry) AS journal,
+       (SELECT jsonb_agg(jsonb_build_object(
+          'name', policy.polname,
+          'definition', pg_get_expr(policy.polqual, policy.polrelid),
+          'check', pg_get_expr(policy.polwithcheck, policy.polrelid),
+          'roles', policy.polroles,
+          'command', policy.polcmd,
+          'permissive', policy.polpermissive
+        ) ORDER BY policy.polname)
+          FROM pg_policy policy
+         WHERE policy.polrelid = 'work.initiatives'::regclass) AS policies,
+       'work.initiatives'::regclass::oid::text AS relation_oid,
+       (SELECT jsonb_agg(jsonb_build_object(
+          'column', attribute.attname,
+          'acl', attribute.attacl
+        ) ORDER BY attribute.attnum)
+          FROM pg_attribute attribute
+         WHERE attribute.attrelid = 'work.initiatives'::regclass
+           AND attribute.attnum > 0 AND NOT attribute.attisdropped) AS privileges,
+       (SELECT to_jsonb(relation)
+          FROM pg_class relation
+         WHERE relation.oid = 'work.initiatives'::regclass) AS catalog`
+  );
+  return JSON.stringify(snapshot.rows[0]);
+}
 
 const adoptionIds = {
   source: "0190a000-0000-7000-8000-000000000401",

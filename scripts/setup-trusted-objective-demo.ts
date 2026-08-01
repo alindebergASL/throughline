@@ -70,10 +70,13 @@ async function main(): Promise<void> {
     `Initiative URL: http://localhost:3000/organizations/initiatives/${demo.initiativeId}`
   );
   console.log(
-    "Owner web server: TRUSTED_OBJECTIVE_DEMO_PERSONA=owner THROUGHLINE_API_ORIGIN=http://127.0.0.1:3001 pnpm --filter @throughline/web dev"
+    "Owner API: AUTH_ADAPTER=dev TRUSTED_OBJECTIVE_DEMO_PERSONA=owner pnpm --filter @throughline/api dev"
   );
   console.log(
-    "Unavailable validation (separate web server session): TRUSTED_OBJECTIVE_DEMO_PERSONA=unavailable THROUGHLINE_API_ORIGIN=http://127.0.0.1:3001 pnpm --filter @throughline/web dev"
+    "Web server (no persona authority): THROUGHLINE_API_ORIGIN=http://127.0.0.1:3001 pnpm --filter @throughline/web dev"
+  );
+  console.log(
+    "Unavailable validation: restart the API with TRUSTED_OBJECTIVE_DEMO_PERSONA=unavailable; use the unchanged web server configuration"
   );
   console.log(
     `API DATABASE_URL template: postgres://throughline_app:<DEMO_APP_ROLE_PASSWORD>@${adminUrl.hostname}:${adminUrl.port || "5432"}/${TRUSTED_OBJECTIVE_DEMO_DATABASE}`

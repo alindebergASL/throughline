@@ -47,12 +47,8 @@ describe("trusted-objective UI and BFF contracts", () => {
     ]);
   });
 
-  it.each([
-    ["owner", "tenant-a-owner"],
-    ["unavailable", "tenant-b-viewer"]
-  ])("maps the server environment value %s to its dev identity", async (value, identity) => {
+  it("forwards correlation metadata but no identity or authority", async () => {
     vi.stubEnv("NODE_ENV", "test");
-    vi.stubEnv("TRUSTED_OBJECTIVE_DEMO_PERSONA", value);
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(JSON.stringify({ state: "empty" }), {
         status: 200,
@@ -65,7 +61,9 @@ describe("trusted-objective UI and BFF contracts", () => {
 
     expect(response.status).toBe(200);
     const headers = fetchMock.mock.calls[0]![1]!.headers as Record<string, string>;
-    expect(headers["x-throughline-dev-identity"]).toBe(identity);
+    expect(headers["x-request-id"]).toMatch(/^demo-/);
+    expect(headers["x-trace-id"]).toMatch(/^[a-f0-9]{32}$/);
+    expect(headers).not.toHaveProperty("x-throughline-dev-identity");
     expect(headers).not.toHaveProperty("x-throughline-tenant-id");
     expect(headers).not.toHaveProperty("x-throughline-membership-id");
   });
@@ -74,7 +72,6 @@ describe("trusted-objective UI and BFF contracts", () => {
     "allows the loopback API origin %s",
     async (origin) => {
       vi.stubEnv("NODE_ENV", "test");
-      vi.stubEnv("TRUSTED_OBJECTIVE_DEMO_PERSONA", "owner");
       vi.stubEnv("THROUGHLINE_API_ORIGIN", origin);
       const fetchMock = vi.fn().mockResolvedValue(
         new Response(JSON.stringify({ state: "empty" }), {
@@ -97,7 +94,6 @@ describe("trusted-objective UI and BFF contracts", () => {
     "rejects the non-loopback or non-http API origin %s",
     async (origin) => {
       vi.stubEnv("NODE_ENV", "test");
-      vi.stubEnv("TRUSTED_OBJECTIVE_DEMO_PERSONA", "owner");
       vi.stubEnv("THROUGHLINE_API_ORIGIN", origin);
       const fetchMock = vi.fn();
       vi.stubGlobal("fetch", fetchMock);
@@ -109,13 +105,28 @@ describe("trusted-objective UI and BFF contracts", () => {
     }
   );
 
-  it.each([undefined, "", "admin", " owner ", "OWNER", "unavailable\n"])(
-    "fails closed without an upstream request for server environment value %s",
-    async (value) => {
+  it("normalizes denied and missing upstream resources to the same response", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValue(new Response(JSON.stringify({ statusCode: 404 }), { status: 404 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    const denied = await forwardDemoRequest({ initiativeId });
+    const missing = await forwardDemoRequest({ initiativeId });
+
+    expect(denied.status).toBe(404);
+    expect(await denied.json()).toEqual(await missing.json());
+  });
+
+  it.each([401, 403, 500])(
+    "normalizes non-conflict upstream status %s to generic unavailable",
+    async (status) => {
       vi.stubEnv("NODE_ENV", "test");
-      vi.stubEnv("TRUSTED_OBJECTIVE_DEMO_PERSONA", value);
-      const fetchMock = vi.fn();
-      vi.stubGlobal("fetch", fetchMock);
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue(new Response(JSON.stringify({ statusCode: status }), { status }))
+      );
 
       const response = await forwardDemoRequest({ initiativeId });
 
@@ -125,29 +136,11 @@ describe("trusted-objective UI and BFF contracts", () => {
         message: "Resource unavailable",
         error: "Not Found"
       });
-      expect(fetchMock).not.toHaveBeenCalled();
     }
   );
 
-  it("normalizes denied and missing upstream resources to the same response", async () => {
-    vi.stubEnv("NODE_ENV", "test");
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValue(new Response(JSON.stringify({ statusCode: 404 }), { status: 404 }));
-    vi.stubGlobal("fetch", fetchMock);
-
-    vi.stubEnv("TRUSTED_OBJECTIVE_DEMO_PERSONA", "unavailable");
-    const denied = await forwardDemoRequest({ initiativeId });
-    vi.stubEnv("TRUSTED_OBJECTIVE_DEMO_PERSONA", "owner");
-    const missing = await forwardDemoRequest({ initiativeId });
-
-    expect(denied.status).toBe(404);
-    expect(await denied.json()).toEqual(await missing.json());
-  });
-
   it("rejects browser-selected identity and unexpected authority fields before the upstream", async () => {
     vi.stubEnv("NODE_ENV", "test");
-    vi.stubEnv("TRUSTED_OBJECTIVE_DEMO_PERSONA", "owner");
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -155,7 +148,7 @@ describe("trusted-objective UI and BFF contracts", () => {
     const bodyInjection = await POST(
       new Request(routeUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: sameOriginJsonHeaders(),
         body: JSON.stringify({ action: "accept", persona: "unavailable" })
       }),
       routeContext
@@ -163,7 +156,7 @@ describe("trusted-objective UI and BFF contracts", () => {
     const authorityInjection = await POST(
       new Request(routeUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: sameOriginJsonHeaders(),
         body: JSON.stringify({ action: "accept", tenantId: "tenant-a" })
       }),
       routeContext
@@ -182,7 +175,6 @@ describe("trusted-objective UI and BFF contracts", () => {
 
   it("fails the demo identity seam closed in production", async () => {
     vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("TRUSTED_OBJECTIVE_DEMO_PERSONA", "owner");
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);
 
@@ -190,6 +182,104 @@ describe("trusted-objective UI and BFF contracts", () => {
 
     expect(response.status).toBe(404);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [
+      "hostile safelisted text POST",
+      { origin: "https://attacker.example", "content-type": "text/plain" }
+    ],
+    [
+      "cross-origin JSON",
+      { origin: "https://attacker.example", "content-type": "application/json" }
+    ],
+    ["missing Origin", { "content-type": "application/json" }],
+    ["plain text", { origin: new URL(routeUrl).origin, "content-type": "text/plain" }],
+    [
+      "form encoding",
+      { origin: new URL(routeUrl).origin, "content-type": "application/x-www-form-urlencoded" }
+    ],
+    ["cross-site fetch metadata", { ...sameOriginJsonHeaders(), "sec-fetch-site": "cross-site" }],
+    [
+      "malformed content type",
+      { origin: new URL(routeUrl).origin, "content-type": "application/jsonx" }
+    ]
+  ])("rejects %s before parsing or forwarding", async (_label, headers) => {
+    vi.stubEnv("NODE_ENV", "test");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await POST(
+      new Request(routeUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ action: "accept" })
+      }),
+      routeContext
+    );
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      statusCode: 404,
+      message: "Resource unavailable",
+      error: "Not Found"
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("allows a same-origin JSON mutation with charset", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ state: "accepted" }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await POST(
+      new Request(routeUrl, {
+        method: "POST",
+        headers: {
+          origin: new URL(routeUrl).origin,
+          "content-type": "application/json; charset=utf-8",
+          "sec-fetch-site": "same-origin"
+        },
+        body: JSON.stringify({ action: "accept" })
+      }),
+      routeContext
+    );
+
+    expect(response.status).toBe(201);
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it("uses the actual loopback Host when the framework normalizes request.url", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ state: "captured" }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await POST(
+      new Request(routeUrl.replace("127.0.0.1", "localhost"), {
+        method: "POST",
+        headers: {
+          host: "127.0.0.1:3000",
+          origin: "http://127.0.0.1:3000",
+          "content-type": "application/json",
+          "sec-fetch-site": "same-origin"
+        },
+        body: JSON.stringify({ action: "source", note: "Exact source note" })
+      }),
+      routeContext
+    );
+
+    expect(response.status).toBe(201);
+    expect(fetchMock).toHaveBeenCalledOnce();
   });
 
   it("keeps the Initiative flow semantic, keyboard-selectable, announced, focused, and responsive", async () => {
@@ -226,3 +316,11 @@ describe("trusted-objective UI and BFF contracts", () => {
     expect(component).not.toContain('className="sr-only" role="status"');
   });
 });
+
+function sameOriginJsonHeaders(): Record<string, string> {
+  return {
+    origin: new URL(routeUrl).origin,
+    "content-type": "application/json",
+    "sec-fetch-site": "same-origin"
+  };
+}

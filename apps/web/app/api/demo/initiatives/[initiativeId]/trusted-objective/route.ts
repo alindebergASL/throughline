@@ -10,6 +10,7 @@ export async function GET(request: Request, context: RouteContext) {
 }
 
 export async function POST(request: Request, context: RouteContext) {
+  if (!isSameOriginJsonMutation(request)) return unavailableResponse();
   const raw = (await request.json().catch(() => null)) as Record<string, unknown> | null;
   const action = parseAction(raw?.action);
   if (!action || !raw || hasUnexpectedEnvelopeKeys(raw)) return unavailableResponse();
@@ -20,6 +21,40 @@ export async function POST(request: Request, context: RouteContext) {
     action,
     body
   });
+}
+
+function isSameOriginJsonMutation(request: Request): boolean {
+  let requestUrl: URL;
+  try {
+    requestUrl = new URL(request.url);
+  } catch {
+    return false;
+  }
+  const contentType = request.headers.get("content-type");
+  if (
+    !contentType ||
+    !/^application\/json(?:\s*;\s*charset=[a-z0-9._-]+)?\s*$/i.test(contentType)
+  ) {
+    return false;
+  }
+  const origin = request.headers.get("origin");
+  if (!origin) return false;
+  let originUrl: URL;
+  try {
+    originUrl = new URL(origin);
+  } catch {
+    return false;
+  }
+  const requestHost = request.headers.get("host") ?? requestUrl.host;
+  if (
+    originUrl.protocol !== "http:" ||
+    !["127.0.0.1", "localhost", "[::1]"].includes(originUrl.hostname) ||
+    originUrl.host.toLowerCase() !== requestHost.toLowerCase()
+  ) {
+    return false;
+  }
+  const fetchSite = request.headers.get("sec-fetch-site");
+  return fetchSite === null || fetchSite === "same-origin";
 }
 
 function parseAction(

@@ -59,13 +59,14 @@ pnpm --filter @throughline/outbox-relay dev
 
 ## B2 Slice 2 local browser demo
 
-The demo identity seam is development-only and controlled only by the Next server process. Set
-`TRUSTED_OBJECTIVE_DEMO_PERSONA` to exactly `owner` or `unavailable` before starting that server.
-The BFF alone maps those values to the existing `AUTH_ADAPTER=dev` identities. Missing, blank, or
-any other value fails closed without contacting the API. Browser requests contain only the
+The demo identity seam is development-only and controlled only by API startup configuration. Set
+`TRUSTED_OBJECTIVE_DEMO_PERSONA` to exactly `owner` or `unavailable` before starting the API.
+The API maps those values internally to fixed `AUTH_ADAPTER=dev` identities. Missing, blank, or
+any other value fails closed. Browser requests contain only the
 Initiative identifier and action data; they contain no identity, tenant, workspace, membership,
 role, permission, policy, visibility, evidence-offset/hash, or acceptance-authority fields. Both
-the API dev adapter and the BFF fail closed in production.
+the API demo guard and the BFF fail closed in production. The web server has no persona or authority
+configuration.
 
 Start the local PostgreSQL service, choose a URL-safe local-only password without committing it,
 and explicitly reset the fixed disposable `throughline_demo` database:
@@ -87,6 +88,7 @@ Start the API in one terminal:
 
 ```bash
 export AUTH_ADAPTER=dev
+export TRUSTED_OBJECTIVE_DEMO_PERSONA=owner
 export DATABASE_URL="postgres://throughline_app:${DEMO_APP_ROLE_PASSWORD}@localhost:5432/throughline_demo"
 pnpm --filter @throughline/api dev
 ```
@@ -95,7 +97,6 @@ Start the same-origin web app for the representative owner flow in another termi
 
 ```bash
 export THROUGHLINE_API_ORIGIN="http://127.0.0.1:3001"
-export TRUSTED_OBJECTIVE_DEMO_PERSONA=owner
 pnpm --filter @throughline/web dev
 ```
 
@@ -126,13 +127,17 @@ product UI.
    and effective visibility. Choose **Draft confirmation question** and confirm **Not sent** and
    `sent: false`.
 
-Validate unauthorized behavior in a separately configured web-server session. Stop the owner web
-server, start a new web server with the server-only value below, and open the same fixed URL in a
-separate browser context:
+Validate unauthorized behavior with a separately configured API session. Stop both development
+servers, restart the API with the exact unavailable persona, then restart the unchanged web server
+and open the same fixed URL in a separate browser context:
+
+```bash
+export TRUSTED_OBJECTIVE_DEMO_PERSONA=unavailable
+pnpm --filter @throughline/api dev
+```
 
 ```bash
 export THROUGHLINE_API_ORIGIN="http://127.0.0.1:3001"
-export TRUSTED_OBJECTIVE_DEMO_PERSONA=unavailable
 pnpm --filter @throughline/web dev
 ```
 

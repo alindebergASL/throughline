@@ -194,10 +194,14 @@ describe("B2 Slice 1 architecture boundaries", () => {
     );
 
     const bff = await source("apps/web/lib/demo-bff.ts");
-    expect(bff).toContain("process.env.TRUSTED_OBJECTIVE_DEMO_PERSONA");
-    expect(bff).toContain('owner: "tenant-a-owner"');
-    expect(bff).toContain('unavailable: "tenant-b-viewer"');
-    expect(bff.match(/x-throughline-dev-identity/g)).toHaveLength(1);
+    expect(bff).not.toMatch(
+      /TRUSTED_OBJECTIVE_DEMO_PERSONA|x-throughline-dev-identity|tenant-a-owner|tenant-b-viewer/
+    );
+    const guard = await source("apps/api/src/trusted-objective/trusted-objective.guard.ts");
+    expect(guard).toContain("process.env.TRUSTED_OBJECTIVE_DEMO_PERSONA");
+    expect(guard).toContain('return "tenant-a-owner"');
+    expect(guard).toContain('return "tenant-b-viewer"');
+    expect(guard).toContain('hasHeader(request.headers, "x-throughline-dev-identity")');
 
     const readme = await source("README.md");
     const setup = await source("scripts/setup-trusted-objective-demo.ts");

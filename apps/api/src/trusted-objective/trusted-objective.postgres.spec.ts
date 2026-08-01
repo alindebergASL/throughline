@@ -36,13 +36,15 @@ const objective =
 suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", () => {
   let ownerPool: PgPool;
   let appPool: PgPool;
-  let app: NestFastifyApplication;
+  let ownerApp: NestFastifyApplication;
+  let unavailableApp: NestFastifyApplication;
   let accountBus: AccountOperationsDomainCommandBus;
   let initiativeId: string;
   let activityId: string;
   let sourceArtifactId: string;
   let priorDatabaseUrl: string | undefined;
   let priorAdapter: string | undefined;
+  let priorPersona: string | undefined;
 
   beforeAll(async () => {
     if (!ownerUrl || !appUrl)
@@ -103,21 +105,21 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
 
     priorDatabaseUrl = process.env.DATABASE_URL;
     priorAdapter = process.env.AUTH_ADAPTER;
+    priorPersona = process.env.TRUSTED_OBJECTIVE_DEMO_PERSONA;
     process.env.DATABASE_URL = appUrl;
     process.env.AUTH_ADAPTER = "dev";
-    app = await NestFactory.create<NestFastifyApplication>(
-      AppModule,
-      new FastifyAdapter({ logger: false })
-    );
-    await app.init();
+    ownerApp = await createApiForPersona("owner");
+    unavailableApp = await createApiForPersona("unavailable");
   }, 60_000);
 
   afterAll(async () => {
-    await app?.close();
+    await ownerApp?.close();
+    await unavailableApp?.close();
     await appPool?.end();
     await ownerPool?.end();
     restore("DATABASE_URL", priorDatabaseUrl);
     restore("AUTH_ADAPTER", priorAdapter);
+    restore("TRUSTED_OBJECTIVE_DEMO_PERSONA", priorPersona);
   });
 
   it("runs capture → proposed Claim → accepted Fact through durable canonical buses and converges double submits", async () => {
@@ -319,6 +321,32 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
     }
   });
 
+  it.each([
+    ["x-throughline-dev-identity", "tenant-a-owner"],
+    ["x-throughline-dev-identity", "tenant-b-viewer"],
+    ["x-throughline-tenant-id", devFixtures.tenantA],
+    ["role", "owner"]
+  ])(
+    "rejects request authority injection through %s without a durable write",
+    async (header, value) => {
+      const before = await durableWriteCount();
+      const response = await unavailableApp.inject({
+        method: "POST",
+        url: `/v1/demo/initiatives/${initiativeId}/trusted-objective/accept`,
+        headers: { [header]: value },
+        payload: {}
+      });
+
+      expect(response.statusCode).toBe(401);
+      expect(response.json()).toEqual({
+        statusCode: 401,
+        message: "Authentication is unavailable",
+        error: "Unauthorized"
+      });
+      expect(await durableWriteCount()).toBe(before);
+    }
+  );
+
   it("rejects client evidence/authority fields and drafts deterministically without a write or send", async () => {
     const tampered = await postAs("tenant-a-owner", initiativeId, "proposal", {
       objective,
@@ -439,10 +467,9 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
   });
 
   function getAs(identity: "tenant-a-owner" | "tenant-b-viewer", id: string) {
-    return app.inject({
+    return appFor(identity).inject({
       method: "GET",
-      url: `/v1/demo/initiatives/${id}/trusted-objective`,
-      headers: { "x-throughline-dev-identity": identity }
+      url: `/v1/demo/initiatives/${id}/trusted-objective`
     });
   }
 
@@ -452,12 +479,27 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
     action: string,
     payload: Record<string, unknown>
   ) {
-    return app.inject({
+    return appFor(identity).inject({
       method: "POST",
       url: `/v1/demo/initiatives/${id}/trusted-objective/${action}`,
-      headers: { "x-throughline-dev-identity": identity },
       payload
     });
+  }
+
+  function appFor(identity: "tenant-a-owner" | "tenant-b-viewer") {
+    return identity === "tenant-a-owner" ? ownerApp : unavailableApp;
+  }
+
+  async function createApiForPersona(
+    persona: "owner" | "unavailable"
+  ): Promise<NestFastifyApplication> {
+    process.env.TRUSTED_OBJECTIVE_DEMO_PERSONA = persona;
+    const configuredApp = await NestFactory.create<NestFastifyApplication>(
+      AppModule,
+      new FastifyAdapter({ logger: false })
+    );
+    await configuredApp.init();
+    return configuredApp;
   }
 
   async function durableWriteCount(): Promise<string> {

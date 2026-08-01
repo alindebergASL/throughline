@@ -32,7 +32,7 @@ The representative flow was performed from the Initiative page after normal deve
 
 The owner journey created the demonstrated SourceArtifact, Claim, and AcceptedFact through the browser workflow. Demo setup seeded only prerequisites; before the journey, database counts were `0 SourceArtifact / 0 Claim / 0 AcceptedFact`.
 
-For the unavailable proof, the owner web-server session was stopped and a new server-only `TRUSTED_OBJECTIVE_DEMO_PERSONA=unavailable` session was started. The same Initiative URL was opened in a separate browser context. Its rendered text contained only the generic unavailable message and disclosed no Initiative title, objective, source, excerpt, hashes, counts, Claim/Fact state, or other protected metadata.
+To reproduce the unavailable proof, stop the owner API session and start a new API session with `AUTH_ADAPTER=dev` and exact startup configuration `TRUSTED_OBJECTIVE_DEMO_PERSONA=unavailable`. The web server has no persona configuration. Open the same Initiative URL in a separate browser context. Its rendered text must contain only the generic unavailable message and disclose no Initiative title, objective, source, excerpt, hashes, counts, Claim/Fact state, or other protected metadata.
 
 ## Accessibility and responsive checklist
 

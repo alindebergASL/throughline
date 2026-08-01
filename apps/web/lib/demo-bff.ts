@@ -1,12 +1,5 @@
 import { NextResponse } from "next/server";
 
-type DemoPersona = "owner" | "unavailable";
-
-const identityForPersona = Object.freeze({
-  owner: "tenant-a-owner",
-  unavailable: "tenant-b-viewer"
-} as const satisfies Record<DemoPersona, string>);
-
 export async function forwardDemoRequest(input: {
   initiativeId: string;
   action?: "source" | "proposal" | "accept" | "draft-confirmation";
@@ -15,8 +8,6 @@ export async function forwardDemoRequest(input: {
   if (!isUuid(input.initiativeId) || process.env.NODE_ENV === "production") {
     return unavailableResponse();
   }
-  const identity = resolveDemoIdentity();
-  if (!identity) return unavailableResponse();
   const origin = apiOrigin();
   if (!origin) return unavailableResponse();
   const suffix = input.action ? `/${input.action}` : "";
@@ -26,7 +17,6 @@ export async function forwardDemoRequest(input: {
       method: input.action ? "POST" : "GET",
       headers: {
         "content-type": "application/json",
-        "x-throughline-dev-identity": identity,
         "x-request-id": `demo-${crypto.randomUUID()}`,
         "x-trace-id": crypto.randomUUID().replaceAll("-", "")
       },
@@ -36,19 +26,13 @@ export async function forwardDemoRequest(input: {
   ).catch(() => null);
   if (!response || response.status === 404) return unavailableResponse();
   if (!response.ok) {
+    if (response.status !== 409) return unavailableResponse();
     return NextResponse.json(
-      response.status === 409
-        ? { statusCode: 409, message: "Command precondition failed", error: "Conflict" }
-        : { statusCode: response.status, message: "Request could not be completed" },
-      { status: response.status }
+      { statusCode: 409, message: "Command precondition failed", error: "Conflict" },
+      { status: 409 }
     );
   }
   return NextResponse.json(await response.json(), { status: response.status });
-}
-
-function resolveDemoIdentity(): string | null {
-  const value: unknown = process.env.TRUSTED_OBJECTIVE_DEMO_PERSONA;
-  return value === "owner" || value === "unavailable" ? identityForPersona[value] : null;
 }
 
 export function unavailableResponse(): NextResponse {
