@@ -139,6 +139,30 @@ describe("trusted-objective UI and BFF contracts", () => {
     }
   );
 
+  it.each([
+    ["malformed JSON", "not-json", "application/json"],
+    ["non-JSON", "plain text", "text/plain"]
+  ])("normalizes %s upstream 2xx to generic unavailable", async (_label, body, contentType) => {
+    vi.stubEnv("NODE_ENV", "test");
+    vi.stubGlobal(
+      "fetch",
+      vi
+        .fn()
+        .mockResolvedValue(
+          new Response(body, { status: 200, headers: { "content-type": contentType } })
+        )
+    );
+
+    const response = await forwardDemoRequest({ initiativeId });
+
+    expect(response.status).toBe(404);
+    expect(await response.json()).toEqual({
+      statusCode: 404,
+      message: "Resource unavailable",
+      error: "Not Found"
+    });
+  });
+
   it("rejects browser-selected identity and unexpected authority fields before the upstream", async () => {
     vi.stubEnv("NODE_ENV", "test");
     const fetchMock = vi.fn();

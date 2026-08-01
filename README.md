@@ -84,6 +84,12 @@ applies current migrations, provisions the existing least-privilege `throughline
 seeds only tenant/workspace/Space/person/membership/organization/Initiative/Engagement
 prerequisites. It never seeds a SourceArtifact, Claim, or AcceptedFact.
 
+Use this setup only with the disposable local Compose PostgreSQL cluster. `ALTER ROLE
+throughline_app` is cluster-wide, and `DEMO_APP_ROLE_PASSWORD` rotates that shared role credential;
+the change can affect other databases in the same cluster. Automated tests can re-provision the
+role, but any manually configured DSNs using `throughline_app` must be updated. Full prerequisite
+seeding also requires the existing product-relay service principal provisioned by the migrations.
+
 Start the API in one terminal:
 
 ```bash

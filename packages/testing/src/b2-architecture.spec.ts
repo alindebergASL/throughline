@@ -223,18 +223,21 @@ describe("B2 Slice 1 architecture boundaries", () => {
     const runner = await source("scripts/run-b2-gate.ts");
     for (const file of [
       "b2-architecture.spec.ts",
+      "trusted-objective-demo-config.spec.ts",
       "command-schemas.spec.ts",
       "truth-ledger.postgres.spec.ts",
       "b2-authorization.spec.ts",
       "transaction.spec.ts",
       "b1-catalog-contract.spec.ts",
       "b2-catalog-contract.postgres.spec.ts",
-      "b2-truth.postgres.spec.ts"
+      "b2-truth.postgres.spec.ts",
+      "trusted-objective.guard.spec.ts"
     ]) {
       expect(runner).toContain(file);
     }
     expect(runner).toContain("numPendingTests");
     expect(runner).toContain("unhandledErrors");
+    await expect(pathExists("scripts/trusted-objective-demo-config.spec.ts")).resolves.toBe(false);
 
     const preflight = await source("scripts/require-b2-test-env.ts");
     expect(preflight).toContain('process.env.B2_AUTHORITATIVE_GATE !== "1"');

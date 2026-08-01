@@ -28,6 +28,7 @@ import {
   parseB2CommandResult
 } from "./command-schemas.js";
 import { TruthLedgerConflictError, TruthLedgerRepository } from "./repository.js";
+import { resolvePredicateDefinition } from "./predicate-registry.js";
 import {
   VerifiedClaimSourceSpanAdmission,
   bindClaimEvidenceSnapshotLookupToTransaction
@@ -188,10 +189,11 @@ export class TruthLedgerDomainCommandBus {
       );
       if (reservation.replay) return reservation.result;
 
-      if (
-        command.payload.subject.type === "initiative" &&
-        command.payload.predicate === "initiative.primary_objective"
-      ) {
+      const predicateDefinition = resolvePredicateDefinition(
+        command.payload.predicate,
+        command.payload.subject.type
+      );
+      if (predicateDefinition.proposalSlotPolicy === "single_open") {
         await ledger.lockPrimaryObjectiveProposalSlot({
           tenantId: context.tenantId,
           workspaceId: context.workspaceId,

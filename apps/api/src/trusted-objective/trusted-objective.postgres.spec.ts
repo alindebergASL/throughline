@@ -1,6 +1,7 @@
 import "reflect-metadata";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
+import { Test } from "@nestjs/testing";
 import {
   AccountOperationsDomainCommandBus,
   B1CommandInvariantError
@@ -17,6 +18,7 @@ import {
 import { createDevSecurityContext, devFixtures } from "@throughline/tenancy";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AppModule } from "../app.module.js";
+import { TrustedObjectiveGuard, type TrustedObjectiveRequest } from "./trusted-objective.guard.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -38,6 +40,7 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
   let appPool: PgPool;
   let ownerApp: NestFastifyApplication;
   let unavailableApp: NestFastifyApplication;
+  let sameTenantViewerApp: NestFastifyApplication;
   let accountBus: AccountOperationsDomainCommandBus;
   let initiativeId: string;
   let activityId: string;
@@ -110,11 +113,13 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
     process.env.AUTH_ADAPTER = "dev";
     ownerApp = await createApiForPersona("owner");
     unavailableApp = await createApiForPersona("unavailable");
+    sameTenantViewerApp = await createApiWithContext(createDevSecurityContext("tenant-a-viewer"));
   }, 60_000);
 
   afterAll(async () => {
     await ownerApp?.close();
     await unavailableApp?.close();
+    await sameTenantViewerApp?.close();
     await appPool?.end();
     await ownerPool?.end();
     restore("DATABASE_URL", priorDatabaseUrl);
@@ -321,6 +326,62 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
     }
   });
 
+  it("lets a same-Space viewer read but denies acceptance generically without durable writes", async () => {
+    const workflow = await createWorkflow("same-space-viewer-denied-accept");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", { note });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt
+    });
+    const access = await ownerPool.query<{ id: string }>(
+      `INSERT INTO access.access_relationships (
+         tenant_id, workspace_id, subject_type, subject_id, relation,
+         resource_type, resource_id, source
+       ) VALUES
+         ($1,$2,'membership',$3,'viewer','space',$4,'direct'),
+         ($1,$2,'membership',$3,'viewer','space',$5,'direct'),
+         ($1,$2,'membership',$3,'viewer','space',$6,'direct')
+       RETURNING id`,
+      [
+        devFixtures.tenantA,
+        devFixtures.workspaceA,
+        devFixtures.membershipAViewer,
+        workflow.organizationSpaceId,
+        workflow.initiativeSpaceId,
+        workflow.activitySpaceId
+      ]
+    );
+    try {
+      const readable = await sameTenantViewerApp.inject({
+        method: "GET",
+        url: `/v1/demo/initiatives/${workflow.initiativeId}/trusted-objective`
+      });
+      expect(readable.statusCode, readable.body).toBe(200);
+      expect(readable.json()).toMatchObject({ state: "proposed", proposal: { objective } });
+
+      const before = await durableWriteCount();
+      const denied = await sameTenantViewerApp.inject({
+        method: "POST",
+        url: `/v1/demo/initiatives/${workflow.initiativeId}/trusted-objective/accept`,
+        payload: {}
+      });
+      const missing = await ownerApp.inject({
+        method: "POST",
+        url: "/v1/demo/initiatives/70000000-0000-7000-8000-000000000997/trusted-objective/accept",
+        payload: {}
+      });
+
+      expect(denied.statusCode).toBe(404);
+      expect(denied.body).toBe(missing.body);
+      expect(await durableWriteCount()).toBe(before);
+      await expectPrimaryObjectiveCounts(workflow.initiativeId, { proposed: 1, accepted: 0 });
+    } finally {
+      await ownerPool.query("DELETE FROM access.access_relationships WHERE id = ANY($1::uuid[])", [
+        access.rows.map(({ id }) => id)
+      ]);
+    }
+  });
+
   it.each([
     ["x-throughline-dev-identity", "tenant-a-owner"],
     ["x-throughline-dev-identity", "tenant-b-viewer"],
@@ -502,6 +563,27 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
     return configuredApp;
   }
 
+  async function createApiWithContext(
+    context: ReturnType<typeof createDevSecurityContext>
+  ): Promise<NestFastifyApplication> {
+    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideGuard(TrustedObjectiveGuard)
+      .useValue({
+        canActivate(executionContext: {
+          switchToHttp(): { getRequest(): TrustedObjectiveRequest };
+        }): boolean {
+          executionContext.switchToHttp().getRequest().trustedObjectiveContext = context;
+          return true;
+        }
+      })
+      .compile();
+    const configuredApp = moduleRef.createNestApplication<NestFastifyApplication>(
+      new FastifyAdapter({ logger: false })
+    );
+    await configuredApp.init();
+    return configuredApp;
+  }
+
   async function durableWriteCount(): Promise<string> {
     const result = await ownerPool.query<{ count: string }>(
       `SELECT (
@@ -513,9 +595,13 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
     return result.rows[0]!.count;
   }
 
-  async function createWorkflow(
-    key: string
-  ): Promise<{ initiativeId: string; activityId: string }> {
+  async function createWorkflow(key: string): Promise<{
+    organizationSpaceId: string;
+    initiativeId: string;
+    initiativeSpaceId: string;
+    activityId: string;
+    activitySpaceId: string;
+  }> {
     const organization = await accountBus.execute(
       {
         kind: "organization.create",
@@ -552,7 +638,28 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
       },
       createDevSecurityContext("tenant-a-owner")
     );
-    return { initiativeId: initiative.initiativeId, activityId: activity.activityId };
+    const persistedOrganization = await ownerPool.query<{ space_id: string }>(
+      `SELECT space_id FROM work.organizations
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+      [devFixtures.tenantA, devFixtures.workspaceA, organization.organizationId]
+    );
+    const persistedInitiative = await ownerPool.query<{ space_id: string }>(
+      `SELECT space_id FROM work.initiatives
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+      [devFixtures.tenantA, devFixtures.workspaceA, initiative.initiativeId]
+    );
+    const persistedActivity = await ownerPool.query<{ space_id: string }>(
+      `SELECT space_id FROM work.activities
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3`,
+      [devFixtures.tenantA, devFixtures.workspaceA, activity.activityId]
+    );
+    return {
+      organizationSpaceId: persistedOrganization.rows[0]!.space_id,
+      initiativeId: initiative.initiativeId,
+      initiativeSpaceId: persistedInitiative.rows[0]!.space_id,
+      activityId: activity.activityId,
+      activitySpaceId: persistedActivity.rows[0]!.space_id
+    };
   }
 
   async function expectPrimaryObjectiveCounts(

@@ -32,7 +32,12 @@ export async function forwardDemoRequest(input: {
       { status: 409 }
     );
   }
-  return NextResponse.json(await response.json(), { status: response.status });
+  if (!response.headers.get("content-type")?.toLowerCase().startsWith("application/json")) {
+    return unavailableResponse();
+  }
+  const body = await response.json().catch(() => null);
+  if (body === null) return unavailableResponse();
+  return NextResponse.json(body, { status: response.status });
 }
 
 export function unavailableResponse(): NextResponse {

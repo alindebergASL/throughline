@@ -20,6 +20,7 @@ const initiativeId = "70000000-0000-7000-8000-000000000204";
 function request(): TrustedObjectiveRequest {
   return {
     headers: {},
+    method: "GET",
     trustedObjectiveContext: createDevSecurityContext("tenant-a-owner")
   };
 }

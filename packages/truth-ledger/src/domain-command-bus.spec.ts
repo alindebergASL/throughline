@@ -344,8 +344,10 @@ describe.sequential("durable truth command boundary", () => {
     expect(implementation).not.toMatch(
       /command\.payload\.subject\.type === "initiative"[\s\S]{0,300}lockFirstAcceptanceSlot/
     );
-    expect(implementation).toContain(
-      'command.payload.predicate === "initiative.primary_objective"'
+    expect(implementation).toContain('proposalSlotPolicy === "single_open"');
+    expect(implementation).toContain("resolvePredicateDefinition(");
+    expect(implementation).not.toMatch(
+      /command\.payload\.predicate === ["']initiative\.primary_objective["']/
     );
   });
 });

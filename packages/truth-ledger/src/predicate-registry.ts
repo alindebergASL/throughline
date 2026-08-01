@@ -26,6 +26,7 @@ export interface PredicateDefinition {
   readonly equals: (left: string, right: string) => boolean;
   readonly conflicts: (left: string, right: string) => boolean;
   readonly cardinality: "single";
+  readonly proposalSlotPolicy: "multiple_open" | "single_open";
   readonly authorityScope: "activity_owner" | "initiative_owner";
   readonly deterministicViewTreatment: {
     readonly viewType: "initiative_summary";
@@ -127,6 +128,7 @@ const registry = Object.freeze({
     equals: textEquals,
     conflicts: textConflicts,
     cardinality: "single",
+    proposalSlotPolicy: "multiple_open",
     authorityScope: "activity_owner",
     deterministicViewTreatment: Object.freeze({
       ...sharedViewTreatment,
@@ -141,6 +143,7 @@ const registry = Object.freeze({
     equals: textEquals,
     conflicts: textConflicts,
     cardinality: "single",
+    proposalSlotPolicy: "single_open",
     authorityScope: "initiative_owner",
     deterministicViewTreatment: Object.freeze({
       ...sharedViewTreatment,
