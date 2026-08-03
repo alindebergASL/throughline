@@ -8,6 +8,16 @@ import {
   type ConfirmationDraft,
   type TrustedObjectiveState
 } from "../../../../lib/trusted-objective";
+import {
+  createAssistedObjectiveDraft,
+  rejectAssistedObjective,
+  type AssistedObjectiveDraft
+} from "../../../../lib/assisted-objective";
+import {
+  focusAssistedObjectiveTarget,
+  runSingleFlight,
+  type AssistedObjectiveFocusTarget
+} from "../../../../lib/assisted-objective-focus";
 
 export function TrustedObjectiveExperience(input: { initiativeId: string }) {
   const [state, setState] = useState<TrustedObjectiveState | null>(null);
@@ -15,10 +25,8 @@ export function TrustedObjectiveExperience(input: { initiativeId: string }) {
   const [busy, setBusy] = useState(false);
   const [announcement, setAnnouncement] = useState("Loading Initiative");
   const [note, setNote] = useState("");
-  const [objective, setObjective] = useState("");
-  const [exactExcerpt, setExactExcerpt] = useState("");
   const [draft, setDraft] = useState<ConfirmationDraft | null>(null);
-  const sourceRef = useRef<HTMLTextAreaElement>(null);
+  const requestOwnerRef = useRef<symbol | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -46,50 +54,38 @@ export function TrustedObjectiveExperience(input: { initiativeId: string }) {
     action: "source" | "proposal" | "accept" | "draft-confirmation",
     values: Record<string, string> = {}
   ) {
-    setBusy(true);
-    setAnnouncement("Saving");
-    try {
-      const response = await fetch(
-        `/api/demo/initiatives/${encodeURIComponent(input.initiativeId)}/trusted-objective`,
-        {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(demoActionEnvelope(action, values as never))
-        }
-      );
-      if (!response.ok) {
-        setAnnouncement(
-          response.status === 409
-            ? "That action no longer matches the current Initiative. Refresh and try again."
-            : "The request could not be completed."
+    return runSingleFlight(requestOwnerRef, setBusy, async () => {
+      setAnnouncement("Saving");
+      try {
+        const response = await fetch(
+          `/api/demo/initiatives/${encodeURIComponent(input.initiativeId)}/trusted-objective`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(demoActionEnvelope(action, values as never))
+          }
         );
-        return;
+        if (!response.ok) {
+          setAnnouncement(
+            response.status === 409
+              ? "That action no longer matches the current Initiative. Refresh and try again."
+              : "The request could not be completed."
+          );
+          return;
+        }
+        if (action === "draft-confirmation") {
+          const nextDraft = (await response.json()) as ConfirmationDraft;
+          setDraft(nextDraft);
+          setAnnouncement("Confirmation question drafted. Not sent.");
+        } else {
+          const next = (await response.json()) as TrustedObjectiveState;
+          setState(next);
+          setAnnouncement(`${nextActionForState(next.state)} ready`);
+        }
+      } catch {
+        setAnnouncement("The request could not be completed.");
       }
-      if (action === "draft-confirmation") {
-        const nextDraft = (await response.json()) as ConfirmationDraft;
-        setDraft(nextDraft);
-        setAnnouncement("Confirmation question drafted. Not sent.");
-      } else {
-        const next = (await response.json()) as TrustedObjectiveState;
-        setState(next);
-        setAnnouncement(`${nextActionForState(next.state)} ready`);
-      }
-    } catch {
-      setAnnouncement("The request could not be completed.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  function useSelection() {
-    const field = sourceRef.current;
-    if (!field || field.selectionStart === field.selectionEnd) {
-      setAnnouncement("Select an exact excerpt in the engagement note first.");
-      return;
-    }
-    const selected = field.value.slice(field.selectionStart, field.selectionEnd);
-    setExactExcerpt(selected);
-    setAnnouncement("Selected excerpt is ready to support the proposed objective.");
+    });
   }
 
   return (
@@ -159,48 +155,13 @@ export function TrustedObjectiveExperience(input: { initiativeId: string }) {
               )}
 
               {state.source && !state.proposal && !state.acceptedMemory && (
-                <section className="workflow-card" aria-labelledby="proposal-title">
-                  <p className="step">2 of 3 · Propose memory</p>
-                  <h2 id="proposal-title">Select the exact supporting excerpt</h2>
-                  <p>
-                    Select text in the read-only note, then use the selected excerpt. You can also
-                    identify the exact text in the field below.
-                  </p>
-                  <label htmlFor="captured-source">{state.source.title}</label>
-                  <textarea
-                    id="captured-source"
-                    ref={sourceRef}
-                    value={state.source.note}
-                    readOnly
-                    rows={10}
-                    className="source-text"
-                  />
-                  <button className="secondary" type="button" onClick={useSelection}>
-                    Use selected excerpt
-                  </button>
-                  <label htmlFor="exact-excerpt">Exact excerpt</label>
-                  <textarea
-                    id="exact-excerpt"
-                    value={exactExcerpt}
-                    onChange={(event) => setExactExcerpt(event.target.value)}
-                    rows={3}
-                  />
-                  <label htmlFor="objective">Proposed primary objective</label>
-                  <textarea
-                    id="objective"
-                    value={objective}
-                    onChange={(event) => setObjective(event.target.value)}
-                    rows={3}
-                    placeholder="State the Initiative’s primary objective in plain language."
-                  />
-                  <button
-                    className="primary"
-                    disabled={busy || objective.trim() === "" || exactExcerpt.trim() === ""}
-                    onClick={() => void act("proposal", { objective, exactExcerpt })}
-                  >
-                    Propose trusted objective
-                  </button>
-                </section>
+                <ObjectiveSuggestionCard
+                  key={state.source.capturedAt}
+                  source={state.source}
+                  busy={busy}
+                  announce={setAnnouncement}
+                  createProposal={(values) => act("proposal", values)}
+                />
               )}
 
               {state.proposal && !state.acceptedMemory && (
@@ -306,6 +267,204 @@ export function TrustedObjectiveExperience(input: { initiativeId: string }) {
       </div>
     </div>
   );
+}
+
+function ObjectiveSuggestionCard(input: {
+  source: NonNullable<TrustedObjectiveState["source"]>;
+  busy: boolean;
+  announce: (message: string) => void;
+  createProposal: (values: { objective: string; exactExcerpt: string }) => Promise<void>;
+}) {
+  const [objectiveDraft, setObjectiveDraft] = useState<AssistedObjectiveDraft>(() =>
+    createAssistedObjectiveDraft(input.source.note)
+  );
+  const [correctingEvidence, setCorrectingEvidence] = useState(false);
+  const objectiveRef = useRef<HTMLTextAreaElement>(null);
+  const exactEvidenceRef = useRef<HTMLTextAreaElement>(null);
+  const sourceRef = useRef<HTMLTextAreaElement>(null);
+  const pendingFocusRef = useRef<AssistedObjectiveFocusTarget | null>(null);
+  const isSuggested = objectiveDraft.mode === "suggested";
+  const showManualEvidence = !isSuggested || correctingEvidence;
+  const controlsDisabled = input.busy;
+
+  useEffect(() => {
+    const target = pendingFocusRef.current;
+    if (!target) return;
+    if (
+      focusAssistedObjectiveTarget(target, {
+        objective: objectiveRef.current,
+        evidence: exactEvidenceRef.current
+      })
+    ) {
+      pendingFocusRef.current = null;
+    }
+  }, [correctingEvidence, objectiveDraft.mode]);
+
+  function setObjective(objective: string) {
+    setObjectiveDraft((current) => ({ ...current, objective }));
+  }
+
+  function setExactExcerpt(exactExcerpt: string) {
+    setObjectiveDraft((current) => ({ ...current, exactExcerpt }));
+  }
+
+  function useSelection() {
+    const field = sourceRef.current;
+    if (!field || field.selectionStart === field.selectionEnd) {
+      input.announce("Select an exact excerpt in the engagement note first.");
+      return;
+    }
+    setExactExcerpt(field.value.slice(field.selectionStart, field.selectionEnd));
+    input.announce("Selected excerpt is ready to support the proposed objective.");
+  }
+
+  function correctEvidence() {
+    pendingFocusRef.current = "evidence";
+    setCorrectingEvidence(true);
+    input.announce("Manual evidence correction controls ready.");
+  }
+
+  function rejectSuggestion() {
+    pendingFocusRef.current = "objective";
+    setObjectiveDraft(rejectAssistedObjective());
+    setCorrectingEvidence(false);
+    input.announce("Suggestion rejected. Manual objective entry ready.");
+  }
+
+  return (
+    <section className="workflow-card suggestion-card" aria-labelledby="proposal-title">
+      <p className="step">2 of 3 · Prepare proposal</p>
+      <h2 id="proposal-title">
+        {isSuggested ? "Review objective suggestion" : "Enter the primary objective manually"}
+      </h2>
+
+      {isSuggested ? (
+        <>
+          <p className="trust-label suggested-label">Suggested proposal · not accepted</p>
+          <p>
+            Inspect the prefilled objective and exact evidence. This browser-only suggestion has not
+            created a Claim or changed shared truth.
+          </p>
+        </>
+      ) : (
+        <p className="manual-explanation">{manualExplanation(objectiveDraft.reason)}</p>
+      )}
+
+      <label htmlFor="objective">Proposed primary objective</label>
+      <textarea
+        id="objective"
+        ref={objectiveRef}
+        value={objectiveDraft.objective}
+        onChange={(event) => setObjective(event.target.value)}
+        disabled={controlsDisabled}
+        rows={3}
+        placeholder="State the Initiative’s primary objective in plain language."
+      />
+
+      <label htmlFor="exact-excerpt">Exact supporting evidence</label>
+      <textarea
+        id="exact-excerpt"
+        ref={exactEvidenceRef}
+        value={objectiveDraft.exactExcerpt}
+        onChange={(event) => setExactExcerpt(event.target.value)}
+        readOnly={isSuggested && !correctingEvidence}
+        disabled={controlsDisabled}
+        rows={3}
+      />
+
+      {isSuggested && !correctingEvidence && (
+        <button
+          className="secondary"
+          type="button"
+          disabled={controlsDisabled}
+          onClick={correctEvidence}
+        >
+          Correct evidence manually
+        </button>
+      )}
+
+      {showManualEvidence ? (
+        <div className="manual-evidence" aria-labelledby="manual-evidence-title">
+          <h3 id="manual-evidence-title">Select exact evidence from the captured source</h3>
+          <label htmlFor="captured-source">{input.source.title}</label>
+          <textarea
+            id="captured-source"
+            ref={sourceRef}
+            value={input.source.note}
+            readOnly
+            disabled={controlsDisabled}
+            rows={10}
+            className="source-text"
+          />
+          <button
+            className="secondary"
+            type="button"
+            disabled={controlsDisabled}
+            onClick={useSelection}
+          >
+            Use selected excerpt
+          </button>
+        </div>
+      ) : (
+        <details>
+          <summary>Inspect captured source</summary>
+          <div className="evidence-panel">
+            <p>
+              <strong>{input.source.title}</strong>
+            </p>
+            <p className="source-inspection">{input.source.note}</p>
+          </div>
+        </details>
+      )}
+
+      {isSuggested && (
+        <button
+          className="text-action"
+          type="button"
+          disabled={controlsDisabled}
+          onClick={rejectSuggestion}
+        >
+          Reject suggestion and enter manually
+        </button>
+      )}
+
+      <div className="proposal-action">
+        <p>
+          Create a Proposed Claim for separate review. This action does not accept the objective as
+          truth.
+        </p>
+        <button
+          className="primary"
+          disabled={
+            controlsDisabled ||
+            objectiveDraft.objective.trim() === "" ||
+            objectiveDraft.exactExcerpt.trim() === ""
+          }
+          onClick={() =>
+            void input.createProposal({
+              objective: objectiveDraft.objective,
+              exactExcerpt: objectiveDraft.exactExcerpt
+            })
+          }
+        >
+          Create proposed objective
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function manualExplanation(reason: Extract<AssistedObjectiveDraft, { mode: "manual" }>["reason"]) {
+  if (reason === "conflicting") {
+    return "Throughline found competing objective statements and did not choose between them. Select the exact evidence and enter the objective manually.";
+  }
+  if (reason === "ambiguous") {
+    return "Throughline could not identify one unique supporting excerpt. Select the exact evidence and enter the objective manually.";
+  }
+  if (reason === "rejected") {
+    return "The suggestion was rejected locally. Select the exact evidence and enter the objective manually.";
+  }
+  return "Throughline did not find one safe objective in this note. Select the exact evidence and enter the objective manually.";
 }
 
 function formatDate(value: string): string {

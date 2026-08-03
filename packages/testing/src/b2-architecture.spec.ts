@@ -187,6 +187,8 @@ describe("B2 Slice 1 architecture boundaries", () => {
       "apps/web/app/organizations/initiatives/[initiativeId]/page.tsx",
       "apps/web/app/organizations/initiatives/[initiativeId]/trusted-objective-experience.tsx",
       "apps/web/app/api/demo/initiatives/[initiativeId]/trusted-objective/route.ts",
+      "apps/web/lib/assisted-objective-focus.ts",
+      "apps/web/lib/assisted-objective.ts",
       "apps/web/lib/trusted-objective.ts"
     ]);
     expect(browserAndRouteSources).not.toMatch(

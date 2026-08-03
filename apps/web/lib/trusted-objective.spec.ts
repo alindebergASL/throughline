@@ -306,7 +306,7 @@ describe("trusted-objective UI and BFF contracts", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it("keeps the Initiative flow semantic, keyboard-selectable, announced, focused, and responsive", async () => {
+  it("contains static semantic, focus-management, and overflow safeguards", async () => {
     const component = await readFile(
       new URL(
         "../app/organizations/initiatives/[initiativeId]/trusted-objective-experience.tsx",
@@ -326,6 +326,15 @@ describe("trusted-objective UI and BFF contracts", () => {
       'htmlFor="captured-source"',
       "selectionStart",
       "readOnly",
+      "Suggested proposal · not accepted",
+      "Correct evidence manually",
+      "Reject suggestion and enter manually",
+      'pendingFocusRef.current = "evidence"',
+      'pendingFocusRef.current = "objective"',
+      "focusAssistedObjectiveTarget",
+      "did not find one safe objective",
+      "Create proposed objective",
+      "does not accept the objective as",
       "state.proposal.status",
       "Not sent"
     ]) {
@@ -337,7 +346,121 @@ describe("trusted-objective UI and BFF contracts", () => {
     expect(css).toContain("min-width: 0");
     expect(css).toContain(".action-announcement");
     expect(css).toContain("max-width: 72ch");
+    expect(css).toContain(".manual-evidence");
+    expect(css).toContain("overflow-wrap: anywhere");
     expect(component).not.toContain('className="sr-only" role="status"');
+  });
+
+  it("statically wires every proposal-preparation control to the in-flight request lock", async () => {
+    const component = await readFile(
+      new URL(
+        "../app/organizations/initiatives/[initiativeId]/trusted-objective-experience.tsx",
+        import.meta.url
+      ),
+      "utf8"
+    );
+    const card = component.slice(
+      component.indexOf("function ObjectiveSuggestionCard"),
+      component.indexOf("function manualExplanation")
+    );
+
+    expect(card).toContain("const controlsDisabled = input.busy");
+    expect(card.match(/disabled=\{controlsDisabled\}/g)).toHaveLength(6);
+    expect(card).toContain("readOnly={isSuggested && !correctingEvidence}");
+  });
+
+  it("runs synchronous action attempts as an owner-token single flight", async () => {
+    const helper = await import("./assisted-objective-focus");
+    const runSingleFlight = Reflect.get(helper, "runSingleFlight") as <Result>(
+      owner: { current: symbol | null },
+      setBusy: (busy: boolean) => void,
+      request: () => Promise<Result>
+    ) => Promise<Result | undefined>;
+    const owner = { current: null as symbol | null };
+    const busyEvents: boolean[] = [];
+    const announcements: string[] = [];
+    let requestCount = 0;
+    let settle!: (value: string) => void;
+    const deferred = new Promise<string>((resolve) => {
+      settle = resolve;
+    });
+    const request = () => {
+      requestCount += 1;
+      announcements.push("Saving");
+      return deferred;
+    };
+
+    const first = runSingleFlight(owner, (busy) => busyEvents.push(busy), request);
+    const losing = runSingleFlight(owner, (busy) => busyEvents.push(busy), request);
+
+    expect(requestCount).toBe(1);
+    expect(announcements).toEqual(["Saving"]);
+    expect(busyEvents).toEqual([true]);
+    expect(owner.current).not.toBeNull();
+    await expect(losing).resolves.toBeUndefined();
+
+    settle("saved");
+    await expect(first).resolves.toBe("saved");
+    expect(busyEvents).toEqual([true, false]);
+    expect(owner.current).toBeNull();
+
+    let settleStale!: () => void;
+    const staleDeferred = new Promise<void>((resolve) => {
+      settleStale = resolve;
+    });
+    const staleOwner = { current: null as symbol | null };
+    const staleBusyEvents: boolean[] = [];
+    const staleFlight = runSingleFlight(
+      staleOwner,
+      (busy) => staleBusyEvents.push(busy),
+      () => staleDeferred
+    );
+    const replacementOwner = Symbol("replacement owner");
+    staleOwner.current = replacementOwner;
+    settleStale();
+    await staleFlight;
+
+    expect(staleOwner.current).toBe(replacementOwner);
+    expect(staleBusyEvents).toEqual([true]);
+  });
+
+  it("statically uses the synchronous single-flight owner around every trusted action", async () => {
+    const component = await readFile(
+      new URL(
+        "../app/organizations/initiatives/[initiativeId]/trusted-objective-experience.tsx",
+        import.meta.url
+      ),
+      "utf8"
+    );
+
+    expect(component).toContain("runSingleFlight");
+    expect(component).toContain("requestOwnerRef");
+    expect(component).toContain("runSingleFlight(requestOwnerRef, setBusy, async () =>");
+    expect(component).toContain('action: "source" | "proposal" | "accept" | "draft-confirmation"');
+    expect(component).toContain("const controlsDisabled = input.busy");
+    expect(component).toContain('disabled={busy || note.trim() === ""}');
+    expect(component).toContain("disabled={busy}");
+  });
+
+  it("keeps deterministic assistance pure, browser-only, and separate from authority", async () => {
+    const adviser = await readFile(new URL("./assisted-objective.ts", import.meta.url), "utf8");
+    const component = await readFile(
+      new URL(
+        "../app/organizations/initiatives/[initiativeId]/trusted-objective-experience.tsx",
+        import.meta.url
+      ),
+      "utf8"
+    );
+
+    expect(adviser).not.toMatch(/^import\s/m);
+    expect(adviser).not.toMatch(
+      /\b(?:fetch|XMLHttpRequest|WebSocket|localStorage|sessionStorage)\b/
+    );
+    expect(component).toContain("createAssistedObjectiveDraft(input.source.note)");
+    expect(component).toContain('act("proposal", values)');
+    expect(component).not.toMatch(
+      /assistedObjective.*(?:tenant|workspace|membership|authority|hash|offset)/i
+    );
   });
 });
 
