@@ -65,6 +65,36 @@ export async function applyMigrations(
     }
     const journal = await validateMigrationJournal(client, migrationChecksums);
     const files = allFiles.filter((file) => !options.through || file <= options.through);
+    const firstUnrecordedProductMigration = files.find(
+      (file) =>
+        !journal.has(file) &&
+        (B1_MIGRATION_IDS.includes(file as (typeof B1_MIGRATION_IDS)[number]) ||
+          B2_MIGRATION_IDS.includes(file as (typeof B2_MIGRATION_IDS)[number]))
+    );
+    if (firstUnrecordedProductMigration) {
+      await client.query("BEGIN");
+      try {
+        if (
+          B1_MIGRATION_IDS.includes(
+            firstUnrecordedProductMigration as (typeof B1_MIGRATION_IDS)[number]
+          )
+        ) {
+          await assertB1MigrationStateAbsent(
+            client,
+            firstUnrecordedProductMigration as (typeof B1_MIGRATION_IDS)[number]
+          );
+        } else {
+          await assertB2MigrationStateAbsent(
+            client,
+            firstUnrecordedProductMigration as (typeof B2_MIGRATION_IDS)[number]
+          );
+        }
+        await client.query("ROLLBACK");
+      } catch (error) {
+        await client.query("ROLLBACK");
+        throw error;
+      }
+    }
 
     for (const file of files) {
       const sql = migrationSources.get(file)!;
@@ -90,13 +120,13 @@ export async function applyMigrations(
 
       await client.query("BEGIN");
       try {
-        if (isB1Migration || isB2Migration) {
-          await validateInstalledProductCatalog(client, journal, migrationSources);
-        }
         if (isB1Migration) {
           await assertB1MigrationStateAbsent(client, file as (typeof B1_MIGRATION_IDS)[number]);
         } else if (isB2Migration) {
           await assertB2MigrationStateAbsent(client, file as (typeof B2_MIGRATION_IDS)[number]);
+        }
+        if (isB1Migration || isB2Migration) {
+          await validateInstalledProductCatalog(client, journal, migrationSources);
         }
         await client.query("SELECT set_config('throughline.migration_batch_applied', $1, true)", [
           result.applied.join(",")
@@ -160,6 +190,12 @@ async function validateInstalledProductCatalog(
     case 3:
       await validateB1CatalogContract(client, journal, migrationSources, {
         additiveB2Phase: 3
+      });
+      await validateB2CatalogContract(client, journal, migrationSources);
+      return;
+    case 4:
+      await validateB1CatalogContract(client, journal, migrationSources, {
+        additiveB2Phase: 4
       });
       await validateB2CatalogContract(client, journal, migrationSources);
       return;

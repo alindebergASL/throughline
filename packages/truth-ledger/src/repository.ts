@@ -512,9 +512,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     subjectId: string;
     predicate: string;
   }): Promise<void> {
-    await this.tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
-      `${input.tenantId}/${input.workspaceId}/${input.spaceId}/${input.subjectType}/${input.subjectId}/${input.predicate}`
-    ]);
+    await this.lockTruthCoordinate(input);
     const prior = await this.tx.query<{ id: string }>(
       `SELECT id
        FROM truth.accepted_facts
@@ -531,6 +529,48 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       ]
     );
     if (prior.rows.length !== 0) throw new TruthLedgerConflictError();
+  }
+
+  async lockPrimaryObjectiveProposalSlot(input: {
+    tenantId: string;
+    workspaceId: string;
+    spaceId: string;
+    subjectId: string;
+  }): Promise<void> {
+    const coordinate = {
+      ...input,
+      subjectType: "initiative" as const,
+      predicate: "initiative.primary_objective"
+    };
+    await this.lockTruthCoordinate(coordinate);
+    const occupied = await this.tx.query<{ occupied: boolean }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM truth.accepted_facts
+         WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
+           AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5
+           AND status IN ('current', 'contested')
+       ) OR EXISTS (
+         SELECT 1 FROM truth.claims
+         WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
+           AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5
+           AND status = 'proposed'
+       ) AS occupied`,
+      [input.tenantId, input.workspaceId, input.spaceId, input.subjectId, coordinate.predicate]
+    );
+    if (occupied.rows[0]?.occupied !== false) throw new TruthLedgerConflictError();
+  }
+
+  private async lockTruthCoordinate(input: {
+    tenantId: string;
+    workspaceId: string;
+    spaceId: string;
+    subjectType: "activity" | "initiative";
+    subjectId: string;
+    predicate: string;
+  }): Promise<void> {
+    await this.tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `${input.tenantId}/${input.workspaceId}/${input.spaceId}/${input.subjectType}/${input.subjectId}/${input.predicate}`
+    ]);
   }
 
   async insertAcceptedFact(input: {

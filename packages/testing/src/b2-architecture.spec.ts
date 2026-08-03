@@ -6,9 +6,32 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
 const root = fileURLToPath(new URL("../../..", import.meta.url));
+const initiativeLockSql = `-- Established row-lock capability for durable Initiative truth mutations.
+CREATE POLICY initiatives_app_truth_lock ON work.initiatives
+AS PERMISSIVE FOR UPDATE TO throughline_app
+USING (
+  tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id()
+  AND space_id = ops.current_space_id()
+  AND EXISTS (
+    SELECT 1 FROM access.spaces governing_space
+    WHERE governing_space.tenant_id = work.initiatives.tenant_id
+      AND governing_space.workspace_id = work.initiatives.workspace_id
+      AND governing_space.id = work.initiatives.space_id
+      AND governing_space.archived_at IS NULL
+  )
+)
+WITH CHECK (false);
+
+CREATE POLICY initiatives_app_permanent_no_write ON work.initiatives
+AS RESTRICTIVE FOR UPDATE TO throughline_app
+USING (true)
+WITH CHECK (false);
+
+GRANT UPDATE (id) ON work.initiatives TO throughline_app;
+`;
 
 describe("B2 Slice 1 architecture boundaries", () => {
-  it("preserves migrations 0001–0008 byte-for-byte", async () => {
+  it("preserves migrations 0001–0009 byte-for-byte", async () => {
     const fixed = {
       "0001_wave_a2_identity_access_rls.sql":
         "22b84fbeb36cfcfdd1f8270e6ffa03d819d5307c0aace86e69aa647d643b1ff7",
@@ -24,12 +47,26 @@ describe("B2 Slice 1 architecture boundaries", () => {
       "0007_b2_slice1_truth_storage.sql":
         "0e51a502b084e23677c1a0832fc3943a6da33266eae517af2641c61452a9dba8",
       "0008_b2_slice1_command_integrity.sql":
-        "84bcc710743c1850a0995763765b9dbb8506b040d965d33557459fd6eb472fcc"
+        "84bcc710743c1850a0995763765b9dbb8506b040d965d33557459fd6eb472fcc",
+      "0009_b2_source_truth_lifecycle_interlock.sql":
+        "0463ee762f2af1b4fc61d551398424740f3927e7a31b478717de03c3c88e29f1"
     };
     for (const [file, digest] of Object.entries(fixed)) {
       const bytes = await readFile(join(root, "packages/db/migrations", file));
       expect(createHash("sha256").update(bytes).digest("hex"), file).toBe(digest);
     }
+  });
+
+  it("keeps 0010 to the bounded Initiative lock capability", async () => {
+    const migration = await source(
+      "packages/db/migrations/0010_b2_trusted_objective_initiative_lock.sql"
+    );
+
+    expect(migration).toBe(initiativeLockSql);
+    expect([...migration.matchAll(/CREATE POLICY/gi)]).toHaveLength(2);
+    expect(migration).not.toMatch(
+      /GRANT\s+UPDATE\s+ON|UPDATE\s*\([^)]*,|\bPUBLIC\b|WITH\s+GRANT\s+OPTION|\b(?:ALTER|DROP)\b|truth\.|fact_lifecycle|derived_view/i
+    );
   });
 
   it("adds only the four durable truth tables needed by Claim → Fact", async () => {
@@ -143,6 +180,38 @@ describe("B2 Slice 1 architecture boundaries", () => {
     expect(controller).not.toMatch(/@Get|current[_ -]?truth|summary/i);
   });
 
+  it("keeps trusted-objective identity selection server-only and browser requests authority-free", async () => {
+    const browserAndRouteSources = await combined([
+      "apps/web/app/page.tsx",
+      "apps/web/app/globals.css",
+      "apps/web/app/organizations/initiatives/[initiativeId]/page.tsx",
+      "apps/web/app/organizations/initiatives/[initiativeId]/trusted-objective-experience.tsx",
+      "apps/web/app/api/demo/initiatives/[initiativeId]/trusted-objective/route.ts",
+      "apps/web/lib/trusted-objective.ts"
+    ]);
+    expect(browserAndRouteSources).not.toMatch(
+      /\bpersona\b|persona-switch|Owner view|Unavailable view|\?persona=|x-throughline-dev-identity/i
+    );
+
+    const bff = await source("apps/web/lib/demo-bff.ts");
+    expect(bff).not.toMatch(
+      /TRUSTED_OBJECTIVE_DEMO_PERSONA|x-throughline-dev-identity|tenant-a-owner|tenant-b-viewer/
+    );
+    const guard = await source("apps/api/src/trusted-objective/trusted-objective.guard.ts");
+    expect(guard).toContain("process.env.TRUSTED_OBJECTIVE_DEMO_PERSONA");
+    expect(guard).toContain('return "tenant-a-owner"');
+    expect(guard).toContain('return "tenant-b-viewer"');
+    expect(guard).toContain('hasHeader(request.headers, "x-throughline-dev-identity")');
+
+    const readme = await source("README.md");
+    const setup = await source("scripts/setup-trusted-objective-demo.ts");
+    expect(readme).toContain("TRUSTED_OBJECTIVE_DEMO_PERSONA=owner");
+    expect(readme).toContain("TRUSTED_OBJECTIVE_DEMO_PERSONA=unavailable");
+    expect(`${readme}\n${setup}`).not.toMatch(
+      /\?persona=|persona-switch|Owner view|Unavailable view/
+    );
+  });
+
   it("owns one fail-fast, non-recursive authoritative B2 gate and invokes it once in CI", async () => {
     const manifest = JSON.parse(await source("package.json")) as {
       scripts: Record<string, string>;
@@ -154,18 +223,21 @@ describe("B2 Slice 1 architecture boundaries", () => {
     const runner = await source("scripts/run-b2-gate.ts");
     for (const file of [
       "b2-architecture.spec.ts",
+      "trusted-objective-demo-config.spec.ts",
       "command-schemas.spec.ts",
       "truth-ledger.postgres.spec.ts",
       "b2-authorization.spec.ts",
       "transaction.spec.ts",
       "b1-catalog-contract.spec.ts",
       "b2-catalog-contract.postgres.spec.ts",
-      "b2-truth.postgres.spec.ts"
+      "b2-truth.postgres.spec.ts",
+      "trusted-objective.guard.spec.ts"
     ]) {
       expect(runner).toContain(file);
     }
     expect(runner).toContain("numPendingTests");
     expect(runner).toContain("unhandledErrors");
+    await expect(pathExists("scripts/trusted-objective-demo-config.spec.ts")).resolves.toBe(false);
 
     const preflight = await source("scripts/require-b2-test-env.ts");
     expect(preflight).toContain('process.env.B2_AUTHORITATIVE_GATE !== "1"');

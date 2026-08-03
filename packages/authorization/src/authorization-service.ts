@@ -604,6 +604,7 @@ const b1Actions = new Set<AuthorizationAction>([
   "source.read",
   "claim.create",
   "claim.read",
+  "fact.read",
   "fact.accept"
 ]);
 
@@ -771,7 +772,8 @@ async function b1Decision(
     "relationship.read",
     "content.read",
     "source.read",
-    "claim.read"
+    "claim.read",
+    "fact.read"
   ]);
   if (readActions.has(action)) {
     return allow(
@@ -827,6 +829,7 @@ async function loadB1ResourceScope(
   else if (action.startsWith("source."))
     [table, expectedType] = ["content.source_artifacts", "source"];
   else if (action.startsWith("claim.")) [table, expectedType] = ["truth.claims", "claim"];
+  else if (action.startsWith("fact.")) [table, expectedType] = ["truth.accepted_facts", "fact"];
   else return undefined;
   if (resource.type !== expectedType) return undefined;
   const result = await tx.query<{

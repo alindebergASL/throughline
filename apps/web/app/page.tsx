@@ -4,7 +4,7 @@ const navItems = ["Today", "Organizations", "Pulse"];
 
 export default function Home() {
   return (
-    <main className="shell">
+    <div className="shell">
       <header className="topbar">
         <strong>Throughline</strong>
         <label className="command">
@@ -15,20 +15,27 @@ export default function Home() {
       <div className="layout">
         <nav aria-label="Primary">
           {navItems.map((item) => (
-            <Link key={item} href={`#${item.toLowerCase()}`}>
+            <Link
+              key={item}
+              href={`#${item.toLowerCase()}`}
+              aria-current={item === "Today" ? "page" : undefined}
+            >
               {item}
             </Link>
           ))}
         </nav>
-        <section className="surface" aria-labelledby="page-title">
-          <p className="eyebrow">Wave A1 shell</p>
-          <h1 id="page-title">Throughline foundation</h1>
-          <p>
-            Minimal application shell only. Product screens, capture, review, truth ledger, and
-            integrations are intentionally deferred to later approved waves.
-          </p>
-        </section>
+        <main className="surface" aria-labelledby="page-title">
+          <p className="eyebrow">Organizations</p>
+          <h1 id="page-title">Trusted objective demo</h1>
+          <p>Open the deterministic Initiative after running the bounded local demo setup.</p>
+          <Link
+            className="primary-link"
+            href="/organizations/initiatives/70000000-0000-7000-8000-000000000204"
+          >
+            Open Initiative
+          </Link>
+        </main>
       </div>
-    </main>
+    </div>
   );
 }

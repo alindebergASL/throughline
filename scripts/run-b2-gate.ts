@@ -10,7 +10,10 @@ type GateLeaf = {
 };
 
 const leaves: readonly GateLeaf[] = [
-  { workspace: "@throughline/testing", files: ["src/b2-architecture.spec.ts"] },
+  {
+    workspace: "@throughline/testing",
+    files: ["src/b2-architecture.spec.ts", "src/trusted-objective-demo-config.spec.ts"]
+  },
   {
     workspace: "@throughline/truth-ledger",
     files: [
@@ -41,7 +44,13 @@ const leaves: readonly GateLeaf[] = [
   },
   {
     workspace: "@throughline/api",
-    files: ["src/b2-truth/b2-truth.controller.spec.ts", "src/b2-truth/b2-truth.postgres.spec.ts"],
+    files: [
+      "src/b2-truth/b2-truth.controller.spec.ts",
+      "src/b2-truth/b2-truth.postgres.spec.ts",
+      "src/trusted-objective/trusted-objective.controller.spec.ts",
+      "src/trusted-objective/trusted-objective.guard.spec.ts",
+      "src/trusted-objective/trusted-objective.postgres.spec.ts"
+    ],
     env: { AUTH_ADAPTER: "dev", NODE_ENV: "test" }
   }
 ] as const;

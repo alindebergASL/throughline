@@ -18,6 +18,7 @@ describe("truth-predicate-catalog.v1", () => {
     expect(TRUTH_PREDICATE_REGISTRY["activity.outcome"]).toMatchObject({
       allowedSubjectKind: "activity",
       cardinality: "single",
+      proposalSlotPolicy: "multiple_open",
       authorityScope: "activity_owner",
       deterministicViewTreatment: {
         viewType: "initiative_summary",
@@ -43,6 +44,7 @@ describe("truth-predicate-catalog.v1", () => {
     expect(TRUTH_PREDICATE_REGISTRY["initiative.primary_objective"]).toMatchObject({
       allowedSubjectKind: "initiative",
       cardinality: "single",
+      proposalSlotPolicy: "single_open",
       authorityScope: "initiative_owner",
       deterministicViewTreatment: {
         viewType: "initiative_summary",

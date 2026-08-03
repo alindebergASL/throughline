@@ -331,6 +331,25 @@ describe.sequential("durable truth command boundary", () => {
     expect(statements[1]?.sql).toContain("LIMIT 1");
     expect(statements[1]?.sql).not.toMatch(/\bFOR\s+(?:NO KEY )?(?:UPDATE|SHARE)\b/i);
   });
+
+  it("locks acceptance at the persisted Claim coordinate without Initiative-wide narrowing", async () => {
+    const implementation = await readFile(
+      new URL("./domain-command-bus.ts", import.meta.url),
+      "utf8"
+    );
+
+    expect(implementation).toContain("predicate: acceptedCoordinate.predicate");
+    expect(implementation).toContain("subjectType: acceptedCoordinate.subjectType");
+    expect(implementation).not.toContain("assertSolePrimaryObjectiveProposal");
+    expect(implementation).not.toMatch(
+      /command\.payload\.subject\.type === "initiative"[\s\S]{0,300}lockFirstAcceptanceSlot/
+    );
+    expect(implementation).toContain('proposalSlotPolicy === "single_open"');
+    expect(implementation).toContain("resolvePredicateDefinition(");
+    expect(implementation).not.toMatch(
+      /command\.payload\.predicate === ["']initiative\.primary_objective["']/
+    );
+  });
 });
 
 function claimCommand(expectedVersion: number): B2AuthorizedDomainCommand<"claim.create"> {
