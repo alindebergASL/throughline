@@ -23,6 +23,7 @@ import { TruthLedgerDomainCommandBus } from "@throughline/truth-ledger";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { AppModule } from "../app.module.js";
 import { TrustedObjectiveGuard, type TrustedObjectiveRequest } from "./trusted-objective.guard.js";
+import { TrustedObjectiveRuntime } from "./trusted-objective.runtime.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -262,6 +263,80 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
 
     expect(responses.map(({ statusCode }) => statusCode).sort()).toEqual([201, 409]);
     await expectPrimaryObjectiveCounts(workflow.initiativeId, { proposed: 1, accepted: 0 });
+  });
+
+  it("projects owner and proposer capabilities from the normal unscoped dev-owner context", async () => {
+    const workflow = await createWorkflow("unscoped-owner-capabilities");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", { note });
+    const proposed = await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    expect(proposed.statusCode, proposed.body).toBe(201);
+
+    const unscopedOwnerContext = createDevSecurityContext("tenant-a-owner");
+    expect(unscopedOwnerContext.requestedSpaceIds).toEqual([]);
+    const unscopedOwnerApp = await createApiWithContext(unscopedOwnerContext);
+    try {
+      const projected = await unscopedOwnerApp.inject({
+        method: "GET",
+        url: `/v1/demo/initiatives/${workflow.initiativeId}/trusted-objective`
+      });
+
+      expect(projected.statusCode, projected.body).toBe(200);
+      expect(projected.json()).toMatchObject({
+        state: "proposed",
+        initiative: { canAccept: true },
+        proposal: {
+          objective,
+          canRework: true,
+          canWithdraw: true,
+          canReject: true
+        }
+      });
+    } finally {
+      await unscopedOwnerApp.close();
+    }
+  });
+
+  it("fails a mismatched exact-Space rediscovery closed with the generic response", async () => {
+    const workflow = await createWorkflow("projection-scope-mismatch");
+    const unscopedOwnerContext = createDevSecurityContext("tenant-a-owner");
+    const unscopedOwnerApp = await createApiWithContext(unscopedOwnerContext);
+    const missing = await unscopedOwnerApp.inject({
+      method: "GET",
+      url: "/v1/demo/initiatives/70000000-0000-7000-8000-000000000996/trusted-objective"
+    });
+    const runtime = unscopedOwnerApp.get(TrustedObjectiveRuntime);
+    const scopeReader = runtime as unknown as {
+      readScope(
+        tx: TenantDbTransaction,
+        context: ReturnType<typeof createDevSecurityContext>,
+        id: string
+      ): Promise<{ initiativeId: string; initiativeSpaceId: string; [key: string]: unknown }>;
+    };
+    const originalReadScope = scopeReader.readScope.bind(runtime);
+    let readCount = 0;
+    const readScopeSpy = vi.spyOn(scopeReader, "readScope").mockImplementation(async (...args) => {
+      const scope = await originalReadScope(...args);
+      readCount += 1;
+      return readCount === 2 ? { ...scope, initiativeSpaceId: devFixtures.rootSpaceA } : scope;
+    });
+    try {
+      const mismatched = await unscopedOwnerApp.inject({
+        method: "GET",
+        url: `/v1/demo/initiatives/${workflow.initiativeId}/trusted-objective`
+      });
+
+      expect(readCount).toBe(2);
+      expect(mismatched.statusCode).toBe(404);
+      expect(mismatched.body).toBe(missing.body);
+      expect(mismatched.body).not.toContain(workflow.initiativeId);
+    } finally {
+      readScopeSpy.mockRestore();
+      await unscopedOwnerApp.close();
+    }
   });
 
   it("serializes different concurrent notes into one durable workflow capture slot", async () => {

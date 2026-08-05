@@ -21,6 +21,7 @@ import {
   withTenantTransaction
 } from "@throughline/db";
 import { createDefaultProfileRegistry } from "@throughline/domain-profiles";
+import { parseSecurityContext } from "@throughline/tenancy";
 import { TruthLedgerDomainCommandBus } from "@throughline/truth-ledger";
 import { createHash } from "node:crypto";
 import {
@@ -116,26 +117,43 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
   }
 
   async getState(context: SecurityContext, initiativeId: string): Promise<TrustedObjectiveState> {
-    return this.read(context, async (tx) => {
-      const scope = await this.readScope(tx, context, initiativeId);
-      const latestObjectiveClaim = await this.readLatestPrimaryObjectiveClaim(tx, context, scope);
+    const discoveredScope = await this.read(context, (tx) =>
+      this.readScope(tx, context, initiativeId)
+    );
+    const scopedContext = parseSecurityContext({
+      ...context,
+      requestedSpaceIds: [discoveredScope.initiativeSpaceId]
+    });
+    return this.read(scopedContext, async (tx) => {
+      const scope = await this.readScope(tx, scopedContext, initiativeId);
+      if (
+        scope.initiativeId !== discoveredScope.initiativeId ||
+        scope.initiativeSpaceId !== discoveredScope.initiativeSpaceId
+      ) {
+        throw new TrustedObjectiveUnavailableError();
+      }
+      const latestObjectiveClaim = await this.readLatestPrimaryObjectiveClaim(
+        tx,
+        scopedContext,
+        scope
+      );
       const proposalGenerationAnchor = primaryObjectiveGenerationAnchor(latestObjectiveClaim);
       const canAccept = await this.isAllowed(
         tx,
-        context,
+        scopedContext,
         "fact.accept",
         "initiative",
         initiativeId
       );
-      const source = await this.readCurrentSource(tx, context, scope);
+      const source = await this.readCurrentSource(tx, scopedContext, scope);
       if (!source)
         return stateFor(scope, null, null, null, canAccept, proposalGenerationAnchor, null);
 
-      const accepted = await this.readAcceptedMemory(tx, context, scope, source);
+      const accepted = await this.readAcceptedMemory(tx, scopedContext, scope, source);
       if (accepted) {
         const reworkLineage = await this.readReworkLineage(
           tx,
-          context,
+          scopedContext,
           scope,
           accepted.supportingClaimId
         );
@@ -153,32 +171,32 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
           reworkLineage
         );
       }
-      if (await this.readOnlyValidClaim(tx, context, scope, source, "accepted")) {
+      if (await this.readOnlyValidClaim(tx, scopedContext, scope, source, "accepted")) {
         throw new TrustedObjectiveUnavailableError();
       }
 
-      const proposal = await this.readOnlyValidClaim(tx, context, scope, source, "proposed");
+      const proposal = await this.readOnlyValidClaim(tx, scopedContext, scope, source, "proposed");
       let canRework = false;
       let canWithdraw = false;
       let canReject = false;
       if (proposal) {
         canRework = await this.isAllowed(
           tx,
-          context,
+          scopedContext,
           "initiative.primary_objective.proposal.rework",
           "claim",
           proposal.id
         );
         canWithdraw = await this.isAllowed(
           tx,
-          context,
+          scopedContext,
           "initiative.primary_objective.proposal.withdraw",
           "claim",
           proposal.id
         );
         canReject = await this.isAllowed(
           tx,
-          context,
+          scopedContext,
           "initiative.primary_objective.proposal.reject",
           "claim",
           proposal.id
@@ -186,9 +204,9 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
       }
       const lastProposalRecovery = proposal
         ? null
-        : await this.readLatestProposalRecovery(tx, context, scope);
+        : await this.readLatestProposalRecovery(tx, scopedContext, scope);
       const reworkLineage = proposal
-        ? await this.readReworkLineage(tx, context, scope, proposal.id)
+        ? await this.readReworkLineage(tx, scopedContext, scope, proposal.id)
         : [];
       return stateFor(
         scope,
