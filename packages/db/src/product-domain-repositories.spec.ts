@@ -67,6 +67,22 @@ function txWithRows(...rowSets: unknown[][]): {
 }
 
 describe("transaction-bound product domain repositories", () => {
+  it("serializes an exact command identity with a transaction advisory lock", async () => {
+    const { tx, query } = txWithRows([]);
+    await new DomainCommandRepository(tx).lockReservationIdentity(reservation);
+
+    expect(query).toHaveBeenCalledWith("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      JSON.stringify([
+        "throughline:domain-command-identity:v1",
+        ids.tenant,
+        ids.workspace,
+        ids.space,
+        "organization.create.v1",
+        "fixture-command-1"
+      ])
+    ]);
+  });
+
   it("reserves with one fixed parameterized statement and composes only one transaction", async () => {
     const { tx, query } = txWithRows([{ id: ids.command }]);
     const repositories = new ProductDomainTransactionRepositories(tx);

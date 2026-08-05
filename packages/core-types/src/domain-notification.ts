@@ -1,3 +1,5 @@
+import { PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES } from "./b2.js";
+
 export const DOMAIN_NOTIFICATION_EVENT_TYPES = [
   "organization.created",
   "initiative.created",
@@ -11,6 +13,9 @@ export const DOMAIN_NOTIFICATION_EVENT_TYPES = [
   "source_artifact.corrected",
   "source_artifact.tombstoned",
   "claim.proposed",
+  "initiative.primary_objective.proposal_withdrawn",
+  "initiative.primary_objective.proposal_rejected",
+  "initiative.primary_objective.proposal_reworked",
   "fact.accepted"
 ] as const;
 
@@ -42,6 +47,9 @@ export const DOMAIN_NOTIFICATION_EVENT_AGGREGATE_PAIRS = {
   "source_artifact.corrected": "source_artifact",
   "source_artifact.tombstoned": "source_artifact",
   "claim.proposed": "claim",
+  "initiative.primary_objective.proposal_withdrawn": "claim",
+  "initiative.primary_objective.proposal_rejected": "claim",
+  "initiative.primary_objective.proposal_reworked": "claim",
   "fact.accepted": "accepted_fact"
 } as const satisfies Record<DomainNotificationEventType, DomainNotificationAggregateType>;
 
@@ -65,7 +73,36 @@ export interface DomainNotificationPayloadMap {
     deletionPolicyRef: string;
     hashDisposition: "retained" | "erased";
   };
-  "claim.proposed": { claimId: string; evidenceSpanId: string };
+  "claim.proposed": {
+    claimId: string;
+    evidenceSpanId: string;
+    supportAttestationId?: string;
+  };
+  "initiative.primary_objective.proposal_withdrawn": {
+    claimId: string;
+    claimVersion: 2;
+    disposition: "withdrawn";
+    reasonCode: (typeof PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)[number];
+    recoveryId: string;
+  };
+  "initiative.primary_objective.proposal_rejected": {
+    claimId: string;
+    claimVersion: 2;
+    disposition: "rejected";
+    reasonCode: (typeof PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)[number];
+    recoveryId: string;
+  };
+  "initiative.primary_objective.proposal_reworked": {
+    predecessorClaimId: string;
+    predecessorVersion: 2;
+    successorClaimId: string;
+    successorVersion: 1;
+    evidenceSpanId: string;
+    supportAttestationId: string;
+    recoveryId: string;
+    disposition: "reworked";
+    reasonCode: "reworked";
+  };
   "fact.accepted": { factId: string };
 }
 
@@ -270,7 +307,11 @@ export function parseDomainNotificationEnvelope(input: unknown): DomainNotificat
       };
     }
     case "claim.proposed": {
-      const payload = requireExactObject(envelope.payload, ["claimId", "evidenceSpanId"]);
+      const payload = requireExactObject(
+        envelope.payload,
+        ["claimId", "evidenceSpanId"],
+        ["supportAttestationId"]
+      );
       const claimId = requireUuidV7(payload.claimId);
       if (claimId !== aggregateId) fail();
       return {
@@ -279,7 +320,87 @@ export function parseDomainNotificationEnvelope(input: unknown): DomainNotificat
         aggregateType: "claim",
         payload: {
           claimId,
-          evidenceSpanId: requireUuidV7(payload.evidenceSpanId)
+          evidenceSpanId: requireUuidV7(payload.evidenceSpanId),
+          ...(Object.hasOwn(payload, "supportAttestationId")
+            ? { supportAttestationId: requireUuidV7(payload.supportAttestationId) }
+            : {})
+        }
+      };
+    }
+    case "initiative.primary_objective.proposal_withdrawn":
+    case "initiative.primary_objective.proposal_rejected": {
+      const payload = requireExactObject(envelope.payload, [
+        "claimId",
+        "claimVersion",
+        "disposition",
+        "reasonCode",
+        "recoveryId"
+      ]);
+      const claimId = requireUuidV7(payload.claimId);
+      if (claimId !== aggregateId || payload.claimVersion !== 2) fail();
+      const detail = {
+        claimId,
+        claimVersion: 2 as const,
+        reasonCode: requireEnum(payload.reasonCode, PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES),
+        recoveryId: requireUuidV7(payload.recoveryId)
+      };
+      if (eventType === "initiative.primary_objective.proposal_rejected") {
+        return {
+          ...base,
+          eventType,
+          aggregateType: "claim",
+          payload: {
+            ...detail,
+            disposition: requireEnum(payload.disposition, ["rejected"] as const)
+          }
+        };
+      }
+      return {
+        ...base,
+        eventType,
+        aggregateType: "claim",
+        payload: {
+          ...detail,
+          disposition: requireEnum(payload.disposition, ["withdrawn"] as const)
+        }
+      };
+    }
+    case "initiative.primary_objective.proposal_reworked": {
+      const payload = requireExactObject(envelope.payload, [
+        "predecessorClaimId",
+        "predecessorVersion",
+        "successorClaimId",
+        "successorVersion",
+        "evidenceSpanId",
+        "supportAttestationId",
+        "recoveryId",
+        "disposition",
+        "reasonCode"
+      ]);
+      const successorClaimId = requireUuidV7(payload.successorClaimId);
+      if (
+        successorClaimId !== aggregateId ||
+        payload.predecessorVersion !== 2 ||
+        payload.successorVersion !== 1 ||
+        payload.disposition !== "reworked" ||
+        payload.reasonCode !== "reworked"
+      ) {
+        fail();
+      }
+      return {
+        ...base,
+        eventType,
+        aggregateType: "claim",
+        payload: {
+          predecessorClaimId: requireUuidV7(payload.predecessorClaimId),
+          predecessorVersion: 2,
+          successorClaimId,
+          successorVersion: 1,
+          evidenceSpanId: requireUuidV7(payload.evidenceSpanId),
+          supportAttestationId: requireUuidV7(payload.supportAttestationId),
+          recoveryId: requireUuidV7(payload.recoveryId),
+          disposition: "reworked",
+          reasonCode: "reworked"
         }
       };
     }

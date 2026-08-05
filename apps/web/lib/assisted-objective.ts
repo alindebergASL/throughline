@@ -57,25 +57,44 @@ export function advisePrimaryObjective(normalizedSource: string): AssistedObject
     return { status: "abstained", reason: "unsupported" };
   }
 
-  const exactExcerpt = normalizedSource.trim();
-  if (exactExcerpt === "") {
+  const trimmedSource = normalizedSource.trim();
+  if (trimmedSource === "") {
     return { status: "abstained", reason: "unsupported" };
   }
-  if (/[\r\n]/u.test(exactExcerpt)) return { status: "abstained", reason: "conflicting" };
-
-  const supportedLine = exactExcerpt.replace(LIST_PREFIX, "");
-  const cueCount = Array.from(supportedLine.matchAll(PRIMARY_OBJECTIVE_CUE_OCCURRENCE)).length;
-  if (cueCount === 0) return { status: "abstained", reason: "unsupported" };
+  const lines = trimmedSource
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  const cueCount = Array.from(trimmedSource.matchAll(PRIMARY_OBJECTIVE_CUE_OCCURRENCE)).length;
   if (cueCount > CANDIDATE_LIMIT) return { status: "abstained", reason: "ambiguous" };
-  if (cueCount !== 1) return { status: "abstained", reason: "unsupported" };
 
-  const cue = PRIMARY_OBJECTIVE_CUE.exec(supportedLine);
-  if (!cue) return { status: "abstained", reason: "unsupported" };
-
-  const objective = normalizeObjective(supportedLine.slice(cue[0].length));
-  if (!objective || !isSafeSupportedLine(supportedLine, objective)) {
-    return { status: "abstained", reason: "unsupported" };
+  const candidates: Array<{ exactExcerpt: string; objective: string }> = [];
+  let hasInvalidCandidate = false;
+  let hasUnsafeContext = false;
+  for (const line of lines) {
+    const supportedLine = line.replace(LIST_PREFIX, "");
+    const cue = PRIMARY_OBJECTIVE_CUE.exec(supportedLine);
+    if (cue) {
+      const objective = normalizeObjective(supportedLine.slice(cue[0].length));
+      if (!objective || !isSafeSupportedLine(supportedLine, objective)) {
+        hasInvalidCandidate = true;
+        continue;
+      }
+      candidates.push({ exactExcerpt: line, objective });
+      continue;
+    }
+    if (!isOrdinaryContext(line)) hasUnsafeContext = true;
   }
+  if (candidates.length === 0) {
+    return {
+      status: "abstained",
+      reason: lines.length > 1 ? "conflicting" : "unsupported"
+    };
+  }
+  if (candidates.length !== 1 || cueCount !== 1 || hasInvalidCandidate || hasUnsafeContext) {
+    return { status: "abstained", reason: "conflicting" };
+  }
+  const { exactExcerpt, objective } = candidates[0]!;
 
   if (countOccurrences(normalizedSource, exactExcerpt, 2) !== 1) {
     return { status: "abstained", reason: "ambiguous" };
@@ -106,6 +125,58 @@ export function createAssistedObjectiveDraft(normalizedSource: string): Assisted
 
 export function rejectAssistedObjective(): AssistedObjectiveDraft {
   return { mode: "manual", objective: "", exactExcerpt: "", reason: "rejected" };
+}
+
+export function rejectAssistedObjectivePreservingEdits(
+  current: AssistedObjectiveDraft,
+  original: Extract<AssistedObjectiveDraft, { mode: "suggested" }>
+): AssistedObjectiveDraft {
+  return {
+    mode: "manual",
+    objective: current.objective === original.objective ? "" : current.objective,
+    exactExcerpt: current.exactExcerpt === original.exactExcerpt ? "" : current.exactExcerpt,
+    reason: "rejected"
+  };
+}
+
+function isOrdinaryContext(line: string): boolean {
+  const safetyLine = createSafetyView(line).toLocaleLowerCase("en");
+  if (
+    /primary\s+objective/iu.test(line) ||
+    UNCERTAIN_OR_DEPENDENT_LANGUAGE.test(safetyLine) ||
+    CONDITIONAL_PHRASE.test(safetyLine) ||
+    APPROVAL_FAMILY_LANGUAGE.test(safetyLine) ||
+    /\bsign[- ]?off\b/u.test(safetyLine) ||
+    /\b(?:not|never|cannot|can't|cant|no longer|wrong|outdated|superseded|contested|disputed|rejected|withdrawn|correct(?:ion|ed)?|instead)\b/u.test(
+      safetyLine
+    ) ||
+    /\b(?:system override|previous instructions?|stored credentials?|call tools?|upload|exfiltrate)\b/u.test(
+      safetyLine
+    )
+  ) {
+    return false;
+  }
+  if (
+    /(?:^|[:.-]\s*)(?:objective|goal|priority|aim|target|desired outcome|we want|we need|we should)\b/u.test(
+      safetyLine
+    )
+  ) {
+    return false;
+  }
+  const metadata =
+    /^(?:meeting|participants|attendees|account|organization|engagement|topic|location|facilitator|recorded by|next meeting)\s*:\s*(.+)$/iu.exec(
+      line
+    );
+  if (!metadata) return false;
+  const value = metadata[1]!;
+  return (
+    value.length <= 160 &&
+    !/[\r\n]/u.test(value) &&
+    !UNCERTAIN_OR_DEPENDENT_LANGUAGE.test(value) &&
+    !CONDITIONAL_PHRASE.test(value) &&
+    !APPROVAL_FAMILY_LANGUAGE.test(value) &&
+    !/\bsign[- ]?off\b/iu.test(value)
+  );
 }
 
 function normalizeObjective(remainder: string): string | null {

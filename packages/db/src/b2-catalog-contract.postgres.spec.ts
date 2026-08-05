@@ -23,6 +23,7 @@ const allMigrationIds = [
   "0010_b2_trusted_objective_initiative_lock.sql"
 ] as const;
 const truthTables = ["accepted_facts", "claims", "fact_claims", "verified_evidence_spans"] as const;
+const PHASE5_TEST_TIMEOUT = 180_000;
 
 maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
   if (!ownerUrl || !appUrl) {
@@ -89,10 +90,27 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     ]);
   };
 
-  const resetToLatest = () => applyMigrations(ownerPool, { reset: true });
+  const checkpoint = "0010_b2_trusted_objective_initiative_lock.sql";
+  const applyCheckpoint = (options: { reset?: boolean } = {}) =>
+    applyMigrations(ownerPool, { ...options, through: checkpoint });
+  const resetToLatest = () => applyCheckpoint({ reset: true });
 
   const expectCatalogContractRejected = async (mutation: string, expectedDiagnostic: string) => {
     try {
+      await ownerPool.query(mutation);
+      await expect(applyCheckpoint()).rejects.toThrow(expectedDiagnostic);
+    } finally {
+      await resetToLatest();
+    }
+  };
+
+  const expectPhase5CatalogContractRejected = async (
+    mutation: string,
+    expectedDiagnostic: string
+  ) => {
+    try {
+      await resetToLatest();
+      await applyMigrations(ownerPool);
       await ownerPool.query(mutation);
       await expect(applyMigrations(ownerPool)).rejects.toThrow(expectedDiagnostic);
     } finally {
@@ -183,7 +201,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
 
   it("boots fresh and reapplies the exact post-0010 ten-migration checkpoint", async () => {
     await resetToLatest();
-    await expect(applyMigrations(ownerPool)).resolves.toEqual({
+    await expect(applyCheckpoint()).resolves.toEqual({
       applied: [],
       skipped: [...allMigrationIds]
     });
@@ -211,6 +229,376 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     await expectExactCommandFunctionPrivileges();
   }, 60_000);
 
+  it(
+    "adds and reapplies the bounded post-0011 objective recovery catalog",
+    async () => {
+      try {
+        await resetToLatest();
+        await expect(applyMigrations(ownerPool)).resolves.toEqual({
+          applied: ["0011_b2_primary_objective_proposal_recovery.sql"],
+          skipped: [...allMigrationIds]
+        });
+        await expect(applyMigrations(ownerPool)).resolves.toEqual({
+          applied: [],
+          skipped: [...allMigrationIds, "0011_b2_primary_objective_proposal_recovery.sql"]
+        });
+        const catalog = await ownerPool.query<{
+          name: string;
+          rls: boolean;
+          forced: boolean;
+        }>(
+          `SELECT relation.relname AS name, relation.relrowsecurity AS rls,
+                relation.relforcerowsecurity AS forced
+           FROM pg_class relation
+           JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+          WHERE namespace.nspname = 'truth' AND relation.relname = ANY($1::text[])
+          ORDER BY relation.relname`,
+          [
+            [
+              "initiative_objective_proposal_recoveries",
+              "initiative_objective_support_attestations"
+            ]
+          ]
+        );
+        expect(catalog.rows).toEqual([
+          { name: "initiative_objective_proposal_recoveries", rls: true, forced: true },
+          { name: "initiative_objective_support_attestations", rls: true, forced: true }
+        ]);
+        const adoptedMarker = await ownerPool.query<{
+          not_null: boolean;
+          default_expression: string;
+          owned_by_migrator: boolean;
+          app_insert: boolean;
+          app_update: boolean;
+        }>(
+          `SELECT attribute.attnotnull AS not_null,
+                  pg_get_expr(default_record.adbin, default_record.adrelid, false)
+                    AS default_expression,
+                  pg_get_userbyid(relation.relowner) = current_user AS owned_by_migrator,
+                  has_column_privilege('throughline_app', relation.oid,
+                    'safe_request_adopted', 'INSERT') AS app_insert,
+                  has_column_privilege('throughline_app', relation.oid,
+                    'safe_request_adopted', 'UPDATE') AS app_update
+             FROM pg_class relation
+             JOIN pg_attribute attribute ON attribute.attrelid = relation.oid
+             JOIN pg_attrdef default_record ON default_record.adrelid = attribute.attrelid
+               AND default_record.adnum = attribute.attnum
+            WHERE relation.oid = 'ops.domain_command_records'::regclass
+              AND attribute.attname = 'safe_request_adopted'`
+        );
+        expect(adoptedMarker.rows).toEqual([
+          {
+            not_null: true,
+            default_expression: "false",
+            owned_by_migrator: true,
+            app_insert: false,
+            app_update: false
+          }
+        ]);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects a missing phase-5 objective recovery integrity policy",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `
+        DROP POLICY objective_support_integrity_select
+          ON truth.initiative_objective_support_attestations
+      `,
+        "Installed B1 catalog does not match B1 integrity policy capability boundary"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects an undeclared persistent truth table",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `CREATE TABLE truth.rogue_store (id bigint PRIMARY KEY);
+         ALTER TABLE truth.rogue_store ENABLE ROW LEVEL SECURITY;
+         ALTER TABLE truth.rogue_store FORCE ROW LEVEL SECURITY`,
+        "B2 Slice 1 truth table inventory or forced RLS drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    [
+      "wrong timing",
+      `DROP TRIGGER objective_support_command_guard
+         ON truth.initiative_objective_support_attestations;
+       CREATE TRIGGER objective_support_command_guard
+         AFTER INSERT ON truth.initiative_objective_support_attestations
+         FOR EACH ROW EXECUTE FUNCTION
+           truth.require_reserved_command('claim.create-or-rework.v1')`
+    ],
+    [
+      "wrong command argument",
+      `DROP TRIGGER verified_evidence_command_guard ON truth.verified_evidence_spans;
+       CREATE TRIGGER verified_evidence_command_guard
+         BEFORE INSERT ON truth.verified_evidence_spans
+         FOR EACH ROW EXECUTE FUNCTION truth.require_reserved_command('fact.accept.v1')`
+    ]
+  ])(
+    "rejects a truth trigger with %s but unchanged identity fields",
+    async (_label, mutation) => {
+      await expectPhase5CatalogContractRejected(
+        mutation,
+        "B2 Slice 1 truth trigger inventory drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects a permissive same-shape safe-request validator body",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `CREATE OR REPLACE FUNCTION ops.b2_slice1_safe_request_valid(
+           command_kind_value text, request_value jsonb
+         ) RETURNS boolean LANGUAGE plpgsql IMMUTABLE STRICT
+         SET search_path = pg_catalog AS $permissive$
+         BEGIN
+           RETURN request_value::text LIKE '%predecessorClaimId%'
+             OR request_value::text LIKE '%expectedPredecessorVersion%';
+         END
+         $permissive$;
+         ALTER FUNCTION ops.b2_slice1_safe_request_valid(text,jsonb)
+           OWNER TO throughline_b1_0_integrity;
+         REVOKE ALL ON FUNCTION ops.b2_slice1_safe_request_valid(text,jsonb) FROM PUBLIC;
+         GRANT EXECUTE ON FUNCTION ops.b2_slice1_safe_request_valid(text,jsonb)
+           TO throughline_app`,
+        "B2 Slice 1 command function ownership or execution shape drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects a legacy truth policy widened while retaining its scope expression",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `DROP POLICY claims_select ON truth.claims;
+         CREATE POLICY claims_select ON truth.claims FOR SELECT TO throughline_app
+         USING (((tenant_id = ops.current_tenant_id())
+           AND (workspace_id = ops.current_workspace_id())
+           AND access.can_read_space(space_id, access_class)) OR true)`,
+        "B2 Slice 1 truth policy inventory drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects an owner-rights rogue truth view and its app grant",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `CREATE VIEW truth.rogue_view AS SELECT id FROM truth.claims;
+         GRANT SELECT ON truth.rogue_view TO throughline_app`,
+        "B2 Slice 1 truth table inventory or forced RLS drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    [
+      "weakened legacy CHECK",
+      `ALTER TABLE truth.claims DROP CONSTRAINT claims_access_class_check;
+       ALTER TABLE truth.claims ADD CONSTRAINT claims_access_class_check
+         CHECK (access_class IS NOT NULL)`,
+      "B2 Slice 1 exact truth constraint inventory drifted"
+    ],
+    [
+      "unexpected legacy index",
+      `CREATE INDEX claims_review_rogue_idx ON truth.claims (created_at)`,
+      "B2 Slice 1 exact truth index inventory drifted"
+    ]
+  ])(
+    "rejects %s",
+    async (_label, mutation, diagnostic) => {
+      await expectPhase5CatalogContractRejected(mutation, diagnostic);
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects a missing phase-5 objective recovery integrity ACL",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `
+        REVOKE SELECT ON truth.initiative_objective_proposal_recoveries
+          FROM throughline_b1_0_integrity
+      `,
+        "Installed predecessor ACL authority does not match the exact normalized contract"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects an extra permissive phase-5 truth policy",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `CREATE POLICY objective_recovery_extra ON truth.initiative_objective_proposal_recoveries
+       FOR SELECT TO throughline_app USING (true)`,
+        "Objective recovery RLS policy inventory drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects an altered phase-5 app policy expression",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `DROP POLICY objective_recovery_select ON truth.initiative_objective_proposal_recoveries;
+       CREATE POLICY objective_recovery_select ON truth.initiative_objective_proposal_recoveries
+       FOR SELECT TO throughline_app USING (true)`,
+        "Objective recovery exact RLS policy definitions drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects an app policy widened with an always-true disjunct",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `DROP POLICY objective_recovery_select ON truth.initiative_objective_proposal_recoveries;
+       CREATE POLICY objective_recovery_select ON truth.initiative_objective_proposal_recoveries
+       FOR SELECT TO throughline_app USING ((
+         tenant_id = ops.current_tenant_id() AND workspace_id = ops.current_workspace_id()
+         AND access.can_read_space(space_id, (SELECT claim.access_class FROM truth.claims claim
+           WHERE claim.tenant_id = initiative_objective_proposal_recoveries.tenant_id
+             AND claim.workspace_id = initiative_objective_proposal_recoveries.workspace_id
+             AND claim.id = initiative_objective_proposal_recoveries.predecessor_claim_id))
+       ) OR true)`,
+        "Objective recovery exact RLS policy definitions drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects representative predecessor phase-4 drift while phase 5 is installed",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `DROP INDEX truth.accepted_facts_one_current_slot;
+       CREATE UNIQUE INDEX accepted_facts_one_current_slot
+         ON truth.accepted_facts (tenant_id, workspace_id, space_id, subject_type, subject_id)
+         WHERE status = 'current'`,
+        "B2 Slice 1 exact truth index inventory drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects a narrowed phase-5 active-proposal index predicate",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `DROP INDEX truth.claims_one_active_primary_objective_proposal;
+       CREATE UNIQUE INDEX claims_one_active_primary_objective_proposal
+         ON truth.claims (
+           tenant_id, workspace_id, space_id, subject_type, subject_id, predicate
+         ) WHERE subject_type = 'initiative'
+           AND predicate = 'initiative.primary_objective' AND status = 'proposed'
+           AND access_class = 'public'`,
+        "Objective recovery exact index inventory drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects an unexpected non-unique phase-5 index",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `CREATE INDEX objective_support_unexpected_nonunique
+           ON truth.initiative_objective_support_attestations (claim_id)`,
+        "Objective recovery exact index inventory drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects an expected phase-5 index with invalid catalog state",
+    async () => {
+      await expectPhase5CatalogContractRejected(
+        `DO $drift$
+         BEGIN
+           UPDATE pg_index SET indisvalid = false
+             WHERE indexrelid =
+               'truth.initiative_objective_support_attestations_pkey'::regclass;
+         END
+         $drift$`,
+        "Objective recovery exact index inventory drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    [
+      "primary key",
+      "initiative_objective_proposal_recoveries",
+      "p",
+      "ALTER TABLE truth.initiative_objective_proposal_recoveries ADD CONSTRAINT objective_recovery_test_drift PRIMARY KEY (id, tenant_id)",
+      undefined
+    ],
+    [
+      "unique key",
+      "initiative_objective_proposal_recoveries",
+      "u",
+      "ALTER TABLE truth.initiative_objective_proposal_recoveries ADD CONSTRAINT objective_recovery_test_drift UNIQUE (tenant_id, workspace_id, causation_command_id, id)",
+      undefined
+    ],
+    [
+      "check",
+      "initiative_objective_support_attestations",
+      "c",
+      "ALTER TABLE truth.initiative_objective_support_attestations ADD CONSTRAINT objective_recovery_test_drift CHECK (version >= 1)",
+      "CHECK ((version = 1))"
+    ],
+    [
+      "foreign key",
+      "initiative_objective_support_attestations",
+      "f",
+      "ALTER TABLE truth.initiative_objective_support_attestations ADD CONSTRAINT objective_recovery_test_drift FOREIGN KEY (tenant_id, workspace_id, causation_command_id) REFERENCES ops.domain_command_records(tenant_id, workspace_id, id) ON DELETE CASCADE",
+      "FOREIGN KEY (tenant_id, workspace_id, causation_command_id) REFERENCES ops.domain_command_records(tenant_id, workspace_id, id)"
+    ]
+  ])(
+    "rejects altered phase-5 %s inventory",
+    async (_label, relation, type, replacement, exactDefinition) => {
+      await expectPhase5CatalogContractRejected(
+        `DO $drift$
+         DECLARE target_name name;
+         BEGIN
+           SELECT constraint_record.conname INTO target_name
+             FROM pg_constraint constraint_record
+            WHERE constraint_record.conrelid = ('truth.' || ${sqlLiteral(relation)})::regclass
+              AND constraint_record.contype = ${sqlLiteral(type)}
+              ${exactDefinition ? `AND pg_get_constraintdef(constraint_record.oid, false) = ${sqlLiteral(exactDefinition)}` : ""}
+            ORDER BY constraint_record.oid LIMIT 1;
+           EXECUTE format('ALTER TABLE truth.%I DROP CONSTRAINT %I', ${sqlLiteral(relation)}, target_name);
+           EXECUTE ${sqlLiteral(replacement)};
+         END
+         $drift$`,
+        "Objective recovery exact constraint inventory drifted"
+      );
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
   it("rejects an installed 0010 state whose final journal row was deleted without changing the database", async () => {
     await resetToLatest();
     await ownerPool.query(
@@ -218,7 +606,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     );
     const before = await exact0010CatalogSnapshot(ownerPool);
 
-    await expect(applyMigrations(ownerPool)).rejects.toThrow(
+    await expect(applyCheckpoint()).rejects.toThrow(
       "B2 migration state already exists without journal row for 0010_b2_trusted_objective_initiative_lock.sql"
     );
 
@@ -246,7 +634,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     );
     expect(privilegeBefore.rows).toEqual([{ installed: false }]);
 
-    await expect(applyMigrations(ownerPool)).resolves.toMatchObject({
+    await expect(applyCheckpoint()).resolves.toMatchObject({
       applied: ["0010_b2_trusted_objective_initiative_lock.sql"]
     });
     const policies = await ownerPool.query<{
@@ -500,7 +888,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
             tenant_id, workspace_id, space_id, subject_type, subject_id
           ) WHERE status = 'current'
       `,
-      "B2 Slice 1 current-Fact unique-slot index definition drifted"
+      "B2 Slice 1 exact truth index inventory drifted"
     );
 
     await expectCatalogContractRejected(
@@ -511,7 +899,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
             tenant_id, workspace_id, space_id, subject_type, subject_id, predicate
           ) WHERE status = 'cur(rent)'
       `,
-      "B2 Slice 1 current-Fact unique-slot index definition drifted"
+      "B2 Slice 1 exact truth index inventory drifted"
     );
 
     await expectCatalogContractRejected(
@@ -588,14 +976,14 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
       `,
       "B2 Slice 1 truth function execution shape or source drifted"
     );
-  }, 120_000);
+  }, 300_000);
 
   it("upgrades an exact B1 database through B2 without rewriting its journal", async () => {
     await applyMigrations(ownerPool, { reset: true, through: "0006_b1_command_integrity.sql" });
     const before = await ownerPool.query<{ id: string; checksum: string }>(
       "SELECT id, checksum FROM throughline_migrations.journal ORDER BY id"
     );
-    const upgraded = await applyMigrations(ownerPool);
+    const upgraded = await applyCheckpoint();
     expect(upgraded.applied).toEqual([
       "0007_b2_slice1_truth_storage.sql",
       "0008_b2_slice1_command_integrity.sql",
@@ -609,27 +997,30 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     await expectExactCommandFunctionPrivileges();
   }, 120_000);
 
-  it("upgrades valid populated exact-0008 truth into canonical text without changing history", async () => {
-    await applyMigrations(ownerPool, {
-      reset: true,
-      through: "0008_b2_slice1_command_integrity.sql"
-    });
-    await insertExact0008TruthFixture(ownerPool);
-    await expectExact0008ReferencesValid(ownerPool);
-    const beforeCounts = await exact0008RowCounts(ownerPool);
-    expect(beforeCounts).toEqual({
-      evidence: "1",
-      claims: "1",
-      facts: "1",
-      support: "1"
-    });
-    const legacyValues = await ownerPool.query<{
-      relation: string;
-      semantic_value: string;
-      json_type: string;
-      hash_matches_v1_json: boolean;
-    }>(
-      `SELECT 'claim' AS relation, value_json #>> '{}' AS semantic_value,
+  it(
+    "upgrades valid populated exact-0008 truth into canonical text without changing history",
+    async () => {
+      await applyMigrations(ownerPool, {
+        reset: true,
+        through: "0008_b2_slice1_command_integrity.sql"
+      });
+      await insertExact0008TruthFixture(ownerPool);
+      await expectExact0008ReferencesValid(ownerPool);
+      const beforeCounts = await exact0008RowCounts(ownerPool);
+      const beforeHistory = await exact0008StableHistory(ownerPool);
+      expect(beforeCounts).toEqual({
+        evidence: "2",
+        claims: "2",
+        facts: "1",
+        support: "1"
+      });
+      const legacyValues = await ownerPool.query<{
+        relation: string;
+        semantic_value: string;
+        json_type: string;
+        hash_matches_v1_json: boolean;
+      }>(
+        `SELECT 'claim_' || subject_type AS relation, value_json #>> '{}' AS semantic_value,
               jsonb_typeof(value_json) AS json_type,
               value_hash = encode(
                 public.digest(convert_to(value_json::text, 'UTF8'), 'sha256'
@@ -642,38 +1033,45 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
               ), 'hex')
          FROM truth.accepted_facts
        ORDER BY relation`
-    );
-    expect(legacyValues.rows).toEqual([
-      {
-        relation: "claim",
-        semantic_value: "Adopted canonical value",
-        json_type: "string",
-        hash_matches_v1_json: true
-      },
-      {
-        relation: "fact",
-        semantic_value: "Adopted canonical value",
-        json_type: "string",
-        hash_matches_v1_json: true
-      }
-    ]);
-    const beforeJournal = await ownerPool.query<{ id: string; checksum: string }>(
-      "SELECT id, checksum FROM throughline_migrations.journal ORDER BY id"
-    );
+      );
+      expect(legacyValues.rows).toEqual([
+        {
+          relation: "claim_activity",
+          semantic_value: "Adopted canonical value",
+          json_type: "string",
+          hash_matches_v1_json: true
+        },
+        {
+          relation: "claim_initiative",
+          semantic_value: "Adopted primary objective",
+          json_type: "string",
+          hash_matches_v1_json: true
+        },
+        {
+          relation: "fact",
+          semantic_value: "Adopted canonical value",
+          json_type: "string",
+          hash_matches_v1_json: true
+        }
+      ]);
+      const beforeJournal = await ownerPool.query<{ id: string; checksum: string }>(
+        "SELECT id, checksum FROM throughline_migrations.journal ORDER BY id"
+      );
 
-    await expect(applyMigrations(ownerPool)).resolves.toMatchObject({
-      applied: [
-        "0009_b2_source_truth_lifecycle_interlock.sql",
-        "0010_b2_trusted_objective_initiative_lock.sql"
-      ]
-    });
+      await expect(applyMigrations(ownerPool)).resolves.toMatchObject({
+        applied: [
+          "0009_b2_source_truth_lifecycle_interlock.sql",
+          "0010_b2_trusted_objective_initiative_lock.sql",
+          "0011_b2_primary_objective_proposal_recovery.sql"
+        ]
+      });
 
-    const values = await ownerPool.query<{
-      relation: string;
-      canonical_value_text: string;
-      hash_matches: boolean;
-    }>(
-      `SELECT 'claim' AS relation, canonical_value_text,
+      const values = await ownerPool.query<{
+        relation: string;
+        canonical_value_text: string;
+        hash_matches: boolean;
+      }>(
+        `SELECT 'claim_' || subject_type AS relation, canonical_value_text,
               value_hash = encode(
                 public.digest(convert_to(canonical_value_text, 'UTF8'), 'sha256'
               ), 'hex') AS hash_matches
@@ -685,23 +1083,249 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
               ), 'hex')
          FROM truth.accepted_facts
        ORDER BY relation`
-    );
-    expect(values.rows).toEqual([
-      { relation: "claim", canonical_value_text: "Adopted canonical value", hash_matches: true },
-      { relation: "fact", canonical_value_text: "Adopted canonical value", hash_matches: true }
-    ]);
-    expect(await exact0008RowCounts(ownerPool)).toEqual(beforeCounts);
-    const afterJournal = await ownerPool.query<{ id: string; checksum: string }>(
-      "SELECT id, checksum FROM throughline_migrations.journal WHERE id <> ALL($1::text[]) ORDER BY id",
-      [
+      );
+      expect(values.rows).toEqual([
+        {
+          relation: "claim_activity",
+          canonical_value_text: "Adopted canonical value",
+          hash_matches: true
+        },
+        {
+          relation: "claim_initiative",
+          canonical_value_text: "Adopted primary objective",
+          hash_matches: true
+        },
+        { relation: "fact", canonical_value_text: "Adopted canonical value", hash_matches: true }
+      ]);
+      expect(await exact0008RowCounts(ownerPool)).toEqual(beforeCounts);
+      expect(await exact0008StableHistory(ownerPool)).toBe(beforeHistory);
+      const reconstructed = await ownerPool.query<{
+        id: string;
+        safe_request: Record<string, unknown>;
+        native_valid: boolean;
+        adopted_valid: boolean;
+        safe_request_adopted: boolean;
+        bound_to_durable: boolean;
+      }>(
+        `SELECT command.id, command.safe_request, command.safe_request_adopted,
+              ops.b2_slice1_safe_request_valid(
+                command.command_kind, command.safe_request
+              ) AS native_valid,
+              (ops.b2_slice1_safe_request_valid(command.command_kind, command.safe_request)
+                OR (command.safe_request ->> 'predicate' = 'initiative.primary_objective'
+                  AND jsonb_typeof(command.safe_request -> 'supportConfirmed') = 'boolean'
+                  AND NOT (command.safe_request ->> 'supportConfirmed')::boolean
+                  AND ops.b2_slice1_safe_request_valid(command.command_kind,
+                    jsonb_set(command.safe_request, '{supportConfirmed}', 'true'::jsonb, false))))
+                AS adopted_valid,
+              command.safe_request ->> 'subjectType' = claim.subject_type
+                AND command.safe_request ->> 'subjectId' = claim.subject_id::text
+                AND (command.safe_request ->> 'expectedSubjectVersion')::integer =
+                  CASE claim.subject_type WHEN 'activity' THEN activity.version
+                    ELSE initiative.version END
+                AND command.safe_request ->> 'predicate' = claim.predicate
+                AND command.safe_request ->> 'valueHash' = claim.value_hash
+                AND command.safe_request ->> 'sourceArtifactId' =
+                  evidence.source_artifact_id::text
+                AND command.safe_request ->> 'sourceChunkId' = evidence.source_chunk_id::text
+                AND (command.safe_request ->> 'expectedSourceVersion')::integer =
+                  evidence.source_version
+                AND (command.safe_request ->> 'expectedChunkVersion')::integer =
+                  evidence.chunk_version
+                AND command.safe_request ->> 'normalizationVersion' =
+                  evidence.normalization_version
+                AND command.safe_request ->> 'chunkingVersion' = evidence.chunking_version
+                AND (command.safe_request ->> 'startOffset')::integer =
+                  evidence.source_start_offset
+                AND (command.safe_request ->> 'endOffset')::integer =
+                  evidence.source_end_offset
+                AND command.safe_request ->> 'sourceContentHash' = evidence.source_content_hash
+                AND command.safe_request ->> 'sourceNormalizedContentHash' =
+                  evidence.source_normalized_content_hash
+                AND command.safe_request ->> 'chunkContentHash' = evidence.chunk_content_hash
+                AND command.safe_request ->> 'excerptHash' = evidence.excerpt_hash
+                AND NOT (command.safe_request ->> 'supportConfirmed')::boolean
+                  AS bound_to_durable
+         FROM ops.domain_command_records command
+         JOIN truth.claims claim ON claim.causation_command_id = command.id
+         JOIN truth.verified_evidence_spans evidence
+           ON evidence.id = claim.verified_evidence_span_id
+         LEFT JOIN work.activities activity
+           ON claim.subject_type = 'activity' AND activity.id = claim.subject_id
+         LEFT JOIN work.initiatives initiative
+           ON claim.subject_type = 'initiative' AND initiative.id = claim.subject_id
+        WHERE command.command_kind = 'claim.create.v1'
+        ORDER BY command.id`
+      );
+      expect(reconstructed.rows).toHaveLength(2);
+      expect(
+        reconstructed.rows.map(
+          ({ native_valid, adopted_valid, safe_request_adopted, bound_to_durable }) => ({
+            native_valid,
+            adopted_valid,
+            safe_request_adopted,
+            bound_to_durable
+          })
+        )
+      ).toEqual([
+        {
+          native_valid: true,
+          adopted_valid: true,
+          safe_request_adopted: true,
+          bound_to_durable: true
+        },
+        {
+          native_valid: false,
+          adopted_valid: true,
+          safe_request_adopted: true,
+          bound_to_durable: true
+        }
+      ]);
+      const genericRequest = reconstructed.rows.find(
+        ({ id }) => id === adoptionIds.command
+      )!.safe_request;
+      expect(Object.keys(genericRequest).sort()).toEqual([
+        "chunkContentHash",
+        "chunkingVersion",
+        "endOffset",
+        "excerptHash",
+        "expectedChunkVersion",
+        "expectedSourceVersion",
+        "expectedSubjectVersion",
+        "normalizationVersion",
+        "predicate",
+        "sourceArtifactId",
+        "sourceChunkId",
+        "sourceContentHash",
+        "sourceNormalizedContentHash",
+        "startOffset",
+        "subjectId",
+        "subjectType",
+        "supportConfirmed",
+        "valueHash"
+      ]);
+      expect(genericRequest).toMatchObject({
+        subjectType: "activity",
+        predicate: "activity.outcome",
+        supportConfirmed: false
+      });
+      const objectiveRequest = reconstructed.rows.find(
+        ({ id }) => id === adoptionIds.objectiveCommand
+      )!.safe_request;
+      expect(objectiveRequest).toMatchObject({
+        subjectType: "initiative",
+        predicate: "initiative.primary_objective",
+        supportConfirmed: false,
+        expectedLatestClaimId: null,
+        expectedLatestClaimVersion: null,
+        expectedLatestClaimStatus: null
+      });
+      expect(
+        (
+          await ownerPool.query(
+            "SELECT 1 FROM truth.initiative_objective_support_attestations LIMIT 1"
+          )
+        ).rows
+      ).toHaveLength(0);
+      await expect(
+        ownerPool.query(
+          `INSERT INTO ops.domain_command_records (
+             id, tenant_id, workspace_id, reservation_space_id, command_kind,
+             command_schema_version, idempotency_key, canonical_request_hash, state,
+             safe_request, safe_request_adopted, actor_user_id, actor_membership_id,
+             policy_version_id, request_id, traceparent
+           ) SELECT
+             '0190a000-0000-7000-8000-0000000000fe', tenant_id, workspace_id,
+             reservation_space_id, command_kind, command_schema_version,
+             'native-unconfirmed-objective', canonical_request_hash, 'reserved', safe_request,
+             false, actor_user_id, actor_membership_id, policy_version_id,
+             'native-unconfirmed-objective',
+             '00-00000000000000000000000000000004-0000000000000004-01'
+           FROM ops.domain_command_records WHERE id = $1`,
+          [adoptionIds.objectiveCommand]
+        )
+      ).rejects.toMatchObject({ code: "23514" });
+      const nullHashRequest = {
+        ...objectiveRequest,
+        supportConfirmed: true,
+        sourceContentHash: null
+      };
+      const nullIntegerRequest = {
+        ...objectiveRequest,
+        expectedSubjectVersion: null
+      };
+      expect(
+        (
+          await ownerPool.query<{ valid: boolean }>(
+            `SELECT ops.b2_slice1_safe_request_valid(
+               'claim.create.v1', request.request_value
+             ) AS valid
+               FROM (VALUES ($1::jsonb), ($2::jsonb)) request(request_value)`,
+            [nullHashRequest, nullIntegerRequest]
+          )
+        ).rows
+      ).toEqual([{ valid: false }, { valid: false }]);
+      const expectNullRequestRejected = async (
+        commandId: string,
+        idempotencyKey: string,
+        request: Record<string, unknown>,
+        adopted: boolean
+      ) =>
+        expect(
+          ownerPool.query(
+            `INSERT INTO ops.domain_command_records (
+               id, tenant_id, workspace_id, reservation_space_id, command_kind,
+               command_schema_version, idempotency_key, canonical_request_hash, state,
+               safe_request, safe_request_adopted, actor_user_id, actor_membership_id,
+               policy_version_id, request_id, traceparent
+             ) SELECT
+               $2, tenant_id, workspace_id, reservation_space_id, command_kind,
+               command_schema_version, $3, canonical_request_hash, 'reserved', $4::jsonb,
+               $5, actor_user_id, actor_membership_id, policy_version_id, $3,
+               '00-00000000000000000000000000000005-0000000000000005-01'
+             FROM ops.domain_command_records WHERE id = $1`,
+            [adoptionIds.objectiveCommand, commandId, idempotencyKey, request, adopted]
+          )
+        ).rejects.toMatchObject({ code: "23514" });
+      await expectNullRequestRejected(
+        "0190a000-0000-7000-8000-0000000000fd",
+        "native-null-source-hash",
+        nullHashRequest,
+        false
+      );
+      await expectNullRequestRejected(
+        "0190a000-0000-7000-8000-0000000000fc",
+        "adopted-null-subject-version",
+        nullIntegerRequest,
+        true
+      );
+      await expect(
+        executeAsRole(
+          "throughline_app",
+          "INSERT INTO ops.domain_command_records (safe_request_adopted) VALUES (true)"
+        )
+      ).rejects.toMatchObject({ code: "42501" });
+      await expect(
+        executeAsRole(
+          "throughline_app",
+          "UPDATE ops.domain_command_records SET safe_request_adopted = true WHERE id = $1",
+          [adoptionIds.objectiveCommand]
+        )
+      ).rejects.toMatchObject({ code: "42501" });
+      const afterJournal = await ownerPool.query<{ id: string; checksum: string }>(
+        "SELECT id, checksum FROM throughline_migrations.journal WHERE id <> ALL($1::text[]) ORDER BY id",
         [
-          "0009_b2_source_truth_lifecycle_interlock.sql",
-          "0010_b2_trusted_objective_initiative_lock.sql"
+          [
+            "0009_b2_source_truth_lifecycle_interlock.sql",
+            "0010_b2_trusted_objective_initiative_lock.sql",
+            "0011_b2_primary_objective_proposal_recovery.sql"
+          ]
         ]
-      ]
-    );
-    expect(afterJournal.rows).toEqual(beforeJournal.rows);
-  }, 120_000);
+      );
+      expect(afterJournal.rows).toEqual(beforeJournal.rows);
+    },
+    PHASE5_TEST_TIMEOUT
+  );
 
   it("executes the additive Fact-support validator from both shared trigger relations", async () => {
     try {
@@ -710,7 +1334,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         through: "0008_b2_slice1_command_integrity.sql"
       });
       await insertExact0008TruthFixture(ownerPool);
-      await applyMigrations(ownerPool);
+      await applyCheckpoint();
 
       const factClient = await ownerPool.connect();
       try {
@@ -831,7 +1455,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
       await expectExact0008ReferencesValid(ownerPool);
       const before = await exact0008Digest(ownerPool);
 
-      const adoptionError = await applyMigrations(ownerPool).then(
+      const adoptionError = await applyCheckpoint().then(
         () => undefined,
         (error: unknown) => error
       );
@@ -901,7 +1525,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
       "SELECT rolcanlogin AS login FROM pg_roles WHERE rolname = 'throughline_app'"
     );
     expect(restoredAppRole.rows).toEqual([{ login: false }]);
-    await expect(applyMigrations(ownerPool)).resolves.toEqual({
+    await expect(applyCheckpoint()).resolves.toEqual({
       applied: [],
       skipped: [...allMigrationIds]
     });
@@ -1156,21 +1780,19 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
 
   it("accepts the clean PUBLIC ACLs and rejects a deliberate PUBLIC truth-table grant", async () => {
     await resetToLatest();
-    await expect(applyMigrations(ownerPool)).resolves.toEqual({
+    await expect(applyCheckpoint()).resolves.toEqual({
       applied: [],
       skipped: [...allMigrationIds]
     });
 
     await ownerPool.query("GRANT SELECT ON truth.claims TO PUBLIC");
     try {
-      await expect(applyMigrations(ownerPool)).rejects.toThrow(
-        "B2 Slice 1 truth table authority drifted"
-      );
+      await expect(applyCheckpoint()).rejects.toThrow("B2 Slice 1 truth table authority drifted");
     } finally {
       await ownerPool.query("REVOKE SELECT ON truth.claims FROM PUBLIC");
     }
 
-    await expect(applyMigrations(ownerPool)).resolves.toEqual({
+    await expect(applyCheckpoint()).resolves.toEqual({
       applied: [],
       skipped: [...allMigrationIds]
     });
@@ -1258,7 +1880,11 @@ const adoptionIds = {
   membership: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa5",
   person: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa3",
   subject: "0190a000-0000-7000-8000-000000000408",
-  organization: "0190a000-0000-7000-8000-000000000410"
+  organization: "0190a000-0000-7000-8000-000000000410",
+  objectiveCommand: "0190a000-0000-7000-8000-000000000421",
+  objectiveEvidence: "0190a000-0000-7000-8000-000000000422",
+  objectiveClaim: "0190a000-0000-7000-8000-000000000423",
+  initiative: "0190a000-0000-7000-8000-000000000424"
 } as const;
 
 async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
@@ -1270,6 +1896,7 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
     await client.query("BEGIN");
     for (const relation of [
       "work.organizations",
+      "work.initiatives",
       "work.activities",
       "work.activity_sources",
       "content.source_artifacts",
@@ -1302,6 +1929,22 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
         adoptionIds.space,
         adoptionIds.person,
         adoptionIds.organization
+      ]
+    );
+    await client.query(
+      `INSERT INTO work.initiatives (
+         id, tenant_id, workspace_id, space_id, title, type_key, stage_key, health,
+         owner_person_id, profile_id, profile_version, version
+       ) VALUES (
+         $1,$2,$3,$4,'Adoption Initiative','delivery','active','active',$5,
+         'ai-solutions','v1',1
+       )`,
+      [
+        adoptionIds.initiative,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.person
       ]
     );
     await client.query(
@@ -1371,6 +2014,10 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
          $7,$2,$3,$4,'fact.accept.v1',1,'exact-0008-fact',repeat('b',64),'reserved',
          $5,$6,'default-v1','exact-0008-fact',
          '00-00000000000000000000000000000002-0000000000000002-01'
+       ), (
+         $8,$2,$3,$4,'claim.create.v1',1,'exact-0008-objective',repeat('c',64),'reserved',
+         $5,$6,'default-v1','exact-0008-objective',
+         '00-00000000000000000000000000000003-0000000000000003-01'
        )`,
       [
         adoptionIds.command,
@@ -1379,7 +2026,8 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
         adoptionIds.space,
         adoptionIds.user,
         adoptionIds.membership,
-        adoptionIds.factCommand
+        adoptionIds.factCommand,
+        adoptionIds.objectiveCommand
       ]
     );
     await client.query(
@@ -1412,6 +2060,23 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
       ]
     );
     await client.query(
+      `INSERT INTO truth.verified_evidence_spans (
+         id, tenant_id, workspace_id, space_id, source_artifact_id, source_chunk_id,
+         source_version, chunk_version, normalization_version, chunking_version,
+         source_start_offset, source_end_offset, source_excerpt,
+         source_content_hash, source_normalized_content_hash, chunk_content_hash,
+         excerpt_hash, access_class, created_by_user_id, created_by_membership_id,
+         causation_command_id
+       ) SELECT
+         $1,tenant_id,workspace_id,space_id,source_artifact_id,source_chunk_id,
+         source_version,chunk_version,normalization_version,chunking_version,
+         source_start_offset,source_end_offset,source_excerpt,
+         source_content_hash,source_normalized_content_hash,chunk_content_hash,
+         excerpt_hash,access_class,created_by_user_id,created_by_membership_id,$2
+       FROM truth.verified_evidence_spans WHERE id = $3`,
+      [adoptionIds.objectiveEvidence, adoptionIds.objectiveCommand, adoptionIds.evidence]
+    );
+    await client.query(
       `INSERT INTO truth.claims (
          id,tenant_id,workspace_id,space_id,subject_type,subject_id,
          predicate_catalog_version,predicate,value_json,value_hash,normalized_text,
@@ -1434,6 +2099,32 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
         adoptionIds.user,
         adoptionIds.membership,
         adoptionIds.command
+      ]
+    );
+    await client.query(
+      `INSERT INTO truth.claims (
+         id,tenant_id,workspace_id,space_id,subject_type,subject_id,
+         predicate_catalog_version,predicate,value_json,value_hash,normalized_text,
+         verified_evidence_span_id,asserted_by_type,asserted_by_id,confidence,status,
+         access_class,created_by_user_id,created_by_membership_id,causation_command_id,version
+       ) VALUES (
+         $1,$2,$3,$4,'initiative',$5,'truth-predicate-catalog.v1',
+         'initiative.primary_objective',to_jsonb($6::text),
+         encode(public.digest(convert_to(to_jsonb($6::text)::text,'UTF8'),'sha256'),'hex'),
+         $6,$7,'person',$8,'strong','proposed','workspace',$9,$10,$11,1
+       )`,
+      [
+        adoptionIds.objectiveClaim,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.initiative,
+        "Adopted primary objective",
+        adoptionIds.objectiveEvidence,
+        adoptionIds.person,
+        adoptionIds.user,
+        adoptionIds.membership,
+        adoptionIds.objectiveCommand
       ]
     );
     await client.query(
@@ -1483,6 +2174,7 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
       "content.source_artifacts",
       "work.activity_sources",
       "work.activities",
+      "work.initiatives",
       "work.organizations"
     ]) {
       await client.query(`ALTER TABLE ${relation} ENABLE TRIGGER USER`);
@@ -1495,6 +2187,11 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
   } finally {
     client.release();
   }
+}
+
+function sqlLiteral(value: unknown): string {
+  if (typeof value !== "string") throw new Error("SQL test fixture must be a string");
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 async function mutateExact0008Evidence(
@@ -1587,6 +2284,38 @@ async function exact0008RowCounts(pool: pg.Pool): Promise<{
        (SELECT count(*)::text FROM truth.fact_claims) AS support`
   );
   return result.rows[0]!;
+}
+
+async function exact0008StableHistory(pool: pg.Pool): Promise<string> {
+  const result = await pool.query<{ history: unknown }>(
+    `SELECT jsonb_build_object(
+       'commands', (SELECT jsonb_agg(
+         to_jsonb(command) - ARRAY['safe_request','safe_request_adopted']::text[]
+         ORDER BY command.id)
+         FROM ops.domain_command_records command),
+       'evidence', (SELECT jsonb_agg(to_jsonb(evidence) ORDER BY evidence.id)
+         FROM truth.verified_evidence_spans evidence),
+       'claims', (SELECT jsonb_agg(
+         to_jsonb(claim) - ARRAY['value_json','canonical_value_text','value_hash']::text[]
+         ORDER BY claim.id) FROM truth.claims claim),
+       'facts', (SELECT jsonb_agg(
+         to_jsonb(fact) - ARRAY['value_json','canonical_value_text','value_hash']::text[]
+         ORDER BY fact.id) FROM truth.accepted_facts fact),
+       'support', (SELECT jsonb_agg(to_jsonb(support) ORDER BY support.fact_id, support.claim_id)
+         FROM truth.fact_claims support),
+       'sources', (SELECT jsonb_agg(to_jsonb(source) ORDER BY source.id)
+         FROM content.source_artifacts source),
+       'chunks', (SELECT jsonb_agg(to_jsonb(chunk) ORDER BY chunk.id)
+         FROM content.source_chunks chunk),
+       'activities', (SELECT jsonb_agg(to_jsonb(activity) ORDER BY activity.id)
+         FROM work.activities activity),
+       'initiatives', (SELECT jsonb_agg(to_jsonb(initiative) ORDER BY initiative.id)
+         FROM work.initiatives initiative),
+       'organizations', (SELECT jsonb_agg(to_jsonb(organization) ORDER BY organization.id)
+         FROM work.organizations organization)
+     ) AS history`
+  );
+  return JSON.stringify(result.rows[0]!.history);
 }
 
 async function expectExact0008ReferencesValid(pool: pg.Pool): Promise<void> {

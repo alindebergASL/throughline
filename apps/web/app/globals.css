@@ -340,6 +340,61 @@ summary {
   max-width: 62ch;
 }
 
+.support-confirmation {
+  align-items: flex-start;
+  display: flex;
+  gap: 10px;
+  line-height: 1.45;
+}
+
+.support-confirmation input {
+  flex: 0 0 auto;
+  height: 20px;
+  margin: 1px 0 0;
+  width: 20px;
+}
+
+.recovery-actions {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.recovery-confirmation,
+.recovery-outcome {
+  background: #f7f8f7;
+  border: 1px solid #d8ddd8;
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+  padding: clamp(16px, 3vw, 22px);
+}
+
+.recovery-confirmation h3,
+.recovery-confirmation p,
+.recovery-outcome p {
+  margin: 0;
+}
+
+.recovery-confirmation select {
+  max-width: 100%;
+  min-height: 44px;
+}
+
+.confirmation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+mark {
+  background: #fff1b8;
+  color: inherit;
+}
+
 .accepted-heading {
   align-items: center;
   display: flex;

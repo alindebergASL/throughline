@@ -2,13 +2,13 @@
 
 ## Scope and trust boundary
 
-This packet covers only deterministic, browser-side assistance for preparing an Initiative primary-objective proposal from the already authorized and normalized `state.source.note`.
+This packet covers deterministic browser-side assistance and the bounded recovery path for an Initiative primary-objective proposal.
 
-The adviser is pure, model-free, provider-free, and ephemeral. Its output is neither a Claim nor accepted truth. The browser still submits only `objective` and `exactExcerpt` through the existing proposal action. The API continues to derive and verify source identity, chunk identity, Unicode-scalar offsets, hashes, exact-match uniqueness, authorization, and proposal authority. Explicit proposal and explicit acceptance remain separate actions on the existing path:
+The adviser is pure, model-free, provider-free, and ephemeral. Its output is neither a Claim nor accepted truth. Initial proposal and atomic rework requests contain the objective, exact excerpt, and a literal fresh human support confirmation. The API independently derives and verifies source identity, chunk identity, Unicode-scalar offsets, hashes, exact-match uniqueness, authorization, and proposal authority. The durable support attestation is bound to the authenticated actor, exact new Claim, value hash, verified evidence span, and excerpt hash. Explicit proposal and explicit owner acceptance remain separate actions on the existing path:
 
-`SourceArtifact → verified evidence span → Proposed Claim → explicit Accept → AcceptedFact`
+`SourceArtifact → verified evidence span + human support attestation → Proposed Claim → explicit owner Accept → AcceptedFact`
 
-No dependency, migration, model/provider, API authority, durable store, external write, telemetry, deployment, or broader predicate was added.
+Migration `0011_b2_primary_objective_proposal_recovery.sql` adds only objective support attestations and objective proposal recovery lineage. It adds no generic Claim/Fact lifecycle, accepted-Fact mutation, provider/model call, external write, telemetry, deployment, or broader predicate.
 
 ## Deterministic rule catalog
 
@@ -20,7 +20,7 @@ The catalog now has exactly one rule:
 
 Case matching follows the prior case-insensitive behavior. A conventional leading bullet (`-`, `*`, `•`) or ordered-list marker (`1.`, `1)`, up to three digits) is allowed. No other objective, goal, or priority cue is recognized, and the infinitive `to` is mandatory.
 
-The input must reduce, after outer trim, to exactly one nonempty logical source line. Any surrounding line, speaker label, heading, or `Owner`/`System`/`Date`/`Deadline`/`Timeline`/`Milestone`/`Next step`/`Follow-up`/`Constraint` metadata causes abstention and a blank manual fallback. There is no neutral metadata allowlist, abbreviation catalog, ranking, metadata-separator splitting, or prefix-returning sentence extractor.
+The adviser analyzes normalized nonempty logical lines. It suggests only when exactly one line matches the strict objective grammar and every other line is bounded ordinary metadata (`Meeting`, `Participants`, `Attendees`, `Account`, `Organization`, `Engagement`, `Topic`, `Location`, `Facilitator`, `Recorded by`, or `Next meeting`) with safe content. Multiple candidates, unknown narrative/labels, corrections, negation, uncertainty, conditions, approval-bearing content, or objective-like competing content abstain. There is no ranking or prefix-returning sentence extractor.
 
 The exact evidence is the whole trimmed supported source line, including any list marker and optional trailing ASCII period. The adviser never returns a plausible prefix. After the cue is removed, a bounded positive scalar grammar permits only ASCII letters/digits/ordinary spaces; comma, period, apostrophe, and hyphen; Unicode letters, combining marks, and numbers; `U+2019` curly apostrophe; and `Extended_Pictographic` scalars. Every other punctuation, symbol, or whitespace scalar causes abstention. This rejects structural lookalikes without a confusable denylist, including colon, pipe, slash, bracket, hyphen-separator, semicolon, and comma confusables as well as unsupported ASCII structural symbols. A structural Unicode check additionally rejects Variation Selector scalars, modifier letters (`Lm`), and any one letter token that mixes ASCII and non-ASCII base letters. Decomposed ordinary Unicode remains supported when its base letters do not mix, including the retained `Cafe` plus combining accent fixture, the separate Greek word, and the Arabic numeral.
 
@@ -34,7 +34,8 @@ The normalized objective removes only the supported leading assertion and option
 
 - the two supported leading infinitive assertions in direct, bullet, and numbered forms, with whole-line exact evidence;
 - direct useful wording including `The primary objective is to launch a governed pilot by October.`, direct/list forms, `U.S.`, `e.g.`, straight and curly apostrophes, safe comma/period/hyphen prose, Unicode letters/combining marks/numbers, and the `🚀` positive;
-- abstention for every formerly broad cue and every multiline note, including all formerly allowlisted metadata labels and correction/dependency values;
+- one realistic multiline note with exactly one safe supported objective line and bounded ordinary metadata;
+- abstention for formerly broad cues and multiline notes containing unknown, competing, corrective, conditional, uncertain, approval-bearing, or unsafe content;
 - pipe `Foobar`/`Deadline`/`Sponsor`/nested-cue suffixes, parenthesized and no-separator `Deadline` suffixes, comma-embedded `Owner`, slash/dash/bullet separators, additional colons, and bracketed suffixes;
 - Unicode `U+2028`, `U+2029`, `U+3002`, `U+FF01`, `U+FF1F`, and another Unicode sentence-terminal boundary;
 - structural scalar rejection for `U+FF1A`, `U+FE55`, `U+A789`, `U+2236`, `U+FF5C`, `U+2223`, `U+FF0F`, `U+2215`, fullwidth parentheses/square/curly brackets, `U+2010`, `U+2011`, fullwidth semicolon/comma, the requested unsupported ASCII structural symbols, and nearby punctuation/symbol/non-ordinary-whitespace representatives;
@@ -44,7 +45,7 @@ The normalized objective removes only the supported leading assertion and option
 - exact excerpt uniqueness, word support, byte-identical repeated calls, and the closed output shape;
 - no cue, unclear/not-agreed/TBD/to-be-determined language, modal/probabilistic/conditional uncertainty, unsafe competing cues, alternatives, competing objectives, repeated evidence, hostile non-human labels, unresolved approval/agreement/review auxiliaries and contractions, withdrawal/replacement/cancellation/invalidity/obsolescence corrections, long-gap challenges, Unicode format/bidi/zero-width controls, realistic conflict, short/oversized/malformed candidates, questions, quoted speculation, and the capture-size limit;
 - the retained attribution, correction, prompt-injection, control-character, hostile-action, source/candidate-bound, and canonical 2,000-scalar chunk security regressions;
-- deterministic pure draft construction, local value-edit isolation, rejection to a blank manual value, and abstention to a blank manual value;
+- deterministic pure draft construction, local value-edit isolation, rejection that clears untouched machine prefill while preserving either user-edited field, and abstention to a blank manual value;
 - executable focus-target routing with test doubles, plus static verification that the component wires pending-focus refs through a post-render effect. The unit suite itself does not claim mounted-DOM or browser-focus proof; disposable browser evidence is recorded separately below.
 - direct owner-token single-flight behavior with a deferred request, two synchronous invocations, losing-invocation announcement isolation, exact busy events, and stale-owner release protection; plus static verification that the component uses the helper and its controls consume the same busy state. This is helper/static evidence, not a mounted-DOM test.
 
@@ -177,12 +178,13 @@ Clear-note state shows one `Review objective suggestion` card with:
 - `Reject suggestion and enter manually`, which clears the suggestion locally;
 - post-render focus moves to the objective field after rejection;
 - one primary `Create proposed objective` action with copy stating that it creates a Proposed Claim and does not accept truth.
+- one explicit semantic-support checkbox; editing the objective or excerpt clears it and submission remains disabled until the human confirms again.
 - while that proposal request is in flight, objective/evidence fields, evidence correction, suggestion rejection, and manual-selection controls are disabled from the same request-busy state.
 - source capture, proposal creation, acceptance, and confirmation drafting share one synchronous owner-token single-flight lock. A same-tick losing invocation performs no request and changes neither busy state nor the live announcement; only the current owner releases busy state.
 
 Abstained or rejected state shows no prefilled guess. It explains the safe abstention, keeps the captured source read-only and selectable, provides `Use selected excerpt`, and leaves exact excerpt and objective editable. Abstention and rejection perform no write.
 
-Durable Proposed, explicit Accept, Accepted trusted memory, generic unavailable, and deterministic confirmation-draft `Not sent` states retain the Slice 2 API and trust path.
+Durable Proposed state projects Workspace visibility, Initiative-owner acceptance authority, acceptance availability, and non-leaking management availability. The original proposer can rework or withdraw their active proposal; the current Initiative owner can reject/withdraw and is the only actor who can accept. Rework atomically terminalizes the predecessor as superseded and creates one successor with new evidence and a new support attestation. Withdrawal/rejection terminalizes the predecessor, frees the active slot, and returns to captured preparation. Reload projects only the active Proposed successor; terminal Claims remain immutable history. Legacy unconfirmed proposals cannot be accepted and must be withdrawn or reworked. Deterministic confirmation drafting remains `Not sent`.
 
 ## Effort comparison
 
@@ -199,18 +201,20 @@ The clear path requires no manual highlight and no objective retyping when the s
 Use the disposable local Slice 2 database/API/web setup documented in the repository root. Do not point the script at shared infrastructure.
 
 1. Capture a direct unprefixed clear note and verify exact objective/evidence prefill, the suggested/not-accepted label, and one create-proposal action.
-2. Capture a speaker-prefixed or multiline note and verify manual fallback with blank objective/evidence; then capture a bullet-form clear note and verify the complete trimmed line, including its bullet, is suggested as byte-exact evidence.
+2. Capture a realistic multiline note with safe meeting/participant context and exactly one clear objective line. Verify that line alone is suggested as the candidate excerpt. Then add a second objective, correction, condition, uncertainty, or approval-bearing line and verify blank manual fallback.
 3. Edit the suggested objective; explicitly enable evidence correction, select source text, and use the selection.
-4. Reject a suggestion and verify both fields clear with the manual selection path available.
+4. Reject an untouched suggestion and verify both fields clear. Repeat after editing only the objective, only the excerpt, and both; verify every user-edited value is preserved and focus moves to the next useful control.
 5. Capture two distinct explicit objectives and verify calm conflicting abstention with no prefilled guess and no write.
 6. Capture a note without an explicit cue and verify unsupported abstention with the same manual path.
-7. Create the proposal and inspect `Proposed, not accepted.` before using the separate Accept action.
-8. Accept explicitly and inspect accepted memory, accepter/time, visibility, source, and exact excerpt.
-9. Draft confirmation twice and verify byte-identical text, `Not sent`, and `Sent: false`.
-10. Refresh at captured, Proposed, and Accepted states. Verify captured assistance reinitializes deterministically while durable states come only from the API.
-11. Repeat the generic unavailable check in its separate server/browser context and verify no protected metadata leaks.
-12. At desktop and 390 px widths, keyboard through every field, disclosure, correction, rejection, manual selection, proposal, Accept, and draft action. Confirm correction focuses exact evidence and rejection focuses objective; also check visible focus, live-region announcements, console errors, clipping, and horizontal overflow.
-13. Before and after abstention/rejection, verify database counts do not change. After proposal, verify one Claim and no Fact; after Accept, verify the expected AcceptedFact linkage.
+7. Verify proposal submission is disabled until semantic support is checked. Check it, edit either field, and verify it clears. Re-check, create the proposal, and inspect `Proposed, not accepted.` plus Workspace visibility and Initiative-owner authority.
+8. As the proposer, begin rework and verify predecessor values populate preparation without changing durable state. Edit objective/evidence, freshly confirm support, submit, refresh, and verify one active successor. Inspect the database for a superseded predecessor, explicit lineage, new evidence, and a new authenticated support attestation.
+9. Withdraw the active proposal, refresh, and verify captured preparation returns, the active slot is free, and Claim/evidence/recovery/audit/outbox history remains. Create a fresh proposal. As current owner but not proposer, repeat the rejection path and verify rework is unavailable.
+10. Attempt acceptance of a legacy/unconfirmed proposal and verify fail-closed conflict with no Fact or partial writes. Accept only the active supported successor as the current Initiative owner and inspect accepted memory, accepter/time, visibility, source, and exact excerpt.
+11. Draft confirmation twice and verify byte-identical text, `Not sent`, and `Sent: false`.
+12. Refresh at captured, Proposed, withdrawn/rejected, reworked, and Accepted states. Verify terminal Claims never project as active or accepted memory.
+13. Repeat the generic unavailable check as a non-authorized actor and verify the identical 404 body, zero writes, and no hidden proposer/owner identity.
+14. At desktop and 390 px widths, keyboard through every field, disclosure, correction, rejection, rework, withdrawal, manual selection, support confirmation, proposal, Accept, and draft action. Confirm major transitions focus the new heading or first useful field; also check visible focus, live announcements, console errors, clipping, and horizontal overflow.
+15. Verify one matching audit row and one versioned outbox event per completed withdraw/reject/rework command. Details must contain only identifiers, versions, disposition/reason, evidence, and attestation references—never source or objective text.
 
 ## Historical disposable browser and database evidence
 

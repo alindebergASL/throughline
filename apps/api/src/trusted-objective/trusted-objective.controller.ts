@@ -31,9 +31,12 @@ import {
   TrustedObjectiveConflictError,
   TrustedObjectiveInputError,
   TrustedObjectiveUnavailableError,
+  parseAcceptBody,
   parseCaptureBody,
   parseEmptyBody,
-  parseProposalBody
+  parseProposalBody,
+  parseReworkBody,
+  parseWithdrawBody
 } from "./trusted-objective.contract.js";
 import { TrustedObjectiveGuard, type TrustedObjectiveRequest } from "./trusted-objective.guard.js";
 import { TrustedObjectiveRuntime } from "./trusted-objective.runtime.js";
@@ -48,6 +51,30 @@ export class TrustedObjectiveController {
     return this.safe(() =>
       this.runtime.getState(requireContext(request), requireUuid(initiativeId))
     );
+  }
+
+  @Post("proposal/withdraw")
+  withdraw(
+    @Req() request: TrustedObjectiveRequest,
+    @Param("initiativeId") initiativeId: string,
+    @Body() body: unknown
+  ) {
+    return this.safe(() => {
+      const input = parseWithdrawBody(body);
+      return this.runtime.withdraw(requireContext(request), requireUuid(initiativeId), input);
+    });
+  }
+
+  @Post("proposal/rework")
+  rework(
+    @Req() request: TrustedObjectiveRequest,
+    @Param("initiativeId") initiativeId: string,
+    @Body() body: unknown
+  ) {
+    return this.safe(() => {
+      const input = parseReworkBody(body);
+      return this.runtime.rework(requireContext(request), requireUuid(initiativeId), input);
+    });
   }
 
   @Post("source")
@@ -81,8 +108,8 @@ export class TrustedObjectiveController {
     @Body() body: unknown
   ) {
     return this.safe(() => {
-      parseEmptyBody(body);
-      return this.runtime.accept(requireContext(request), requireUuid(initiativeId));
+      const input = parseAcceptBody(body);
+      return this.runtime.accept(requireContext(request), requireUuid(initiativeId), input);
     });
   }
 

@@ -33,7 +33,10 @@ const ids = {
   fact: "018f0000-0000-7000-8000-000000000006",
   replacementFact: "018f0000-0000-7000-8000-000000000007",
   conflict: "018f0000-0000-7000-8000-000000000008",
-  view: "018f0000-0000-7000-8000-000000000009"
+  view: "018f0000-0000-7000-8000-000000000009",
+  evidence: "018f0000-0000-7000-8000-000000000010",
+  attestation: "018f0000-0000-7000-8000-000000000011",
+  recovery: "018f0000-0000-7000-8000-000000000012"
 } as const;
 
 const hashA = "a".repeat(64);
@@ -71,6 +74,32 @@ const commands = {
         chunkContentHash: hashC,
         excerptHash: hashD
       }
+    }
+  },
+  "initiative.primary_objective.withdraw": {
+    ...metadata,
+    kind: "initiative.primary_objective.withdraw",
+    payload: {
+      subject: { type: "initiative", id: ids.subject, expectedVersion: 3 },
+      proposal: { claimId: ids.claim1, expectedVersion: 1 },
+      disposition: "withdrawn",
+      reasonCode: "needs_rework"
+    }
+  },
+  "initiative.primary_objective.rework": {
+    ...metadata,
+    kind: "initiative.primary_objective.rework",
+    payload: {
+      subject: { type: "initiative", id: ids.subject, expectedVersion: 3 },
+      predecessor: { claimId: ids.claim1, expectedVersion: 1 },
+      valueJson: "Reduce response time",
+      normalizedText: "Reduce response time",
+      confidence: "strong",
+      evidence: {
+        ...commandsEvidence(),
+        excerpt: "outcome"
+      },
+      supportConfirmation: { confirmed: true }
     }
   },
   "fact.accept": {
@@ -187,6 +216,27 @@ const commands = {
 
 const results = {
   "claim.create": { claimId: ids.claim1, version: 1, status: "proposed" },
+  "initiative.primary_objective.withdraw": {
+    claimId: ids.claim1,
+    version: 2,
+    status: "rejected",
+    recoveryId: ids.recovery,
+    disposition: "withdrawn",
+    reasonCode: "needs_rework"
+  },
+  "initiative.primary_objective.rework": {
+    predecessorClaimId: ids.claim1,
+    predecessorVersion: 2,
+    predecessorStatus: "superseded",
+    successorClaimId: ids.claim2,
+    successorVersion: 1,
+    successorStatus: "proposed",
+    evidenceSpanId: ids.evidence,
+    supportAttestationId: ids.attestation,
+    recoveryId: ids.recovery,
+    disposition: "reworked",
+    reasonCode: "reworked"
+  },
   "fact.accept": {
     factId: ids.fact,
     version: 1,
@@ -253,6 +303,8 @@ describe("B2 strict command contracts", () => {
   it("pins the complete explicit command vocabulary and parses every exact shape", () => {
     expect(B2_COMMAND_KINDS).toEqual([
       "claim.create",
+      "initiative.primary_objective.withdraw",
+      "initiative.primary_objective.rework",
       "fact.accept",
       "fact.contest",
       "fact.uphold",
@@ -290,7 +342,9 @@ describe("B2 strict command contracts", () => {
           subject: { type: "initiative", id: ids.subject, expectedVersion: 3 },
           predicate: "initiative.primary_objective",
           valueJson: "Reduce response time",
-          normalizedText: "Reduce response time"
+          normalizedText: "Reduce response time",
+          supportConfirmation: { confirmed: true },
+          expectedPrimaryObjectiveGeneration: { kind: "empty" }
         }
       })
     ).toMatchObject({
@@ -307,6 +361,85 @@ describe("B2 strict command contracts", () => {
         }
       })
     ).toMatchObject({ kind: "fact.accept", payload: { acceptanceScope: "initiative" } });
+  });
+
+  it("requires a fresh literal human support confirmation on every new objective Claim", () => {
+    const initialObjective = {
+      ...commands["claim.create"],
+      payload: {
+        ...commands["claim.create"].payload,
+        subject: { type: "initiative", id: ids.subject, expectedVersion: 3 },
+        predicate: "initiative.primary_objective",
+        valueJson: "Reduce response time",
+        normalizedText: "Reduce response time",
+        supportConfirmation: { confirmed: true },
+        expectedPrimaryObjectiveGeneration: { kind: "empty" }
+      }
+    };
+    expect(parseB2Command(initialObjective)).toMatchObject({
+      payload: {
+        supportConfirmation: { confirmed: true },
+        expectedPrimaryObjectiveGeneration: { kind: "empty" }
+      }
+    });
+    for (const supportConfirmation of [
+      undefined,
+      { confirmed: false },
+      { confirmed: true, inferred: true },
+      true,
+      "confirmed"
+    ]) {
+      expect(() =>
+        parseB2Command({
+          ...initialObjective,
+          payload: { ...initialObjective.payload, supportConfirmation }
+        })
+      ).toThrow();
+      expect(() =>
+        parseB2Command({
+          ...commands["initiative.primary_objective.rework"],
+          payload: {
+            ...commands["initiative.primary_objective.rework"].payload,
+            supportConfirmation
+          }
+        })
+      ).toThrow();
+    }
+    for (const expectedPrimaryObjectiveGeneration of [
+      undefined,
+      { kind: "empty", extra: true },
+      { kind: "claim", claimId: ids.claim1, expectedVersion: 0, expectedStatus: "rejected" },
+      { kind: "claim", claimId: ids.claim1, expectedVersion: 2, expectedStatus: "conflicted" }
+    ]) {
+      expect(() =>
+        parseB2Command({
+          ...initialObjective,
+          payload: { ...initialObjective.payload, expectedPrimaryObjectiveGeneration }
+        })
+      ).toThrow();
+    }
+    expect(
+      parseB2Command({
+        ...initialObjective,
+        payload: {
+          ...initialObjective.payload,
+          expectedPrimaryObjectiveGeneration: {
+            kind: "claim",
+            claimId: ids.claim1,
+            expectedVersion: 2,
+            expectedStatus: "rejected"
+          }
+        }
+      })
+    ).toMatchObject({
+      payload: {
+        expectedPrimaryObjectiveGeneration: {
+          claimId: ids.claim1,
+          expectedVersion: 2,
+          expectedStatus: "rejected"
+        }
+      }
+    });
   });
 
   it("rejects missing, extra, type-confused, non-v7, noncanonical, and caller-trusted fields", () => {
@@ -602,9 +735,54 @@ describe("B2 strict command contracts", () => {
       "fact.revoke": "91f362637596bf38f964f41e6e17ab71c82dd7dce8a5c9765a56c21f9bdf0a2d",
       "fact.emergency_contest": "634e17c53b2039281ebeb8ec0ea3ab68275e5cc0e4a966e50d1b80a9c244694c",
       "fact.emergency_revoke": "13371e6671c107d5ebee35f0cd1fa330e655232f0b9620c1ac0eb88a3fb71b77",
+      "initiative.primary_objective.rework":
+        "7d6cac712c11d2af471d28a6cd8f8ca687ef6e929c6c40712aa613ccc20ae64d",
+      "initiative.primary_objective.withdraw":
+        "0bf722c5eeca8e7dd8102e2698de086556a2658794707b4631c84cda334501e6",
       "derived_view.regenerate": "f26f104ed217f67cdf79e3db66e43d9cde7d43f3684d96d51c022ac508367126"
     });
   });
+
+  it("makes divergent objective recovery retries conflict-sensitive while excluding the reservation key", () => {
+    const withdrawal = commands["initiative.primary_objective.withdraw"];
+    const rework = commands["initiative.primary_objective.rework"];
+    expect(
+      hashB2CommandIdentity({
+        ...withdrawal,
+        payload: { ...withdrawal.payload, reasonCode: "unsupported" }
+      })
+    ).not.toBe(hashB2CommandIdentity(withdrawal));
+    expect(
+      hashB2CommandIdentity({
+        ...rework,
+        payload: {
+          ...rework.payload,
+          valueJson: "Reduce governed response time",
+          normalizedText: "Reduce governed response time"
+        }
+      })
+    ).not.toBe(hashB2CommandIdentity(rework));
+    expect(
+      hashB2CommandIdentity({ ...withdrawal, idempotencyKey: "same-request-new-transport" })
+    ).toBe(hashB2CommandIdentity(withdrawal));
+  });
 });
+
+function commandsEvidence() {
+  return {
+    sourceArtifactId: ids.source,
+    sourceChunkId: ids.chunk,
+    expectedSourceVersion: 1,
+    expectedChunkVersion: 1 as const,
+    normalizationVersion: "source-normalization.v1" as const,
+    chunkingVersion: "source-chunking.v1" as const,
+    startOffset: 4,
+    endOffset: 11,
+    sourceContentHash: hashA,
+    sourceNormalizedContentHash: hashB,
+    chunkContentHash: hashC,
+    excerptHash: hashD
+  };
+}
 
 export { commands as B2_TEST_COMMANDS };

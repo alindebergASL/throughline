@@ -38,9 +38,12 @@ describe("closed B1.0 audit safe-detail language", () => {
     ).toThrow(ProductAuditDetailValidationError);
   });
 
-  it("accepts exactly the two B2 Slice 1 audit shapes and rejects added keys", () => {
-    const factId = "77abcdef-abcd-7abc-8def-abcdef000001";
+  it("accepts exactly the B2 Slice 1 and objective-recovery audit shapes", () => {
+    const resourceId = "77abcdef-abcd-7abc-8def-abcdef000001";
     const relatedId = "77abcdef-abcd-7abc-8def-abcdef000002";
+    const evidenceSpanId = "77abcdef-abcd-7abc-8def-abcdef000003";
+    const supportAttestationId = "77abcdef-abcd-7abc-8def-abcdef000004";
+    const recoveryId = "77abcdef-abcd-7abc-8def-abcdef000005";
     const vectors: Array<{
       action: ProductAuditAction;
       resourceType: "claim" | "accepted_fact";
@@ -50,14 +53,60 @@ describe("closed B1.0 audit safe-detail language", () => {
       {
         action: "claim.create",
         resourceType: "claim",
-        resourceId: factId,
-        safeDetail: { claimId: factId, evidenceSpanId: relatedId }
+        resourceId,
+        safeDetail: { claimId: resourceId, evidenceSpanId }
+      },
+      {
+        action: "claim.create",
+        resourceType: "claim",
+        resourceId,
+        safeDetail: { claimId: resourceId, evidenceSpanId, supportAttestationId }
+      },
+      {
+        action: "initiative.primary_objective.withdraw",
+        resourceType: "claim",
+        resourceId,
+        safeDetail: {
+          claimId: resourceId,
+          claimVersion: 2,
+          disposition: "withdrawn",
+          reasonCode: "needs_rework",
+          recoveryId
+        }
+      },
+      {
+        action: "initiative.primary_objective.reject",
+        resourceType: "claim",
+        resourceId,
+        safeDetail: {
+          claimId: resourceId,
+          claimVersion: 2,
+          disposition: "rejected",
+          reasonCode: "unsupported",
+          recoveryId
+        }
+      },
+      {
+        action: "initiative.primary_objective.rework",
+        resourceType: "claim",
+        resourceId,
+        safeDetail: {
+          predecessorClaimId: relatedId,
+          predecessorVersion: 2,
+          successorClaimId: resourceId,
+          successorVersion: 1,
+          evidenceSpanId,
+          supportAttestationId,
+          recoveryId,
+          disposition: "reworked",
+          reasonCode: "reworked"
+        }
       },
       {
         action: "fact.accept",
         resourceType: "accepted_fact",
-        resourceId: factId,
-        safeDetail: { factId }
+        resourceId,
+        safeDetail: { factId: resourceId }
       }
     ];
 
@@ -76,6 +125,73 @@ describe("closed B1.0 audit safe-detail language", () => {
           ...vector.safeDetail,
           unexpected: true
         })
+      ).toThrow(ProductAuditDetailValidationError);
+    }
+  });
+
+  it("rejects malformed objective support and recovery audit fields", () => {
+    const claimId = "77abcdef-abcd-7abc-8def-abcdef000001";
+    const predecessorClaimId = "77abcdef-abcd-7abc-8def-abcdef000002";
+    const evidenceSpanId = "77abcdef-abcd-7abc-8def-abcdef000003";
+    const supportAttestationId = "77abcdef-abcd-7abc-8def-abcdef000004";
+    const recoveryId = "77abcdef-abcd-7abc-8def-abcdef000005";
+    const invalidVectors: Array<{
+      action: ProductAuditAction;
+      safeDetail: Record<string, unknown>;
+    }> = [
+      {
+        action: "claim.create",
+        safeDetail: { claimId, evidenceSpanId, supportAttestationId: "not-a-uuid" }
+      },
+      {
+        action: "initiative.primary_objective.withdraw",
+        safeDetail: {
+          claimId,
+          claimVersion: 1,
+          disposition: "withdrawn",
+          reasonCode: "needs_rework",
+          recoveryId
+        }
+      },
+      {
+        action: "initiative.primary_objective.withdraw",
+        safeDetail: {
+          claimId,
+          claimVersion: 2,
+          disposition: "superseded",
+          reasonCode: "needs_rework",
+          recoveryId
+        }
+      },
+      {
+        action: "initiative.primary_objective.withdraw",
+        safeDetail: {
+          claimId,
+          claimVersion: 2,
+          disposition: "rejected",
+          reasonCode: "arbitrary_reason",
+          recoveryId
+        }
+      },
+      {
+        action: "initiative.primary_objective.rework",
+        safeDetail: {
+          predecessorClaimId,
+          predecessorVersion: 2,
+          successorClaimId: claimId,
+          successorVersion: 1,
+          evidenceSpanId,
+          supportAttestationId,
+          recoveryId,
+          disposition: "reworked",
+          reasonCode: "arbitrary_reason"
+        }
+      }
+    ];
+
+    for (const vector of invalidVectors) {
+      expect(() =>
+        parseProductAuditSafeDetail(vector.action, "claim", claimId, 1, vector.safeDetail)
       ).toThrow(ProductAuditDetailValidationError);
     }
   });

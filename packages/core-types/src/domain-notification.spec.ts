@@ -14,6 +14,8 @@ const ids = {
   command: "70000000-0000-7000-8000-000000000003",
   source: "70000000-0000-7000-8000-000000000004",
   previousSource: "70000000-0000-7000-8000-000000000005",
+  attestation: "70000000-0000-7000-8000-000000000006",
+  recovery: "70000000-0000-7000-8000-000000000007",
   tenant: "10000000-0000-4000-8000-000000000001",
   workspace: "10000000-0000-4000-8000-000000000002",
   space: "10000000-0000-4000-8000-000000000003"
@@ -76,7 +78,39 @@ function payload(eventType: string): Record<string, unknown> {
         hashDisposition: "erased"
       };
     case "claim.proposed":
-      return { claimId: ids.aggregate, evidenceSpanId: ids.source };
+      return {
+        claimId: ids.aggregate,
+        evidenceSpanId: ids.source,
+        supportAttestationId: ids.attestation
+      };
+    case "initiative.primary_objective.proposal_withdrawn":
+      return {
+        claimId: ids.aggregate,
+        claimVersion: 2,
+        disposition: "withdrawn",
+        reasonCode: "needs_rework",
+        recoveryId: ids.recovery
+      };
+    case "initiative.primary_objective.proposal_rejected":
+      return {
+        claimId: ids.aggregate,
+        claimVersion: 2,
+        disposition: "rejected",
+        reasonCode: "unsupported",
+        recoveryId: ids.recovery
+      };
+    case "initiative.primary_objective.proposal_reworked":
+      return {
+        predecessorClaimId: ids.previousSource,
+        predecessorVersion: 2,
+        successorClaimId: ids.aggregate,
+        successorVersion: 1,
+        evidenceSpanId: ids.source,
+        supportAttestationId: ids.attestation,
+        recoveryId: ids.recovery,
+        disposition: "reworked",
+        reasonCode: "reworked"
+      };
     case "fact.accepted":
       return { factId: ids.aggregate };
     default:
@@ -99,6 +133,9 @@ describe("DomainNotificationEnvelope", () => {
       "source_artifact.corrected",
       "source_artifact.tombstoned",
       "claim.proposed",
+      "initiative.primary_objective.proposal_withdrawn",
+      "initiative.primary_objective.proposal_rejected",
+      "initiative.primary_objective.proposal_reworked",
       "fact.accepted"
     ]);
     expect(DOMAIN_NOTIFICATION_AGGREGATE_TYPES).toEqual([
@@ -114,6 +151,57 @@ describe("DomainNotificationEnvelope", () => {
     for (const eventType of DOMAIN_NOTIFICATION_EVENT_TYPES) {
       expect(parseDomainNotificationEnvelope(envelope(eventType))).toMatchObject({ eventType });
     }
+  });
+
+  it("keeps objective support and recovery payloads exact and fail closed", () => {
+    expect(
+      parseDomainNotificationEnvelope({
+        ...envelope("claim.proposed"),
+        payload: { claimId: ids.aggregate, evidenceSpanId: ids.source }
+      })
+    ).toMatchObject({ payload: { claimId: ids.aggregate, evidenceSpanId: ids.source } });
+
+    for (const [eventType, payloadOverride] of [
+      [
+        "claim.proposed",
+        { claimId: ids.aggregate, evidenceSpanId: ids.source, supportAttestationId: "not-a-uuid" }
+      ],
+      [
+        "initiative.primary_objective.proposal_withdrawn",
+        {
+          ...payload("initiative.primary_objective.proposal_withdrawn"),
+          reasonCode: "arbitrary_reason"
+        }
+      ],
+      [
+        "initiative.primary_objective.proposal_rejected",
+        {
+          ...payload("initiative.primary_objective.proposal_rejected"),
+          disposition: "withdrawn"
+        }
+      ],
+      [
+        "initiative.primary_objective.proposal_reworked",
+        {
+          ...payload("initiative.primary_objective.proposal_reworked"),
+          predecessorVersion: 1
+        }
+      ]
+    ] as const) {
+      expect(() =>
+        parseDomainNotificationEnvelope({ ...envelope(eventType), payload: payloadOverride })
+      ).toThrow("Domain notification envelope is invalid");
+    }
+
+    expect(() =>
+      parseDomainNotificationEnvelope({
+        ...envelope("initiative.primary_objective.proposal_reworked"),
+        payload: {
+          ...payload("initiative.primary_objective.proposal_reworked"),
+          objectiveText: "must not enter the event"
+        }
+      })
+    ).toThrow("Domain notification envelope is invalid");
   });
 
   it("rejects unknown fields, authority fields, wrong pairs, and payload/aggregate drift", () => {

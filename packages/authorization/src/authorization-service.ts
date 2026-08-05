@@ -604,6 +604,9 @@ const b1Actions = new Set<AuthorizationAction>([
   "source.read",
   "claim.create",
   "claim.read",
+  "initiative.primary_objective.proposal.withdraw",
+  "initiative.primary_objective.proposal.reject",
+  "initiative.primary_objective.proposal.rework",
   "fact.read",
   "fact.accept"
 ]);
@@ -612,7 +615,13 @@ function isB1Action(action: AuthorizationAction): boolean {
   return b1Actions.has(action);
 }
 
-const truthMutationActions = new Set<AuthorizationAction>(["claim.create", "fact.accept"]);
+const truthMutationActions = new Set<AuthorizationAction>([
+  "claim.create",
+  "initiative.primary_objective.proposal.withdraw",
+  "initiative.primary_objective.proposal.reject",
+  "initiative.primary_objective.proposal.rework",
+  "fact.accept"
+]);
 
 function isTruthMutationAction(action: AuthorizationAction): boolean {
   return truthMutationActions.has(action);
@@ -630,6 +639,9 @@ async function truthMutationDecision(
   const actor = exactHumanAuthorityActor(context, membership);
   if (!actor || context.actorDisplayPersonId !== actor.personId) {
     return nonLeakingB1Deny(context.policyVersion);
+  }
+  if (action.startsWith("initiative.primary_objective.proposal.")) {
+    return objectiveProposalMutationDecision(tx, context, role, action, resource, options, actor);
   }
   const target = await loadTruthAuthorityTarget(tx, context, action, resource, options);
   if (!target || !canReadDataClass(context.dataClassCeiling, target.accessClass)) {
@@ -663,6 +675,68 @@ async function truthMutationDecision(
         undefined,
         readable.authorityTokens
       )
+    : nonLeakingB1Deny(context.policyVersion);
+}
+
+async function objectiveProposalMutationDecision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  role: MembershipRole,
+  action: AuthorizationAction,
+  resource: ResourceRef,
+  options: TransactionAuthorizationDecisionOptions,
+  actor: { userId: string; membershipId: string; personId: string }
+): Promise<AuthorizationDecision> {
+  if (resource.type !== "claim") return nonLeakingB1Deny(context.policyVersion);
+  const result = await tx.query<{
+    space_id: string;
+    access_class: AccessClass;
+    owner_person_id: string;
+    created_by_user_id: string;
+    created_by_membership_id: string;
+  }>(
+    `SELECT claim.space_id, claim.access_class, initiative.owner_person_id,
+            claim.created_by_user_id, claim.created_by_membership_id
+       FROM truth.claims claim
+       JOIN work.initiatives initiative
+         ON initiative.tenant_id = claim.tenant_id
+        AND initiative.workspace_id = claim.workspace_id
+        AND initiative.space_id = claim.space_id
+        AND initiative.id = claim.subject_id
+       JOIN access.spaces space
+         ON space.tenant_id = claim.tenant_id
+        AND space.workspace_id = claim.workspace_id
+        AND space.id = claim.space_id
+      WHERE claim.tenant_id = $1 AND claim.workspace_id = $2 AND claim.id = $3
+        AND claim.subject_type = 'initiative'
+        AND claim.predicate = 'initiative.primary_objective'
+        AND space.archived_at IS NULL
+      LIMIT 1 ${options.lockAuthority === true ? "FOR SHARE OF claim, initiative, space" : ""}`,
+    [context.tenantId, context.workspaceId, resource.id]
+  );
+  const proposal = result.rows[0];
+  if (!proposal || !canReadDataClass(context.dataClassCeiling, proposal.access_class)) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+  const readable = await canReadSpaceResource(tx, context, proposal.space_id, role, {
+    lockAuthority: options.lockAuthority === true
+  });
+  if (!readable.allowed) return nonLeakingB1Deny(context.policyVersion);
+  const isProposer =
+    proposal.created_by_user_id === actor.userId &&
+    proposal.created_by_membership_id === actor.membershipId;
+  const isOwner = proposal.owner_person_id === actor.personId;
+  const allowed =
+    action === "initiative.primary_objective.proposal.rework"
+      ? isProposer
+      : action === "initiative.primary_objective.proposal.reject"
+        ? isOwner
+        : isProposer || isOwner;
+  return allowed
+    ? allow(context.policyVersion, "b2_primary_objective_proposal_manager", undefined, [
+        ...readable.authorityTokens,
+        isOwner ? "initiative_owner" : "original_proposer"
+      ])
     : nonLeakingB1Deny(context.policyVersion);
 }
 

@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   advisePrimaryObjective,
   createAssistedObjectiveDraft,
-  rejectAssistedObjective
+  rejectAssistedObjective,
+  rejectAssistedObjectivePreservingEdits
 } from "./assisted-objective";
 
 const clearNotes = [
@@ -1339,18 +1340,33 @@ describe("deterministic assisted primary-objective adviser", () => {
       }
     );
 
+    it("suggests the one clear objective line in a realistic multiline note", () => {
+      const source = [
+        "Meeting: Northstar pilot kickoff",
+        "Participants: Operations and Solutions",
+        "The primary objective is to reduce review time while preserving human review.",
+        "Next meeting: Thursday"
+      ].join("\n");
+
+      expect(advisePrimaryObjective(source)).toEqual({
+        status: "suggested",
+        exactExcerpt:
+          "The primary objective is to reduce review time while preserving human review.",
+        objective: "Reduce review time while preserving human review.",
+        ruleId: "explicit_primary_objective"
+      });
+    });
+
     it.each([
       ["Owner", "possible sponsor"],
-      ["System", "dependent service"],
       ["Date", "once approval arrives"],
       ["Deadline", "pending sign-off"],
-      ["Timeline", "when governance approves"],
       ["Milestone", "potential authorization"],
       ["Next step", "launch upon approval"],
-      ["Follow-up", "on the condition that security approves"],
-      ["Constraint", "pending signoff"]
+      ["Correction", "the stated goal is wrong"],
+      ["Alternative goal", "reduce infrastructure spend"]
     ])(
-      "rejects every multiline note, including formerly allowlisted %s metadata",
+      "abstains when multiline context contains competing or unsafe %s content",
       (label, value) => {
         const source = [
           `${label}: ${value}.`,
@@ -1489,6 +1505,35 @@ describe("deterministic assisted primary-objective adviser", () => {
       reason: "unsupported"
     });
     expect(createAssistedObjectiveDraft(source)).toEqual(suggested);
+  });
+
+  it("rejects assistance without discarding user-authored objective or evidence edits", () => {
+    const original = createAssistedObjectiveDraft(
+      "The primary objective is to reduce review time while preserving human review."
+    );
+    if (original.mode !== "suggested") throw new Error("expected deterministic suggestion");
+
+    expect(rejectAssistedObjectivePreservingEdits(original, original)).toEqual({
+      mode: "manual",
+      objective: "",
+      exactExcerpt: "",
+      reason: "rejected"
+    });
+    expect(
+      rejectAssistedObjectivePreservingEdits(
+        {
+          ...original,
+          objective: "Reduce governed review time.",
+          exactExcerpt: "An operator confirmed the governed review target."
+        },
+        original
+      )
+    ).toEqual({
+      mode: "manual",
+      objective: "Reduce governed review time.",
+      exactExcerpt: "An operator confirmed the governed review target.",
+      reason: "rejected"
+    });
   });
 
   it("routes the focus helper to the exact evidence and objective controls", async () => {

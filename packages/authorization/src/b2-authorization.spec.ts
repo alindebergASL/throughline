@@ -81,6 +81,65 @@ describe("central B2 Slice 1 authorization", () => {
       )
     ).resolves.toMatchObject({ allowed: true, reasonCode: "b1_resource_read" });
   });
+
+  it("limits objective proposal recovery to the original proposer and current Initiative owner", async () => {
+    const service = new PostgresAuthorizationService({} as never);
+    const context = createDevSecurityContext("tenant-a-owner");
+    const proposer = executor({
+      proposalOwnerPersonId: devFixtures.personBInTenantA,
+      proposalCreatedByUserId: devFixtures.userA,
+      proposalCreatedByMembershipId: devFixtures.membershipAOwner
+    });
+    const ownerNotProposer = executor({
+      proposalOwnerPersonId: devFixtures.personA,
+      proposalCreatedByUserId: devFixtures.userB,
+      proposalCreatedByMembershipId: devFixtures.membershipBViewer
+    });
+    const neither = executor({
+      proposalOwnerPersonId: devFixtures.personBInTenantA,
+      proposalCreatedByUserId: devFixtures.userB,
+      proposalCreatedByMembershipId: devFixtures.membershipBViewer
+    });
+
+    for (const action of [
+      "initiative.primary_objective.proposal.rework",
+      "initiative.primary_objective.proposal.withdraw"
+    ] as const) {
+      await expect(
+        service.canInTransaction(context, action, { type: "claim", id: claimId }, proposer.tx, {
+          lockAuthority: true
+        })
+      ).resolves.toMatchObject({ allowed: true });
+    }
+    await expect(
+      service.canInTransaction(
+        context,
+        "initiative.primary_objective.proposal.reject",
+        { type: "claim", id: claimId },
+        ownerNotProposer.tx,
+        { lockAuthority: true }
+      )
+    ).resolves.toMatchObject({ allowed: true });
+    await expect(
+      service.canInTransaction(
+        context,
+        "initiative.primary_objective.proposal.rework",
+        { type: "claim", id: claimId },
+        ownerNotProposer.tx,
+        { lockAuthority: true }
+      )
+    ).resolves.toMatchObject({ allowed: false, reasonCode: "b1_resource_not_available" });
+    await expect(
+      service.canInTransaction(
+        context,
+        "initiative.primary_objective.proposal.withdraw",
+        { type: "claim", id: claimId },
+        neither.tx,
+        { lockAuthority: true }
+      )
+    ).resolves.toMatchObject({ allowed: false, reasonCode: "b1_resource_not_available" });
+    expect(neither.query.mock.calls.every(([sql]) => /^SELECT|^WITH/u.test(sql.trim()))).toBe(true);
+  });
 });
 
 function executor(
@@ -89,6 +148,9 @@ function executor(
     subjectOwnerPersonId?: string;
     accessClass?: "public" | "workspace" | "restricted" | "confidential";
     present?: boolean;
+    proposalOwnerPersonId?: string;
+    proposalCreatedByUserId?: string;
+    proposalCreatedByMembershipId?: string;
   } = {}
 ) {
   const present = options.present ?? true;
@@ -138,6 +200,22 @@ function executor(
     }
     if (sql.includes("SELECT id") && sql.includes("FROM access.spaces")) {
       return { rows: present ? [{ id: devFixtures.rootSpaceA }] : [] };
+    }
+    if (sql.includes("FROM truth.claims claim") && sql.includes("JOIN work.initiatives")) {
+      return {
+        rows: present
+          ? [
+              {
+                space_id: devFixtures.rootSpaceA,
+                access_class: accessClass,
+                owner_person_id: options.proposalOwnerPersonId ?? devFixtures.personA,
+                created_by_user_id: options.proposalCreatedByUserId ?? devFixtures.userA,
+                created_by_membership_id:
+                  options.proposalCreatedByMembershipId ?? devFixtures.membershipAOwner
+              }
+            ]
+          : []
+      };
     }
     if (
       sql.includes("FROM truth.claims resource") ||

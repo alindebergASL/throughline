@@ -27,6 +27,7 @@ export interface DomainCommandReservationInput {
   commandSchemaVersion: number;
   idempotencyKey: string;
   canonicalRequestHash: string;
+  safeRequest?: Readonly<Record<string, unknown>>;
   actorUserId: string;
   actorMembershipId: string;
   delegatingUserId?: string;
@@ -83,19 +84,36 @@ export interface CompleteDomainCommandInput {
 export class DomainCommandRepository {
   constructor(private readonly tx: TenantDbTransaction) {}
 
+  async lockReservationIdentity(
+    input: Pick<
+      DomainCommandReservationInput,
+      "tenantId" | "workspaceId" | "reservationSpaceId" | "commandKind" | "idempotencyKey"
+    >
+  ): Promise<void> {
+    const identity = JSON.stringify([
+      "throughline:domain-command-identity:v1",
+      input.tenantId,
+      input.workspaceId,
+      input.reservationSpaceId,
+      input.commandKind,
+      input.idempotencyKey
+    ]);
+    await this.tx.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [identity]);
+  }
+
   async reserve(input: DomainCommandReservationInput): Promise<DomainCommandReservationResult> {
     validateReservationInput(input);
     const inserted = await this.tx.query<{ id: string }>(
       `INSERT INTO ops.domain_command_records (
          id, tenant_id, workspace_id, reservation_space_id, command_kind,
-         command_schema_version, idempotency_key, canonical_request_hash,
+         command_schema_version, idempotency_key, canonical_request_hash, safe_request,
          actor_user_id, actor_membership_id, delegating_user_id, delegating_membership_id,
          agent_principal_id, policy_version_id, request_id, traceparent, tracestate
        ) VALUES (
          $1, $2, $3, $4, $5,
-         $6, $7, $8,
-         $9, $10, $11, $12,
-         $13, $14, $15, $16, $17
+         $6, $7, $8, $9,
+         $10, $11, $12, $13,
+         $14, $15, $16, $17, $18
        )
        ON CONFLICT (
          tenant_id, workspace_id, reservation_space_id, command_kind, idempotency_key
@@ -110,6 +128,7 @@ export class DomainCommandRepository {
         input.commandSchemaVersion,
         input.idempotencyKey,
         input.canonicalRequestHash,
+        input.safeRequest ?? null,
         input.actorUserId,
         input.actorMembershipId,
         input.delegatingUserId ?? null,

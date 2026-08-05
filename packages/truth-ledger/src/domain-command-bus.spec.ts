@@ -109,14 +109,17 @@ describe.sequential("durable truth command boundary", () => {
       accessClass: "workspace",
       version: 3
     });
-    const lockHeaders = vi
-      .spyOn(TruthLedgerRepository.prototype, "lockClaimSupportHeaders")
+    const readHeaders = vi
+      .spyOn(TruthLedgerRepository.prototype, "readClaimSupportHeaders")
       .mockResolvedValue([
         {
           claimId: id("10"),
           evidenceSpanId: id("11"),
           sourceArtifactId: id("5"),
-          spaceId
+          spaceId,
+          subjectType: "activity",
+          subjectId: id("4"),
+          predicate: "activity.outcome"
         }
       ]);
     const loadClaims = vi
@@ -184,12 +187,12 @@ describe.sequential("durable truth command boundary", () => {
     expect(vi.mocked(auth.canInTransaction).mock.invocationCallOrder[0]).toBeLessThan(
       reserve.mock.invocationCallOrder[0]!
     );
-    expect(lockHeaders).not.toHaveBeenCalled();
+    expect(readHeaders).not.toHaveBeenCalled();
     expect(loadClaims).not.toHaveBeenCalled();
     expect(admission).not.toHaveBeenCalled();
   });
 
-  it("rolls back an early Fact reservation when downstream Claim locking fails", async () => {
+  it("rolls back an early Fact reservation when RLS-constrained Claim discovery fails", async () => {
     const { pool, client } = transactionPool(true);
     vi.spyOn(TruthLedgerRepository.prototype, "getSubjectScope").mockResolvedValue({
       subjectType: "activity",
@@ -202,9 +205,9 @@ describe.sequential("durable truth command boundary", () => {
     const reserve = vi
       .spyOn(DomainCommandRepository.prototype, "reserve")
       .mockImplementation(async (input) => ({ status: "reserved", commandId: input.id }));
-    const lockHeaders = vi
-      .spyOn(TruthLedgerRepository.prototype, "lockClaimSupportHeaders")
-      .mockRejectedValue(new Error("simulated Claim lock failure"));
+    const readHeaders = vi
+      .spyOn(TruthLedgerRepository.prototype, "readClaimSupportHeaders")
+      .mockRejectedValue(new Error("simulated Claim discovery failure"));
 
     await expect(
       new TruthLedgerDomainCommandBus(pool, auth).execute(factCommand(), context())
@@ -214,7 +217,7 @@ describe.sequential("durable truth command boundary", () => {
       reserve.mock.invocationCallOrder[0]!
     );
     expect(reserve.mock.invocationCallOrder[0]).toBeLessThan(
-      lockHeaders.mock.invocationCallOrder[0]!
+      readHeaders.mock.invocationCallOrder[0]!
     );
     expect(client.query).toHaveBeenCalledWith("ROLLBACK");
   });
@@ -295,9 +298,13 @@ describe.sequential("durable truth command boundary", () => {
     expect(statements[1]).not.toContain("FOR SHARE OF activity_source");
   });
 
-  it("locks Claim and source lifecycle rows without locking immutable evidence or chunks", async () => {
+  it("discovers acceptance headers without locks and locks only the final Claim/source load", async () => {
     const repository = await readFile(new URL("./repository.ts", import.meta.url), "utf8");
-    expect(repository).toContain("FOR SHARE OF claim`");
+    const discovery = repository.slice(
+      repository.indexOf("async readClaimSupportHeaders"),
+      repository.indexOf("async loadClaimsForAcceptance")
+    );
+    expect(discovery).not.toMatch(/\bFOR\s+(?:NO KEY )?(?:UPDATE|SHARE)\b/i);
     expect(repository).toContain("FOR UPDATE OF claim\n       FOR SHARE OF source`");
     expect(repository).not.toMatch(/FOR SHARE OF (?:claim, )?span/);
     expect(repository).not.toMatch(/FOR SHARE OF (?:span, )?source, chunk/);
@@ -338,8 +345,8 @@ describe.sequential("durable truth command boundary", () => {
       "utf8"
     );
 
-    expect(implementation).toContain("predicate: acceptedCoordinate.predicate");
-    expect(implementation).toContain("subjectType: acceptedCoordinate.subjectType");
+    expect(implementation).toContain("predicate: discoveredCoordinate.predicate");
+    expect(implementation).toContain("subjectType: discoveredCoordinate.subjectType");
     expect(implementation).not.toContain("assertSolePrimaryObjectiveProposal");
     expect(implementation).not.toMatch(
       /command\.payload\.subject\.type === "initiative"[\s\S]{0,300}lockFirstAcceptanceSlot/
@@ -349,6 +356,170 @@ describe.sequential("durable truth command boundary", () => {
     expect(implementation).not.toMatch(
       /command\.payload\.predicate === ["']initiative\.primary_objective["']/
     );
+    const acceptance = implementation.slice(
+      implementation.indexOf("const claimIds = command.payload.claims.map"),
+      implementation.indexOf("const admittedClaims: Claim[]")
+    );
+    expect(acceptance.indexOf("readClaimSupportHeaders(")).toBeLessThan(
+      acceptance.indexOf("lockFirstAcceptanceSlot({")
+    );
+    expect(acceptance.indexOf("lockFirstAcceptanceSlot({")).toBeLessThan(
+      acceptance.indexOf('await this.authorize(tx, context, "claim.read"')
+    );
+    expect(acceptance.indexOf('await this.authorize(tx, context, "claim.read"')).toBeLessThan(
+      acceptance.indexOf("loadClaimsForAcceptance(")
+    );
+  });
+
+  it("locks the shared objective coordinate before revalidating and locking the predecessor", async () => {
+    const statements: string[] = [];
+    const tx = {
+      client: {} as TenantDbTransaction["client"],
+      async query(sql: string) {
+        statements.push(sql);
+        if (sql.includes("FROM truth.claims") && sql.includes("FOR UPDATE")) {
+          return {
+            rows: [
+              {
+                id: id("10"),
+                created_by_user_id: id("7"),
+                created_by_membership_id: id("8")
+              }
+            ]
+          };
+        }
+        if (sql.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
+        throw new Error(`Unexpected objective recovery lock query: ${sql}`);
+      }
+    } as unknown as TenantDbTransaction;
+
+    await new TruthLedgerRepository(tx).lockPrimaryObjectiveProposal({
+      tenantId: id("1"),
+      workspaceId: id("2"),
+      spaceId,
+      initiativeId: id("4"),
+      claimId: id("10"),
+      expectedVersion: 1
+    });
+
+    expect(statements).toHaveLength(2);
+    expect(statements[0]).toBe("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))");
+    expect(statements[1]).toContain("status = 'proposed' AND version = $6");
+    expect(statements[1]).toContain("NOT EXISTS");
+    expect(statements[1]).toContain("FROM truth.accepted_facts");
+    expect(statements[1]).toContain("FOR UPDATE");
+  });
+
+  it("revalidates the exact objective generation after taking the shared coordinate lock", async () => {
+    const statements: Array<{ sql: string; values?: readonly unknown[] }> = [];
+    const tx = {
+      client: {} as TenantDbTransaction["client"],
+      async query(sql: string, values?: readonly unknown[]) {
+        statements.push({ sql, ...(values === undefined ? {} : { values }) });
+        if (sql.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
+        if (sql.includes("ORDER BY created_at DESC, id DESC")) {
+          return { rows: [{ id: id("10"), version: 2, status: "rejected" }] };
+        }
+        if (sql.includes("AS occupied")) return { rows: [{ occupied: false }] };
+        throw new Error(`Unexpected objective generation query: ${sql}`);
+      }
+    } as unknown as TenantDbTransaction;
+
+    await new TruthLedgerRepository(tx).lockPrimaryObjectiveProposalSlot({
+      tenantId: id("1"),
+      workspaceId: id("2"),
+      spaceId,
+      subjectId: id("4"),
+      expectedLatestClaim: {
+        kind: "claim",
+        claimId: id("10"),
+        expectedVersion: 2,
+        expectedStatus: "rejected"
+      }
+    });
+
+    expect(statements).toHaveLength(3);
+    expect(statements[0]?.sql).toBe("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))");
+    expect(statements[1]?.sql).toContain("FOR SHARE");
+    expect(statements[2]?.sql).toContain("AS occupied");
+
+    const staleTx = {
+      ...tx,
+      async query(sql: string, values?: readonly unknown[]) {
+        if (sql.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
+        if (sql.includes("ORDER BY created_at DESC, id DESC")) {
+          return { rows: [{ id: id("11"), version: 2, status: "rejected" }] };
+        }
+        return tx.query(sql, values);
+      }
+    } as unknown as TenantDbTransaction;
+    await expect(
+      new TruthLedgerRepository(staleTx).lockPrimaryObjectiveProposalSlot({
+        tenantId: id("1"),
+        workspaceId: id("2"),
+        spaceId,
+        subjectId: id("4"),
+        expectedLatestClaim: {
+          kind: "claim",
+          claimId: id("10"),
+          expectedVersion: 2,
+          expectedStatus: "rejected"
+        }
+      })
+    ).rejects.toBeInstanceOf(TruthLedgerConflictError);
+
+    const implementation = await readFile(
+      new URL("./domain-command-bus.ts", import.meta.url),
+      "utf8"
+    );
+    expect(implementation).toContain("expectedPrimaryObjectiveGeneration");
+    expect(implementation).toContain("expectedLatestClaimId");
+    expect(implementation).toContain("expectedLatestClaimStatus");
+    expect(implementation).toContain("expectedLatestClaimVersion");
+  });
+
+  it("serializes recovery identity and takes locking authorization only after the coordinate", async () => {
+    const implementation = await readFile(
+      new URL("./domain-command-bus.ts", import.meta.url),
+      "utf8"
+    );
+    const recovery = implementation.slice(
+      implementation.indexOf(
+        'command.kind === "initiative.primary_objective.withdraw" ||\n      command.kind === "initiative.primary_objective.rework"'
+      ),
+      implementation.indexOf("const timestamp = await ledger.transactionTimestamp()")
+    );
+
+    expect(recovery).toContain("domain.commands.lockReservationIdentity({");
+    const preauthorization = recovery.indexOf("await this.authorize(");
+    const reservation = recovery.indexOf("const reservation = await reserveCommand(");
+    const coordinateAndClaimLock = recovery.indexOf("await ledger.lockPrimaryObjectiveProposal({");
+    const lockingReauthorization = recovery.indexOf(
+      "await this.authorize(",
+      coordinateAndClaimLock
+    );
+    expect(recovery.indexOf("lockReservationIdentity({")).toBeLessThan(preauthorization);
+    expect(preauthorization).toBeLessThan(reservation);
+    expect(recovery.slice(preauthorization, reservation)).toContain("false");
+    expect(reservation).toBeLessThan(coordinateAndClaimLock);
+    expect(coordinateAndClaimLock).toBeLessThan(lockingReauthorization);
+    expect(recovery.slice(lockingReauthorization)).toContain("true");
+    expect(recovery).toMatch(/if \(reservation\.replay\) \{[\s\S]*?this\.authorize[\s\S]*?true/);
+    expect(recovery).not.toMatch(/40P01|deadlock|retry/i);
+  });
+
+  it("terminalizes objective proposals without mutating their objective or evidence payload", async () => {
+    const repository = await readFile(new URL("./repository.ts", import.meta.url), "utf8");
+    const terminalize = repository.slice(
+      repository.indexOf("async terminalizePrimaryObjectiveProposal"),
+      repository.indexOf("async requirePrimaryObjectiveSupportConfirmations")
+    );
+    expect(terminalize).toContain("SET status = $6, version = 2, updated_at = $7");
+    expect(terminalize).toContain("predicate = 'initiative.primary_objective'");
+    expect(terminalize).not.toMatch(
+      /SET[\s\S]*?(?:canonical_value_text|normalized_text|verified_evidence_span_id|value_hash)\s*=/
+    );
+    expect(terminalize).not.toMatch(/DELETE FROM truth\.(?:claims|verified_evidence_spans)/);
   });
 });
 
