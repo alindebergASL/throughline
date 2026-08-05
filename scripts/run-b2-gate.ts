@@ -2,12 +2,11 @@ import { spawn } from "node:child_process";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, resolve } from "node:path";
-
-type GateLeaf = {
-  readonly workspace: string;
-  readonly files: readonly string[];
-  readonly env?: Readonly<Record<string, string>>;
-};
+import {
+  normalizedConfiguredIdentity,
+  reportedTestIdentity,
+  type GateLeaf
+} from "../packages/testing/src/b2-gate-provenance.js";
 
 const leaves: readonly GateLeaf[] = [
   {
@@ -52,14 +51,19 @@ const leaves: readonly GateLeaf[] = [
       "src/trusted-objective/trusted-objective.postgres.spec.ts"
     ],
     env: { AUTH_ADAPTER: "dev", NODE_ENV: "test" }
+  },
+  {
+    workspace: "@throughline/web",
+    files: ["lib/assisted-objective.spec.ts", "lib/trusted-objective.spec.ts"]
   }
 ] as const;
 
 const expectedFiles = new Set(
   leaves.flatMap((leaf) =>
-    leaf.files.map((file) => `${leaf.workspace}:${file.replace(/^src\//, "")}`)
+    leaf.files.map((file) => `${leaf.workspace}:${normalizedConfiguredIdentity(file)}`)
   )
 );
+
 async function main(): Promise<void> {
   const observedFiles = new Set<string>();
   const outputDirectory = await mkdtemp(resolve(tmpdir(), "throughline-b2-gate-"));
@@ -99,12 +103,7 @@ async function main(): Promise<void> {
         ) {
           throw new Error(`B2 gate leaf contained a non-authoritative test in ${leaf.workspace}`);
         }
-        const sourceName = testFile.name;
-        const marker = sourceName?.lastIndexOf("/src/");
-        if (sourceName === undefined || marker === undefined || marker < 0) {
-          throw new Error(`B2 gate leaf emitted an unrecognized test path for ${leaf.workspace}`);
-        }
-        observedFiles.add(`${leaf.workspace}:${sourceName.slice(marker + 5)}`);
+        observedFiles.add(reportedTestIdentity(leaf, testFile.name));
       }
     }
 

@@ -38,6 +38,9 @@ export type AuthorizationAction =
   | "source.read"
   | "claim.create"
   | "claim.read"
+  | "initiative.primary_objective.proposal.withdraw"
+  | "initiative.primary_objective.proposal.reject"
+  | "initiative.primary_objective.proposal.rework"
   | "fact.read"
   | "fact.accept";
 

@@ -1715,7 +1715,11 @@ function auditInput(
 
 type B1DomainNotificationEventType = Exclude<
   DomainNotificationEventType,
-  "claim.proposed" | "fact.accepted"
+  | "claim.proposed"
+  | "initiative.primary_objective.proposal_withdrawn"
+  | "initiative.primary_objective.proposal_rejected"
+  | "initiative.primary_objective.proposal_reworked"
+  | "fact.accepted"
 >;
 
 function notification(

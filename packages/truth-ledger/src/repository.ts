@@ -36,6 +36,9 @@ export interface ClaimSupportHeader {
   evidenceSpanId: string;
   sourceArtifactId: string;
   spaceId: string;
+  subjectType: "activity" | "initiative";
+  subjectId: string;
+  predicate: "activity.outcome" | "initiative.primary_objective";
 }
 
 export interface PersistedClaimForAcceptance {
@@ -291,6 +294,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     workspaceId: string;
     claimId: string;
     evidenceSpanId: string;
+    supportAttestationId?: string;
     commandId: string;
     actorUserId: string;
     actorMembershipId: string;
@@ -374,9 +378,185 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
         input.commandId
       ]
     );
+    if (input.predicate === "initiative.primary_objective") {
+      if (!input.supportAttestationId) throw new TruthLedgerInvariantError();
+      await this.tx.query(
+        `INSERT INTO truth.initiative_objective_support_attestations (
+           id, tenant_id, workspace_id, space_id, initiative_id, claim_id,
+           verified_evidence_span_id, objective_value_hash, excerpt_hash,
+           confirmed_by_user_id, confirmed_by_membership_id, causation_command_id
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [
+          input.supportAttestationId,
+          input.tenantId,
+          input.workspaceId,
+          evidence.spaceId,
+          evidence.subject.id,
+          input.claimId,
+          input.evidenceSpanId,
+          valueHash,
+          evidence.excerptHash,
+          input.actorUserId,
+          input.actorMembershipId,
+          input.commandId
+        ]
+      );
+    } else if (input.supportAttestationId) {
+      throw new TruthLedgerInvariantError();
+    }
   }
 
-  async lockClaimSupportHeaders(
+  async lockPrimaryObjectiveProposal(input: {
+    tenantId: string;
+    workspaceId: string;
+    spaceId: string;
+    initiativeId: string;
+    claimId: string;
+    expectedVersion: number;
+  }): Promise<{
+    claimId: string;
+    createdByUserId: string;
+    createdByMembershipId: string;
+  }> {
+    await this.lockTruthCoordinate({
+      tenantId: input.tenantId,
+      workspaceId: input.workspaceId,
+      spaceId: input.spaceId,
+      subjectType: "initiative",
+      subjectId: input.initiativeId,
+      predicate: "initiative.primary_objective"
+    });
+    const result = await this.tx.query<{
+      id: string;
+      created_by_user_id: string;
+      created_by_membership_id: string;
+    }>(
+      `SELECT id, created_by_user_id, created_by_membership_id
+         FROM truth.claims
+        WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
+          AND id = $4 AND subject_type = 'initiative' AND subject_id = $5
+          AND predicate = 'initiative.primary_objective'
+          AND status = 'proposed' AND version = $6
+          AND NOT EXISTS (
+            SELECT 1 FROM truth.accepted_facts fact
+             WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.space_id = $3
+               AND fact.subject_type = 'initiative' AND fact.subject_id = $5
+               AND fact.predicate = 'initiative.primary_objective'
+          )
+        LIMIT 1 FOR UPDATE`,
+      [
+        input.tenantId,
+        input.workspaceId,
+        input.spaceId,
+        input.claimId,
+        input.initiativeId,
+        input.expectedVersion
+      ]
+    );
+    const row = result.rows[0];
+    if (!row) throw new TruthLedgerConflictError();
+    return {
+      claimId: row.id,
+      createdByUserId: row.created_by_user_id,
+      createdByMembershipId: row.created_by_membership_id
+    };
+  }
+
+  async terminalizePrimaryObjectiveProposal(input: {
+    tenantId: string;
+    workspaceId: string;
+    spaceId: string;
+    initiativeId: string;
+    predecessorClaimId: string;
+    successorClaimId?: string;
+    recoveryId: string;
+    disposition: "withdrawn" | "rejected" | "reworked";
+    reasonCode: string;
+    actorUserId: string;
+    actorMembershipId: string;
+    commandId: string;
+    timestamp: string;
+  }): Promise<void> {
+    const status = input.disposition === "reworked" ? "superseded" : "rejected";
+    const changed = await this.tx.query<{ id: string }>(
+      `UPDATE truth.claims
+          SET status = $6, version = 2, updated_at = $7
+        WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3 AND id = $4
+          AND subject_type = 'initiative' AND subject_id = $5
+          AND predicate = 'initiative.primary_objective'
+          AND status = 'proposed' AND version = 1
+        RETURNING id`,
+      [
+        input.tenantId,
+        input.workspaceId,
+        input.spaceId,
+        input.predecessorClaimId,
+        input.initiativeId,
+        status,
+        input.timestamp
+      ]
+    );
+    if (changed.rows.length !== 1) throw new TruthLedgerConflictError();
+    await this.tx.query(
+      `INSERT INTO truth.initiative_objective_proposal_recoveries (
+         id, tenant_id, workspace_id, space_id, initiative_id,
+         predecessor_claim_id, successor_claim_id, disposition, reason_code,
+         acted_by_user_id, acted_by_membership_id, causation_command_id, created_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+      [
+        input.recoveryId,
+        input.tenantId,
+        input.workspaceId,
+        input.spaceId,
+        input.initiativeId,
+        input.predecessorClaimId,
+        input.successorClaimId ?? null,
+        input.disposition,
+        input.reasonCode,
+        input.actorUserId,
+        input.actorMembershipId,
+        input.commandId,
+        input.timestamp
+      ]
+    );
+  }
+
+  async requirePrimaryObjectiveSupportConfirmations(
+    tenantId: string,
+    workspaceId: string,
+    claimIds: readonly string[]
+  ): Promise<void> {
+    const result = await this.tx.query<{ claim_id: string }>(
+      `SELECT claim.id AS claim_id
+         FROM truth.claims claim
+         JOIN truth.initiative_objective_support_attestations attestation
+           ON attestation.tenant_id = claim.tenant_id
+          AND attestation.workspace_id = claim.workspace_id
+          AND attestation.space_id = claim.space_id
+          AND attestation.claim_id = claim.id
+          AND attestation.initiative_id = claim.subject_id
+          AND attestation.verified_evidence_span_id = claim.verified_evidence_span_id
+          AND attestation.objective_value_hash = claim.value_hash
+          AND attestation.confirmed_by_user_id = claim.created_by_user_id
+          AND attestation.confirmed_by_membership_id = claim.created_by_membership_id
+          AND attestation.causation_command_id = claim.causation_command_id
+         JOIN truth.verified_evidence_spans span
+           ON span.tenant_id = attestation.tenant_id
+          AND span.workspace_id = attestation.workspace_id
+          AND span.space_id = attestation.space_id
+          AND span.id = attestation.verified_evidence_span_id
+          AND span.excerpt_hash = attestation.excerpt_hash
+        WHERE claim.tenant_id = $1 AND claim.workspace_id = $2
+          AND claim.id = ANY($3::uuid[])
+          AND claim.subject_type = 'initiative'
+          AND claim.predicate = 'initiative.primary_objective'
+        ORDER BY claim.id`,
+      [tenantId, workspaceId, [...claimIds].sort()]
+    );
+    if (result.rows.length !== claimIds.length) throw new TruthLedgerConflictError();
+  }
+
+  async readClaimSupportHeaders(
     tenantId: string,
     workspaceId: string,
     claimIds: readonly string[]
@@ -386,9 +566,13 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       evidence_span_id: string;
       source_artifact_id: string;
       space_id: string;
+      subject_type: ClaimSupportHeader["subjectType"];
+      subject_id: string;
+      predicate: ClaimSupportHeader["predicate"];
     }>(
       `SELECT claim.id AS claim_id, span.id AS evidence_span_id,
-              span.source_artifact_id, claim.space_id
+              span.source_artifact_id, claim.space_id,
+              claim.subject_type, claim.subject_id, claim.predicate
        FROM truth.claims claim
        JOIN truth.verified_evidence_spans span
          ON span.tenant_id = claim.tenant_id
@@ -397,8 +581,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
         AND span.id = claim.verified_evidence_span_id
        WHERE claim.tenant_id = $1 AND claim.workspace_id = $2
          AND claim.id = ANY($3::uuid[])
-       ORDER BY claim.id
-       FOR SHARE OF claim`,
+       ORDER BY claim.id`,
       [tenantId, workspaceId, [...claimIds].sort()]
     );
     if (result.rows.length !== claimIds.length) throw new TruthLedgerInvariantError();
@@ -406,7 +589,10 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       claimId: row.claim_id,
       evidenceSpanId: row.evidence_span_id,
       sourceArtifactId: row.source_artifact_id,
-      spaceId: row.space_id
+      spaceId: row.space_id,
+      subjectType: row.subject_type,
+      subjectId: row.subject_id,
+      predicate: row.predicate
     }));
   }
 
@@ -536,6 +722,14 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     workspaceId: string;
     spaceId: string;
     subjectId: string;
+    expectedLatestClaim:
+      | { kind: "empty" }
+      | {
+          kind: "claim";
+          claimId: string;
+          expectedVersion: number;
+          expectedStatus: "proposed" | "accepted" | "rejected" | "superseded";
+        };
   }): Promise<void> {
     const coordinate = {
       ...input,
@@ -543,6 +737,26 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       predicate: "initiative.primary_objective"
     };
     await this.lockTruthCoordinate(coordinate);
+    const latest = await this.tx.query<{ id: string; version: number; status: string }>(
+      `SELECT id, version, status
+       FROM truth.claims
+       WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
+         AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5
+       ORDER BY created_at DESC, id DESC LIMIT 1
+       FOR SHARE`,
+      [input.tenantId, input.workspaceId, input.spaceId, input.subjectId, coordinate.predicate]
+    );
+    const latestClaim = latest.rows[0];
+    if (
+      (input.expectedLatestClaim.kind === "empty" && latestClaim !== undefined) ||
+      (input.expectedLatestClaim.kind === "claim" &&
+        (!latestClaim ||
+          latestClaim.id !== input.expectedLatestClaim.claimId ||
+          latestClaim.version !== input.expectedLatestClaim.expectedVersion ||
+          latestClaim.status !== input.expectedLatestClaim.expectedStatus))
+    ) {
+      throw new TruthLedgerConflictError();
+    }
     const occupied = await this.tx.query<{ occupied: boolean }>(
       `SELECT EXISTS (
          SELECT 1 FROM truth.accepted_facts

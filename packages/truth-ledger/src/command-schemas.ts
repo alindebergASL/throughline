@@ -2,6 +2,7 @@ import {
   B2_COMMAND_KINDS,
   B2_COMMAND_SCHEMA_VERSION,
   B2_TRUTH_PREDICATE_CATALOG_VERSION,
+  PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES,
   SOURCE_CHUNKING_VERSION,
   SOURCE_CHUNK_MAX_SCALARS,
   SOURCE_NORMALIZATION_VERSION,
@@ -72,6 +73,10 @@ export function parseB2Command(input: unknown): B2AuthorizedDomainCommand {
     switch (kind) {
       case "claim.create":
         return { ...metadata, kind, payload: parseCreateClaim(command.payload) };
+      case "initiative.primary_objective.withdraw":
+        return { ...metadata, kind, payload: parseWithdrawPrimaryObjective(command.payload) };
+      case "initiative.primary_objective.rework":
+        return { ...metadata, kind, payload: parseReworkPrimaryObjective(command.payload) };
       case "fact.accept":
         return { ...metadata, kind, payload: parseAcceptFact(command.payload) };
       case "fact.contest":
@@ -136,7 +141,13 @@ function parseCreateClaim(input: unknown): B2CommandPayloadMap["claim.create"] {
   const value = exactObject(
     input,
     ["subject", "predicate", "valueJson", "normalizedText", "confidence", "evidence"],
-    ["validFrom", "validTo", "observedAt"]
+    [
+      "validFrom",
+      "validTo",
+      "observedAt",
+      "supportConfirmation",
+      "expectedPrimaryObjectiveGeneration"
+    ]
   );
   const subject = parseSubject(value.subject);
   const assertion = parsePredicateAssertion({
@@ -154,6 +165,22 @@ function parseCreateClaim(input: unknown): B2CommandPayloadMap["claim.create"] {
   ) {
     return failContract();
   }
+  const supportConfirmation =
+    value.supportConfirmation === undefined
+      ? undefined
+      : parseSupportConfirmation(value.supportConfirmation);
+  const expectedPrimaryObjectiveGeneration =
+    value.expectedPrimaryObjectiveGeneration === undefined
+      ? undefined
+      : parsePrimaryObjectiveGeneration(value.expectedPrimaryObjectiveGeneration);
+  if (
+    (assertion.predicate === "initiative.primary_objective") !==
+      (supportConfirmation !== undefined) ||
+    (assertion.predicate === "initiative.primary_objective") !==
+      (expectedPrimaryObjectiveGeneration !== undefined)
+  ) {
+    return failContract();
+  }
   return {
     subject,
     predicate: assertion.predicate,
@@ -163,8 +190,84 @@ function parseCreateClaim(input: unknown): B2CommandPayloadMap["claim.create"] {
     ...(validFrom === undefined ? {} : { validFrom }),
     ...(validTo === undefined ? {} : { validTo }),
     ...(value.observedAt === undefined ? {} : { observedAt: requireTimestamp(value.observedAt) }),
-    evidence: parseEvidence(value.evidence)
+    evidence: parseEvidence(value.evidence),
+    ...(supportConfirmation === undefined ? {} : { supportConfirmation }),
+    ...(expectedPrimaryObjectiveGeneration === undefined
+      ? {}
+      : { expectedPrimaryObjectiveGeneration })
   };
+}
+
+function parsePrimaryObjectiveGeneration(
+  input: unknown
+): NonNullable<B2CommandPayloadMap["claim.create"]["expectedPrimaryObjectiveGeneration"]> {
+  const candidate = exactObject(input, ["kind"], ["claimId", "expectedVersion", "expectedStatus"]);
+  if (candidate.kind === "empty") {
+    exactObject(input, ["kind"]);
+    return { kind: "empty" };
+  }
+  const value = exactObject(input, ["kind", "claimId", "expectedVersion", "expectedStatus"]);
+  return {
+    kind: requireLiteral(value.kind, "claim"),
+    claimId: requireUuidV7(value.claimId),
+    expectedVersion: requirePositiveInteger(value.expectedVersion),
+    expectedStatus: requireEnum(value.expectedStatus, [
+      "proposed",
+      "accepted",
+      "rejected",
+      "superseded"
+    ] as const)
+  };
+}
+
+function parseWithdrawPrimaryObjective(
+  input: unknown
+): B2CommandPayloadMap["initiative.primary_objective.withdraw"] {
+  const value = exactObject(input, ["subject", "proposal", "disposition", "reasonCode"]);
+  const subject = parseSubject(value.subject);
+  if (subject.type !== "initiative") return failContract();
+  return {
+    subject: { ...subject, type: "initiative" },
+    proposal: parseClaimRef(value.proposal),
+    disposition: requireEnum(value.disposition, ["withdrawn", "rejected"] as const),
+    reasonCode: requireEnum(value.reasonCode, PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)
+  };
+}
+
+function parseReworkPrimaryObjective(
+  input: unknown
+): B2CommandPayloadMap["initiative.primary_objective.rework"] {
+  const value = exactObject(input, [
+    "subject",
+    "predecessor",
+    "valueJson",
+    "normalizedText",
+    "confidence",
+    "evidence",
+    "supportConfirmation"
+  ]);
+  const subject = parseSubject(value.subject);
+  if (subject.type !== "initiative") return failContract();
+  const assertion = parsePredicateAssertion({
+    predicate: "initiative.primary_objective",
+    subjectKind: subject.type,
+    canonicalValue: value.valueJson,
+    normalizedText: value.normalizedText
+  });
+  return {
+    subject: { ...subject, type: "initiative" },
+    predecessor: parseClaimRef(value.predecessor),
+    valueJson: assertion.canonicalValue,
+    normalizedText: assertion.normalizedText,
+    confidence: parseConfidence(value.confidence),
+    evidence: parseEvidence(value.evidence),
+    supportConfirmation: parseSupportConfirmation(value.supportConfirmation)
+  };
+}
+
+function parseSupportConfirmation(input: unknown): { confirmed: true } {
+  const value = exactObject(input, ["confirmed"]);
+  return { confirmed: requireLiteral(value.confirmed, true) };
 }
 
 function parseAcceptFact(input: unknown): B2CommandPayloadMap["fact.accept"] {
@@ -387,11 +490,67 @@ function parseEvidence(input: unknown): ClaimSourceSpanCandidate {
 function parseResult(kind: B2CommandKind, input: unknown): B2CommandResultMap[B2CommandKind] {
   switch (kind) {
     case "claim.create": {
-      const value = exactObject(input, ["claimId", "version", "status"]);
+      const value = exactObject(
+        input,
+        ["claimId", "version", "status"],
+        ["evidenceSpanId", "supportAttestationId"]
+      );
       return {
         claimId: requireUuidV7(value.claimId),
         version: requireLiteral(value.version, 1),
-        status: requireLiteral(value.status, "proposed")
+        status: requireLiteral(value.status, "proposed"),
+        ...(value.evidenceSpanId === undefined
+          ? {}
+          : { evidenceSpanId: requireUuidV7(value.evidenceSpanId) }),
+        ...(value.supportAttestationId === undefined
+          ? {}
+          : { supportAttestationId: requireUuidV7(value.supportAttestationId) })
+      };
+    }
+    case "initiative.primary_objective.withdraw": {
+      const value = exactObject(input, [
+        "claimId",
+        "version",
+        "status",
+        "recoveryId",
+        "disposition",
+        "reasonCode"
+      ]);
+      return {
+        claimId: requireUuidV7(value.claimId),
+        version: requireLiteral(value.version, 2),
+        status: requireLiteral(value.status, "rejected"),
+        recoveryId: requireUuidV7(value.recoveryId),
+        disposition: requireEnum(value.disposition, ["withdrawn", "rejected"] as const),
+        reasonCode: requireEnum(value.reasonCode, PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)
+      };
+    }
+    case "initiative.primary_objective.rework": {
+      const value = exactObject(input, [
+        "predecessorClaimId",
+        "predecessorVersion",
+        "predecessorStatus",
+        "successorClaimId",
+        "successorVersion",
+        "successorStatus",
+        "evidenceSpanId",
+        "supportAttestationId",
+        "recoveryId",
+        "disposition",
+        "reasonCode"
+      ]);
+      return {
+        predecessorClaimId: requireUuidV7(value.predecessorClaimId),
+        predecessorVersion: requireLiteral(value.predecessorVersion, 2),
+        predecessorStatus: requireLiteral(value.predecessorStatus, "superseded"),
+        successorClaimId: requireUuidV7(value.successorClaimId),
+        successorVersion: requireLiteral(value.successorVersion, 1),
+        successorStatus: requireLiteral(value.successorStatus, "proposed"),
+        evidenceSpanId: requireUuidV7(value.evidenceSpanId),
+        supportAttestationId: requireUuidV7(value.supportAttestationId),
+        recoveryId: requireUuidV7(value.recoveryId),
+        disposition: requireLiteral(value.disposition, "reworked"),
+        reasonCode: requireLiteral(value.reasonCode, "reworked")
       };
     }
     case "fact.accept": {

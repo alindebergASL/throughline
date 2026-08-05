@@ -11,6 +11,8 @@ export type B2TruthPredicate = (typeof B2_TRUTH_PREDICATES)[number];
 
 export const B2_COMMAND_KINDS = Object.freeze([
   "claim.create",
+  "initiative.primary_objective.withdraw",
+  "initiative.primary_objective.rework",
   "fact.accept",
   "fact.contest",
   "fact.uphold",
@@ -145,6 +147,48 @@ export interface CreateClaimPayload {
   validTo?: string;
   observedAt?: string;
   evidence: ClaimSourceSpanCandidate;
+  supportConfirmation?: HumanSemanticSupportConfirmation;
+  expectedPrimaryObjectiveGeneration?: PrimaryObjectiveClaimGenerationCoordinate;
+}
+
+export type PrimaryObjectiveClaimGenerationCoordinate =
+  | { kind: "empty" }
+  | {
+      kind: "claim";
+      claimId: string;
+      expectedVersion: number;
+      expectedStatus: "proposed" | "accepted" | "rejected" | "superseded";
+    };
+
+export interface HumanSemanticSupportConfirmation {
+  confirmed: true;
+}
+
+export const PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES = Object.freeze([
+  "needs_rework",
+  "unsupported",
+  "incorrect",
+  "duplicate",
+  "not_useful",
+  "sensitive",
+  "other"
+] as const);
+
+export interface WithdrawPrimaryObjectiveProposalPayload {
+  subject: B2SubjectVersionRef & { type: "initiative" };
+  proposal: B2ClaimVersionRef;
+  disposition: "withdrawn" | "rejected";
+  reasonCode: (typeof PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)[number];
+}
+
+export interface ReworkPrimaryObjectiveProposalPayload {
+  subject: B2SubjectVersionRef & { type: "initiative" };
+  predecessor: B2ClaimVersionRef;
+  valueJson: string;
+  normalizedText: string;
+  confidence: Confidence;
+  evidence: ClaimSourceSpanCandidate;
+  supportConfirmation: HumanSemanticSupportConfirmation;
 }
 
 export interface AcceptFactPayload {
@@ -216,6 +260,8 @@ export interface RegenerateDerivedViewPayload {
 
 export interface B2CommandPayloadMap {
   "claim.create": CreateClaimPayload;
+  "initiative.primary_objective.withdraw": WithdrawPrimaryObjectiveProposalPayload;
+  "initiative.primary_objective.rework": ReworkPrimaryObjectiveProposalPayload;
   "fact.accept": AcceptFactPayload;
   "fact.contest": ContestFactPayload;
   "fact.uphold": UpholdFactPayload;
@@ -231,7 +277,34 @@ export type B2AuthorizedDomainCommand<K extends B2CommandKind = B2CommandKind> =
 }[K];
 
 export interface B2CommandResultMap {
-  "claim.create": { claimId: string; version: 1; status: "proposed" };
+  "claim.create": {
+    claimId: string;
+    version: 1;
+    status: "proposed";
+    evidenceSpanId?: string;
+    supportAttestationId?: string;
+  };
+  "initiative.primary_objective.withdraw": {
+    claimId: string;
+    version: 2;
+    status: "rejected";
+    recoveryId: string;
+    disposition: "withdrawn" | "rejected";
+    reasonCode: (typeof PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)[number];
+  };
+  "initiative.primary_objective.rework": {
+    predecessorClaimId: string;
+    predecessorVersion: 2;
+    predecessorStatus: "superseded";
+    successorClaimId: string;
+    successorVersion: 1;
+    successorStatus: "proposed";
+    evidenceSpanId: string;
+    supportAttestationId: string;
+    recoveryId: string;
+    disposition: "reworked";
+    reasonCode: "reworked";
+  };
   "fact.accept": {
     factId: string;
     version: 1;

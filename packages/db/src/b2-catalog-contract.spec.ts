@@ -7,6 +7,7 @@ import {
   assertProductValidatorDelegatesExactB1Kinds,
   validateB2CatalogContract
 } from "./b2-catalog-contract.js";
+import { exactTruthCatalogForPhase } from "./b2-exact-catalog.js";
 
 const fixedPredecessors = [
   "0001_wave_a2_identity_access_rls.sql",
@@ -60,6 +61,7 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     await assertB2MigrationStateAbsent(client, "0008_b2_slice1_command_integrity.sql");
     await assertB2MigrationStateAbsent(client, "0009_b2_source_truth_lifecycle_interlock.sql");
     await assertB2MigrationStateAbsent(client, "0010_b2_trusted_objective_initiative_lock.sql");
+    await assertB2MigrationStateAbsent(client, "0011_b2_primary_objective_proposal_recovery.sql");
 
     expect(query.mock.calls[0]?.[0]).toContain("to_regnamespace('truth')");
     expect(query.mock.calls[1]?.[0]).toContain("ops.product_command_record_valid");
@@ -72,6 +74,7 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(query.mock.calls[3]?.[1]).toEqual([
       ["initiatives_app_truth_lock", "initiatives_app_permanent_no_write"]
     ]);
+    expect(query.mock.calls[4]?.[0]).toContain("truth.initiative_objective_support_attestations");
   });
 
   it("rejects an unjournaled Initiative lock capability", async () => {
@@ -130,6 +133,149 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(contract).toContain("domain_command_records_b2_slice1_atomicity_deferred");
     expect(contract).not.toContain("command_effects_immutable");
     expect(contract).not.toContain("require_product_command_atomicity");
+  });
+
+  it("adds only the objective recovery catalog without generalized Claim or Fact lifecycle", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+    const migration = await readFile(
+      new URL("../migrations/0011_b2_primary_objective_proposal_recovery.sql", import.meta.url),
+      "utf8"
+    );
+
+    for (const bounded of [
+      "initiative_objective_support_attestations",
+      "initiative_objective_proposal_recoveries",
+      "initiative.primary_objective.withdraw.v1",
+      "initiative.primary_objective.rework.v1",
+      "claims_one_active_primary_objective_proposal"
+    ]) {
+      expect(contract).toContain(bounded);
+      expect(migration).toContain(bounded);
+    }
+    expect(migration).not.toMatch(
+      /fact\.(?:contest|uphold|supersede|revoke)|derived_view\.regenerate|CREATE TABLE truth\.(?:conflict|fact_lifecycle|claim_lifecycle)/
+    );
+  });
+
+  it("compares every phase-5 constraint and index by exact normalized catalog definition", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+    const objectiveCatalog = contract.slice(
+      contract.indexOf("async function validateObjectiveRecoveryCatalog"),
+      contract.indexOf("async function validateTruthTables")
+    );
+    expect(objectiveCatalog).toContain("pg_get_constraintdef(constraint_record.oid, false)");
+    expect(objectiveCatalog).toContain("pg_get_indexdef(index_record.indexrelid, 0, false)");
+    expect(objectiveCatalog).toContain("exactObjectiveRecoveryConstraints(");
+    expect(objectiveCatalog).toContain("exactObjectiveRecoveryIndexes()");
+    expect(objectiveCatalog).toContain("FOREIGN KEY (tenant_id, workspace_id, space_id");
+    expect(objectiveCatalog).toContain("DEFERRABLE INITIALLY DEFERRED");
+    expect(objectiveCatalog).toContain("PRIMARY KEY (id)");
+    expect(objectiveCatalog).toContain("UNIQUE (tenant_id, workspace_id, causation_command_id)");
+    expect(objectiveCatalog).toContain("CHECK ((version = 1))");
+    expect(objectiveCatalog).not.toMatch(/active_index_(?:definition|predicate).*\.includes/);
+  });
+
+  it("closes every non-index truth relation and ACL without expected-name filtering", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+    const relationInventory = contract.slice(
+      contract.indexOf("async function validateTruthTables"),
+      contract.indexOf("async function validateTruthColumnsAndConstraints")
+    );
+    const aclInventory = contract.slice(
+      contract.indexOf("async function validateTruthSecurity"),
+      contract.indexOf("async function validateTruthFunctions")
+    );
+
+    for (const inventory of [relationInventory, aclInventory]) {
+      expect(inventory).toContain("relation.relkind NOT IN ('i','I')");
+      expect(inventory).not.toContain("relation.relname = ANY");
+    }
+    expect(relationInventory).toContain(
+      "CASE WHEN relation.relowner = current_user::regrole THEN 'migration_owner'"
+    );
+    expect(relationInventory).toContain("ELSE pg_get_userbyid(relation.relowner) END AS owner");
+  });
+
+  it("encodes the canonical phase catalog as compact exact deltas", () => {
+    expect(
+      [1, 2, 3, 4, 5].map((phase) => {
+        const catalog = exactTruthCatalogForPhase(phase);
+        return [
+          catalog.relations.length,
+          catalog.policies.length,
+          catalog.constraints.length,
+          catalog.indexes.length
+        ];
+      })
+    ).toEqual([
+      [4, 9, 70, 13],
+      [4, 13, 70, 13],
+      [4, 13, 68, 13],
+      [4, 13, 68, 13],
+      [6, 19, 100, 23]
+    ]);
+    expect(exactTruthCatalogForPhase(5).relations.map(({ owner }) => owner)).toEqual(
+      Array(6).fill("migration_owner")
+    );
+  });
+
+  it("uses exact policy, constraint, index, and safe-request function rows", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+
+    expect(contract).toContain("pg_get_expr(policy.polqual, policy.polrelid) AS using_expression");
+    expect(contract).toContain("JSON.stringify(result.rows) !== JSON.stringify(expectedPolicies)");
+    for (const field of [
+      "constraint_record.conname AS name",
+      "constraint_record.contype::text AS type",
+      "constraint_record.condeferrable AS deferrable",
+      "constraint_record.condeferred AS initially_deferred",
+      "constraint_record.convalidated AS validated",
+      "index_record.indisunique AS unique",
+      "index_record.indisprimary AS primary",
+      "index_record.indisvalid AS valid",
+      "index_record.indisready AS ready",
+      "index_record.indislive AS live",
+      "pg_get_indexdef(index_record.indexrelid, 0, false) AS definition"
+    ]) {
+      expect(contract).toContain(field);
+    }
+    expect(contract).toContain("safeRequestIdentity");
+    expect(contract).toContain(
+      'migrationFunctionSource(recoverySource!, "ops.b2_slice1_safe_request_valid")'
+    );
+  });
+
+  it("pins complete canonical truth trigger definitions including timing, events, and arguments", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+    const triggerContract = contract.slice(
+      contract.indexOf("async function validateTruthConstraintsAndTriggers"),
+      contract.indexOf("const currentSlotIndexes")
+    );
+
+    expect(triggerContract).toContain("pg_get_triggerdef(trigger_record.oid, true) AS definition");
+    expect(triggerContract).toContain('timing_and_events: "AFTER INSERT OR UPDATE"');
+    expect(triggerContract).toContain('timing_and_events: "BEFORE DELETE OR UPDATE"');
+    expect(triggerContract).toContain('arguments: ["fact.accept.v1"]');
+    expect(triggerContract).toContain('arguments: ["claim.create-or-rework.v1"]');
+    expect(triggerContract).toContain('CREATE ${contract.deferred ? "CONSTRAINT " : ""}TRIGGER');
+    expect(triggerContract).toContain("DEFERRABLE INITIALLY DEFERRED");
+    expect(triggerContract).toContain("FOR EACH ROW EXECUTE FUNCTION");
+  });
+
+  it("keeps migration-adopted request provenance distinct from native confirmation", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+    const migration = await readFile(
+      new URL("../migrations/0011_b2_primary_objective_proposal_recovery.sql", import.meta.url),
+      "utf8"
+    );
+
+    expect(migration).toContain("safe_request_adopted boolean NOT NULL DEFAULT false");
+    expect(migration).toContain("'supportConfirmed', false");
+    expect(migration).toContain("jsonb_set(safe_request, '{supportConfirmed}', 'true'::jsonb");
+    expect(migration).not.toMatch(/GRANT (?:INSERT|UPDATE) \(safe_request_adopted\)/);
+    expect(contract).toContain("app_can_insert_safe_request_adopted");
+    expect(contract).toContain("app_can_update_safe_request_adopted");
+    expect(contract).toContain('safe_request_adopted_default !== "false"');
   });
 
   it("pins the staged B2 capability boundary and rejects full lifecycle objects", async () => {

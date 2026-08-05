@@ -387,6 +387,7 @@ export const domainCommandRecords = ops.table(
     commandSchemaVersion: integer("command_schema_version").notNull(),
     idempotencyKey: text("idempotency_key").notNull(),
     canonicalRequestHash: text("canonical_request_hash").notNull(),
+    safeRequest: jsonb("safe_request"),
     state: text("state").notNull().default("reserved"),
     resultResourceType: text("result_resource_type"),
     resultResourceId: uuid("result_resource_id"),
@@ -1004,5 +1005,51 @@ export const factClaims = truth.table(
   },
   (table) => [
     primaryKey({ columns: [table.tenantId, table.workspaceId, table.factId, table.claimId] })
+  ]
+);
+
+export const initiativeObjectiveSupportAttestations = truth.table(
+  "initiative_objective_support_attestations",
+  {
+    id: uuid("id").primaryKey(),
+    ...truthScope,
+    initiativeId: uuid("initiative_id").notNull(),
+    claimId: uuid("claim_id").notNull(),
+    verifiedEvidenceSpanId: uuid("verified_evidence_span_id").notNull(),
+    objectiveValueHash: text("objective_value_hash").notNull(),
+    excerptHash: text("excerpt_hash").notNull(),
+    confirmedByUserId: uuid("confirmed_by_user_id").notNull(),
+    confirmedByMembershipId: uuid("confirmed_by_membership_id").notNull(),
+    causationCommandId: uuid("causation_command_id").notNull(),
+    confirmedAt: timestamp("confirmed_at", { withTimezone: true }).notNull().defaultNow(),
+    version: integer("version").notNull().default(1)
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.claimId)
+  ]
+);
+
+export const initiativeObjectiveProposalRecoveries = truth.table(
+  "initiative_objective_proposal_recoveries",
+  {
+    id: uuid("id").primaryKey(),
+    ...truthScope,
+    initiativeId: uuid("initiative_id").notNull(),
+    predecessorClaimId: uuid("predecessor_claim_id").notNull(),
+    successorClaimId: uuid("successor_claim_id"),
+    disposition: text("disposition").notNull(),
+    reasonCode: text("reason_code").notNull(),
+    actedByUserId: uuid("acted_by_user_id").notNull(),
+    actedByMembershipId: uuid("acted_by_membership_id").notNull(),
+    causationCommandId: uuid("causation_command_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    version: integer("version").notNull().default(1)
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.predecessorClaimId)
   ]
 );

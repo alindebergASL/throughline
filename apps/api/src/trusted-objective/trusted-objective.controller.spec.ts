@@ -5,17 +5,25 @@ import { describe, expect, it, vi } from "vitest";
 import {
   TrustedObjectiveInputError,
   TrustedObjectiveUnavailableError,
-  parseProposalBody
+  parseAcceptBody,
+  parseProposalBody,
+  parseReworkBody,
+  parseWithdrawBody
 } from "./trusted-objective.contract.js";
 import { TrustedObjectiveController } from "./trusted-objective.controller.js";
 import type { TrustedObjectiveRequest } from "./trusted-objective.guard.js";
 import {
   TrustedObjectiveRuntime,
   deriveEvidenceCandidate,
+  primaryObjectiveProposalKey,
+  primaryObjectiveGenerationAnchor,
+  primaryObjectiveSourceRevisionAnchor,
   stableKey
 } from "./trusted-objective.runtime.js";
 
 const initiativeId = "70000000-0000-7000-8000-000000000204";
+const proposalGenerationAnchor = primaryObjectiveGenerationAnchor(null);
+const sourceRevisionAnchor = `trusted-objective:source-revision:${"b".repeat(64)}`;
 
 function request(): TrustedObjectiveRequest {
   return {
@@ -31,6 +39,8 @@ describe("TrustedObjectiveController", () => {
     const runtime = {
       capture: vi.fn(async () => state),
       propose: vi.fn(async () => ({ state: "proposed" })),
+      rework: vi.fn(async () => ({ state: "proposed" })),
+      withdraw: vi.fn(async () => ({ state: "captured" })),
       accept: vi.fn(async () => ({ state: "accepted" })),
       draftConfirmation: vi.fn(async () => ({
         question: "Confirm?",
@@ -42,9 +52,25 @@ describe("TrustedObjectiveController", () => {
     await controller.capture(request(), initiativeId, { note: "Exact note" });
     await controller.propose(request(), initiativeId, {
       objective: "Reduce response time.",
-      exactExcerpt: "reduce response time"
+      exactExcerpt: "reduce response time",
+      supportConfirmed: true,
+      proposalGenerationAnchor,
+      sourceRevisionAnchor
     });
-    await controller.accept(request(), initiativeId, {});
+    await controller.rework(request(), initiativeId, {
+      claimId: "70000000-0000-7000-8000-000000000401",
+      expectedClaimVersion: 1,
+      expectedInitiativeVersion: 2,
+      objective: "Reduce governed response time.",
+      exactExcerpt: "reduce response time",
+      supportConfirmed: true,
+      sourceRevisionAnchor
+    });
+    await controller.accept(request(), initiativeId, {
+      claimId: "70000000-0000-7000-8000-000000000401",
+      expectedClaimVersion: 1,
+      expectedInitiativeVersion: 2
+    });
     await expect(controller.draftConfirmation(request(), initiativeId, {})).resolves.toEqual({
       question: "Confirm?",
       sent: false,
@@ -53,9 +79,25 @@ describe("TrustedObjectiveController", () => {
     expect(runtime.capture).toHaveBeenCalledWith(expect.any(Object), initiativeId, "Exact note");
     expect(runtime.propose).toHaveBeenCalledWith(expect.any(Object), initiativeId, {
       objective: "Reduce response time.",
-      exactExcerpt: "reduce response time"
+      exactExcerpt: "reduce response time",
+      supportConfirmed: true,
+      proposalGenerationAnchor,
+      sourceRevisionAnchor
     });
-    expect(runtime.accept).toHaveBeenCalledWith(expect.any(Object), initiativeId);
+    expect(runtime.rework).toHaveBeenCalledWith(expect.any(Object), initiativeId, {
+      claimId: "70000000-0000-7000-8000-000000000401",
+      expectedClaimVersion: 1,
+      expectedInitiativeVersion: 2,
+      objective: "Reduce governed response time.",
+      exactExcerpt: "reduce response time",
+      supportConfirmed: true,
+      sourceRevisionAnchor
+    });
+    expect(runtime.accept).toHaveBeenCalledWith(expect.any(Object), initiativeId, {
+      claimId: "70000000-0000-7000-8000-000000000401",
+      expectedClaimVersion: 1,
+      expectedInitiativeVersion: 2
+    });
   });
 
   it("rejects browser-supplied hashes, authority, scope, and identities", async () => {
@@ -63,16 +105,118 @@ describe("TrustedObjectiveController", () => {
       { sourceContentHash: "a".repeat(64) },
       { tenantId: "tenant" },
       { accessClass: "public" },
-      { acceptedByUserId: "actor" }
+      { acceptedByUserId: "actor" },
+      { proposalGeneration: 2 },
+      { latestObjectiveClaimId: "70000000-0000-7000-8000-000000000401" }
     ]) {
       expect(() =>
         parseProposalBody({
           objective: "Reduce response time.",
           exactExcerpt: "reduce response time",
+          supportConfirmed: true,
+          proposalGenerationAnchor,
+          sourceRevisionAnchor,
           ...injected
         })
       ).toThrow(TrustedObjectiveInputError);
     }
+  });
+
+  it("requires a fresh exact support confirmation for initial proposals and rework", () => {
+    for (const supportConfirmed of [undefined, false, "true", 1, { confirmed: true }]) {
+      expect(() =>
+        parseProposalBody({
+          objective: "Reduce response time.",
+          exactExcerpt: "reduce response time",
+          proposalGenerationAnchor,
+          sourceRevisionAnchor,
+          supportConfirmed
+        })
+      ).toThrow(TrustedObjectiveInputError);
+      expect(() =>
+        parseReworkBody({
+          claimId: "70000000-0000-7000-8000-000000000401",
+          expectedClaimVersion: 1,
+          expectedInitiativeVersion: 1,
+          objective: "Reduce response time.",
+          exactExcerpt: "reduce response time",
+          sourceRevisionAnchor,
+          supportConfirmed
+        })
+      ).toThrow(TrustedObjectiveInputError);
+    }
+  });
+
+  it("requires the opaque server-derived source revision anchor for proposal confirmation", () => {
+    for (const invalidAnchor of [undefined, "", "trusted-objective:source-revision:decoded"]) {
+      expect(() =>
+        parseProposalBody({
+          objective: "Reduce response time.",
+          exactExcerpt: "reduce response time",
+          supportConfirmed: true,
+          proposalGenerationAnchor,
+          sourceRevisionAnchor: invalidAnchor
+        })
+      ).toThrow(TrustedObjectiveInputError);
+      expect(() =>
+        parseReworkBody({
+          claimId: "70000000-0000-7000-8000-000000000401",
+          expectedClaimVersion: 1,
+          expectedInitiativeVersion: 1,
+          objective: "Reduce response time.",
+          exactExcerpt: "reduce response time",
+          supportConfirmed: true,
+          sourceRevisionAnchor: invalidAnchor
+        })
+      ).toThrow(TrustedObjectiveInputError);
+    }
+  });
+
+  it("requires the exact rendered Claim and Initiative versions for acceptance", () => {
+    expect(
+      parseAcceptBody({
+        claimId: "70000000-0000-7000-8000-000000000401",
+        expectedClaimVersion: 1,
+        expectedInitiativeVersion: 3
+      })
+    ).toEqual({
+      claimId: "70000000-0000-7000-8000-000000000401",
+      expectedClaimVersion: 1,
+      expectedInitiativeVersion: 3
+    });
+    for (const invalid of [
+      {},
+      { claimId: "70000000-0000-7000-8000-000000000401" },
+      {
+        claimId: "70000000-0000-7000-8000-000000000401",
+        expectedClaimVersion: 2,
+        expectedInitiativeVersion: 3
+      }
+    ]) {
+      expect(() => parseAcceptBody(invalid)).toThrow(TrustedObjectiveInputError);
+    }
+  });
+
+  it("accepts only objective-specific bounded recovery request shapes", () => {
+    expect(
+      parseWithdrawBody({
+        claimId: "70000000-0000-7000-8000-000000000401",
+        expectedClaimVersion: 1,
+        expectedInitiativeVersion: 3,
+        disposition: "withdrawn",
+        reasonCode: "needs_rework"
+      })
+    ).toMatchObject({ disposition: "withdrawn", reasonCode: "needs_rework" });
+    expect(() =>
+      parseWithdrawBody({
+        claimId: "70000000-0000-7000-8000-000000000401",
+        expectedClaimVersion: 1,
+        expectedInitiativeVersion: 3,
+        disposition: "withdrawn",
+        reasonCode: "needs_rework",
+        claimText: "must never enter audit detail"
+      })
+    ).toThrow(TrustedObjectiveInputError);
   });
 
   it("makes unavailable and missing resources outwardly identical", async () => {
@@ -109,6 +253,7 @@ describe("trusted objective evidence and idempotency contracts", () => {
     } as never;
     const normalized = normalizeSourceFixture(source as never);
     const evidence = deriveEvidenceCandidate(normalized as never, "twelve days to five");
+    const anchor = primaryObjectiveSourceRevisionAnchor(normalized as never);
     expect(evidence).toMatchObject({
       startOffset: 40,
       endOffset: 59,
@@ -118,6 +263,10 @@ describe("trusted objective evidence and idempotency contracts", () => {
     });
     expect(evidence.sourceContentHash).toMatch(/^[a-f0-9]{64}$/);
     expect(evidence.excerptHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(anchor).toMatch(/^trusted-objective:source-revision:[a-f0-9]{64}$/);
+    expect(primaryObjectiveSourceRevisionAnchor({ ...normalized, version: 2 } as never)).not.toBe(
+      anchor
+    );
   });
 
   it("uses stable semantic command keys", () => {
@@ -127,6 +276,136 @@ describe("trusted objective evidence and idempotency contracts", () => {
     expect(stableKey("accept", initiativeId, "claim")).not.toBe(
       stableKey("accept", initiativeId, "other")
     );
+  });
+
+  it("converges an initial proposal but starts a fresh generation after terminal history", () => {
+    const evidence = {
+      sourceArtifactId: "70000000-0000-7000-8000-000000000301",
+      sourceChunkId: "70000000-0000-7000-8000-000000000302",
+      startOffset: 6,
+      endOffset: 26
+    };
+    const initialA = primaryObjectiveProposalKey(
+      initiativeId,
+      "Reduce response time.",
+      evidence,
+      primaryObjectiveGenerationAnchor(null),
+      sourceRevisionAnchor
+    );
+    const initialB = primaryObjectiveProposalKey(
+      initiativeId,
+      "Reduce response time.",
+      evidence,
+      primaryObjectiveGenerationAnchor(null),
+      sourceRevisionAnchor
+    );
+    const afterTerminal = primaryObjectiveProposalKey(
+      initiativeId,
+      "Reduce response time.",
+      evidence,
+      primaryObjectiveGenerationAnchor({
+        id: "70000000-0000-7000-8000-000000000401",
+        version: 2,
+        status: "superseded"
+      }),
+      sourceRevisionAnchor
+    );
+    const afterSourceRevision = primaryObjectiveProposalKey(
+      initiativeId,
+      "Reduce response time.",
+      evidence,
+      primaryObjectiveGenerationAnchor(null),
+      `trusted-objective:source-revision:${"c".repeat(64)}`
+    );
+
+    expect(initialA).toBe(initialB);
+    expect(afterTerminal).not.toBe(initialA);
+    expect(afterSourceRevision).not.toBe(initialA);
+  });
+
+  it("derives the proposal generation from the latest durable objective Claim", async () => {
+    const query = vi.fn(async () => ({
+      rows: [
+        {
+          id: "70000000-0000-7000-8000-000000000401",
+          version: 2,
+          status: "rejected"
+        }
+      ]
+    }));
+    const runtime = new TrustedObjectiveRuntime();
+    const anchor = await (
+      runtime as unknown as {
+        readLatestPrimaryObjectiveClaim(
+          tx: object,
+          context: object,
+          scope: object
+        ): Promise<unknown>;
+      }
+    ).readLatestPrimaryObjectiveClaim({ query }, createDevSecurityContext("tenant-a-owner"), {
+      initiativeId
+    });
+
+    expect(anchor).toEqual({
+      id: "70000000-0000-7000-8000-000000000401",
+      version: 2,
+      status: "rejected"
+    });
+    expect(query).toHaveBeenCalledWith(
+      expect.stringContaining("ORDER BY created_at DESC, id DESC"),
+      expect.arrayContaining([initiativeId, "initiative.primary_objective"])
+    );
+  });
+
+  it("projects a bounded authorized rework lineage rooted at the rendered successor", async () => {
+    const predecessorClaimId = "70000000-0000-7000-8000-000000000401";
+    const successorClaimId = "70000000-0000-7000-8000-000000000402";
+    const query = vi.fn(async () => ({
+      rows: [
+        {
+          predecessor_claim_id: predecessorClaimId,
+          successor_claim_id: successorClaimId,
+          disposition: "reworked",
+          reason_code: "reworked",
+          reworked_at: new Date("2026-08-05T01:00:00.000Z")
+        }
+      ]
+    }));
+    const canInTransaction = vi.fn(async () => ({ allowed: true }));
+    const runtime = new TrustedObjectiveRuntime();
+    (runtime as unknown as { authorization: object }).authorization = { canInTransaction };
+    const lineage = await (
+      runtime as unknown as {
+        readReworkLineage(
+          tx: object,
+          context: object,
+          scope: object,
+          currentClaimId: string
+        ): Promise<unknown>;
+      }
+    ).readReworkLineage(
+      { query },
+      createDevSecurityContext("tenant-a-owner"),
+      { initiativeId },
+      successorClaimId
+    );
+
+    expect(lineage).toEqual([
+      {
+        predecessorClaimId,
+        successorClaimId,
+        disposition: "reworked",
+        reasonCode: "reworked",
+        reworkedAt: "2026-08-05T01:00:00.000Z"
+      }
+    ]);
+    expect(query).toHaveBeenCalledWith(expect.stringContaining("lineage.depth < 20"), [
+      expect.any(String),
+      expect.any(String),
+      initiativeId,
+      successorClaimId
+    ]);
+    expect(canInTransaction).toHaveBeenCalledTimes(2);
   });
 
   it("fails the read projection closed when persisted source, chunk, or excerpt relationships are invalid", async () => {

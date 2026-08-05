@@ -39,13 +39,29 @@ import { generateUuidV7 } from "./uuid.js";
 const APP_ROLE = "throughline_app";
 const COMMAND_SCHEMA_VERSION = 1;
 
-export type DurableTruthCommandKind = "claim.create" | "fact.accept";
+export type DurableTruthCommandKind =
+  | "claim.create"
+  | "initiative.primary_objective.withdraw"
+  | "initiative.primary_objective.rework"
+  | "fact.accept";
 type InternalCreateClaimCommand = Omit<B2AuthorizedDomainCommand<"claim.create">, "payload"> & {
   payload: Omit<B2CommandPayloadMap["claim.create"], "valueJson"> & {
     canonicalValue: string;
   };
 };
-type DurableTruthCommand = InternalCreateClaimCommand | B2AuthorizedDomainCommand<"fact.accept">;
+type InternalReworkPrimaryObjectiveCommand = Omit<
+  B2AuthorizedDomainCommand<"initiative.primary_objective.rework">,
+  "payload"
+> & {
+  payload: Omit<B2CommandPayloadMap["initiative.primary_objective.rework"], "valueJson"> & {
+    canonicalValue: string;
+  };
+};
+type DurableTruthCommand =
+  | InternalCreateClaimCommand
+  | InternalReworkPrimaryObjectiveCommand
+  | B2AuthorizedDomainCommand<"initiative.primary_objective.withdraw">
+  | B2AuthorizedDomainCommand<"fact.accept">;
 type DurableTruthResult = B2CommandResultMap[DurableTruthCommandKind];
 
 export class B2AuthorizationError extends Error {
@@ -77,7 +93,12 @@ export class TruthLedgerDomainCommandBus {
     context: SecurityContext
   ): Promise<B2CommandResultMap[K]> {
     const parsed = parseB2Command(input);
-    if (parsed.kind !== "claim.create" && parsed.kind !== "fact.accept") {
+    if (
+      parsed.kind !== "claim.create" &&
+      parsed.kind !== "initiative.primary_objective.withdraw" &&
+      parsed.kind !== "initiative.primary_objective.rework" &&
+      parsed.kind !== "fact.accept"
+    ) {
       throw new B2CommandValidationError();
     }
     const requestHash = hashB2CommandIdentity(parsed);
@@ -194,21 +215,29 @@ export class TruthLedgerDomainCommandBus {
         command.payload.subject.type
       );
       if (predicateDefinition.proposalSlotPolicy === "single_open") {
+        if (!command.payload.expectedPrimaryObjectiveGeneration) {
+          throw new B2CommandInvariantError();
+        }
         await ledger.lockPrimaryObjectiveProposalSlot({
           tenantId: context.tenantId,
           workspaceId: context.workspaceId,
           spaceId: subject.spaceId,
-          subjectId: subject.subjectId
+          subjectId: subject.subjectId,
+          expectedLatestClaim: command.payload.expectedPrimaryObjectiveGeneration
         });
       }
 
       const claimId = generateUuidV7();
       const evidenceSpanId = generateUuidV7();
+      const supportAttestationId = command.payload.supportConfirmation
+        ? generateUuidV7()
+        : undefined;
       await ledger.insertEvidenceAndClaim({
         tenantId: context.tenantId,
         workspaceId: context.workspaceId,
         claimId,
         evidenceSpanId,
+        ...(supportAttestationId === undefined ? {} : { supportAttestationId }),
         commandId: reservation.commandId,
         actorUserId: actor.userId,
         actorMembershipId: actor.membershipId,
@@ -239,10 +268,24 @@ export class TruthLedgerDomainCommandBus {
         eventType: "claim.proposed",
         aggregateType: "claim",
         aggregateVersion: 1,
-        payload: { claimId, evidenceSpanId },
-        auditDetail: { claimId, evidenceSpanId }
+        payload: {
+          claimId,
+          evidenceSpanId,
+          ...(supportAttestationId === undefined ? {} : { supportAttestationId })
+        },
+        auditDetail: {
+          claimId,
+          evidenceSpanId,
+          ...(supportAttestationId === undefined ? {} : { supportAttestationId })
+        }
       });
-      const result = { claimId, version: 1 as const, status: "proposed" as const };
+      const result = {
+        claimId,
+        version: 1 as const,
+        status: "proposed" as const,
+        evidenceSpanId,
+        ...(supportAttestationId === undefined ? {} : { supportAttestationId })
+      };
       await completeCommand(
         domain.commands,
         command,
@@ -252,6 +295,225 @@ export class TruthLedgerDomainCommandBus {
         reservation.commandId,
         "claim",
         claimId,
+        result
+      );
+      return result;
+    }
+
+    if (
+      command.kind === "initiative.primary_objective.withdraw" ||
+      command.kind === "initiative.primary_objective.rework"
+    ) {
+      const predecessor =
+        command.kind === "initiative.primary_objective.withdraw"
+          ? command.payload.proposal
+          : command.payload.predecessor;
+      const action: AuthorizationAction =
+        command.kind === "initiative.primary_objective.rework"
+          ? "initiative.primary_objective.proposal.rework"
+          : command.payload.disposition === "rejected"
+            ? "initiative.primary_objective.proposal.reject"
+            : "initiative.primary_objective.proposal.withdraw";
+      await domain.commands.lockReservationIdentity({
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        reservationSpaceId,
+        commandKind: `${command.kind}.v1`,
+        idempotencyKey: command.idempotencyKey
+      });
+      await this.authorize(tx, context, action, { type: "claim", id: predecessor.claimId }, false);
+      const reservation = await reserveCommand(
+        domain.commands,
+        command,
+        context,
+        requestHash,
+        traceparent,
+        reservationSpaceId
+      );
+      if (reservation.replay) {
+        await this.authorize(tx, context, action, { type: "claim", id: predecessor.claimId }, true);
+        return reservation.result;
+      }
+
+      await ledger.lockPrimaryObjectiveProposal({
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        spaceId: subject.spaceId,
+        initiativeId: subject.subjectId,
+        claimId: predecessor.claimId,
+        expectedVersion: predecessor.expectedVersion
+      });
+      await this.authorize(tx, context, action, { type: "claim", id: predecessor.claimId }, true);
+      const timestamp = await ledger.transactionTimestamp();
+      const recoveryId = generateUuidV7();
+
+      if (command.kind === "initiative.primary_objective.withdraw") {
+        await ledger.terminalizePrimaryObjectiveProposal({
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId,
+          spaceId: subject.spaceId,
+          initiativeId: subject.subjectId,
+          predecessorClaimId: predecessor.claimId,
+          recoveryId,
+          disposition: command.payload.disposition,
+          reasonCode: command.payload.reasonCode,
+          actorUserId: actor.userId,
+          actorMembershipId: actor.membershipId,
+          commandId: reservation.commandId,
+          timestamp
+        });
+        const result = {
+          claimId: predecessor.claimId,
+          version: 2 as const,
+          status: "rejected" as const,
+          recoveryId,
+          disposition: command.payload.disposition,
+          reasonCode: command.payload.reasonCode
+        };
+        const rejected = command.payload.disposition === "rejected";
+        await writeAuditAndOutbox({
+          tx,
+          ledger,
+          context,
+          commandId: reservation.commandId,
+          traceparent,
+          spaceId: subject.spaceId,
+          action: rejected
+            ? "initiative.primary_objective.reject"
+            : "initiative.primary_objective.withdraw",
+          resourceType: "claim",
+          resourceId: predecessor.claimId,
+          eventType: rejected
+            ? "initiative.primary_objective.proposal_rejected"
+            : "initiative.primary_objective.proposal_withdrawn",
+          aggregateType: "claim",
+          aggregateVersion: 2,
+          payload: {
+            claimId: predecessor.claimId,
+            claimVersion: 2,
+            recoveryId,
+            disposition: command.payload.disposition,
+            reasonCode: command.payload.reasonCode
+          },
+          auditDetail: {
+            claimId: predecessor.claimId,
+            claimVersion: 2,
+            recoveryId,
+            disposition: command.payload.disposition,
+            reasonCode: command.payload.reasonCode
+          }
+        });
+        await completeCommand(
+          domain.commands,
+          command,
+          context,
+          requestHash,
+          reservationSpaceId,
+          reservation.commandId,
+          "claim",
+          predecessor.claimId,
+          result
+        );
+        return result;
+      }
+
+      await this.authorize(
+        tx,
+        context,
+        "source.read",
+        { type: "source", id: command.payload.evidence.sourceArtifactId },
+        true
+      );
+      const verified = await new VerifiedClaimSourceSpanAdmission(
+        tx,
+        bindClaimEvidenceSnapshotLookupToTransaction(tx, ledger),
+        { tenantId: context.tenantId, workspaceId: context.workspaceId }
+      ).admit({ subject: command.payload.subject, evidence: command.payload.evidence });
+      if (verified.spaceId !== subject.spaceId) throw new B2AuthorizationError();
+
+      const successorClaimId = generateUuidV7();
+      const evidenceSpanId = generateUuidV7();
+      const supportAttestationId = generateUuidV7();
+      await ledger.terminalizePrimaryObjectiveProposal({
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        spaceId: subject.spaceId,
+        initiativeId: subject.subjectId,
+        predecessorClaimId: predecessor.claimId,
+        successorClaimId,
+        recoveryId,
+        disposition: "reworked",
+        reasonCode: "reworked",
+        actorUserId: actor.userId,
+        actorMembershipId: actor.membershipId,
+        commandId: reservation.commandId,
+        timestamp
+      });
+      await ledger.insertEvidenceAndClaim({
+        tenantId: context.tenantId,
+        workspaceId: context.workspaceId,
+        claimId: successorClaimId,
+        evidenceSpanId,
+        supportAttestationId,
+        commandId: reservation.commandId,
+        actorUserId: actor.userId,
+        actorMembershipId: actor.membershipId,
+        assertedById: actor.displayPersonId,
+        predicate: "initiative.primary_objective",
+        canonicalValue: command.payload.canonicalValue,
+        normalizedText: command.payload.normalizedText,
+        confidence: command.payload.confidence,
+        evidence: verified
+      });
+      const result = {
+        predecessorClaimId: predecessor.claimId,
+        predecessorVersion: 2 as const,
+        predecessorStatus: "superseded" as const,
+        successorClaimId,
+        successorVersion: 1 as const,
+        successorStatus: "proposed" as const,
+        evidenceSpanId,
+        supportAttestationId,
+        recoveryId,
+        disposition: "reworked" as const,
+        reasonCode: "reworked" as const
+      };
+      const safeDetail = {
+        predecessorClaimId: predecessor.claimId,
+        predecessorVersion: 2,
+        successorClaimId,
+        successorVersion: 1,
+        evidenceSpanId,
+        supportAttestationId,
+        recoveryId,
+        disposition: "reworked",
+        reasonCode: "reworked"
+      };
+      await writeAuditAndOutbox({
+        tx,
+        ledger,
+        context,
+        commandId: reservation.commandId,
+        traceparent,
+        spaceId: subject.spaceId,
+        action: "initiative.primary_objective.rework",
+        resourceType: "claim",
+        resourceId: successorClaimId,
+        eventType: "initiative.primary_objective.proposal_reworked",
+        aggregateType: "claim",
+        aggregateVersion: 1,
+        payload: safeDetail,
+        auditDetail: safeDetail
+      });
+      await completeCommand(
+        domain.commands,
+        command,
+        context,
+        requestHash,
+        reservationSpaceId,
+        reservation.commandId,
+        "claim",
+        successorClaimId,
         result
       );
       return result;
@@ -276,10 +538,34 @@ export class TruthLedgerDomainCommandBus {
 
     const claimIds = command.payload.claims.map(({ claimId }) => claimId);
     const headers = await ledger
-      .lockClaimSupportHeaders(context.tenantId, context.workspaceId, claimIds)
+      .readClaimSupportHeaders(context.tenantId, context.workspaceId, claimIds)
       .catch(() => {
         throw new B2AuthorizationError();
       });
+    const discoveredCoordinate = headers[0];
+    if (
+      !discoveredCoordinate ||
+      discoveredCoordinate.spaceId !== subject.spaceId ||
+      discoveredCoordinate.subjectType !== subject.subjectType ||
+      discoveredCoordinate.subjectId !== subject.subjectId ||
+      headers.some(
+        (header) =>
+          header.spaceId !== discoveredCoordinate.spaceId ||
+          header.subjectType !== discoveredCoordinate.subjectType ||
+          header.subjectId !== discoveredCoordinate.subjectId ||
+          header.predicate !== discoveredCoordinate.predicate
+      )
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+    await ledger.lockFirstAcceptanceSlot({
+      tenantId: context.tenantId,
+      workspaceId: context.workspaceId,
+      spaceId: discoveredCoordinate.spaceId,
+      subjectType: discoveredCoordinate.subjectType,
+      subjectId: discoveredCoordinate.subjectId,
+      predicate: discoveredCoordinate.predicate
+    });
     for (const header of headers) {
       await this.authorize(tx, context, "claim.read", { type: "claim", id: header.claimId }, true);
       await this.authorize(
@@ -296,37 +582,38 @@ export class TruthLedgerDomainCommandBus {
       context.workspaceId,
       claimIds
     );
+    const expectedVersions = new Map(
+      command.payload.claims.map(({ claimId, expectedVersion }) => [claimId, expectedVersion])
+    );
+    const headersByClaimId = new Map(headers.map((header) => [header.claimId, header]));
     if (
-      persistedClaims.some(
-        ({ claim }) =>
-          claim.subjectType !== subject.subjectType ||
-          claim.subjectId !== subject.subjectId ||
-          claim.spaceId !== subject.spaceId
-      )
+      persistedClaims.some(({ claim, claimVersion, evidenceSpanId, sourceArtifactId }) => {
+        const header = headersByClaimId.get(claim.id);
+        return (
+          !header ||
+          claim.status !== "proposed" ||
+          expectedVersions.get(claim.id) !== claimVersion ||
+          claim.spaceId !== discoveredCoordinate.spaceId ||
+          claim.subjectType !== discoveredCoordinate.subjectType ||
+          claim.subjectId !== discoveredCoordinate.subjectId ||
+          claim.predicate !== discoveredCoordinate.predicate ||
+          evidenceSpanId !== header.evidenceSpanId ||
+          sourceArtifactId !== header.sourceArtifactId
+        );
+      })
     ) {
       throw new TruthLedgerConflictError();
     }
-    const acceptedCoordinate = persistedClaims[0]?.claim;
     if (
-      !acceptedCoordinate ||
-      persistedClaims.some(
-        ({ claim }) =>
-          claim.subjectType !== acceptedCoordinate.subjectType ||
-          claim.subjectId !== acceptedCoordinate.subjectId ||
-          claim.spaceId !== acceptedCoordinate.spaceId ||
-          claim.predicate !== acceptedCoordinate.predicate
-      )
+      discoveredCoordinate.subjectType === "initiative" &&
+      discoveredCoordinate.predicate === "initiative.primary_objective"
     ) {
-      throw new TruthLedgerConflictError();
+      await ledger.requirePrimaryObjectiveSupportConfirmations(
+        context.tenantId,
+        context.workspaceId,
+        claimIds
+      );
     }
-    await ledger.lockFirstAcceptanceSlot({
-      tenantId: context.tenantId,
-      workspaceId: context.workspaceId,
-      spaceId: acceptedCoordinate.spaceId,
-      subjectType: acceptedCoordinate.subjectType,
-      subjectId: acceptedCoordinate.subjectId,
-      predicate: acceptedCoordinate.predicate
-    });
 
     const admittedClaims: Claim[] = [];
     for (const persisted of persistedClaims) {
@@ -342,18 +629,6 @@ export class TruthLedgerDomainCommandBus {
         evidence: persisted.evidence
       });
       admittedClaims.push(Object.freeze({ ...persisted.claim, sourceSpan }));
-    }
-
-    const expectedVersions = new Map(
-      command.payload.claims.map(({ claimId, expectedVersion }) => [claimId, expectedVersion])
-    );
-    if (
-      persistedClaims.some(
-        ({ claim, claimVersion }) =>
-          claim.status !== "proposed" || expectedVersions.get(claim.id) !== claimVersion
-      )
-    ) {
-      throw new TruthLedgerConflictError();
     }
 
     const timestamp = await ledger.transactionTimestamp();
@@ -431,12 +706,11 @@ export class TruthLedgerDomainCommandBus {
 function toDurableTruthCommand(
   command: B2AuthorizedDomainCommand<DurableTruthCommandKind>
 ): DurableTruthCommand {
-  if (command.kind === "fact.accept") return command;
+  if (command.kind === "fact.accept" || command.kind === "initiative.primary_objective.withdraw") {
+    return command;
+  }
   const { valueJson, ...payload } = command.payload;
-  return {
-    ...command,
-    payload: { ...payload, canonicalValue: valueJson }
-  };
+  return { ...command, payload: { ...payload, canonicalValue: valueJson } } as DurableTruthCommand;
 }
 
 async function reserveCommand(
@@ -458,6 +732,9 @@ async function reserveCommand(
       commandSchemaVersion: COMMAND_SCHEMA_VERSION,
       idempotencyKey: command.idempotencyKey,
       canonicalRequestHash: requestHash,
+      ...(safeRequestForCommand(command) === undefined
+        ? {}
+        : { safeRequest: safeRequestForCommand(command)! }),
       actorUserId: context.actorUserId!,
       actorMembershipId: context.actorMembershipId!,
       ...(context.delegatedByUserId === undefined
@@ -484,6 +761,67 @@ async function reserveCommand(
     }
     throw error;
   }
+}
+
+function safeRequestForCommand(
+  command: DurableTruthCommand
+): Readonly<Record<string, unknown>> | undefined {
+  if (command.kind === "fact.accept") return undefined;
+  const subject = {
+    subjectType: command.payload.subject.type,
+    subjectId: command.payload.subject.id,
+    expectedSubjectVersion: command.payload.subject.expectedVersion
+  };
+  if (command.kind === "initiative.primary_objective.withdraw") {
+    return {
+      ...subject,
+      predecessorClaimId: command.payload.proposal.claimId,
+      expectedPredecessorVersion: command.payload.proposal.expectedVersion,
+      disposition: command.payload.disposition,
+      reasonCode: command.payload.reasonCode
+    };
+  }
+  const evidence = command.payload.evidence;
+  return {
+    ...subject,
+    ...(command.kind === "claim.create" && command.payload.expectedPrimaryObjectiveGeneration
+      ? command.payload.expectedPrimaryObjectiveGeneration.kind === "empty"
+        ? {
+            expectedLatestClaimId: null,
+            expectedLatestClaimStatus: null,
+            expectedLatestClaimVersion: null
+          }
+        : {
+            expectedLatestClaimId: command.payload.expectedPrimaryObjectiveGeneration.claimId,
+            expectedLatestClaimStatus:
+              command.payload.expectedPrimaryObjectiveGeneration.expectedStatus,
+            expectedLatestClaimVersion:
+              command.payload.expectedPrimaryObjectiveGeneration.expectedVersion
+          }
+      : {}),
+    ...(command.kind === "initiative.primary_objective.rework"
+      ? {
+          predecessorClaimId: command.payload.predecessor.claimId,
+          expectedPredecessorVersion: command.payload.predecessor.expectedVersion
+        }
+      : {}),
+    predicate:
+      command.kind === "claim.create" ? command.payload.predicate : "initiative.primary_objective",
+    valueHash: createHash("sha256").update(command.payload.canonicalValue, "utf8").digest("hex"),
+    sourceArtifactId: evidence.sourceArtifactId,
+    sourceChunkId: evidence.sourceChunkId,
+    expectedSourceVersion: evidence.expectedSourceVersion,
+    expectedChunkVersion: evidence.expectedChunkVersion,
+    normalizationVersion: evidence.normalizationVersion,
+    chunkingVersion: evidence.chunkingVersion,
+    startOffset: evidence.startOffset,
+    endOffset: evidence.endOffset,
+    sourceContentHash: evidence.sourceContentHash,
+    sourceNormalizedContentHash: evidence.sourceNormalizedContentHash,
+    chunkContentHash: evidence.chunkContentHash,
+    excerptHash: evidence.excerptHash,
+    supportConfirmed: command.payload.supportConfirmation?.confirmed === true
+  };
 }
 
 async function completeCommand(
@@ -518,12 +856,22 @@ async function writeAuditAndOutbox(input: {
   commandId: string;
   traceparent: string;
   spaceId: string;
-  action: "claim.create" | "fact.accept";
+  action:
+    | "claim.create"
+    | "initiative.primary_objective.withdraw"
+    | "initiative.primary_objective.reject"
+    | "initiative.primary_objective.rework"
+    | "fact.accept";
   resourceType: "claim" | "accepted_fact";
   resourceId: string;
-  eventType: "claim.proposed" | "fact.accepted";
+  eventType:
+    | "claim.proposed"
+    | "initiative.primary_objective.proposal_withdrawn"
+    | "initiative.primary_objective.proposal_rejected"
+    | "initiative.primary_objective.proposal_reworked"
+    | "fact.accepted";
   aggregateType: "claim" | "accepted_fact";
-  aggregateVersion: 1;
+  aggregateVersion: number;
   payload: Record<string, unknown>;
   auditDetail: Record<string, unknown>;
 }): Promise<void> {

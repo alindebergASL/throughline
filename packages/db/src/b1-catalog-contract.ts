@@ -9,7 +9,7 @@ export const B1_MIGRATION_IDS = [
 
 type B1MigrationId = (typeof B1_MIGRATION_IDS)[number];
 type MigrationSources = ReadonlyMap<string, string>;
-type AdditiveB2Phase = 0 | 1 | 2 | 3 | 4;
+type AdditiveB2Phase = 0 | 1 | 2 | 3 | 4 | 5;
 
 const B1_PREDECESSOR_IDS = [
   "0001_wave_a2_identity_access_rls.sql",
@@ -19,6 +19,7 @@ const B1_PREDECESSOR_IDS = [
 
 const B2_INTEGRITY_MIGRATION_ID = "0008_b2_slice1_command_integrity.sql";
 const B2_LIFECYCLE_MIGRATION_ID = "0009_b2_source_truth_lifecycle_interlock.sql";
+const B2_OBJECTIVE_RECOVERY_MIGRATION_ID = "0011_b2_primary_objective_proposal_recovery.sql";
 
 export async function validateMigrationJournal(
   client: PgPoolClient,
@@ -1772,6 +1773,41 @@ async function validateCommandIntegrityObjects(
     }
   }
 
+  if (additiveB2Phase >= 5) {
+    const objectiveRecoverySource = requireSource(
+      migrationSources,
+      B2_OBJECTIVE_RECOVERY_MIGRATION_ID
+    );
+    const dropB2TriggerStatement = objectiveRecoverySource.match(
+      /DROP TRIGGER domain_command_records_b2_slice1_atomicity_deferred[\s\S]*?;/
+    )?.[0];
+    const replacementB2TriggerStatement = objectiveRecoverySource.match(
+      /CREATE CONSTRAINT TRIGGER domain_command_records_b2_slice1_atomicity_deferred[\s\S]*?;/
+    )?.[0];
+    const safeRequestConstraintStatement = objectiveRecoverySource.match(
+      /ALTER TABLE ops\.domain_command_records\s+ADD CONSTRAINT domain_command_records_b2_safe_request_check[\s\S]*?\n\s*\);/
+    )?.[0];
+    if (
+      !dropB2TriggerStatement ||
+      !replacementB2TriggerStatement ||
+      !safeRequestConstraintStatement
+    ) {
+      throw new Error("Fixed objective recovery command trigger contract parser failed");
+    }
+    await client.query(
+      safeRequestConstraintStatement.replace("ops.domain_command_records", expectedRelation)
+    );
+    await client.query(
+      dropB2TriggerStatement.replace("ops.domain_command_records", expectedRelation)
+    );
+    await client.query(
+      replacementB2TriggerStatement.replace(
+        "ON ops.domain_command_records",
+        `ON ${expectedRelation}`
+      )
+    );
+  }
+
   const constraintCatalog = async (relation: string) =>
     (
       await client.query<Record<string, unknown>>(
@@ -1869,6 +1905,11 @@ const predecessorAclRelations = [
   "ops.product_outbox_events"
 ] as const;
 
+const objectiveRecoveryIntegrityRelations = [
+  "truth.initiative_objective_proposal_recoveries",
+  "truth.initiative_objective_support_attestations"
+] as const;
+
 function predecessorAclRows(
   relation: string,
   scope: "table" | "column",
@@ -1891,7 +1932,10 @@ function predecessorAclRows(
   );
 }
 
-function expectedPredecessorAcl(integrityInstalled: boolean): ExpectedPredecessorAcl[] {
+function expectedPredecessorAcl(
+  integrityInstalled: boolean,
+  additiveB2Phase: AdditiveB2Phase
+): ExpectedPredecessorAcl[] {
   const rows: ExpectedPredecessorAcl[] = [];
   for (const relation of [
     "access.access_relationships",
@@ -1952,6 +1996,7 @@ function expectedPredecessorAcl(integrityInstalled: boolean): ExpectedPredecesso
         "command_schema_version",
         "idempotency_key",
         "canonical_request_hash",
+        ...(additiveB2Phase >= 5 ? ["safe_request"] : []),
         "actor_user_id",
         "actor_membership_id",
         "delegating_user_id",
@@ -2069,6 +2114,14 @@ function expectedPredecessorAcl(integrityInstalled: boolean): ExpectedPredecesso
       );
     }
   }
+  if (additiveB2Phase >= 5) {
+    for (const relation of objectiveRecoveryIntegrityRelations) {
+      rows.push(
+        ...predecessorAclRows(relation, "table", [], "throughline_app", ["INSERT", "SELECT"]),
+        ...predecessorAclRows(relation, "table", [], "throughline_b1_0_integrity", ["SELECT"])
+      );
+    }
+  }
   return rows;
 }
 
@@ -2131,6 +2184,31 @@ async function validateIntegrityPredecessorAccess(
         using_expression: "true",
         check_expression: null
       }))
+    );
+    expectedPolicies.sort((left, right) =>
+      `${left.relation}|${left.name}`.localeCompare(`${right.relation}|${right.name}`)
+    );
+  }
+  if (additiveB2Phase >= 5) {
+    expectedPolicies.push(
+      {
+        relation: "truth.initiative_objective_proposal_recoveries",
+        name: "objective_recovery_integrity_select",
+        command: "r",
+        permissive: true,
+        roles: ["throughline_b1_0_integrity"],
+        using_expression: "true",
+        check_expression: null
+      },
+      {
+        relation: "truth.initiative_objective_support_attestations",
+        name: "objective_support_integrity_select",
+        command: "r",
+        permissive: true,
+        roles: ["throughline_b1_0_integrity"],
+        using_expression: "true",
+        check_expression: null
+      }
     );
     expectedPolicies.sort((left, right) =>
       `${left.relation}|${left.name}`.localeCompare(`${right.relation}|${right.name}`)
@@ -2208,7 +2286,13 @@ async function validateIntegrityPredecessorAccess(
      UNION ALL
      SELECT * FROM unexpected_diagnostic
      ORDER BY direction`,
-    [predecessorAclRelations, JSON.stringify(expectedPredecessorAcl(integrityInstalled))]
+    [
+      [
+        ...predecessorAclRelations,
+        ...(additiveB2Phase >= 5 ? objectiveRecoveryIntegrityRelations : [])
+      ],
+      JSON.stringify(expectedPredecessorAcl(integrityInstalled, additiveB2Phase))
+    ]
   );
   if (aclDiagnostics.rowCount !== 0) {
     throw new Error(

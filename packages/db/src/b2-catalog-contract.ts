@@ -1,10 +1,17 @@
 import type { PgPoolClient } from "./client.js";
+import {
+  exactTruthCatalogForPhase,
+  type ExactTruthCatalog,
+  type ExactTruthPolicy,
+  type ExactTruthRelation
+} from "./b2-exact-catalog.js";
 
 export const B2_MIGRATION_IDS = [
   "0007_b2_slice1_truth_storage.sql",
   "0008_b2_slice1_command_integrity.sql",
   "0009_b2_source_truth_lifecycle_interlock.sql",
-  "0010_b2_trusted_objective_initiative_lock.sql"
+  "0010_b2_trusted_objective_initiative_lock.sql",
+  "0011_b2_primary_objective_proposal_recovery.sql"
 ] as const;
 
 export type B2MigrationId = (typeof B2_MIGRATION_IDS)[number];
@@ -19,7 +26,6 @@ const fixedPredecessors = [
 ] as const;
 
 const truthTables = ["accepted_facts", "claims", "fact_claims", "verified_evidence_spans"] as const;
-
 const truthColumns = {
   accepted_facts: [
     "id",
@@ -174,8 +180,9 @@ export async function assertB2MigrationStateAbsent(
           ? await client.query(
               "SELECT to_regprocedure('ops.enforce_b2_source_truth_lifecycle_interlock()')::text AS installed"
             )
-          : await client.query(
-              `SELECT
+          : migrationId === "0010_b2_trusted_objective_initiative_lock.sql"
+            ? await client.query(
+                `SELECT
                  has_column_privilege(
                    'throughline_app','work.initiatives','id','UPDATE'
                  ) OR EXISTS (
@@ -183,8 +190,11 @@ export async function assertB2MigrationStateAbsent(
                     WHERE policy.polrelid = to_regclass('work.initiatives')
                       AND policy.polname = ANY($1::text[])
                  ) AS installed`,
-              [["initiatives_app_truth_lock", "initiatives_app_permanent_no_write"]]
-            );
+                [["initiatives_app_truth_lock", "initiatives_app_permanent_no_write"]]
+              )
+            : await client.query(
+                "SELECT to_regclass('truth.initiative_objective_support_attestations')::text AS installed"
+              );
   if (installed.rows[0]?.installed) {
     throw new Error(`B2 migration state already exists without journal row for ${migrationId}`);
   }
@@ -207,21 +217,27 @@ export async function validateB2CatalogContract(
   if (phase === 0) return;
 
   assertNarrowMigrationSources(migrationSources, phase);
-  await validateTruthTables(client);
-  await validateTruthColumnsAndConstraints(client, phase);
-  await validateTruthPolicies(client, phase);
-  await validateTruthSecurity(client, phase);
+  const exactTruthCatalog = exactTruthCatalogForPhase(phase);
+  if (phase >= 5) {
+    await validateObjectiveRecoveryCatalog(client, migrationSources.get(B2_MIGRATION_IDS[4])!);
+  }
+  await validateTruthTables(client, exactTruthCatalog.relations);
+  await validateTruthColumnsAndConstraints(client, phase, exactTruthCatalog);
+  await validateTruthPolicies(client, exactTruthCatalog.policies);
+  await validateTruthSecurity(client, phase, exactTruthCatalog.relations);
   await validateTruthFunctions(
     client,
     migrationSources.get(B2_MIGRATION_IDS[0])!,
     migrationSources.get(B2_MIGRATION_IDS[2]),
+    migrationSources.get(B2_MIGRATION_IDS[4]),
     phase
   );
-  await validateTruthConstraintsAndTriggers(client);
+  await validateTruthConstraintsAndTriggers(client, phase);
   await validateCommandBoundary(
     client,
     migrationSources.get("0008_b2_slice1_command_integrity.sql")!,
     migrationSources.get("0009_b2_source_truth_lifecycle_interlock.sql"),
+    migrationSources.get("0011_b2_primary_objective_proposal_recovery.sql"),
     phase
   );
   if (phase >= 3) {
@@ -253,6 +269,34 @@ function assertNarrowMigrationSources(
   if (phase >= 4) {
     if (!initiativeLock) throw new Error("Missing fixed B2 Initiative lock migration source");
     assertB2InitiativeLockMigrationSource(initiativeLock);
+  }
+  if (phase >= 5) {
+    const recovery = migrationSources.get("0011_b2_primary_objective_proposal_recovery.sql");
+    if (!recovery) throw new Error("Missing objective proposal recovery migration source");
+    for (const required of [
+      "initiative_objective_support_attestations",
+      "initiative_objective_proposal_recoveries",
+      "initiative.primary_objective.withdraw.v1",
+      "initiative.primary_objective.rework.v1",
+      "claims_one_active_primary_objective_proposal",
+      "objective acceptance requires human support confirmation"
+    ]) {
+      if (!recovery.includes(required)) {
+        throw new Error(`Objective proposal recovery migration omits ${required}`);
+      }
+    }
+    for (const forbidden of [
+      "fact.supersede.v1",
+      "fact.revoke.v1",
+      "fact.contest.v1",
+      "derived_view.regenerate.v1",
+      "CREATE TABLE truth.conflict",
+      "CREATE TABLE truth.fact_lifecycle"
+    ]) {
+      if (recovery.includes(forbidden)) {
+        throw new Error(`Objective proposal recovery migration broadens into ${forbidden}`);
+      }
+    }
   }
   for (const table of truthTables) {
     if (!schema.includes(`CREATE TABLE truth.${table}`)) {
@@ -315,35 +359,793 @@ function assertNarrowMigrationSources(
   }
 }
 
-async function validateTruthTables(client: PgPoolClient): Promise<void> {
+async function validateObjectiveRecoveryCatalog(
+  client: PgPoolClient,
+  recoverySource: string
+): Promise<void> {
+  const columns = await client.query<{ table_name: string; columns: string[] }>(
+    `SELECT relation.relname AS table_name,
+            array_agg(attribute.attname::text ORDER BY attribute.attnum) AS columns
+       FROM pg_class relation
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+       JOIN pg_attribute attribute ON attribute.attrelid = relation.oid
+      WHERE namespace.nspname = 'truth'
+        AND relation.relname IN (
+          'initiative_objective_support_attestations',
+          'initiative_objective_proposal_recoveries'
+        ) AND attribute.attnum > 0 AND NOT attribute.attisdropped
+      GROUP BY relation.relname ORDER BY relation.relname`
+  );
+  const expectedColumns = [
+    {
+      table_name: "initiative_objective_proposal_recoveries",
+      columns: [
+        "id",
+        "tenant_id",
+        "workspace_id",
+        "space_id",
+        "initiative_id",
+        "predecessor_claim_id",
+        "successor_claim_id",
+        "disposition",
+        "reason_code",
+        "acted_by_user_id",
+        "acted_by_membership_id",
+        "causation_command_id",
+        "created_at",
+        "version"
+      ]
+    },
+    {
+      table_name: "initiative_objective_support_attestations",
+      columns: [
+        "id",
+        "tenant_id",
+        "workspace_id",
+        "space_id",
+        "initiative_id",
+        "claim_id",
+        "verified_evidence_span_id",
+        "objective_value_hash",
+        "excerpt_hash",
+        "confirmed_by_user_id",
+        "confirmed_by_membership_id",
+        "causation_command_id",
+        "confirmed_at",
+        "version"
+      ]
+    }
+  ];
+  if (JSON.stringify(columns.rows) !== JSON.stringify(expectedColumns)) {
+    throw new Error("Objective recovery column inventory drifted");
+  }
+
+  const constraints = await client.query<{
+    relation: string;
+    type: string;
+    definition: string;
+  }>(
+    `SELECT relation.relname AS relation, constraint_record.contype::text AS type,
+            regexp_replace(
+              pg_get_constraintdef(constraint_record.oid, false), E'\\\\s+', ' ', 'g'
+            ) AS definition
+       FROM pg_constraint constraint_record
+       JOIN pg_class relation ON relation.oid = constraint_record.conrelid
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE (namespace.nspname = 'truth' AND (
+        relation.relname IN (
+          'initiative_objective_support_attestations',
+          'initiative_objective_proposal_recoveries'
+        ) OR (
+          relation.relname = 'claims' AND constraint_record.conname IN (
+            'claims_status_check','claims_canonical_value_text_valid'
+          )
+        )
+      )) OR (namespace.nspname = 'ops' AND constraint_record.conname IN (
+        'domain_command_records_b2_safe_request_check',
+        'audit_events_action_check','audit_events_action_resource_pair_check',
+        'product_outbox_events_event_type_check',
+        'product_outbox_events_event_aggregate_pair_check'
+      )) ORDER BY relation.relname, constraint_record.contype, definition`
+  );
+  const constraintStatement = recoverySource.match(
+    /ALTER TABLE ops\.domain_command_records\s+ADD CONSTRAINT domain_command_records_b2_safe_request_check[\s\S]*?\n\s*\);/
+  )?.[0];
+  if (!constraintStatement) {
+    throw new Error("Fixed objective recovery safe-request constraint parser failed");
+  }
+  await client.query(`CREATE TEMP TABLE b2_expected_safe_request_constraint (
+    command_kind text, safe_request jsonb, safe_request_adopted boolean
+  ) ON COMMIT DROP`);
+  await client.query(
+    constraintStatement.replace(
+      "ops.domain_command_records",
+      "pg_temp.b2_expected_safe_request_constraint"
+    )
+  );
+  const canonicalConstraint = await client.query<{ definition: string }>(
+    `SELECT regexp_replace(
+       pg_get_constraintdef(constraint_record.oid, false), E'\\\\s+', ' ', 'g'
+     ) AS definition
+       FROM pg_constraint constraint_record
+      WHERE constraint_record.conrelid =
+        to_regclass('pg_temp.b2_expected_safe_request_constraint')
+        AND constraint_record.conname = 'domain_command_records_b2_safe_request_check'`
+  );
+  await client.query("DROP TABLE pg_temp.b2_expected_safe_request_constraint");
+  const expectedConstraints = exactObjectiveRecoveryConstraints(
+    canonicalConstraint.rows[0]?.definition ?? ""
+  );
+  if (
+    JSON.stringify(sortExactCatalogRows(constraints.rows)) !==
+    JSON.stringify(sortExactCatalogRows(expectedConstraints))
+  ) {
+    throw new Error("Objective recovery exact constraint inventory drifted");
+  }
+
+  const indexes = await client.query<{
+    relation: string;
+    name: string;
+    definition: string;
+    is_unique: boolean;
+    is_primary: boolean;
+    is_valid: boolean;
+    is_ready: boolean;
+    is_live: boolean;
+  }>(
+    `SELECT relation.relname AS relation, index_relation.relname AS name,
+            regexp_replace(regexp_replace(
+              pg_get_indexdef(index_record.indexrelid, 0, false),
+              '^CREATE UNIQUE INDEX [^ ]+ ON ', 'CREATE UNIQUE INDEX ON '
+            ), E'\\\\s+', ' ', 'g') AS definition,
+            index_record.indisunique AS is_unique,
+            index_record.indisprimary AS is_primary,
+            index_record.indisvalid AS is_valid,
+            index_record.indisready AS is_ready,
+            index_record.indislive AS is_live
+       FROM pg_index index_record
+       JOIN pg_class relation ON relation.oid = index_record.indrelid
+       JOIN pg_class index_relation ON index_relation.oid = index_record.indexrelid
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'truth' AND (
+        relation.relname IN (
+          'initiative_objective_support_attestations',
+          'initiative_objective_proposal_recoveries'
+        ) OR index_record.indexrelid =
+          to_regclass('truth.claims_one_active_primary_objective_proposal')
+      ) ORDER BY relation.relname, index_relation.relname`
+  );
+  const expectedIndexes = exactObjectiveRecoveryIndexes();
+  if (JSON.stringify(indexes.rows) !== JSON.stringify(expectedIndexes)) {
+    throw new Error("Objective recovery exact index inventory drifted");
+  }
+
+  const catalog = await client.query<{
+    atomicity_function: string | null;
+    support_function: string | null;
+    recovery_function: string | null;
+    terminal_recovery_function: string | null;
+  }>(
+    `SELECT
+       to_regprocedure('ops.require_b2_slice1_command_atomicity()')::text AS atomicity_function,
+       to_regprocedure('truth.require_objective_support_attestation()')::text AS support_function,
+       to_regprocedure('truth.validate_objective_recovery()')::text AS recovery_function,
+       to_regprocedure('truth.require_objective_recovery_for_terminal_claim()')::text
+         AS terminal_recovery_function`
+  );
+  const row = catalog.rows[0];
+  if (
+    !row ||
+    !row.atomicity_function ||
+    !row.support_function ||
+    !row.recovery_function ||
+    !row.terminal_recovery_function
+  ) {
+    throw new Error("Objective recovery constraints or functions are incomplete");
+  }
+
+  const commandBoundary = await client.query<{
+    validator: string;
+    atomicity: string;
+    trigger_kinds: string[];
+    safe_request_column: boolean;
+    safe_request_adopted_column: boolean;
+    safe_request_adopted_not_null: boolean;
+    safe_request_adopted_default: string | null;
+    command_relation_owned_by_migrator: boolean;
+    app_can_insert_safe_request_adopted: boolean;
+    app_can_update_safe_request_adopted: boolean;
+    safe_request_constraint: string | null;
+    safe_request_owner: string;
+    safe_request_config: string[] | null;
+    app_can_execute_safe_request: boolean;
+    public_can_execute_safe_request: boolean;
+  }>(
+    `SELECT
+       pg_get_functiondef(
+         'ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)'::regprocedure
+       ) AS validator,
+       pg_get_functiondef('ops.require_b2_slice1_command_atomicity()'::regprocedure) AS atomicity,
+       regexp_split_to_array(pg_get_triggerdef(trigger_record.oid, false), E'\\n') AS trigger_kinds,
+       EXISTS (SELECT 1 FROM pg_attribute attribute
+         WHERE attribute.attrelid = to_regclass('ops.domain_command_records')
+           AND attribute.attname = 'safe_request' AND NOT attribute.attisdropped)
+         AS safe_request_column,
+       EXISTS (SELECT 1 FROM pg_attribute attribute
+         WHERE attribute.attrelid = to_regclass('ops.domain_command_records')
+           AND attribute.attname = 'safe_request_adopted' AND NOT attribute.attisdropped)
+         AS safe_request_adopted_column,
+       (SELECT attribute.attnotnull FROM pg_attribute attribute
+         WHERE attribute.attrelid = to_regclass('ops.domain_command_records')
+           AND attribute.attname = 'safe_request_adopted' AND NOT attribute.attisdropped)
+         AS safe_request_adopted_not_null,
+       (SELECT pg_get_expr(default_record.adbin, default_record.adrelid, false)
+          FROM pg_attribute attribute
+          JOIN pg_attrdef default_record ON default_record.adrelid = attribute.attrelid
+            AND default_record.adnum = attribute.attnum
+         WHERE attribute.attrelid = to_regclass('ops.domain_command_records')
+           AND attribute.attname = 'safe_request_adopted' AND NOT attribute.attisdropped)
+         AS safe_request_adopted_default,
+       pg_get_userbyid(command_relation.relowner) = current_user
+         AS command_relation_owned_by_migrator,
+       has_column_privilege('throughline_app', command_relation.oid,
+         'safe_request_adopted', 'INSERT') AS app_can_insert_safe_request_adopted,
+       has_column_privilege('throughline_app', command_relation.oid,
+         'safe_request_adopted', 'UPDATE') AS app_can_update_safe_request_adopted,
+       (SELECT pg_get_constraintdef(constraint_record.oid, false)
+          FROM pg_constraint constraint_record
+         WHERE constraint_record.conrelid = to_regclass('ops.domain_command_records')
+           AND constraint_record.conname = 'domain_command_records_b2_safe_request_check')
+         AS safe_request_constraint,
+       pg_get_userbyid(safe_request_function.proowner) AS safe_request_owner,
+       safe_request_function.proconfig AS safe_request_config,
+       has_function_privilege('throughline_app', safe_request_function.oid, 'EXECUTE')
+         AS app_can_execute_safe_request,
+       EXISTS (SELECT 1 FROM aclexplode(COALESCE(safe_request_function.proacl,
+         acldefault('f', safe_request_function.proowner))) acl
+         WHERE acl.grantee = 0 AND acl.privilege_type = 'EXECUTE')
+         AS public_can_execute_safe_request
+      FROM pg_trigger trigger_record
+      CROSS JOIN pg_proc safe_request_function
+      CROSS JOIN pg_class command_relation
+      WHERE trigger_record.tgrelid = to_regclass('ops.domain_command_records')
+        AND trigger_record.tgname = 'domain_command_records_b2_slice1_atomicity_deferred'
+        AND NOT trigger_record.tgisinternal
+        AND safe_request_function.oid =
+          'ops.b2_slice1_safe_request_valid(text,jsonb)'::regprocedure
+        AND command_relation.oid = to_regclass('ops.domain_command_records')`
+  );
+  const boundary = commandBoundary.rows[0];
+  if (
+    !boundary?.safe_request_column ||
+    !boundary.safe_request_adopted_column ||
+    !boundary.safe_request_adopted_not_null ||
+    boundary.safe_request_adopted_default !== "false" ||
+    !boundary.command_relation_owned_by_migrator ||
+    boundary.app_can_insert_safe_request_adopted ||
+    boundary.app_can_update_safe_request_adopted ||
+    !boundary.safe_request_constraint?.includes("b2_slice1_safe_request_valid") ||
+    boundary.safe_request_owner !== "throughline_b1_0_integrity" ||
+    JSON.stringify(boundary.safe_request_config) !== JSON.stringify(["search_path=pg_catalog"]) ||
+    !boundary.app_can_execute_safe_request ||
+    boundary.public_can_execute_safe_request ||
+    !boundary.atomicity.includes("caused_recovery_count") ||
+    !boundary.atomicity.includes("caused_attestation_count")
+  ) {
+    throw new Error("Objective recovery exact command request/effect boundary drifted");
+  }
+  for (const kind of [
+    "claim.create.v1",
+    "initiative.primary_objective.withdraw.v1",
+    "initiative.primary_objective.rework.v1",
+    "fact.accept.v1"
+  ]) {
+    if (
+      !boundary?.validator.includes(kind) ||
+      !boundary.atomicity.includes(kind) ||
+      !boundary.trigger_kinds.join("\n").includes(kind)
+    ) {
+      throw new Error(`Objective recovery command boundary omits ${kind}`);
+    }
+  }
+
+  const policyCount = await client.query<{ count: string }>(
+    `SELECT count(*)::text AS count FROM pg_policy policy
+      WHERE policy.polrelid IN (
+        to_regclass('truth.initiative_objective_support_attestations'),
+        to_regclass('truth.initiative_objective_proposal_recoveries')
+      )`
+  );
+  if (policyCount.rows[0]?.count !== "6") {
+    throw new Error("Objective recovery RLS policy inventory drifted");
+  }
+  const policies = await client.query<{
+    relation: string;
+    name: string;
+    command: string;
+    permissive: boolean;
+    roles: string[];
+    using_expression: string | null;
+    check_expression: string | null;
+  }>(
+    `SELECT relation.relname AS relation, policy.polname AS name,
+            policy.polcmd::text AS command, policy.polpermissive AS permissive,
+            ARRAY(SELECT role::regrole::text FROM unnest(policy.polroles) role ORDER BY 1) AS roles,
+            regexp_replace(
+              pg_get_expr(policy.polqual, policy.polrelid, false), E'\\\\s+', ' ', 'g'
+            ) AS using_expression,
+            regexp_replace(
+              pg_get_expr(policy.polwithcheck, policy.polrelid, false), E'\\\\s+', ' ', 'g'
+            ) AS check_expression
+       FROM pg_policy policy
+       JOIN pg_class relation ON relation.oid = policy.polrelid
+      WHERE policy.polrelid IN (
+        to_regclass('truth.initiative_objective_support_attestations'),
+        to_regclass('truth.initiative_objective_proposal_recoveries')
+      ) ORDER BY relation.relname, policy.polname`
+  );
+  if (JSON.stringify(policies.rows) !== JSON.stringify(exactObjectiveRecoveryPolicies())) {
+    throw new Error("Objective recovery exact RLS policy definitions drifted");
+  }
+
+  const triggers = await client.query<{ name: string }>(
+    `SELECT trigger_record.tgname AS name FROM pg_trigger trigger_record
+      WHERE trigger_record.tgname = ANY($1::text[]) AND NOT trigger_record.tgisinternal
+      ORDER BY trigger_record.tgname`,
+    [
+      [
+        "attestations_objective_support_deferred",
+        "claims_objective_recovery_deferred",
+        "claims_objective_support_deferred",
+        "objective_recovery_command_guard",
+        "objective_recovery_immutable",
+        "objective_recovery_valid_deferred",
+        "objective_support_command_guard",
+        "objective_support_immutable",
+        "objective_support_insert_guard"
+      ]
+    ]
+  );
+  if (triggers.rows.length !== 9) {
+    throw new Error("Objective recovery trigger inventory drifted");
+  }
+
+  const privilegeShape = await client.query<{
+    app_support_select: boolean;
+    app_support_insert: boolean;
+    app_support_update: boolean;
+    app_recovery_select: boolean;
+    app_recovery_insert: boolean;
+    app_recovery_delete: boolean;
+    worker_support_select: boolean;
+    relay_recovery_select: boolean;
+  }>(`SELECT
+    has_table_privilege('throughline_app',
+      'truth.initiative_objective_support_attestations','SELECT') AS app_support_select,
+    has_table_privilege('throughline_app',
+      'truth.initiative_objective_support_attestations','INSERT') AS app_support_insert,
+    has_table_privilege('throughline_app',
+      'truth.initiative_objective_support_attestations','UPDATE') AS app_support_update,
+    has_table_privilege('throughline_app',
+      'truth.initiative_objective_proposal_recoveries','SELECT') AS app_recovery_select,
+    has_table_privilege('throughline_app',
+      'truth.initiative_objective_proposal_recoveries','INSERT') AS app_recovery_insert,
+    has_table_privilege('throughline_app',
+      'truth.initiative_objective_proposal_recoveries','DELETE') AS app_recovery_delete,
+    has_table_privilege('throughline_worker',
+      'truth.initiative_objective_support_attestations','SELECT') AS worker_support_select,
+    has_table_privilege('throughline_relay',
+      'truth.initiative_objective_proposal_recoveries','SELECT') AS relay_recovery_select`);
+  if (
+    JSON.stringify(privilegeShape.rows[0]) !==
+    JSON.stringify({
+      app_support_select: true,
+      app_support_insert: true,
+      app_support_update: false,
+      app_recovery_select: true,
+      app_recovery_insert: true,
+      app_recovery_delete: false,
+      worker_support_select: false,
+      relay_recovery_select: false
+    })
+  ) {
+    throw new Error("Objective recovery least-privilege grants drifted");
+  }
+
+  const forbidden = await client.query<{ present: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1 FROM pg_class relation
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+       WHERE namespace.nspname = 'truth' AND relation.relname IN (
+         'conflict_groups','fact_lifecycle_events','fact_supersessions','derived_view_snapshots'
+       )
+     ) AS present`
+  );
+  if (forbidden.rows[0]?.present) {
+    throw new Error("Objective recovery catalog contains generalized lifecycle storage");
+  }
+}
+
+function exactObjectiveRecoveryPolicies(): Array<{
+  relation: string;
+  name: string;
+  command: string;
+  permissive: boolean;
+  roles: string[];
+  using_expression: string | null;
+  check_expression: string | null;
+}> {
+  return [
+    {
+      relation: "initiative_objective_proposal_recoveries",
+      name: "objective_recovery_insert",
+      command: "a",
+      permissive: true,
+      roles: ["throughline_app"],
+      using_expression: null,
+      check_expression:
+        "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (acted_by_user_id = ops.current_user_id()) AND (acted_by_membership_id = ops.current_membership_id()) AND access.can_read_space(space_id, ( SELECT claim.access_class FROM truth.claims claim WHERE ((claim.tenant_id = initiative_objective_proposal_recoveries.tenant_id) AND (claim.workspace_id = initiative_objective_proposal_recoveries.workspace_id) AND (claim.id = initiative_objective_proposal_recoveries.predecessor_claim_id)))))"
+    },
+    {
+      relation: "initiative_objective_proposal_recoveries",
+      name: "objective_recovery_integrity_select",
+      command: "r",
+      permissive: true,
+      roles: ["throughline_b1_0_integrity"],
+      using_expression: "true",
+      check_expression: null
+    },
+    {
+      relation: "initiative_objective_proposal_recoveries",
+      name: "objective_recovery_select",
+      command: "r",
+      permissive: true,
+      roles: ["throughline_app"],
+      using_expression:
+        "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND access.can_read_space(space_id, ( SELECT claim.access_class FROM truth.claims claim WHERE ((claim.tenant_id = initiative_objective_proposal_recoveries.tenant_id) AND (claim.workspace_id = initiative_objective_proposal_recoveries.workspace_id) AND (claim.id = initiative_objective_proposal_recoveries.predecessor_claim_id)))))",
+      check_expression: null
+    },
+    {
+      relation: "initiative_objective_support_attestations",
+      name: "objective_support_insert",
+      command: "a",
+      permissive: true,
+      roles: ["throughline_app"],
+      using_expression: null,
+      check_expression:
+        "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (confirmed_by_user_id = ops.current_user_id()) AND (confirmed_by_membership_id = ops.current_membership_id()) AND access.can_read_space(space_id, ( SELECT claim.access_class FROM truth.claims claim WHERE ((claim.tenant_id = initiative_objective_support_attestations.tenant_id) AND (claim.workspace_id = initiative_objective_support_attestations.workspace_id) AND (claim.id = initiative_objective_support_attestations.claim_id)))))"
+    },
+    {
+      relation: "initiative_objective_support_attestations",
+      name: "objective_support_integrity_select",
+      command: "r",
+      permissive: true,
+      roles: ["throughline_b1_0_integrity"],
+      using_expression: "true",
+      check_expression: null
+    },
+    {
+      relation: "initiative_objective_support_attestations",
+      name: "objective_support_select",
+      command: "r",
+      permissive: true,
+      roles: ["throughline_app"],
+      using_expression:
+        "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND access.can_read_space(space_id, ( SELECT claim.access_class FROM truth.claims claim WHERE ((claim.tenant_id = initiative_objective_support_attestations.tenant_id) AND (claim.workspace_id = initiative_objective_support_attestations.workspace_id) AND (claim.id = initiative_objective_support_attestations.claim_id)))))",
+      check_expression: null
+    }
+  ];
+}
+
+function exactObjectiveRecoveryConstraints(safeRequestConstraint: string): Array<{
+  relation: string;
+  type: string;
+  definition: string;
+}> {
+  const claims = "claims";
+  const recovery = "initiative_objective_proposal_recoveries";
+  const support = "initiative_objective_support_attestations";
+  return [
+    {
+      relation: "audit_events",
+      type: "c",
+      definition:
+        "CHECK ((((action = 'organization.create'::text) AND (resource_type = 'organization'::text)) OR ((action = 'initiative.create'::text) AND (resource_type = 'initiative'::text)) OR ((action = ANY (ARRAY['activity.create'::text, 'activity.capture_add'::text])) AND (resource_type = 'activity'::text)) OR ((action = ANY (ARRAY['relationship.create'::text, 'relationship.end'::text])) AND (resource_type = 'relationship'::text)) OR ((action = ANY (ARRAY['content.create'::text, 'content.revise'::text])) AND (resource_type = 'content_item'::text)) OR ((action = ANY (ARRAY['source_artifact.capture'::text, 'source_artifact.correct'::text, 'source_artifact.tombstone'::text])) AND (resource_type = 'source_artifact'::text)) OR ((action = ANY (ARRAY['claim.create'::text, 'initiative.primary_objective.withdraw'::text, 'initiative.primary_objective.reject'::text, 'initiative.primary_objective.rework'::text])) AND (resource_type = 'claim'::text)) OR ((action = 'fact.accept'::text) AND (resource_type = 'accepted_fact'::text))))"
+    },
+    {
+      relation: "audit_events",
+      type: "c",
+      definition:
+        "CHECK ((action = ANY (ARRAY['organization.create'::text, 'initiative.create'::text, 'activity.create'::text, 'activity.capture_add'::text, 'relationship.create'::text, 'relationship.end'::text, 'content.create'::text, 'content.revise'::text, 'source_artifact.capture'::text, 'source_artifact.correct'::text, 'source_artifact.tombstone'::text, 'claim.create'::text, 'initiative.primary_objective.withdraw'::text, 'initiative.primary_objective.reject'::text, 'initiative.primary_objective.rework'::text, 'fact.accept'::text])))"
+    },
+    {
+      relation: claims,
+      type: "c",
+      definition:
+        "CHECK (((canonical_value_text = normalized_text) AND (normalized_text = NORMALIZE(normalized_text, NFC)) AND ((length(btrim(normalized_text)) >= 1) AND (length(btrim(normalized_text)) <= 2000)) AND (((status = 'proposed'::text) AND (version = 1)) OR ((status = ANY (ARRAY['accepted'::text, 'rejected'::text, 'superseded'::text])) AND (version = 2)))))"
+    },
+    {
+      relation: claims,
+      type: "c",
+      definition:
+        "CHECK ((status = ANY (ARRAY['proposed'::text, 'accepted'::text, 'rejected'::text, 'superseded'::text])))"
+    },
+    {
+      relation: "domain_command_records",
+      type: "c",
+      definition: safeRequestConstraint
+    },
+    {
+      relation: recovery,
+      type: "c",
+      definition:
+        "CHECK ((((disposition = 'reworked'::text) AND (reason_code = 'reworked'::text) AND (successor_claim_id IS NOT NULL)) OR ((disposition = ANY (ARRAY['withdrawn'::text, 'rejected'::text])) AND (reason_code <> 'reworked'::text) AND (successor_claim_id IS NULL))))"
+    },
+    {
+      relation: recovery,
+      type: "c",
+      definition:
+        "CHECK ((disposition = ANY (ARRAY['withdrawn'::text, 'rejected'::text, 'reworked'::text])))"
+    },
+    {
+      relation: recovery,
+      type: "c",
+      definition:
+        "CHECK ((reason_code = ANY (ARRAY['needs_rework'::text, 'unsupported'::text, 'incorrect'::text, 'duplicate'::text, 'not_useful'::text, 'sensitive'::text, 'other'::text, 'reworked'::text])))"
+    },
+    { relation: recovery, type: "c", definition: "CHECK ((version = 1))" },
+    { relation: recovery, type: "c", definition: "CHECK (ops.is_uuid_v7(id))" },
+    {
+      relation: recovery,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, acted_by_membership_id, acted_by_user_id) REFERENCES identity.memberships(tenant_id, workspace_id, id, user_id)"
+    },
+    {
+      relation: recovery,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, causation_command_id) REFERENCES ops.domain_command_records(tenant_id, workspace_id, id)"
+    },
+    {
+      relation: recovery,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, space_id, initiative_id) REFERENCES work.initiatives(tenant_id, workspace_id, space_id, id)"
+    },
+    {
+      relation: recovery,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, space_id, predecessor_claim_id) REFERENCES truth.claims(tenant_id, workspace_id, space_id, id)"
+    },
+    {
+      relation: recovery,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, space_id, successor_claim_id) REFERENCES truth.claims(tenant_id, workspace_id, space_id, id) DEFERRABLE INITIALLY DEFERRED"
+    },
+    { relation: recovery, type: "p", definition: "PRIMARY KEY (id)" },
+    {
+      relation: recovery,
+      type: "t",
+      definition: "TRIGGER DEFERRABLE INITIALLY DEFERRED"
+    },
+    {
+      relation: recovery,
+      type: "u",
+      definition: "UNIQUE (tenant_id, workspace_id, causation_command_id)"
+    },
+    {
+      relation: recovery,
+      type: "u",
+      definition: "UNIQUE (tenant_id, workspace_id, id)"
+    },
+    {
+      relation: recovery,
+      type: "u",
+      definition: "UNIQUE (tenant_id, workspace_id, predecessor_claim_id)"
+    },
+    {
+      relation: recovery,
+      type: "u",
+      definition: "UNIQUE (tenant_id, workspace_id, space_id, id)"
+    },
+    {
+      relation: support,
+      type: "c",
+      definition: "CHECK ((excerpt_hash ~ '^[a-f0-9]{64}$'::text))"
+    },
+    {
+      relation: support,
+      type: "c",
+      definition: "CHECK ((objective_value_hash ~ '^[a-f0-9]{64}$'::text))"
+    },
+    { relation: support, type: "c", definition: "CHECK ((version = 1))" },
+    { relation: support, type: "c", definition: "CHECK (ops.is_uuid_v7(id))" },
+    {
+      relation: support,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, causation_command_id) REFERENCES ops.domain_command_records(tenant_id, workspace_id, id)"
+    },
+    {
+      relation: support,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, confirmed_by_membership_id, confirmed_by_user_id) REFERENCES identity.memberships(tenant_id, workspace_id, id, user_id)"
+    },
+    {
+      relation: support,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, space_id, claim_id) REFERENCES truth.claims(tenant_id, workspace_id, space_id, id)"
+    },
+    {
+      relation: support,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, space_id, initiative_id) REFERENCES work.initiatives(tenant_id, workspace_id, space_id, id)"
+    },
+    {
+      relation: support,
+      type: "f",
+      definition:
+        "FOREIGN KEY (tenant_id, workspace_id, space_id, verified_evidence_span_id) REFERENCES truth.verified_evidence_spans(tenant_id, workspace_id, space_id, id)"
+    },
+    { relation: support, type: "p", definition: "PRIMARY KEY (id)" },
+    {
+      relation: support,
+      type: "t",
+      definition: "TRIGGER DEFERRABLE INITIALLY DEFERRED"
+    },
+    {
+      relation: support,
+      type: "u",
+      definition: "UNIQUE (tenant_id, workspace_id, claim_id)"
+    },
+    {
+      relation: support,
+      type: "u",
+      definition: "UNIQUE (tenant_id, workspace_id, id)"
+    },
+    {
+      relation: support,
+      type: "u",
+      definition: "UNIQUE (tenant_id, workspace_id, space_id, id)"
+    },
+    {
+      relation: "product_outbox_events",
+      type: "c",
+      definition:
+        "CHECK ((((event_type = 'organization.created'::text) AND (aggregate_type = 'organization'::text)) OR ((event_type = 'initiative.created'::text) AND (aggregate_type = 'initiative'::text)) OR ((event_type = ANY (ARRAY['activity.created'::text, 'activity.capture_added'::text])) AND (aggregate_type = 'activity'::text)) OR ((event_type = ANY (ARRAY['relationship.created'::text, 'relationship.ended'::text])) AND (aggregate_type = 'relationship'::text)) OR ((event_type = ANY (ARRAY['content.created'::text, 'content.revised'::text])) AND (aggregate_type = 'content_item'::text)) OR ((event_type = ANY (ARRAY['source_artifact.captured'::text, 'source_artifact.corrected'::text, 'source_artifact.tombstoned'::text])) AND (aggregate_type = 'source_artifact'::text)) OR ((event_type = ANY (ARRAY['claim.proposed'::text, 'initiative.primary_objective.proposal_withdrawn'::text, 'initiative.primary_objective.proposal_rejected'::text, 'initiative.primary_objective.proposal_reworked'::text])) AND (aggregate_type = 'claim'::text)) OR ((event_type = 'fact.accepted'::text) AND (aggregate_type = 'accepted_fact'::text))))"
+    },
+    {
+      relation: "product_outbox_events",
+      type: "c",
+      definition:
+        "CHECK ((event_type = ANY (ARRAY['organization.created'::text, 'initiative.created'::text, 'activity.created'::text, 'activity.capture_added'::text, 'relationship.created'::text, 'relationship.ended'::text, 'content.created'::text, 'content.revised'::text, 'source_artifact.captured'::text, 'source_artifact.corrected'::text, 'source_artifact.tombstoned'::text, 'claim.proposed'::text, 'initiative.primary_objective.proposal_withdrawn'::text, 'initiative.primary_objective.proposal_rejected'::text, 'initiative.primary_objective.proposal_reworked'::text, 'fact.accepted'::text])))"
+    }
+  ];
+}
+
+function sortExactCatalogRows<T extends { relation: string; definition: string; type?: string }>(
+  rows: readonly T[]
+): T[] {
+  return [...rows].sort((left, right) => {
+    const leftKey = `${left.relation}\u0000${left.type ?? ""}\u0000${left.definition}`;
+    const rightKey = `${right.relation}\u0000${right.type ?? ""}\u0000${right.definition}`;
+    return leftKey < rightKey ? -1 : leftKey > rightKey ? 1 : 0;
+  });
+}
+
+function exactObjectiveRecoveryIndexes(): Array<{
+  relation: string;
+  name: string;
+  definition: string;
+  is_unique: boolean;
+  is_primary: boolean;
+  is_valid: boolean;
+  is_ready: boolean;
+  is_live: boolean;
+}> {
+  const recovery = "initiative_objective_proposal_recoveries";
+  const support = "initiative_objective_support_attestations";
+  const index = (relation: string, name: string, keys: string, primary = false) => ({
+    relation,
+    name,
+    definition: `CREATE UNIQUE INDEX ON truth.${relation} USING btree (${keys})`,
+    is_unique: true,
+    is_primary: primary,
+    is_valid: true,
+    is_ready: true,
+    is_live: true
+  });
+  return [
+    {
+      relation: "claims",
+      name: "claims_one_active_primary_objective_proposal",
+      definition:
+        "CREATE UNIQUE INDEX ON truth.claims USING btree (tenant_id, workspace_id, space_id, subject_type, subject_id, predicate) WHERE ((subject_type = 'initiative'::text) AND (predicate = 'initiative.primary_objective'::text) AND (status = 'proposed'::text))",
+      is_unique: true,
+      is_primary: false,
+      is_valid: true,
+      is_ready: true,
+      is_live: true
+    },
+    index(
+      recovery,
+      "initiative_objective_proposal_rec_tenant_id_workspace_id_id_key",
+      "tenant_id, workspace_id, id"
+    ),
+    index(recovery, "initiative_objective_proposal_recoveries_pkey", "id", true),
+    index(
+      recovery,
+      "initiative_objective_proposal_tenant_id_workspace_id_causat_key",
+      "tenant_id, workspace_id, causation_command_id"
+    ),
+    index(
+      recovery,
+      "initiative_objective_proposal_tenant_id_workspace_id_predec_key",
+      "tenant_id, workspace_id, predecessor_claim_id"
+    ),
+    index(
+      recovery,
+      "initiative_objective_proposal_tenant_id_workspace_id_space__key",
+      "tenant_id, workspace_id, space_id, id"
+    ),
+    index(
+      support,
+      "initiative_objective_support__tenant_id_workspace_id_claim__key",
+      "tenant_id, workspace_id, claim_id"
+    ),
+    index(
+      support,
+      "initiative_objective_support__tenant_id_workspace_id_space__key",
+      "tenant_id, workspace_id, space_id, id"
+    ),
+    index(
+      support,
+      "initiative_objective_support_atte_tenant_id_workspace_id_id_key",
+      "tenant_id, workspace_id, id"
+    ),
+    index(support, "initiative_objective_support_attestations_pkey", "id", true)
+  ];
+}
+
+async function validateTruthTables(
+  client: PgPoolClient,
+  expectedRelations: ExactTruthRelation[]
+): Promise<void> {
   const result = await client.query<{
     name: string;
+    kind: string;
     rls: boolean;
     forced_rls: boolean;
     persistence: string;
+    owner: string;
   }>(
-    `SELECT relation.relname AS name, relation.relrowsecurity AS rls,
+    `SELECT relation.relname AS name, relation.relkind::text AS kind,
+            relation.relpersistence::text AS persistence,
+            relation.relrowsecurity AS rls,
             relation.relforcerowsecurity AS forced_rls,
-            relation.relpersistence::text AS persistence
+            CASE WHEN relation.relowner = current_user::regrole THEN 'migration_owner'
+                 ELSE pg_get_userbyid(relation.relowner) END AS owner
        FROM pg_class relation
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-      WHERE namespace.nspname = 'truth' AND relation.relkind = 'r'
+      WHERE namespace.nspname = 'truth'
+        AND relation.relkind NOT IN ('i','I')
       ORDER BY relation.relname`
   );
-  if (
-    result.rows.length !== truthTables.length ||
-    result.rows.some(
-      (row, index) =>
-        row.name !== truthTables[index] || !row.rls || !row.forced_rls || row.persistence !== "p"
-    )
-  ) {
+  if (JSON.stringify(result.rows) !== JSON.stringify(expectedRelations)) {
     throw new Error("B2 Slice 1 truth table inventory or forced RLS drifted");
   }
 }
 
 async function validateTruthColumnsAndConstraints(
   client: PgPoolClient,
-  phase: number
+  phase: number,
+  expectedCatalog: ExactTruthCatalog
 ): Promise<void> {
   const columns = await client.query<{ table_name: string; columns: string[] }>(
     `SELECT relation.relname AS table_name,
@@ -353,10 +1155,12 @@ async function validateTruthColumnsAndConstraints(
        JOIN pg_attribute attribute ON attribute.attrelid = relation.oid
       WHERE namespace.nspname = 'truth'
         AND relation.relkind = 'r'
+        AND relation.relname = ANY($1::text[])
         AND attribute.attnum > 0
         AND NOT attribute.attisdropped
       GROUP BY relation.relname
-      ORDER BY relation.relname`
+      ORDER BY relation.relname`,
+    [[...truthTables]]
   );
   const expectedColumns = truthTables.map((table_name) => ({
     table_name,
@@ -397,16 +1201,37 @@ async function validateTruthColumnsAndConstraints(
     );
   }
 
-  const constraints = await client.query<{ definition: string }>(
-    `SELECT pg_get_constraintdef(constraint_record.oid, false) AS definition
+  const constraints = await client.query<{
+    table_name: string;
+    name: string;
+    type: string;
+    definition: string;
+    deferrable: boolean;
+    initially_deferred: boolean;
+    validated: boolean;
+  }>(
+    `SELECT relation.relname AS table_name, constraint_record.conname AS name,
+            constraint_record.contype::text AS type,
+            pg_get_constraintdef(constraint_record.oid, false) AS definition,
+            constraint_record.condeferrable AS deferrable,
+            constraint_record.condeferred AS initially_deferred,
+            constraint_record.convalidated AS validated
        FROM pg_constraint constraint_record
        JOIN pg_class relation ON relation.oid = constraint_record.conrelid
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
       WHERE namespace.nspname = 'truth'
       ORDER BY relation.relname, constraint_record.conname`
   );
+  if (JSON.stringify(constraints.rows) !== JSON.stringify(expectedCatalog.constraints)) {
+    throw new Error("B2 Slice 1 exact truth constraint inventory drifted");
+  }
   const definitions = constraints.rows.map(({ definition }) => definition).join("\n");
-  for (const forbidden of ["rejected", "revoked", "redacted", "hash_disposition"]) {
+  for (const forbidden of [
+    ...(phase >= 5 ? [] : ["rejected"]),
+    "revoked",
+    "redacted",
+    "hash_disposition"
+  ]) {
     if (definitions.includes(forbidden)) {
       throw new Error(`B2 Slice 1 truth constraint contains future state ${forbidden}`);
     }
@@ -424,9 +1249,38 @@ async function validateTruthColumnsAndConstraints(
       throw new Error(`B2 Slice 1 truth constraint omits ${required}`);
     }
   }
+
+  const indexes = await client.query<{
+    table_name: string;
+    index_name: string;
+    unique: boolean;
+    primary: boolean;
+    valid: boolean;
+    ready: boolean;
+    live: boolean;
+    definition: string;
+  }>(
+    `SELECT relation.relname AS table_name, index_relation.relname AS index_name,
+            index_record.indisunique AS unique, index_record.indisprimary AS primary,
+            index_record.indisvalid AS valid, index_record.indisready AS ready,
+            index_record.indislive AS live,
+            pg_get_indexdef(index_record.indexrelid, 0, false) AS definition
+       FROM pg_index index_record
+       JOIN pg_class relation ON relation.oid = index_record.indrelid
+       JOIN pg_class index_relation ON index_relation.oid = index_record.indexrelid
+       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      WHERE namespace.nspname = 'truth'
+      ORDER BY relation.relname, index_relation.relname`
+  );
+  if (JSON.stringify(indexes.rows) !== JSON.stringify(expectedCatalog.indexes)) {
+    throw new Error("B2 Slice 1 exact truth index inventory drifted");
+  }
 }
 
-async function validateTruthPolicies(client: PgPoolClient, phase: number): Promise<void> {
+async function validateTruthPolicies(
+  client: PgPoolClient,
+  expectedPolicies: ExactTruthPolicy[]
+): Promise<void> {
   const result = await client.query<{
     policy_name: string;
     table_name: string;
@@ -436,7 +1290,7 @@ async function validateTruthPolicies(client: PgPoolClient, phase: number): Promi
     using_expression: string | null;
     check_expression: string | null;
   }>(
-    `SELECT policy.polname AS policy_name, relation.relname AS table_name,
+    `SELECT relation.relname AS table_name, policy.polname AS policy_name,
             policy.polcmd::text AS operation, policy.polpermissive AS permissive,
             ARRAY(
               SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC' ELSE role_oid::regrole::text END
@@ -445,62 +1299,13 @@ async function validateTruthPolicies(client: PgPoolClient, phase: number): Promi
             ) AS roles,
             pg_get_expr(policy.polqual, policy.polrelid) AS using_expression,
             pg_get_expr(policy.polwithcheck, policy.polrelid) AS check_expression
-       FROM pg_policy policy
-       JOIN pg_class relation ON relation.oid = policy.polrelid
-       JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+      FROM pg_policy policy
+      JOIN pg_class relation ON relation.oid = policy.polrelid
+      JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
       WHERE namespace.nspname = 'truth'
       ORDER BY relation.relname, policy.polname`
   );
-  const expectedPolicies = [
-    ["accepted_facts_insert", "accepted_facts", "a", "throughline_app"],
-    ["accepted_facts_select", "accepted_facts", "r", "throughline_app"],
-    ...(phase >= 2
-      ? [["accepted_facts_integrity_select", "accepted_facts", "r", "throughline_b1_0_integrity"]]
-      : []),
-    ["claims_insert", "claims", "a", "throughline_app"],
-    ["claims_select", "claims", "r", "throughline_app"],
-    ["claims_update", "claims", "w", "throughline_app"],
-    ...(phase >= 2
-      ? [["claims_integrity_select", "claims", "r", "throughline_b1_0_integrity"]]
-      : []),
-    ["fact_claims_insert", "fact_claims", "a", "throughline_app"],
-    ["fact_claims_select", "fact_claims", "r", "throughline_app"],
-    ...(phase >= 2
-      ? [["fact_claims_integrity_select", "fact_claims", "r", "throughline_b1_0_integrity"]]
-      : []),
-    ["verified_evidence_insert", "verified_evidence_spans", "a", "throughline_app"],
-    ["verified_evidence_select", "verified_evidence_spans", "r", "throughline_app"],
-    ...(phase >= 2
-      ? [
-          [
-            "verified_evidence_integrity_select",
-            "verified_evidence_spans",
-            "r",
-            "throughline_b1_0_integrity"
-          ]
-        ]
-      : [])
-  ]
-    .map(([policy_name, table_name, operation, role]) => ({
-      policy_name,
-      table_name,
-      operation,
-      permissive: true,
-      roles: [role]
-    }))
-    .sort((left, right) =>
-      `${left.table_name}|${left.policy_name}`.localeCompare(
-        `${right.table_name}|${right.policy_name}`
-      )
-    );
-  const actualPolicies = result.rows.map((policy) => ({
-    policy_name: policy.policy_name,
-    table_name: policy.table_name,
-    operation: policy.operation,
-    permissive: policy.permissive,
-    roles: policy.roles
-  }));
-  if (JSON.stringify(actualPolicies) !== JSON.stringify(expectedPolicies)) {
+  if (JSON.stringify(result.rows) !== JSON.stringify(expectedPolicies)) {
     throw new Error("B2 Slice 1 truth policy inventory drifted");
   }
   for (const policy of result.rows) {
@@ -524,7 +1329,11 @@ async function validateTruthPolicies(client: PgPoolClient, phase: number): Promi
   }
 }
 
-async function validateTruthSecurity(client: PgPoolClient, phase: number): Promise<void> {
+async function validateTruthSecurity(
+  client: PgPoolClient,
+  phase: number,
+  expectedRelations: ExactTruthRelation[]
+): Promise<void> {
   const schemaPrivileges = await client.query<Record<string, unknown>>(
     `SELECT CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
                  ELSE pg_get_userbyid(acl.grantee) END AS grantee,
@@ -559,9 +1368,9 @@ async function validateTruthSecurity(client: PgPoolClient, phase: number): Promi
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
        CROSS JOIN LATERAL aclexplode(COALESCE(
          relation.relacl, acldefault('r', relation.relowner)
-       )) acl
+      )) acl
       WHERE namespace.nspname = 'truth'
-        AND relation.relkind = 'r'
+        AND relation.relkind NOT IN ('i','I')
         AND acl.grantee <> relation.relowner
       UNION ALL
      SELECT relation.relname AS table_name, 'column'::text AS scope,
@@ -575,16 +1384,16 @@ async function validateTruthSecurity(client: PgPoolClient, phase: number): Promi
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
        CROSS JOIN LATERAL aclexplode(COALESCE(
          attribute.attacl, acldefault('c', relation.relowner)
-       )) acl
+      )) acl
       WHERE namespace.nspname = 'truth'
-        AND relation.relkind = 'r'
+        AND relation.relkind NOT IN ('i','I')
         AND attribute.attnum > 0
         AND NOT attribute.attisdropped
         AND acl.grantee <> relation.relowner
       ORDER BY table_name, scope, column_name NULLS FIRST, grantee, privilege, grantable`
   );
   const expectedTablePrivileges: Array<Record<string, unknown>> = [];
-  for (const table_name of truthTables) {
+  for (const { name: table_name } of expectedRelations) {
     for (const privilege of ["INSERT", "SELECT"]) {
       expectedTablePrivileges.push({
         table_name,
@@ -630,8 +1439,20 @@ async function validateTruthFunctions(
   client: PgPoolClient,
   schemaSource: string,
   lifecycleSource: string | undefined,
+  recoverySource: string | undefined,
   phase: number
 ): Promise<void> {
+  const objectiveRecoveryFunctionIdentities = [
+    "truth.require_objective_recovery_command()",
+    "truth.require_objective_recovery_for_terminal_claim()",
+    "truth.require_objective_support_attestation()",
+    "truth.validate_objective_recovery()",
+    "truth.validate_objective_support_attestation()"
+  ] as const;
+  const expectedTruthFunctionIdentities = [
+    ...truthFunctionIdentities,
+    ...(phase >= 5 ? objectiveRecoveryFunctionIdentities : [])
+  ].sort();
   const inventory = await client.query<{ identity: string }>(
     `SELECT procedure.oid::regprocedure::text AS identity
        FROM pg_proc procedure
@@ -641,12 +1462,15 @@ async function validateTruthFunctions(
   );
   if (
     JSON.stringify(inventory.rows.map(({ identity }) => identity)) !==
-    JSON.stringify(truthFunctionIdentities)
+    JSON.stringify(expectedTruthFunctionIdentities)
   ) {
     throw new Error("B2 Slice 1 truth function inventory drifted");
   }
 
-  const inspectedIdentities = [...truthFunctionIdentities, "access.can_read_space(uuid,text)"];
+  const inspectedIdentities = [
+    ...expectedTruthFunctionIdentities,
+    "access.can_read_space(uuid,text)"
+  ];
   const functions = await client.query<Record<string, unknown>>(
     `SELECT procedure.oid::regprocedure::text AS identity,
             pg_get_function_result(procedure.oid) AS result,
@@ -670,11 +1494,18 @@ async function validateTruthFunctions(
   const expectedFunctions = inspectedIdentities
     .map((identity) => {
       const accessFunction = identity === "access.can_read_space(uuid,text)";
+      const objectiveRecoveryFunction = objectiveRecoveryFunctionIdentities.includes(
+        identity as (typeof objectiveRecoveryFunctionIdentities)[number]
+      );
+      const recoveryBackedFunction =
+        objectiveRecoveryFunction ||
+        identity === "truth.enforce_claim_transition()" ||
+        identity === "truth.require_reserved_command()";
       return {
         identity,
         result: accessFunction ? "boolean" : "trigger",
         language: accessFunction ? "sql" : "plpgsql",
-        owner: "migration_owner",
+        owner: objectiveRecoveryFunction ? "throughline_b1_0_integrity" : "migration_owner",
         security_definer: false,
         strict: false,
         volatility: accessFunction ? "s" : "v",
@@ -683,7 +1514,11 @@ async function validateTruthFunctions(
         kind: "f",
         configuration: ["search_path=pg_catalog"],
         source: migrationFunctionSource(
-          phase >= 3 && !accessFunction ? lifecycleSource! : schemaSource,
+          phase >= 5 && recoveryBackedFunction
+            ? recoverySource!
+            : phase >= 3 && !accessFunction
+              ? lifecycleSource!
+              : schemaSource,
           accessFunction ? "access.can_read_space" : identity.slice(0, -2)
         )
       };
@@ -737,46 +1572,190 @@ async function validateTruthFunctions(
   }
 }
 
-async function validateTruthConstraintsAndTriggers(client: PgPoolClient): Promise<void> {
-  const expectedTriggers = [
-    ["accepted_facts_command_guard", "accepted_facts", "truth.require_reserved_command()", false],
-    ["accepted_facts_immutable", "accepted_facts", "truth.reject_mutation()", false],
-    ["accepted_facts_insert_guard", "accepted_facts", "truth.validate_fact_insert()", false],
-    ["accepted_facts_support_deferred", "accepted_facts", "truth.validate_fact_support()", true],
-    ["claims_command_guard", "claims", "truth.require_reserved_command()", false],
-    ["claims_delete_guard", "claims", "truth.reject_mutation()", false],
-    ["claims_insert_guard", "claims", "truth.validate_claim_insert()", false],
-    ["claims_transition_guard", "claims", "truth.enforce_claim_transition()", false],
-    ["fact_claims_command_guard", "fact_claims", "truth.require_fact_accept_reservation()", false],
-    ["fact_claims_immutable", "fact_claims", "truth.reject_mutation()", false],
-    ["fact_claims_support_deferred", "fact_claims", "truth.validate_fact_support()", true],
-    [
-      "verified_evidence_command_guard",
-      "verified_evidence_spans",
-      "truth.require_reserved_command()",
-      false
-    ],
-    ["verified_evidence_immutable", "verified_evidence_spans", "truth.reject_mutation()", false],
-    [
-      "verified_evidence_snapshot_guard",
-      "verified_evidence_spans",
-      "truth.verify_evidence_snapshot()",
-      false
-    ]
-  ].map(([name, table_name, function_identity, deferred]) => ({
-    name,
-    table_name,
-    function_identity,
-    enabled: true,
-    deferrable: deferred,
-    initially_deferred: deferred
-  }));
+async function validateTruthConstraintsAndTriggers(
+  client: PgPoolClient,
+  phase: number
+): Promise<void> {
+  type TruthTriggerContract = {
+    name: string;
+    table_name: string;
+    function_identity: string;
+    timing_and_events: string;
+    deferred?: boolean;
+    arguments?: string[];
+  };
+  const triggerContracts: TruthTriggerContract[] = [
+    {
+      name: "accepted_facts_command_guard",
+      table_name: "accepted_facts",
+      function_identity: "truth.require_reserved_command()",
+      timing_and_events: "BEFORE INSERT",
+      arguments: ["fact.accept.v1"]
+    },
+    {
+      name: "accepted_facts_immutable",
+      table_name: "accepted_facts",
+      function_identity: "truth.reject_mutation()",
+      timing_and_events: "BEFORE DELETE OR UPDATE"
+    },
+    {
+      name: "accepted_facts_insert_guard",
+      table_name: "accepted_facts",
+      function_identity: "truth.validate_fact_insert()",
+      timing_and_events: "BEFORE INSERT"
+    },
+    {
+      name: "accepted_facts_support_deferred",
+      table_name: "accepted_facts",
+      function_identity: "truth.validate_fact_support()",
+      timing_and_events: "AFTER INSERT",
+      deferred: true
+    },
+    {
+      name: "claims_command_guard",
+      table_name: "claims",
+      function_identity: "truth.require_reserved_command()",
+      timing_and_events: "BEFORE INSERT",
+      arguments: [phase >= 5 ? "claim.create-or-rework.v1" : "claim.create.v1"]
+    },
+    {
+      name: "claims_delete_guard",
+      table_name: "claims",
+      function_identity: "truth.reject_mutation()",
+      timing_and_events: "BEFORE DELETE"
+    },
+    {
+      name: "claims_insert_guard",
+      table_name: "claims",
+      function_identity: "truth.validate_claim_insert()",
+      timing_and_events: "BEFORE INSERT"
+    },
+    {
+      name: "claims_transition_guard",
+      table_name: "claims",
+      function_identity: "truth.enforce_claim_transition()",
+      timing_and_events: "BEFORE UPDATE"
+    },
+    {
+      name: "fact_claims_command_guard",
+      table_name: "fact_claims",
+      function_identity: "truth.require_fact_accept_reservation()",
+      timing_and_events: "BEFORE INSERT"
+    },
+    {
+      name: "fact_claims_immutable",
+      table_name: "fact_claims",
+      function_identity: "truth.reject_mutation()",
+      timing_and_events: "BEFORE DELETE OR UPDATE"
+    },
+    {
+      name: "fact_claims_support_deferred",
+      table_name: "fact_claims",
+      function_identity: "truth.validate_fact_support()",
+      timing_and_events: "AFTER INSERT",
+      deferred: true
+    },
+    {
+      name: "verified_evidence_command_guard",
+      table_name: "verified_evidence_spans",
+      function_identity: "truth.require_reserved_command()",
+      timing_and_events: "BEFORE INSERT",
+      arguments: [phase >= 5 ? "claim.create-or-rework.v1" : "claim.create.v1"]
+    },
+    {
+      name: "verified_evidence_immutable",
+      table_name: "verified_evidence_spans",
+      function_identity: "truth.reject_mutation()",
+      timing_and_events: "BEFORE DELETE OR UPDATE"
+    },
+    {
+      name: "verified_evidence_snapshot_guard",
+      table_name: "verified_evidence_spans",
+      function_identity: "truth.verify_evidence_snapshot()",
+      timing_and_events: "BEFORE INSERT"
+    },
+    ...(phase >= 5
+      ? [
+          {
+            name: "attestations_objective_support_deferred",
+            table_name: "initiative_objective_support_attestations",
+            function_identity: "truth.require_objective_support_attestation()",
+            timing_and_events: "AFTER INSERT",
+            deferred: true
+          },
+          {
+            name: "claims_objective_recovery_deferred",
+            table_name: "claims",
+            function_identity: "truth.require_objective_recovery_for_terminal_claim()",
+            timing_and_events: "AFTER UPDATE",
+            deferred: true
+          },
+          {
+            name: "claims_objective_support_deferred",
+            table_name: "claims",
+            function_identity: "truth.require_objective_support_attestation()",
+            timing_and_events: "AFTER INSERT OR UPDATE",
+            deferred: true
+          },
+          {
+            name: "objective_recovery_command_guard",
+            table_name: "initiative_objective_proposal_recoveries",
+            function_identity: "truth.require_objective_recovery_command()",
+            timing_and_events: "BEFORE INSERT"
+          },
+          {
+            name: "objective_recovery_immutable",
+            table_name: "initiative_objective_proposal_recoveries",
+            function_identity: "truth.reject_mutation()",
+            timing_and_events: "BEFORE DELETE OR UPDATE"
+          },
+          {
+            name: "objective_recovery_valid_deferred",
+            table_name: "initiative_objective_proposal_recoveries",
+            function_identity: "truth.validate_objective_recovery()",
+            timing_and_events: "AFTER INSERT",
+            deferred: true
+          },
+          {
+            name: "objective_support_command_guard",
+            table_name: "initiative_objective_support_attestations",
+            function_identity: "truth.require_reserved_command()",
+            timing_and_events: "BEFORE INSERT",
+            arguments: ["claim.create-or-rework.v1"]
+          },
+          {
+            name: "objective_support_immutable",
+            table_name: "initiative_objective_support_attestations",
+            function_identity: "truth.reject_mutation()",
+            timing_and_events: "BEFORE DELETE OR UPDATE"
+          },
+          {
+            name: "objective_support_insert_guard",
+            table_name: "initiative_objective_support_attestations",
+            function_identity: "truth.validate_objective_support_attestation()",
+            timing_and_events: "BEFORE INSERT"
+          }
+        ]
+      : [])
+  ];
+  const expectedTriggers = triggerContracts
+    .map((contract) => ({
+      name: contract.name,
+      table_name: contract.table_name,
+      function_identity: contract.function_identity,
+      enabled: true,
+      deferrable: contract.deferred ?? false,
+      initially_deferred: contract.deferred ?? false,
+      definition: `CREATE ${contract.deferred ? "CONSTRAINT " : ""}TRIGGER ${contract.name} ${contract.timing_and_events} ON truth.${contract.table_name}${contract.deferred ? " DEFERRABLE INITIALLY DEFERRED" : ""} FOR EACH ROW EXECUTE FUNCTION ${contract.function_identity.slice(0, -2)}(${(contract.arguments ?? []).map((argument) => `'${argument}'`).join(", ")})`
+    }))
+    .sort((left, right) => left.name.localeCompare(right.name));
   const triggers = await client.query<Record<string, unknown>>(
     `SELECT trigger_record.tgname AS name, relation.relname AS table_name,
             procedure.oid::regprocedure::text AS function_identity,
             trigger_record.tgenabled = 'O' AS enabled,
             trigger_record.tgdeferrable AS deferrable,
-            trigger_record.tginitdeferred AS initially_deferred
+            trigger_record.tginitdeferred AS initially_deferred,
+            pg_get_triggerdef(trigger_record.oid, true) AS definition
        FROM pg_trigger trigger_record
        JOIN pg_class relation ON relation.oid = trigger_record.tgrelid
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
@@ -917,6 +1896,7 @@ async function validateCommandBoundary(
   client: PgPoolClient,
   integritySource: string,
   lifecycleSource: string | undefined,
+  recoverySource: string | undefined,
   phase: number
 ): Promise<void> {
   const boundary = await client.query<{
@@ -978,7 +1958,26 @@ async function validateCommandBoundary(
      ) AS definition`
   );
   assertProductValidatorDelegatesExactB1Kinds(validator.rows[0]?.definition ?? "");
-  await validateCommandFunctionSecurity(client, integritySource, lifecycleSource, phase);
+  await validateCommandFunctionSecurity(
+    client,
+    integritySource,
+    lifecycleSource,
+    recoverySource,
+    phase
+  );
+  const validClaimResponse =
+    phase >= 5
+      ? {
+          claimId: "0190a000-0000-7000-8000-000000000302",
+          evidenceSpanId: "0190a000-0000-7000-8000-000000000304",
+          status: "proposed",
+          version: 1
+        }
+      : {
+          claimId: "0190a000-0000-7000-8000-000000000302",
+          status: "proposed",
+          version: 1
+        };
   const probes = await client.query<{
     b1_valid: boolean;
     claim_valid: boolean;
@@ -996,8 +1995,7 @@ async function validateCommandBoundary(
        ops.product_command_record_valid(
          'claim.create.v1', 1, 'completed', 'claim',
          '0190a000-0000-7000-8000-000000000302'::uuid,
-         '{"claimId":"0190a000-0000-7000-8000-000000000302",
-           "status":"proposed","version":1}'::jsonb
+         $1::jsonb
        ) AS claim_valid,
        ops.product_command_record_valid(
          'fact.accept.v1', 1, 'completed', 'accepted_fact',
@@ -1014,7 +2012,8 @@ async function validateCommandBoundary(
          '0190a000-0000-7000-8000-000000000302'::uuid,
          '{"claimId":"0190a000-0000-7000-8000-000000000302",
            "status":"proposed","version":1,"extra":true}'::jsonb
-       ) AS malformed_invalid`
+       ) AS malformed_invalid`,
+    [JSON.stringify(validClaimResponse)]
   );
   const probe = probes.rows[0];
   if (
@@ -1032,14 +2031,17 @@ async function validateCommandFunctionSecurity(
   client: PgPoolClient,
   integritySource: string,
   lifecycleSource: string | undefined,
+  recoverySource: string | undefined,
   phase: number
 ): Promise<void> {
+  const safeRequestIdentity = "ops.b2_slice1_safe_request_valid(text,jsonb)" as const;
   const functionIdentities = [
     "ops.b2_slice1_audit_detail_valid(text,text,integer,uuid,jsonb)",
     "ops.b2_slice1_event_payload_valid(text,integer,uuid,jsonb)",
+    ...(phase >= 5 ? [safeRequestIdentity] : []),
     "ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)",
     "ops.require_b2_slice1_command_atomicity()"
-  ] as const;
+  ];
   const functions = await client.query<Record<string, unknown>>(
     `SELECT procedure.oid::regprocedure::text AS identity,
             pg_get_function_result(procedure.oid) AS result,
@@ -1076,7 +2078,10 @@ async function validateCommandFunctionSecurity(
       parallel: "u",
       kind: "f",
       configuration: searchPath,
-      source: migrationFunctionSource(integritySource, "ops.b2_slice1_audit_detail_valid")
+      source: migrationFunctionSource(
+        phase >= 5 ? recoverySource! : integritySource,
+        "ops.b2_slice1_audit_detail_valid"
+      )
     },
     {
       identity: functionIdentities[1],
@@ -1090,10 +2095,31 @@ async function validateCommandFunctionSecurity(
       parallel: "u",
       kind: "f",
       configuration: searchPath,
-      source: migrationFunctionSource(integritySource, "ops.b2_slice1_event_payload_valid")
+      source: migrationFunctionSource(
+        phase >= 5 ? recoverySource! : integritySource,
+        "ops.b2_slice1_event_payload_valid"
+      )
     },
+    ...(phase >= 5
+      ? [
+          {
+            identity: safeRequestIdentity,
+            result: "boolean",
+            language: "plpgsql",
+            owner: "throughline_b1_0_integrity",
+            security_definer: false,
+            strict: true,
+            volatility: "i",
+            leakproof: false,
+            parallel: "u",
+            kind: "f",
+            configuration: searchPath,
+            source: migrationFunctionSource(recoverySource!, "ops.b2_slice1_safe_request_valid")
+          }
+        ]
+      : []),
     {
-      identity: functionIdentities[2],
+      identity: "ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)",
       result: "boolean",
       language: "plpgsql",
       owner: "migration_owner",
@@ -1104,10 +2130,13 @@ async function validateCommandFunctionSecurity(
       parallel: "u",
       kind: "f",
       configuration: searchPath,
-      source: migrationFunctionSource(integritySource, "ops.product_command_record_valid")
+      source: migrationFunctionSource(
+        phase >= 5 ? recoverySource! : integritySource,
+        "ops.product_command_record_valid"
+      )
     },
     {
-      identity: functionIdentities[3],
+      identity: "ops.require_b2_slice1_command_atomicity()",
       result: "trigger",
       language: "plpgsql",
       owner: "throughline_b1_0_integrity",
@@ -1119,7 +2148,7 @@ async function validateCommandFunctionSecurity(
       kind: "f",
       configuration: searchPath,
       source: migrationFunctionSource(
-        phase >= 3 ? lifecycleSource! : integritySource,
+        phase >= 5 ? recoverySource! : phase >= 3 ? lifecycleSource! : integritySource,
         "ops.require_b2_slice1_command_atomicity"
       )
     }
@@ -1171,8 +2200,19 @@ async function validateCommandFunctionSecurity(
       grantable: false,
       grantor: "migration_owner"
     },
+    ...(phase >= 5
+      ? [
+          {
+            identity: safeRequestIdentity,
+            grantee: "throughline_app",
+            privilege: "EXECUTE",
+            grantable: false,
+            grantor: "throughline_b1_0_integrity"
+          }
+        ]
+      : []),
     {
-      identity: functionIdentities[2],
+      identity: "ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)",
       grantee: "throughline_app",
       privilege: "EXECUTE",
       grantable: false,

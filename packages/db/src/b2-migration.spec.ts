@@ -13,6 +13,10 @@ const initiativeLockUrl = new URL(
   "../migrations/0010_b2_trusted_objective_initiative_lock.sql",
   import.meta.url
 );
+const objectiveRecoveryUrl = new URL(
+  "../migrations/0011_b2_primary_objective_proposal_recovery.sql",
+  import.meta.url
+);
 const initiativeLockSql = `-- Established row-lock capability for durable Initiative truth mutations.
 CREATE POLICY initiatives_app_truth_lock ON work.initiatives
 AS PERMISSIVE FOR UPDATE TO throughline_app
@@ -89,6 +93,40 @@ describe("B2 Slice 1 additive migration contract", () => {
     expect(b1Contract).toContain("A staged B2 catalog requires the exact complete B1 predecessor");
     expect(b1Contract).not.toContain("source_artifacts_truth_retention");
     expect(b1Contract).toContain("Fixed staged B2 command integrity contract parser failed");
+    const commandIntegrityContract = b1Contract.match(
+      /async function validateCommandIntegrityObjects[\s\S]*?\n}\n\nconst integrityPolicyContracts/
+    )?.[0];
+    expect(commandIntegrityContract).toBeDefined();
+    expect(commandIntegrityContract).toContain("if (additiveB2Phase >= 5)");
+    expect(commandIntegrityContract).toContain("B2_OBJECTIVE_RECOVERY_MIGRATION_ID");
+    expect(commandIntegrityContract).toContain(
+      "Fixed objective recovery command trigger contract parser failed"
+    );
+    expect(commandIntegrityContract).toContain(
+      'dropB2TriggerStatement.replace("ops.domain_command_records", expectedRelation)'
+    );
+    expect(commandIntegrityContract).toContain(
+      '"ON ops.domain_command_records",\n        `ON ${expectedRelation}`'
+    );
+    const integrityCapabilityContract = b1Contract.match(
+      /const objectiveRecoveryIntegrityRelations[\s\S]*?async function validateIntegrityPredecessorAccess[\s\S]*?\n}/
+    )?.[0];
+    expect(integrityCapabilityContract).toBeDefined();
+    expect(integrityCapabilityContract).toContain(
+      '"truth.initiative_objective_proposal_recoveries"'
+    );
+    expect(integrityCapabilityContract).toContain(
+      '"truth.initiative_objective_support_attestations"'
+    );
+    expect(integrityCapabilityContract).toContain('name: "objective_recovery_integrity_select"');
+    expect(integrityCapabilityContract).toContain('name: "objective_support_integrity_select"');
+    expect(integrityCapabilityContract).toContain("if (additiveB2Phase >= 5)");
+    expect(integrityCapabilityContract).toContain(
+      "expectedPredecessorAcl(integrityInstalled, additiveB2Phase)"
+    );
+    expect(integrityCapabilityContract).toContain(
+      'predecessorAclRows(relation, "table", [], "throughline_app", ["INSERT", "SELECT"])'
+    );
   });
 
   it("adds only the established Initiative row-lock capability", async () => {
@@ -277,5 +315,153 @@ describe("B2 Slice 1 additive migration contract", () => {
     ]);
     expect(executeGrantsFor("throughline_relay")).toEqual([]);
     expect(executeGrantsFor("throughline_worker")).toEqual([]);
+  });
+
+  it("adds a bounded immutable objective-proposal recovery ledger and no generic lifecycle", async () => {
+    const sql = await readFile(objectiveRecoveryUrl, "utf8");
+    expect([...sql.matchAll(/CREATE TABLE truth\.([a-z_]+)/g)].map((match) => match[1])).toEqual([
+      "initiative_objective_support_attestations",
+      "initiative_objective_proposal_recoveries"
+    ]);
+    expect(sql).toContain("claims_one_active_primary_objective_proposal");
+    expect(sql).toContain("DROP CONSTRAINT claims_status_check");
+    expect(sql).toContain("status IN ('proposed','accepted','rejected','superseded')");
+    expect(sql).toContain("status IN ('accepted','rejected','superseded') AND version = 2");
+    expect(sql).toContain("(to_jsonb(NEW) - ARRAY['status','version','updated_at'])");
+    expect(sql).toContain("objective_support_immutable");
+    expect(sql).toContain("objective_recovery_immutable");
+    expect(sql).toContain("DEFERRABLE INITIALLY DEFERRED");
+    expect(sql).not.toMatch(
+      /CREATE TABLE truth\.(?:claim_lifecycle|fact_lifecycle|fact_supersessions|conflict_groups)|DELETE FROM truth\.|UPDATE truth\.accepted_facts/
+    );
+  });
+
+  it("fails acceptance closed on support while allowing unconfirmed legacy proposals to terminalize", async () => {
+    const sql = await readFile(objectiveRecoveryUrl, "utf8");
+    expect(sql).toContain("objective acceptance requires human support confirmation");
+    expect(sql).toContain("claim_record.status IN ('proposed','accepted')");
+    expect(sql).toContain("claim_record.status IN ('rejected','superseded')");
+    expect(sql).toContain("attestation_count IN (0, 1)");
+    expect(sql).toContain("row_data jsonb := to_jsonb(NEW)");
+    expect(sql).toContain("WHEN 'claims' THEN row_data ->> 'id'");
+    const recoveryValidator = sql.slice(
+      sql.indexOf("CREATE FUNCTION truth.validate_objective_recovery()"),
+      sql.indexOf("CREATE FUNCTION truth.require_objective_recovery_for_terminal_claim()")
+    );
+    expect(recoveryValidator).toContain("IF NEW.disposition = 'reworked' THEN");
+    expect(recoveryValidator).toContain("IF predecessor.status <> 'superseded'");
+    expect(recoveryValidator).toContain("ELSIF NEW.disposition IN ('withdrawn','rejected') THEN");
+    expect(recoveryValidator).toContain("IF predecessor.status <> 'rejected'");
+    const withdrawalBranch = recoveryValidator.slice(
+      recoveryValidator.indexOf("ELSIF NEW.disposition IN ('withdrawn','rejected') THEN"),
+      recoveryValidator.indexOf("  ELSE", recoveryValidator.indexOf("ELSIF NEW.disposition"))
+    );
+    expect(withdrawalBranch).not.toMatch(/successor\.(?:id|subject_id|predicate|status|version)/);
+    expect(recoveryValidator).not.toMatch(/NEW\.disposition = 'reworked' AND \([\s\S]*successor\./);
+    expect(sql).toContain("attestation.confirmed_by_user_id = claim_record.created_by_user_id");
+    expect(sql).toContain("attestation.causation_command_id = claim_record.causation_command_id");
+    const deferredRecovery = sql.slice(
+      sql.indexOf("CREATE FUNCTION truth.validate_objective_recovery()"),
+      sql.indexOf("CREATE OR REPLACE FUNCTION truth.require_reserved_command()")
+    );
+    expect(deferredRecovery).toContain("command.state = 'completed'");
+    const immediateGuards = sql.slice(
+      sql.indexOf("CREATE OR REPLACE FUNCTION truth.require_reserved_command()"),
+      sql.indexOf("CREATE OR REPLACE FUNCTION truth.enforce_claim_transition()")
+    );
+    expect(immediateGuards.indexOf("ERRCODE = 'TLB22'")).toBeLessThan(
+      immediateGuards.indexOf("command.state = 'reserved'")
+    );
+    expect(immediateGuards).toContain("MESSAGE = 'Truth mutation transaction is unavailable'");
+    expect(immediateGuards).toContain("command.state = 'reserved'");
+  });
+
+  it("pins exact recovery audit/outbox vocabulary and excludes objective/source text", async () => {
+    const sql = await readFile(objectiveRecoveryUrl, "utf8");
+    for (const value of [
+      "initiative.primary_objective.withdraw",
+      "initiative.primary_objective.rework",
+      "initiative.primary_objective.proposal_withdrawn",
+      "initiative.primary_objective.proposal_rejected",
+      "initiative.primary_objective.proposal_reworked",
+      "predecessorClaimId",
+      "successorClaimId",
+      "evidenceSpanId",
+      "supportAttestationId",
+      "recoveryId",
+      "reasonCode"
+    ]) {
+      expect(sql).toContain(value);
+    }
+    const atomicity = sql.slice(
+      sql.indexOf("CREATE OR REPLACE FUNCTION ops.require_b2_slice1_command_atomicity")
+    );
+    const eventPayloadValidator = sql.slice(
+      sql.indexOf("CREATE OR REPLACE FUNCTION ops.b2_slice1_event_payload_valid"),
+      sql.indexOf("CREATE OR REPLACE FUNCTION ops.b2_slice1_audit_detail_valid")
+    );
+    const safeRequestValidator = sql.slice(
+      sql.indexOf("CREATE FUNCTION ops.b2_slice1_safe_request_valid"),
+      sql.indexOf(
+        "ALTER TABLE ops.domain_command_records",
+        sql.indexOf("CREATE FUNCTION ops.b2_slice1_safe_request_valid")
+      )
+    );
+    expect(safeRequestValidator).toContain("octet_length(request_value::text) > 8192");
+    expect(safeRequestValidator).not.toContain("ops.product_safe_json(request_value)");
+    expect(safeRequestValidator).not.toMatch(/sourceExcerpt|sourceText|objectiveText/);
+    expect(safeRequestValidator).toContain(
+      "'expectedLatestClaimId','expectedLatestClaimStatus','expectedLatestClaimVersion',"
+    );
+    expect(safeRequestValidator).toContain(
+      "jsonb_typeof(request_value -> 'expectedLatestClaimId') = 'null'"
+    );
+    expect(safeRequestValidator).toContain("RETURN COALESCE((request_keys = ARRAY[");
+    expect(safeRequestValidator).toContain(
+      "RETURN COALESCE((request_value ->> 'subjectType' IN ('activity','initiative')"
+    );
+    expect(safeRequestValidator).toContain("), false) THEN RETURN false; END IF;");
+    expect(sql).not.toContain("command_request ->> 'subjectType' <> NEW.subject_type");
+    expect(sql).not.toContain("command_request ->> 'sourceArtifactId' <> NEW.source_artifact_id");
+    expect(eventPayloadValidator).toContain(
+      "ARRAY['claimId','evidenceSpanId','supportAttestationId']"
+    );
+    expect(eventPayloadValidator).toContain(
+      "ARRAY['claimId','claimVersion','disposition','reasonCode','recoveryId']"
+    );
+    expect(eventPayloadValidator).toContain(
+      "'needs_rework','unsupported','incorrect','duplicate','not_useful','sensitive','other'"
+    );
+    expect(eventPayloadValidator).toContain(
+      "'disposition','evidenceSpanId','predecessorClaimId','predecessorVersion','reasonCode',\n" +
+        "        'recoveryId','successorClaimId','successorVersion','supportAttestationId'"
+    );
+    expect(eventPayloadValidator).toContain("payload_value ->> 'reasonCode' = 'reworked'");
+    expect(atomicity).toContain("audit_count <> 1 OR outbox_count <> 1");
+    expect(atomicity).toContain("audit.safe_detail = expected_audit_detail");
+    expect(atomicity).toContain("event.payload = expected_event_payload");
+    expect(atomicity).toContain("caused_claim_count <> 1");
+    expect(atomicity).toContain("caused_recovery_count <> 1");
+    expect(atomicity).toContain("caused_attestation_count <> 1");
+    expect(atomicity).toContain("NEW.safe_request ->> 'predecessorClaimId'");
+    expect(atomicity).toContain("claim.create objective generation is stale");
+    expect(atomicity).toContain("latest_predecessor_claim_id IS DISTINCT FROM");
+    expect(sql).toContain("UNIQUE (tenant_id, workspace_id, causation_command_id)");
+    expect(sql).toContain("domain_command_records_b2_safe_request_check");
+    expect(sql).toContain("ADD COLUMN safe_request_adopted boolean NOT NULL DEFAULT false");
+    expect(sql).toContain(
+      "SET safe_request = reconstructable.safe_request,\n       safe_request_adopted = true"
+    );
+    expect(sql).toContain("'supportConfirmed', false");
+    expect(sql).toContain("AND NOT safe_request_adopted");
+    expect(sql).toContain("AND safe_request_adopted");
+    expect(sql).toContain("jsonb_set(safe_request, '{supportConfirmed}', 'true'::jsonb, false)");
+    expect(sql.match(/b2_slice1_safe_request_valid\([\s\S]*?\) IS TRUE/g)).toHaveLength(5);
+    expect(sql).toContain("GRANT INSERT (safe_request) ON ops.domain_command_records");
+    expect(sql).not.toMatch(/GRANT (?:INSERT|UPDATE) \(safe_request_adopted\)/);
+    expect(sql).toContain(
+      "'normalizationVersion','predecessorClaimId','predicate','sourceArtifactId'"
+    );
+    expect(atomicity).not.toMatch(/sourceExcerpt|sourceText|objectiveText/);
   });
 });

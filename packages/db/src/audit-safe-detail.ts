@@ -1,4 +1,7 @@
-import { isDomainNotificationTimestamp } from "@throughline/core-types";
+import {
+  isDomainNotificationTimestamp,
+  PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES
+} from "@throughline/core-types";
 
 export const PRODUCT_AUDIT_SCHEMA_VERSION = 1 as const;
 
@@ -54,7 +57,41 @@ export interface ProductAuditDetailMap {
   };
   "claim.create": {
     resourceType: "claim";
-    detail: { claimId: string; evidenceSpanId: string };
+    detail: { claimId: string; evidenceSpanId: string; supportAttestationId?: string };
+  };
+  "initiative.primary_objective.withdraw": {
+    resourceType: "claim";
+    detail: {
+      claimId: string;
+      claimVersion: 2;
+      recoveryId: string;
+      disposition: "withdrawn";
+      reasonCode: (typeof PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)[number];
+    };
+  };
+  "initiative.primary_objective.reject": {
+    resourceType: "claim";
+    detail: {
+      claimId: string;
+      claimVersion: 2;
+      recoveryId: string;
+      disposition: "rejected";
+      reasonCode: (typeof PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)[number];
+    };
+  };
+  "initiative.primary_objective.rework": {
+    resourceType: "claim";
+    detail: {
+      predecessorClaimId: string;
+      predecessorVersion: 2;
+      successorClaimId: string;
+      successorVersion: 1;
+      evidenceSpanId: string;
+      supportAttestationId: string;
+      recoveryId: string;
+      disposition: "reworked";
+      reasonCode: "reworked";
+    };
   };
   "fact.accept": {
     resourceType: "accepted_fact";
@@ -169,12 +206,77 @@ export function parseProductAuditSafeDetail(
     }
     case "claim.create": {
       requireResourceType(resourceType, "claim");
-      const detail = requireExactObject(safeDetail, ["claimId", "evidenceSpanId"]);
+      const detail = requireExactObject(
+        safeDetail,
+        ["claimId", "evidenceSpanId"],
+        ["supportAttestationId"]
+      );
       const claimId = requireUuidV7(detail.claimId);
       if (claimId !== resourceId) fail();
       return {
         claimId,
-        evidenceSpanId: requireUuidV7(detail.evidenceSpanId)
+        evidenceSpanId: requireUuidV7(detail.evidenceSpanId),
+        ...(Object.hasOwn(detail, "supportAttestationId")
+          ? { supportAttestationId: requireUuidV7(detail.supportAttestationId) }
+          : {})
+      };
+    }
+    case "initiative.primary_objective.withdraw":
+    case "initiative.primary_objective.reject": {
+      requireResourceType(resourceType, "claim");
+      const detail = requireExactObject(safeDetail, [
+        "claimId",
+        "claimVersion",
+        "disposition",
+        "reasonCode",
+        "recoveryId"
+      ]);
+      const claimId = requireUuidV7(detail.claimId);
+      if (claimId !== resourceId || detail.claimVersion !== 2) fail();
+      const disposition = requireEnum(detail.disposition, [
+        action === "initiative.primary_objective.reject" ? "rejected" : "withdrawn"
+      ] as const);
+      return {
+        claimId,
+        claimVersion: 2,
+        recoveryId: requireUuidV7(detail.recoveryId),
+        disposition,
+        reasonCode: requireEnum(detail.reasonCode, PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES)
+      };
+    }
+    case "initiative.primary_objective.rework": {
+      requireResourceType(resourceType, "claim");
+      const detail = requireExactObject(safeDetail, [
+        "predecessorClaimId",
+        "predecessorVersion",
+        "successorClaimId",
+        "successorVersion",
+        "evidenceSpanId",
+        "supportAttestationId",
+        "recoveryId",
+        "disposition",
+        "reasonCode"
+      ]);
+      const successorClaimId = requireUuidV7(detail.successorClaimId);
+      if (
+        successorClaimId !== resourceId ||
+        detail.predecessorVersion !== 2 ||
+        detail.successorVersion !== 1 ||
+        detail.disposition !== "reworked" ||
+        detail.reasonCode !== "reworked"
+      ) {
+        fail();
+      }
+      return {
+        predecessorClaimId: requireUuidV7(detail.predecessorClaimId),
+        predecessorVersion: 2,
+        successorClaimId,
+        successorVersion: 1,
+        evidenceSpanId: requireUuidV7(detail.evidenceSpanId),
+        supportAttestationId: requireUuidV7(detail.supportAttestationId),
+        recoveryId: requireUuidV7(detail.recoveryId),
+        disposition: "reworked",
+        reasonCode: "reworked"
       };
     }
     case "fact.accept": {
@@ -202,14 +304,14 @@ function singleResourceIdDetail<Key extends string>(
 
 function requireExactObject(
   input: unknown,
-  requiredKeys: readonly string[]
+  requiredKeys: readonly string[],
+  optionalKeys: readonly string[] = []
 ): Record<string, unknown> {
   if (!isPlainRecord(input)) fail();
   const keys = Object.keys(input);
   if (
-    keys.length !== requiredKeys.length ||
     requiredKeys.some((key) => !Object.hasOwn(input, key)) ||
-    keys.some((key) => !requiredKeys.includes(key))
+    keys.some((key) => !requiredKeys.includes(key) && !optionalKeys.includes(key))
   ) {
     fail();
   }

@@ -4,6 +4,7 @@ import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { reportedTestIdentity, type GateLeaf } from "./b2-gate-provenance.js";
 
 const root = fileURLToPath(new URL("../../..", import.meta.url));
 const initiativeLockSql = `-- Established row-lock capability for durable Initiative truth mutations.
@@ -66,6 +67,21 @@ describe("B2 Slice 1 architecture boundaries", () => {
     expect([...migration.matchAll(/CREATE POLICY/gi)]).toHaveLength(2);
     expect(migration).not.toMatch(
       /GRANT\s+UPDATE\s+ON|UPDATE\s*\([^)]*,|\bPUBLIC\b|WITH\s+GRANT\s+OPTION|\b(?:ALTER|DROP)\b|truth\.|fact_lifecycle|derived_view/i
+    );
+  });
+
+  it("keeps 0011 objective-specific with no generalized lifecycle, shadow store, or API", async () => {
+    const implementation = await combined([
+      "packages/db/migrations/0011_b2_primary_objective_proposal_recovery.sql",
+      "packages/truth-ledger/src/domain-command-bus.ts",
+      "packages/truth-ledger/src/repository.ts",
+      "apps/api/src/trusted-objective/trusted-objective.controller.ts",
+      "apps/api/src/trusted-objective/trusted-objective.runtime.ts"
+    ]);
+    expect(implementation).toContain("initiative.primary_objective.withdraw");
+    expect(implementation).toContain("initiative.primary_objective.rework");
+    expect(implementation).not.toMatch(
+      /claim\.(?:update|delete|manage)|@Controller\(["'](?:claims|proposals|lifecycle)|fact\.(?:supersede|revoke|contest)|CREATE TABLE truth\.(?:claim_lifecycle|fact_lifecycle|conflict_groups)|model\.generate|OpenAI|sendEmail|scheduleMeeting/i
     );
   });
 
@@ -187,6 +203,8 @@ describe("B2 Slice 1 architecture boundaries", () => {
       "apps/web/app/organizations/initiatives/[initiativeId]/page.tsx",
       "apps/web/app/organizations/initiatives/[initiativeId]/trusted-objective-experience.tsx",
       "apps/web/app/api/demo/initiatives/[initiativeId]/trusted-objective/route.ts",
+      "apps/web/lib/assisted-objective-focus.ts",
+      "apps/web/lib/assisted-objective.ts",
       "apps/web/lib/trusted-objective.ts"
     ]);
     expect(browserAndRouteSources).not.toMatch(
@@ -231,7 +249,9 @@ describe("B2 Slice 1 architecture boundaries", () => {
       "b1-catalog-contract.spec.ts",
       "b2-catalog-contract.postgres.spec.ts",
       "b2-truth.postgres.spec.ts",
-      "trusted-objective.guard.spec.ts"
+      "trusted-objective.guard.spec.ts",
+      "assisted-objective.spec.ts",
+      "trusted-objective.spec.ts"
     ]) {
       expect(runner).toContain(file);
     }
@@ -247,6 +267,45 @@ describe("B2 Slice 1 architecture boundaries", () => {
     const workflow = await source(".github/workflows/ci.yml");
     expect(workflow.match(/pnpm test:b2/g)).toHaveLength(1);
     expect(workflow).toContain('B2_AUTHORITATIVE_GATE: "1"');
+  });
+
+  it("accepts only exact configured absolute test-path suffixes in B2 provenance", () => {
+    const sourceLeaf: GateLeaf = {
+      workspace: "@throughline/api",
+      files: ["src/example.spec.ts"]
+    };
+    const libraryLeaf: GateLeaf = {
+      workspace: "@throughline/web",
+      files: ["lib/assisted-objective.spec.ts", "lib/trusted-objective.spec.ts"]
+    };
+
+    expect(reportedTestIdentity(sourceLeaf, "/repo/apps/api/src/example.spec.ts")).toBe(
+      "@throughline/api:example.spec.ts"
+    );
+    expect(reportedTestIdentity(libraryLeaf, "/repo/apps/web/lib/assisted-objective.spec.ts")).toBe(
+      "@throughline/web:lib/assisted-objective.spec.ts"
+    );
+
+    for (const unrecognized of [
+      "lib/assisted-objective.spec.ts",
+      "/repo/apps/web/lib/assisted-objective.spec.ts.neighbor",
+      "/repo/apps/web/lib/unconfigured.spec.ts",
+      "/repo/apps/web/src/assisted-objective.spec.ts"
+    ]) {
+      expect(() => reportedTestIdentity(libraryLeaf, unrecognized)).toThrow(
+        "B2 gate leaf emitted an unrecognized test path"
+      );
+    }
+
+    expect(() =>
+      reportedTestIdentity(
+        {
+          workspace: "@throughline/testing",
+          files: ["src/example.spec.ts", "example.spec.ts"]
+        },
+        "/repo/packages/testing/src/example.spec.ts"
+      )
+    ).toThrow("B2 gate leaf emitted an unrecognized test path");
   });
 
   it("fails the B2 preflight before any test runner starts when configuration is absent", () => {

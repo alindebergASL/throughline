@@ -2,7 +2,13 @@ import { NextResponse } from "next/server";
 
 export async function forwardDemoRequest(input: {
   initiativeId: string;
-  action?: "source" | "proposal" | "accept" | "draft-confirmation";
+  action?:
+    | "source"
+    | "proposal"
+    | "proposal/withdraw"
+    | "proposal/rework"
+    | "accept"
+    | "draft-confirmation";
   body?: unknown;
 }): Promise<NextResponse> {
   if (!isUuid(input.initiativeId) || process.env.NODE_ENV === "production") {
