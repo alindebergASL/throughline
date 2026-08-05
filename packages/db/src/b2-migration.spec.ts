@@ -17,6 +17,7 @@ const objectiveRecoveryUrl = new URL(
   "../migrations/0011_b2_primary_objective_proposal_recovery.sql",
   import.meta.url
 );
+const factLifecycleUrl = new URL("../migrations/0012_b2_fact_lifecycle.sql", import.meta.url);
 const initiativeLockSql = `-- Established row-lock capability for durable Initiative truth mutations.
 CREATE POLICY initiatives_app_truth_lock ON work.initiatives
 AS PERMISSIVE FOR UPDATE TO throughline_app
@@ -79,6 +80,14 @@ describe("B2 Slice 1 additive migration contract", () => {
       [
         "0009_b2_source_truth_lifecycle_interlock.sql",
         "0463ee762f2af1b4fc61d551398424740f3927e7a31b478717de03c3c88e29f1"
+      ],
+      [
+        "0010_b2_trusted_objective_initiative_lock.sql",
+        "1fac8f65c9dd80262ea577f1109ca1e6fa4822983cb62ac52868b138e375bb93"
+      ],
+      [
+        "0011_b2_primary_objective_proposal_recovery.sql",
+        "e1160864d02eff6baa56f326bba93a6b79e98904b604fd7f5823672c7885f1f2"
       ]
     ] as const;
     for (const [file, digest] of expected) {
@@ -87,7 +96,7 @@ describe("B2 Slice 1 additive migration contract", () => {
     }
     const runner = await readFile(new URL("./migrations.ts", import.meta.url), "utf8");
     expect(runner).toMatch(
-      /case 0:[\s\S]*?validateB1CatalogContract[\s\S]*?case 1:[\s\S]*?additiveB2Phase: 1[\s\S]*?case 2:[\s\S]*?additiveB2Phase: 2[\s\S]*?case 3:[\s\S]*?additiveB2Phase: 3[\s\S]*?case 4:[\s\S]*?additiveB2Phase: 4[\s\S]*?validateB2CatalogContract/
+      /case 0:[\s\S]*?validateB1CatalogContract[\s\S]*?case 1:[\s\S]*?additiveB2Phase: 1[\s\S]*?case 2:[\s\S]*?additiveB2Phase: 2[\s\S]*?case 3:[\s\S]*?additiveB2Phase: 3[\s\S]*?case 4:[\s\S]*?additiveB2Phase: 4[\s\S]*?case 5:[\s\S]*?additiveB2Phase: 5[\s\S]*?case 6:[\s\S]*?additiveB2Phase: 6[\s\S]*?validateB2CatalogContract/
     );
     const b1Contract = await readFile(new URL("./b1-catalog-contract.ts", import.meta.url), "utf8");
     expect(b1Contract).toContain("A staged B2 catalog requires the exact complete B1 predecessor");
@@ -463,5 +472,90 @@ describe("B2 Slice 1 additive migration contract", () => {
       "'normalizationVersion','predecessorClaimId','predicate','sourceArtifactId'"
     );
     expect(atomicity).not.toMatch(/sourceExcerpt|sourceText|objectiveText/);
+  });
+
+  it("adds only bounded ordinary Fact supersession and revocation durability", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+
+    expect([...sql.matchAll(/CREATE TABLE truth\.([a-z_]+)/g)].map((match) => match[1])).toEqual([
+      "fact_lifecycle_events"
+    ]);
+    for (const required of [
+      "predecessor_fact_id",
+      "successor_fact_id",
+      "transition_kind",
+      "from_status",
+      "to_status",
+      "reason_code",
+      "reason_rationale",
+      "authority_basis",
+      "acted_by_user_id",
+      "acted_by_membership_id",
+      "policy_version",
+      "causation_command_id",
+      "recorded_at",
+      "version"
+    ]) {
+      expect(sql).toContain(required);
+    }
+    expect(sql).toContain("status IN ('current','superseded','revoked')");
+    expect(sql).toMatch(
+      /status = 'current'[\s\S]*?version = 1[\s\S]*?status IN \('superseded','revoked'\)[\s\S]*?version = 2/
+    );
+    expect(sql).toMatch(
+      /transition_kind = 'supersede'[\s\S]*?successor_fact_id IS NOT NULL[\s\S]*?transition_kind = 'revoke'[\s\S]*?successor_fact_id IS NULL/
+    );
+    expect(sql).toMatch(
+      /FOREIGN KEY \(tenant_id, workspace_id, space_id, predecessor_fact_id\)[\s\S]*?REFERENCES truth\.accepted_facts\(tenant_id, workspace_id, space_id, id\)[\s\S]*?MATCH FULL[\s\S]*?ON UPDATE RESTRICT ON DELETE RESTRICT[\s\S]*?DEFERRABLE INITIALLY DEFERRED/
+    );
+    expect(sql).toMatch(
+      /FOREIGN KEY \(tenant_id, workspace_id, space_id, successor_fact_id\)[\s\S]*?REFERENCES truth\.accepted_facts\(tenant_id, workspace_id, space_id, id\)[\s\S]*?ON UPDATE RESTRICT ON DELETE RESTRICT[\s\S]*?DEFERRABLE INITIALLY DEFERRED/
+    );
+    expect(sql).toMatch(
+      /to_jsonb\(NEW\) - ARRAY\['status','last_causation_command_id','updated_at','version'\][\s\S]*?to_jsonb\(OLD\) - ARRAY\['status','last_causation_command_id','updated_at','version'\]/
+    );
+    expect(sql).not.toMatch(/DROP (?:INDEX|TRIGGER) (?:truth\.)?accepted_facts_one_current_slot/);
+    expect(sql).not.toMatch(
+      /DROP TRIGGER (?:claims_delete_guard|fact_claims_immutable|verified_evidence_immutable)/
+    );
+    expect(sql).toMatch(
+      /CREATE TRIGGER fact_lifecycle_immutable\s+BEFORE (?:DELETE OR UPDATE|UPDATE OR DELETE) ON truth\.fact_lifecycle_events/
+    );
+    expect(sql).toMatch(
+      /CREATE TRIGGER fact_lifecycle_truncate_guard\s+BEFORE TRUNCATE ON truth\.fact_lifecycle_events\s+FOR EACH STATEMENT/
+    );
+
+    expect(sql).toContain("ALTER TABLE truth.fact_lifecycle_events ENABLE ROW LEVEL SECURITY");
+    expect(sql).toContain("ALTER TABLE truth.fact_lifecycle_events FORCE ROW LEVEL SECURITY");
+    for (const policy of [
+      "accepted_facts_lifecycle_update",
+      "fact_lifecycle_select",
+      "fact_lifecycle_insert",
+      "fact_lifecycle_integrity_select"
+    ]) {
+      expect(sql).toContain(`CREATE POLICY ${policy}`);
+    }
+    expect(sql).toMatch(/GRANT SELECT, INSERT ON truth\.fact_lifecycle_events TO throughline_app;/);
+    expect(sql).toMatch(
+      /GRANT UPDATE \(status, last_causation_command_id, updated_at, version\)[\s\S]*?truth\.accepted_facts TO throughline_app;/
+    );
+    expect(sql).not.toMatch(
+      /GRANT (?:UPDATE|DELETE|TRUNCATE) ON truth\.fact_lifecycle_events|GRANT (?:UPDATE|DELETE|TRUNCATE) ON truth\.accepted_facts|GRANT[^;]*?TO (?:PUBLIC|throughline_worker|throughline_relay|throughline_product_relay);/
+    );
+
+    for (const command of ["fact.supersede.v1", "fact.revoke.v1"]) {
+      expect(sql).toContain(command);
+    }
+    expect(sql).toContain("domain_command_records_b2_slice1_atomicity_deferred");
+    expect(sql).toContain("audit_count <> 1 OR outbox_count <> 1");
+    expect(sql).toContain("fact.superseded");
+    expect(sql).toContain("fact.revoked");
+    expect(sql).toContain("caused_lifecycle_count <> 1");
+    expect(sql).toContain("predecessor_fact_count <> 1");
+    expect(sql).toContain("successor_fact_count <> 1");
+    expect(sql).toMatch(/fact\.revoke\.v1[\s\S]*?successor_fact_count <> 0/);
+    expect(sql).not.toMatch(
+      /fact\.(?:contest|uphold|emergency(?:[._][a-z0-9_]+)*|source(?:[._][a-z0-9_]+)*reconcil[a-z_]*)\.v\d+|(?:derived_view|derived_views)(?:\.[a-z0-9_]+)*\.v\d+|(?:contest|uphold|emergency|derived_view|source_reconcil)[a-z_]*_(?:event|command|record|store|view)s?|reconcile_source_retention|source_artifacts_truth_retention/i
+    );
   });
 });

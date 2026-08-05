@@ -22,8 +22,607 @@ const allMigrationIds = [
   "0009_b2_source_truth_lifecycle_interlock.sql",
   "0010_b2_trusted_objective_initiative_lock.sql"
 ] as const;
+const postSlice3MigrationIds = [
+  ...allMigrationIds,
+  "0011_b2_primary_objective_proposal_recovery.sql"
+] as const;
+const postSlice4AMigrationIds = [...postSlice3MigrationIds, "0012_b2_fact_lifecycle.sql"] as const;
 const truthTables = ["accepted_facts", "claims", "fact_claims", "verified_evidence_spans"] as const;
 const PHASE5_TEST_TIMEOUT = 180_000;
+const normalizeSql = (source: string) => source.trim().replace(/\s+/g, " ");
+const exactPhase6LifecycleFunctionSources = {
+  "truth.enforce_fact_lifecycle_transition()": normalizeSql(`
+    DECLARE
+      required_kind text;
+    BEGIN
+      IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION USING ERRCODE = 'TLB22',
+          MESSAGE = 'Truth mutation transaction is unavailable';
+      END IF;
+      required_kind := CASE NEW.status
+        WHEN 'superseded' THEN 'fact.supersede.v1'
+        WHEN 'revoked' THEN 'fact.revoke.v1'
+        ELSE NULL
+      END;
+      IF OLD.status <> 'current' OR OLD.version <> 1 OR required_kind IS NULL
+        OR NEW.version <> 2
+        OR NEW.last_causation_command_id IS NOT DISTINCT FROM OLD.last_causation_command_id
+        OR NEW.updated_at IS DISTINCT FROM pg_catalog.transaction_timestamp()
+        OR (pg_catalog.to_jsonb(NEW) - ARRAY[
+          'status','last_causation_command_id','updated_at','version'
+        ]) IS DISTINCT FROM (pg_catalog.to_jsonb(OLD) - ARRAY[
+          'status','last_causation_command_id','updated_at','version'
+        ])
+      THEN
+        RAISE EXCEPTION 'accepted Fact lifecycle transition is not permitted';
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1
+          FROM ops.domain_command_records command
+         WHERE command.tenant_id = NEW.tenant_id
+           AND command.workspace_id = NEW.workspace_id
+           AND command.reservation_space_id = NEW.space_id
+           AND command.id = NEW.last_causation_command_id
+           AND command.state = 'reserved'
+           AND command.command_kind = required_kind
+           AND command.command_schema_version = 1
+           AND command.actor_user_id = ops.current_user_id()
+           AND command.actor_membership_id = ops.current_membership_id()
+           AND command.policy_version_id = ops.current_policy_version()
+           AND command.safe_request ->> 'factId' = OLD.id::text
+           AND (command.safe_request ->> 'expectedFactVersion')::integer = OLD.version
+           AND (required_kind = 'fact.revoke.v1' OR (
+             command.safe_request #>> '{subject,type}' = OLD.subject_type
+             AND command.safe_request #>> '{subject,id}' = OLD.subject_id::text
+           ))
+      ) THEN
+        RAISE EXCEPTION 'accepted Fact lifecycle transition requires its exact reserved command';
+      END IF;
+      RETURN NEW;
+    END
+  `),
+  "truth.require_fact_lifecycle_command()": normalizeSql(`
+    BEGIN
+      IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION USING ERRCODE = 'TLB22',
+          MESSAGE = 'Truth mutation transaction is unavailable';
+      END IF;
+      IF NEW.recorded_at IS DISTINCT FROM pg_catalog.transaction_timestamp()
+        OR NEW.acted_by_user_id IS DISTINCT FROM ops.current_user_id()
+        OR NEW.acted_by_membership_id IS DISTINCT FROM ops.current_membership_id()
+        OR NEW.policy_version IS DISTINCT FROM ops.current_policy_version()
+        OR NOT EXISTS (
+          SELECT 1
+            FROM truth.accepted_facts predecessor
+            JOIN ops.domain_command_records command
+              ON command.tenant_id = predecessor.tenant_id
+             AND command.workspace_id = predecessor.workspace_id
+             AND command.reservation_space_id = predecessor.space_id
+             AND command.id = NEW.causation_command_id
+           WHERE predecessor.tenant_id = NEW.tenant_id
+             AND predecessor.workspace_id = NEW.workspace_id
+             AND predecessor.space_id = NEW.space_id
+             AND predecessor.id = NEW.predecessor_fact_id
+             AND predecessor.status = NEW.to_status
+             AND predecessor.version = 2
+             AND predecessor.last_causation_command_id = NEW.causation_command_id
+             AND predecessor.authority_basis = NEW.authority_basis
+             AND command.state = 'reserved'
+             AND command.command_schema_version = 1
+             AND command.command_kind = CASE NEW.transition_kind
+               WHEN 'supersede' THEN 'fact.supersede.v1'
+               WHEN 'revoke' THEN 'fact.revoke.v1'
+             END
+             AND command.actor_user_id = NEW.acted_by_user_id
+             AND command.actor_membership_id = NEW.acted_by_membership_id
+             AND command.policy_version_id = NEW.policy_version
+             AND command.safe_request ->> 'factId' = predecessor.id::text
+             AND (command.safe_request ->> 'expectedFactVersion')::integer = 1
+             AND command.safe_request #>> '{reason,code}' = NEW.reason_code
+             AND command.safe_request #>> '{reason,rationale}' = NEW.reason_rationale
+             AND (NEW.transition_kind = 'revoke' OR (
+               command.safe_request #>> '{subject,type}' = predecessor.subject_type
+               AND command.safe_request #>> '{subject,id}' = predecessor.subject_id::text
+             ))
+        )
+      THEN
+        RAISE EXCEPTION 'Fact lifecycle event requires its exact reserved command';
+      END IF;
+      RETURN NEW;
+    END
+  `),
+  "truth.require_fact_lifecycle_event()": normalizeSql(`
+    BEGIN
+      IF OLD.status = 'current' AND NEW.status IN ('superseded','revoked')
+        AND NOT EXISTS (
+          SELECT 1
+            FROM truth.fact_lifecycle_events lifecycle
+           WHERE lifecycle.tenant_id = NEW.tenant_id
+             AND lifecycle.workspace_id = NEW.workspace_id
+             AND lifecycle.space_id = NEW.space_id
+             AND lifecycle.predecessor_fact_id = NEW.id
+             AND lifecycle.causation_command_id = NEW.last_causation_command_id
+             AND lifecycle.from_status = OLD.status
+             AND lifecycle.to_status = NEW.status
+             AND lifecycle.transition_kind = CASE NEW.status
+               WHEN 'superseded' THEN 'supersede'
+               WHEN 'revoked' THEN 'revoke'
+             END
+        )
+      THEN
+        RAISE EXCEPTION 'accepted Fact lifecycle transition requires exactly one lineage event';
+      END IF;
+      RETURN NEW;
+    END
+  `),
+  "truth.reject_statement_mutation()": normalizeSql(`
+    BEGIN
+      RAISE EXCEPTION 'truth statement mutation is not permitted';
+    END
+  `),
+  "truth.validate_fact_lifecycle_event()": normalizeSql(`
+    DECLARE
+      predecessor truth.accepted_facts%ROWTYPE;
+      successor truth.accepted_facts%ROWTYPE;
+      command_record ops.domain_command_records%ROWTYPE;
+    BEGIN
+      SELECT * INTO predecessor
+        FROM truth.accepted_facts fact
+       WHERE fact.tenant_id = NEW.tenant_id
+         AND fact.workspace_id = NEW.workspace_id
+         AND fact.space_id = NEW.space_id
+         AND fact.id = NEW.predecessor_fact_id;
+      IF NOT FOUND OR predecessor.status <> NEW.to_status
+        OR predecessor.version <> 2
+        OR predecessor.last_causation_command_id <> NEW.causation_command_id
+      THEN
+        RAISE EXCEPTION 'Fact lifecycle predecessor is inconsistent';
+      END IF;
+      IF NEW.transition_kind = 'supersede' THEN
+        SELECT * INTO successor
+          FROM truth.accepted_facts fact
+         WHERE fact.tenant_id = NEW.tenant_id
+           AND fact.workspace_id = NEW.workspace_id
+           AND fact.space_id = NEW.space_id
+           AND fact.id = NEW.successor_fact_id;
+        IF NOT FOUND OR successor.status <> 'current' OR successor.version <> 1
+          OR successor.last_causation_command_id <> NEW.causation_command_id
+          OR successor.subject_type <> predecessor.subject_type
+          OR successor.subject_id <> predecessor.subject_id
+          OR successor.predicate <> predecessor.predicate
+        THEN
+          RAISE EXCEPTION 'Fact supersession lineage is inconsistent';
+        END IF;
+      ELSIF NEW.successor_fact_id IS NOT NULL THEN
+        RAISE EXCEPTION 'Fact revocation cannot identify a successor';
+      END IF;
+      IF TG_WHEN = 'AFTER' THEN
+        SELECT * INTO command_record
+          FROM ops.domain_command_records command
+         WHERE command.tenant_id = NEW.tenant_id
+           AND command.workspace_id = NEW.workspace_id
+           AND command.id = NEW.causation_command_id;
+        IF NOT FOUND OR command_record.state <> 'completed'
+          OR command_record.result_resource_type <> 'accepted_fact'
+          OR command_record.result_resource_id <> NEW.predecessor_fact_id
+          OR NOT ops.product_command_record_valid(
+            command_record.command_kind, command_record.command_schema_version,
+            command_record.state, command_record.result_resource_type,
+            command_record.result_resource_id, command_record.safe_response
+          )
+        THEN
+          RAISE EXCEPTION 'Fact lifecycle command completion is inconsistent';
+        END IF;
+      END IF;
+      RETURN NEW;
+    END
+  `)
+} as const;
+const exactPhase6LifecycleFunctionCatalog = Object.entries(exactPhase6LifecycleFunctionSources)
+  .map(([identity, source]) => ({
+    identity,
+    result: "trigger",
+    language: "plpgsql",
+    owner: "migration_owner",
+    security_definer: false,
+    strict: false,
+    volatility: "v",
+    leakproof: false,
+    parallel: "u",
+    kind: "f",
+    configuration: ["search_path=pg_catalog"],
+    source,
+    acl: []
+  }))
+  .sort((left, right) => left.identity.localeCompare(right.identity));
+const exactPhase6TruthFunctionIdentities = [
+  "truth.enforce_claim_transition()",
+  "truth.enforce_fact_lifecycle_transition()",
+  "truth.reject_mutation()",
+  "truth.reject_statement_mutation()",
+  "truth.require_fact_accept_reservation()",
+  "truth.require_fact_lifecycle_command()",
+  "truth.require_fact_lifecycle_event()",
+  "truth.require_objective_recovery_command()",
+  "truth.require_objective_recovery_for_terminal_claim()",
+  "truth.require_objective_support_attestation()",
+  "truth.require_reserved_command()",
+  "truth.validate_claim_insert()",
+  "truth.validate_fact_insert()",
+  "truth.validate_fact_lifecycle_event()",
+  "truth.validate_fact_support()",
+  "truth.validate_objective_recovery()",
+  "truth.validate_objective_support_attestation()",
+  "truth.verify_evidence_snapshot()"
+] as const;
+const exactFactLifecycleColumns = [
+  ["id", "uuid", true, null],
+  ["tenant_id", "uuid", true, null],
+  ["workspace_id", "uuid", true, null],
+  ["space_id", "uuid", true, null],
+  ["predecessor_fact_id", "uuid", true, null],
+  ["successor_fact_id", "uuid", false, null],
+  ["transition_kind", "text", true, null],
+  ["from_status", "text", true, null],
+  ["to_status", "text", true, null],
+  ["reason_code", "text", true, null],
+  ["reason_rationale", "text", true, null],
+  ["authority_basis", "text", true, null],
+  ["policy_version", "text", true, null],
+  ["acted_by_user_id", "uuid", true, null],
+  ["acted_by_membership_id", "uuid", true, null],
+  ["causation_command_id", "uuid", true, null],
+  ["recorded_at", "timestamp with time zone", true, "transaction_timestamp()"],
+  ["version", "integer", true, "1"]
+].map(([column_name, data_type, not_null, default_expression]) => ({
+  column_name,
+  data_type,
+  not_null,
+  default_expression
+}));
+const exactFactScope =
+  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND access.can_read_space(space_id, access_class))";
+const exactLifecycleScope =
+  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND access.can_read_space(space_id, ( SELECT fact.access_class\n   FROM truth.accepted_facts fact\n  WHERE ((fact.tenant_id = fact_lifecycle_events.tenant_id) AND (fact.workspace_id = fact_lifecycle_events.workspace_id) AND (fact.space_id = fact_lifecycle_events.space_id) AND (fact.id = fact_lifecycle_events.predecessor_fact_id)))))";
+const exactLifecycleInsertScope =
+  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (acted_by_user_id = ops.current_user_id()) AND (acted_by_membership_id = ops.current_membership_id()) AND (policy_version = ops.current_policy_version()) AND access.can_read_space(space_id, ( SELECT fact.access_class\n   FROM truth.accepted_facts fact\n  WHERE ((fact.tenant_id = fact_lifecycle_events.tenant_id) AND (fact.workspace_id = fact_lifecycle_events.workspace_id) AND (fact.space_id = fact_lifecycle_events.space_id) AND (fact.id = fact_lifecycle_events.predecessor_fact_id)))))";
+const exactPhase6Policies = [
+  {
+    table_name: "accepted_facts",
+    policy_name: "accepted_facts_lifecycle_update",
+    operation: "w",
+    permissive: true,
+    roles: ["throughline_app"],
+    using_expression: exactFactScope,
+    check_expression: exactFactScope
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    policy_name: "fact_lifecycle_insert",
+    operation: "a",
+    permissive: true,
+    roles: ["throughline_app"],
+    using_expression: null,
+    check_expression: exactLifecycleInsertScope
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    policy_name: "fact_lifecycle_integrity_select",
+    operation: "r",
+    permissive: true,
+    roles: ["throughline_b1_0_integrity"],
+    using_expression: "true",
+    check_expression: null
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    policy_name: "fact_lifecycle_select",
+    operation: "r",
+    permissive: true,
+    roles: ["throughline_app"],
+    using_expression: exactLifecycleScope,
+    check_expression: null
+  }
+] as const;
+const exactPhase6TriggerRows = [
+  {
+    name: "accepted_facts_command_guard",
+    table_name: "accepted_facts",
+    function_identity: "truth.require_reserved_command()",
+    enabled: true,
+    deferrable: false,
+    initially_deferred: false,
+    definition:
+      "CREATE TRIGGER accepted_facts_command_guard BEFORE INSERT ON truth.accepted_facts FOR EACH ROW EXECUTE FUNCTION truth.require_reserved_command('fact.accept-or-supersede.v1')"
+  },
+  {
+    name: "accepted_facts_delete_guard",
+    table_name: "accepted_facts",
+    function_identity: "truth.reject_mutation()",
+    enabled: true,
+    deferrable: false,
+    initially_deferred: false,
+    definition:
+      "CREATE TRIGGER accepted_facts_delete_guard BEFORE DELETE ON truth.accepted_facts FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation()"
+  },
+  {
+    name: "accepted_facts_lifecycle_deferred",
+    table_name: "accepted_facts",
+    function_identity: "truth.require_fact_lifecycle_event()",
+    enabled: true,
+    deferrable: true,
+    initially_deferred: true,
+    definition:
+      "CREATE CONSTRAINT TRIGGER accepted_facts_lifecycle_deferred AFTER UPDATE ON truth.accepted_facts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION truth.require_fact_lifecycle_event()"
+  },
+  {
+    name: "accepted_facts_lifecycle_guard",
+    table_name: "accepted_facts",
+    function_identity: "truth.enforce_fact_lifecycle_transition()",
+    enabled: true,
+    deferrable: false,
+    initially_deferred: false,
+    definition:
+      "CREATE TRIGGER accepted_facts_lifecycle_guard BEFORE UPDATE ON truth.accepted_facts FOR EACH ROW EXECUTE FUNCTION truth.enforce_fact_lifecycle_transition()"
+  },
+  {
+    name: "fact_lifecycle_command_guard",
+    table_name: "fact_lifecycle_events",
+    function_identity: "truth.require_fact_lifecycle_command()",
+    enabled: true,
+    deferrable: false,
+    initially_deferred: false,
+    definition:
+      "CREATE TRIGGER fact_lifecycle_command_guard BEFORE INSERT ON truth.fact_lifecycle_events FOR EACH ROW EXECUTE FUNCTION truth.require_fact_lifecycle_command('fact.supersede-or-revoke.v1')"
+  },
+  {
+    name: "fact_lifecycle_immutable",
+    table_name: "fact_lifecycle_events",
+    function_identity: "truth.reject_mutation()",
+    enabled: true,
+    deferrable: false,
+    initially_deferred: false,
+    definition:
+      "CREATE TRIGGER fact_lifecycle_immutable BEFORE DELETE OR UPDATE ON truth.fact_lifecycle_events FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation()"
+  },
+  {
+    name: "fact_lifecycle_insert_guard",
+    table_name: "fact_lifecycle_events",
+    function_identity: "truth.validate_fact_lifecycle_event()",
+    enabled: true,
+    deferrable: false,
+    initially_deferred: false,
+    definition:
+      "CREATE TRIGGER fact_lifecycle_insert_guard BEFORE INSERT ON truth.fact_lifecycle_events FOR EACH ROW EXECUTE FUNCTION truth.validate_fact_lifecycle_event()"
+  },
+  {
+    name: "fact_lifecycle_truncate_guard",
+    table_name: "fact_lifecycle_events",
+    function_identity: "truth.reject_statement_mutation()",
+    enabled: true,
+    deferrable: false,
+    initially_deferred: false,
+    definition:
+      "CREATE TRIGGER fact_lifecycle_truncate_guard BEFORE TRUNCATE ON truth.fact_lifecycle_events FOR EACH STATEMENT EXECUTE FUNCTION truth.reject_statement_mutation()"
+  },
+  {
+    name: "fact_lifecycle_valid_deferred",
+    table_name: "fact_lifecycle_events",
+    function_identity: "truth.validate_fact_lifecycle_event()",
+    enabled: true,
+    deferrable: true,
+    initially_deferred: true,
+    definition:
+      "CREATE CONSTRAINT TRIGGER fact_lifecycle_valid_deferred AFTER INSERT ON truth.fact_lifecycle_events DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION truth.validate_fact_lifecycle_event()"
+  }
+] as const;
+const exactPhase6ForeignKeys = [
+  {
+    name: "fact_lifecycle_events_actor_membership_fkey",
+    definition:
+      "FOREIGN KEY (tenant_id, workspace_id, acted_by_membership_id, acted_by_user_id) REFERENCES identity.memberships(tenant_id, workspace_id, id, user_id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    match_type: "f",
+    update_action: "r",
+    delete_action: "r"
+  },
+  {
+    name: "fact_lifecycle_events_actor_user_fkey",
+    definition:
+      "FOREIGN KEY (acted_by_user_id) REFERENCES identity.users(id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    match_type: "f",
+    update_action: "r",
+    delete_action: "r"
+  },
+  {
+    name: "fact_lifecycle_events_command_fkey",
+    definition:
+      "FOREIGN KEY (tenant_id, workspace_id, causation_command_id) REFERENCES ops.domain_command_records(tenant_id, workspace_id, id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    match_type: "f",
+    update_action: "r",
+    delete_action: "r"
+  },
+  {
+    name: "fact_lifecycle_events_policy_fkey",
+    definition:
+      "FOREIGN KEY (tenant_id, workspace_id, policy_version) REFERENCES identity.policy_versions(tenant_id, workspace_id, id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    match_type: "f",
+    update_action: "r",
+    delete_action: "r"
+  },
+  {
+    name: "fact_lifecycle_events_predecessor_fkey",
+    definition:
+      "FOREIGN KEY (tenant_id, workspace_id, space_id, predecessor_fact_id) REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    match_type: "f",
+    update_action: "r",
+    delete_action: "r"
+  },
+  {
+    name: "fact_lifecycle_events_successor_fkey",
+    definition:
+      "FOREIGN KEY (tenant_id, workspace_id, space_id, successor_fact_id) REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    match_type: "s",
+    update_action: "r",
+    delete_action: "r"
+  }
+].map((row) => ({
+  ...row,
+  deferrable: true,
+  initially_deferred: true,
+  validated: true
+}));
+const exactPhase6Checks = [
+  {
+    table_name: "accepted_facts",
+    name: "accepted_facts_status_check",
+    definition:
+      "CHECK ((status = ANY (ARRAY['current'::text, 'superseded'::text, 'revoked'::text])))"
+  },
+  {
+    table_name: "accepted_facts",
+    name: "accepted_facts_version_check",
+    definition:
+      "CHECK ((((status = 'current'::text) AND (version = 1)) OR ((status = ANY (ARRAY['superseded'::text, 'revoked'::text])) AND (version = 2))))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    name: "fact_lifecycle_events_authority_check",
+    definition:
+      "CHECK ((authority_basis = ANY (ARRAY['activity_owner'::text, 'initiative_owner'::text])))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    name: "fact_lifecycle_events_id_check",
+    definition: "CHECK (ops.is_uuid_v7(id))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    name: "fact_lifecycle_events_rationale_check",
+    definition:
+      "CHECK (((reason_rationale = NORMALIZE(reason_rationale, NFC)) AND (reason_rationale = btrim(reason_rationale)) AND ((length(reason_rationale) >= 1) AND (length(reason_rationale) <= 2000))))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    name: "fact_lifecycle_events_reason_check",
+    definition:
+      "CHECK ((((transition_kind = 'supersede'::text) AND (reason_code = ANY (ARRAY['newer_evidence'::text, 'accepted_value_changed'::text, 'corrected_source_revalidated'::text]))) OR ((transition_kind = 'revoke'::text) AND (reason_code = ANY (ARRAY['no_longer_true'::text, 'support_invalidated'::text, 'entered_in_error'::text])))))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    name: "fact_lifecycle_events_timestamp_check",
+    definition: "CHECK ((recorded_at = transaction_timestamp()))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    name: "fact_lifecycle_events_transition_shape_check",
+    definition:
+      "CHECK ((((transition_kind = 'supersede'::text) AND (from_status = 'current'::text) AND (to_status = 'superseded'::text) AND (successor_fact_id IS NOT NULL) AND (successor_fact_id <> predecessor_fact_id)) OR ((transition_kind = 'revoke'::text) AND (from_status = 'current'::text) AND (to_status = 'revoked'::text) AND (successor_fact_id IS NULL))))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    name: "fact_lifecycle_events_version_check",
+    definition: "CHECK ((version = 1))"
+  }
+].map((row) => ({
+  ...row,
+  deferrable: false,
+  initially_deferred: false,
+  validated: true
+}));
+const exactPhase6Privileges = [
+  ...["INSERT", "SELECT"].map((privilege) => ({
+    table_name: "accepted_facts",
+    scope: "table",
+    column_name: null,
+    grantee: "throughline_app",
+    privilege,
+    grantable: false
+  })),
+  {
+    table_name: "accepted_facts",
+    scope: "table",
+    column_name: null,
+    grantee: "throughline_b1_0_integrity",
+    privilege: "SELECT",
+    grantable: false
+  },
+  ...["last_causation_command_id", "status", "updated_at", "version"].map((column_name) => ({
+    table_name: "accepted_facts",
+    scope: "column",
+    column_name,
+    grantee: "throughline_app",
+    privilege: "UPDATE",
+    grantable: false
+  })),
+  ...["INSERT", "SELECT"].map((privilege) => ({
+    table_name: "fact_lifecycle_events",
+    scope: "table",
+    column_name: null,
+    grantee: "throughline_app",
+    privilege,
+    grantable: false
+  })),
+  {
+    table_name: "fact_lifecycle_events",
+    scope: "table",
+    column_name: null,
+    grantee: "throughline_b1_0_integrity",
+    privilege: "SELECT",
+    grantable: false
+  }
+].sort((left, right) =>
+  `${left.table_name}|${left.scope}|${left.column_name ?? ""}|${left.grantee}|${left.privilege}`.localeCompare(
+    `${right.table_name}|${right.scope}|${right.column_name ?? ""}|${right.grantee}|${right.privilege}`
+  )
+);
+const exactPhase6AuditActions = [
+  "organization.create",
+  "initiative.create",
+  "activity.create",
+  "activity.capture_add",
+  "relationship.create",
+  "relationship.end",
+  "content.create",
+  "content.revise",
+  "source_artifact.capture",
+  "source_artifact.correct",
+  "source_artifact.tombstone",
+  "claim.create",
+  "initiative.primary_objective.withdraw",
+  "initiative.primary_objective.reject",
+  "initiative.primary_objective.rework",
+  "fact.accept",
+  "fact.supersede",
+  "fact.revoke"
+] as const;
+const exactPhase6OutboxEvents = [
+  "organization.created",
+  "initiative.created",
+  "activity.created",
+  "activity.capture_added",
+  "relationship.created",
+  "relationship.ended",
+  "content.created",
+  "content.revised",
+  "source_artifact.captured",
+  "source_artifact.corrected",
+  "source_artifact.tombstoned",
+  "claim.proposed",
+  "initiative.primary_objective.proposal_withdrawn",
+  "initiative.primary_objective.proposal_rejected",
+  "initiative.primary_objective.proposal_reworked",
+  "fact.accepted",
+  "fact.superseded",
+  "fact.revoked"
+] as const;
+const exactPhase6CommandTrigger = {
+  name: "domain_command_records_b2_slice1_atomicity_deferred",
+  function_identity: "ops.require_b2_slice1_command_atomicity()",
+  deferrable: true,
+  initially_deferred: true,
+  definition:
+    "CREATE CONSTRAINT TRIGGER domain_command_records_b2_slice1_atomicity_deferred AFTER INSERT OR UPDATE ON ops.domain_command_records DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN ((new.command_kind = ANY (ARRAY['claim.create.v1'::text, 'initiative.primary_objective.withdraw.v1'::text, 'initiative.primary_objective.rework.v1'::text, 'fact.accept.v1'::text, 'fact.supersede.v1'::text, 'fact.revoke.v1'::text]))) EXECUTE FUNCTION ops.require_b2_slice1_command_atomicity()"
+} as const;
 
 maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
   if (!ownerUrl || !appUrl) {
@@ -107,6 +706,20 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
   const expectPhase5CatalogContractRejected = async (
     mutation: string,
     expectedDiagnostic: string
+  ) => {
+    try {
+      await resetToLatest();
+      await applyMigrations(ownerPool);
+      await ownerPool.query(mutation);
+      await expect(applyMigrations(ownerPool)).rejects.toThrow(expectedDiagnostic);
+    } finally {
+      await resetToLatest();
+    }
+  };
+
+  const expectPhase6CatalogContractRejected = async (
+    mutation: string,
+    expectedDiagnostic: RegExp
   ) => {
     try {
       await resetToLatest();
@@ -234,11 +847,19 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     async () => {
       try {
         await resetToLatest();
-        await expect(applyMigrations(ownerPool)).resolves.toEqual({
+        await expect(
+          applyMigrations(ownerPool, {
+            through: "0011_b2_primary_objective_proposal_recovery.sql"
+          })
+        ).resolves.toEqual({
           applied: ["0011_b2_primary_objective_proposal_recovery.sql"],
           skipped: [...allMigrationIds]
         });
-        await expect(applyMigrations(ownerPool)).resolves.toEqual({
+        await expect(
+          applyMigrations(ownerPool, {
+            through: "0011_b2_primary_objective_proposal_recovery.sql"
+          })
+        ).resolves.toEqual({
           applied: [],
           skipped: [...allMigrationIds, "0011_b2_primary_objective_proposal_recovery.sql"]
         });
@@ -295,6 +916,1401 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
             app_update: false
           }
         ]);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "adds and reapplies only the bounded post-0012 ordinary Fact lifecycle catalog",
+    async () => {
+      try {
+        await resetToLatest();
+        await expect(applyMigrations(ownerPool)).resolves.toEqual({
+          applied: [
+            "0011_b2_primary_objective_proposal_recovery.sql",
+            "0012_b2_fact_lifecycle.sql"
+          ],
+          skipped: [...allMigrationIds]
+        });
+        await expect(applyMigrations(ownerPool)).resolves.toEqual({
+          applied: [],
+          skipped: [...postSlice4AMigrationIds]
+        });
+        const journal = await ownerPool.query<{ id: string }>(
+          "SELECT id FROM throughline_migrations.journal ORDER BY id"
+        );
+        expect(journal.rows.map(({ id }) => id)).toEqual(postSlice4AMigrationIds);
+
+        const truthFunctionInventory = await ownerPool.query<{ identity: string }>(
+          `SELECT procedure.oid::regprocedure::text AS identity
+             FROM pg_proc procedure
+             JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+            WHERE namespace.nspname = 'truth'
+            ORDER BY procedure.oid::regprocedure::text`
+        );
+        expect(truthFunctionInventory.rows.map(({ identity }) => identity)).toEqual(
+          exactPhase6TruthFunctionIdentities
+        );
+
+        const lifecycleFunctions = await ownerPool.query<{
+          identity: string;
+          result: string;
+          language: string;
+          owner: string;
+          security_definer: boolean;
+          strict: boolean;
+          volatility: string;
+          leakproof: boolean;
+          parallel: string;
+          kind: string;
+          configuration: string[];
+          source: string;
+          acl: unknown[];
+        }>(
+          `SELECT procedure.oid::regprocedure::text AS identity,
+                  pg_get_function_result(procedure.oid) AS result,
+                  language.lanname AS language,
+                  CASE WHEN procedure.proowner = current_user::regrole
+                       THEN 'migration_owner'
+                       ELSE pg_get_userbyid(procedure.proowner) END AS owner,
+                  procedure.prosecdef AS security_definer,
+                  procedure.proisstrict AS strict,
+                  procedure.provolatile::text AS volatility,
+                  procedure.proleakproof AS leakproof,
+                  procedure.proparallel::text AS parallel,
+                  procedure.prokind::text AS kind,
+                  COALESCE(procedure.proconfig, ARRAY[]::text[]) AS configuration,
+                  regexp_replace(btrim(procedure.prosrc), '[[:space:]]+', ' ', 'g') AS source,
+                  COALESCE((
+                    SELECT jsonb_agg(jsonb_build_object(
+                             'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                                             ELSE pg_get_userbyid(acl.grantee) END,
+                             'privilege', acl.privilege_type,
+                             'grantable', acl.is_grantable,
+                             'grantor', CASE WHEN acl.grantor = current_user::regrole
+                                            THEN 'migration_owner'
+                                            ELSE pg_get_userbyid(acl.grantor) END
+                           ) ORDER BY acl.grantee, acl.privilege_type,
+                                      acl.is_grantable, acl.grantor)
+                      FROM aclexplode(COALESCE(
+                        procedure.proacl, acldefault('f', procedure.proowner)
+                      )) acl
+                     WHERE acl.grantee <> procedure.proowner
+                  ), '[]'::jsonb) AS acl
+             FROM pg_proc procedure
+             JOIN pg_language language ON language.oid = procedure.prolang
+            WHERE procedure.oid = ANY($1::regprocedure[])
+            ORDER BY procedure.oid::regprocedure::text`,
+          [Object.keys(exactPhase6LifecycleFunctionSources)]
+        );
+        expect(lifecycleFunctions.rows).toEqual(exactPhase6LifecycleFunctionCatalog);
+
+        const columns = await ownerPool.query<{
+          column_name: string;
+          data_type: string;
+          not_null: boolean;
+          default_expression: string | null;
+        }>(
+          `SELECT attribute.attname::text AS column_name,
+                  format_type(attribute.atttypid, attribute.atttypmod) AS data_type,
+                  attribute.attnotnull AS not_null,
+                  pg_get_expr(default_record.adbin, default_record.adrelid, false)
+                    AS default_expression
+             FROM pg_class relation
+             JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+             JOIN pg_attribute attribute ON attribute.attrelid = relation.oid
+             LEFT JOIN pg_attrdef default_record
+               ON default_record.adrelid = attribute.attrelid
+              AND default_record.adnum = attribute.attnum
+            WHERE namespace.nspname = 'truth'
+              AND relation.relname = 'fact_lifecycle_events'
+              AND attribute.attnum > 0 AND NOT attribute.attisdropped
+            ORDER BY attribute.attnum`
+        );
+        expect(columns.rows).toEqual(exactFactLifecycleColumns);
+
+        const lifecycleBoundary = await ownerPool.query<{
+          rls: boolean;
+          forced: boolean;
+          status_constraint: string;
+          version_constraint: string;
+          current_slot: string;
+        }>(
+          `SELECT lifecycle.relrowsecurity AS rls,
+                  lifecycle.relforcerowsecurity AS forced,
+                  (SELECT pg_get_constraintdef(constraint_record.oid, false)
+                     FROM pg_constraint constraint_record
+                    WHERE constraint_record.conrelid = 'truth.accepted_facts'::regclass
+                      AND constraint_record.conname = 'accepted_facts_status_check')
+                    AS status_constraint,
+                  (SELECT pg_get_constraintdef(constraint_record.oid, false)
+                     FROM pg_constraint constraint_record
+                    WHERE constraint_record.conrelid = 'truth.accepted_facts'::regclass
+                      AND constraint_record.conname = 'accepted_facts_version_check')
+                    AS version_constraint,
+                  pg_get_indexdef('truth.accepted_facts_one_current_slot'::regclass, 0, false)
+                    AS current_slot
+             FROM pg_class lifecycle
+            WHERE lifecycle.oid = 'truth.fact_lifecycle_events'::regclass`
+        );
+        expect(lifecycleBoundary.rows).toEqual([
+          {
+            rls: true,
+            forced: true,
+            status_constraint:
+              "CHECK ((status = ANY (ARRAY['current'::text, 'superseded'::text, 'revoked'::text])))",
+            version_constraint:
+              "CHECK ((((status = 'current'::text) AND (version = 1)) OR ((status = ANY (ARRAY['superseded'::text, 'revoked'::text])) AND (version = 2))))",
+            current_slot:
+              "CREATE UNIQUE INDEX accepted_facts_one_current_slot ON truth.accepted_facts USING btree (tenant_id, workspace_id, space_id, subject_type, subject_id, predicate) WHERE (status = 'current'::text)"
+          }
+        ]);
+
+        const checks = await ownerPool.query<{
+          table_name: string;
+          name: string;
+          definition: string;
+          deferrable: boolean;
+          initially_deferred: boolean;
+          validated: boolean;
+        }>(
+          `SELECT relation.relname AS table_name,
+                  constraint_record.conname AS name,
+                  pg_get_constraintdef(constraint_record.oid, false) AS definition,
+                  constraint_record.condeferrable AS deferrable,
+                  constraint_record.condeferred AS initially_deferred,
+                  constraint_record.convalidated AS validated
+             FROM pg_constraint constraint_record
+             JOIN pg_class relation ON relation.oid = constraint_record.conrelid
+            WHERE constraint_record.contype = 'c'
+              AND (
+                constraint_record.conrelid = 'truth.fact_lifecycle_events'::regclass OR
+                (constraint_record.conrelid = 'truth.accepted_facts'::regclass AND
+                 constraint_record.conname IN (
+                   'accepted_facts_status_check', 'accepted_facts_version_check'
+                 ))
+              )
+            ORDER BY relation.relname, constraint_record.conname`
+        );
+        expect(checks.rows).toEqual(exactPhase6Checks);
+
+        const closedVocabulary = await ownerPool.query<{
+          name: string;
+          definition: string;
+        }>(
+          `SELECT constraint_record.conname AS name,
+                  pg_get_constraintdef(constraint_record.oid, false) AS definition
+             FROM pg_constraint constraint_record
+            WHERE constraint_record.conname = ANY($1::text[])
+            ORDER BY constraint_record.conname`,
+          [["audit_events_action_check", "product_outbox_events_event_type_check"]]
+        );
+        const exactAnyCheck = (column: string, values: readonly string[]) =>
+          `CHECK ((${column} = ANY (ARRAY[${values
+            .map((value) => `'${value}'::text`)
+            .join(", ")}]))))`;
+        expect(closedVocabulary.rows).toEqual([
+          {
+            name: "audit_events_action_check",
+            definition: exactAnyCheck("action", exactPhase6AuditActions)
+          },
+          {
+            name: "product_outbox_events_event_type_check",
+            definition: exactAnyCheck("event_type", exactPhase6OutboxEvents)
+          }
+        ]);
+
+        const policies = await ownerPool.query<{
+          table_name: string;
+          policy_name: string;
+          operation: string;
+          permissive: boolean;
+          roles: string[];
+          using_expression: string | null;
+          check_expression: string | null;
+        }>(
+          `SELECT relation.relname AS table_name, policy.polname AS policy_name,
+                  policy.polcmd::text AS operation,
+                  policy.polpermissive AS permissive,
+                  ARRAY(SELECT CASE WHEN role_oid = 0 THEN 'PUBLIC'
+                                    ELSE role_oid::regrole::text END
+                          FROM unnest(policy.polroles) role_oid ORDER BY 1) AS roles,
+                  pg_get_expr(policy.polqual, policy.polrelid) AS using_expression,
+                  pg_get_expr(policy.polwithcheck, policy.polrelid) AS check_expression
+             FROM pg_policy policy
+             JOIN pg_class relation ON relation.oid = policy.polrelid
+            WHERE policy.polname = ANY($1::text[])
+            ORDER BY relation.relname, policy.polname`,
+          [
+            [
+              "accepted_facts_lifecycle_update",
+              "fact_lifecycle_insert",
+              "fact_lifecycle_integrity_select",
+              "fact_lifecycle_select"
+            ]
+          ]
+        );
+        expect(policies.rows).toEqual(exactPhase6Policies);
+
+        const foreignKeys = await ownerPool.query<{
+          name: string;
+          definition: string;
+          deferrable: boolean;
+          initially_deferred: boolean;
+          validated: boolean;
+          match_type: string;
+          update_action: string;
+          delete_action: string;
+        }>(
+          `SELECT constraint_record.conname AS name,
+                  pg_get_constraintdef(constraint_record.oid, false) AS definition,
+                  constraint_record.condeferrable AS deferrable,
+                  constraint_record.condeferred AS initially_deferred,
+                  constraint_record.convalidated AS validated,
+                  constraint_record.confmatchtype::text AS match_type,
+                  constraint_record.confupdtype::text AS update_action,
+                  constraint_record.confdeltype::text AS delete_action
+             FROM pg_constraint constraint_record
+            WHERE constraint_record.conrelid = 'truth.fact_lifecycle_events'::regclass
+              AND constraint_record.contype = 'f'
+            ORDER BY constraint_record.conname`
+        );
+        expect(foreignKeys.rows).toEqual(exactPhase6ForeignKeys);
+
+        const triggers = await ownerPool.query<{
+          name: string;
+          table_name: string;
+          function_identity: string;
+          enabled: boolean;
+          deferrable: boolean;
+          initially_deferred: boolean;
+          definition: string;
+        }>(
+          `SELECT trigger_record.tgname AS name,
+                  relation.relname AS table_name,
+                  procedure.oid::regprocedure::text AS function_identity,
+                  trigger_record.tgenabled <> 'D' AS enabled,
+                  trigger_record.tgdeferrable AS deferrable,
+                  trigger_record.tginitdeferred AS initially_deferred,
+                  pg_get_triggerdef(trigger_record.oid, false) AS definition
+             FROM pg_trigger trigger_record
+             JOIN pg_class relation ON relation.oid = trigger_record.tgrelid
+             JOIN pg_proc procedure ON procedure.oid = trigger_record.tgfoid
+            WHERE NOT trigger_record.tgisinternal
+              AND trigger_record.tgname = ANY($1::text[])
+            ORDER BY trigger_record.tgname`,
+          [exactPhase6TriggerRows.map(({ name }) => name)]
+        );
+        expect(triggers.rows).toEqual(exactPhase6TriggerRows);
+
+        const commandTrigger = await ownerPool.query<{
+          name: string;
+          function_identity: string;
+          deferrable: boolean;
+          initially_deferred: boolean;
+          definition: string;
+        }>(
+          `SELECT trigger_record.tgname AS name,
+                  procedure.oid::regprocedure::text AS function_identity,
+                  trigger_record.tgdeferrable AS deferrable,
+                  trigger_record.tginitdeferred AS initially_deferred,
+                  pg_get_triggerdef(trigger_record.oid, false) AS definition
+             FROM pg_trigger trigger_record
+             JOIN pg_proc procedure ON procedure.oid = trigger_record.tgfoid
+            WHERE trigger_record.tgrelid = 'ops.domain_command_records'::regclass
+              AND trigger_record.tgname = $1`,
+          [exactPhase6CommandTrigger.name]
+        );
+        expect(commandTrigger.rows).toEqual([exactPhase6CommandTrigger]);
+
+        const preservedImmutability = await ownerPool.query<{
+          name: string;
+          table_name: string;
+          function_identity: string;
+          definition: string;
+        }>(
+          `SELECT trigger_record.tgname AS name,
+                  relation.relname AS table_name,
+                  procedure.oid::regprocedure::text AS function_identity,
+                  pg_get_triggerdef(trigger_record.oid, false) AS definition
+             FROM pg_trigger trigger_record
+             JOIN pg_class relation ON relation.oid = trigger_record.tgrelid
+             JOIN pg_proc procedure ON procedure.oid = trigger_record.tgfoid
+            WHERE NOT trigger_record.tgisinternal
+              AND trigger_record.tgname = ANY($1::text[])
+            ORDER BY trigger_record.tgname`,
+          [
+            [
+              "accepted_facts_insert_guard",
+              "accepted_facts_support_deferred",
+              "claims_command_guard",
+              "claims_delete_guard",
+              "claims_insert_guard",
+              "claims_transition_guard",
+              "fact_claims_command_guard",
+              "fact_claims_immutable",
+              "fact_claims_support_deferred",
+              "verified_evidence_command_guard",
+              "verified_evidence_immutable",
+              "verified_evidence_snapshot_guard"
+            ]
+          ]
+        );
+        expect(preservedImmutability.rows).toEqual([
+          {
+            name: "accepted_facts_insert_guard",
+            table_name: "accepted_facts",
+            function_identity: "truth.validate_fact_insert()",
+            definition:
+              "CREATE TRIGGER accepted_facts_insert_guard BEFORE INSERT ON truth.accepted_facts FOR EACH ROW EXECUTE FUNCTION truth.validate_fact_insert()"
+          },
+          {
+            name: "accepted_facts_support_deferred",
+            table_name: "accepted_facts",
+            function_identity: "truth.validate_fact_support()",
+            definition:
+              "CREATE CONSTRAINT TRIGGER accepted_facts_support_deferred AFTER INSERT ON truth.accepted_facts DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION truth.validate_fact_support()"
+          },
+          {
+            name: "claims_command_guard",
+            table_name: "claims",
+            function_identity: "truth.require_reserved_command()",
+            definition:
+              "CREATE TRIGGER claims_command_guard BEFORE INSERT ON truth.claims FOR EACH ROW EXECUTE FUNCTION truth.require_reserved_command('claim.create-or-rework.v1')"
+          },
+          {
+            name: "claims_delete_guard",
+            table_name: "claims",
+            function_identity: "truth.reject_mutation()",
+            definition:
+              "CREATE TRIGGER claims_delete_guard BEFORE DELETE ON truth.claims FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation()"
+          },
+          {
+            name: "claims_insert_guard",
+            table_name: "claims",
+            function_identity: "truth.validate_claim_insert()",
+            definition:
+              "CREATE TRIGGER claims_insert_guard BEFORE INSERT ON truth.claims FOR EACH ROW EXECUTE FUNCTION truth.validate_claim_insert()"
+          },
+          {
+            name: "claims_transition_guard",
+            table_name: "claims",
+            function_identity: "truth.enforce_claim_transition()",
+            definition:
+              "CREATE TRIGGER claims_transition_guard BEFORE UPDATE ON truth.claims FOR EACH ROW EXECUTE FUNCTION truth.enforce_claim_transition()"
+          },
+          {
+            name: "fact_claims_command_guard",
+            table_name: "fact_claims",
+            function_identity: "truth.require_fact_accept_reservation()",
+            definition:
+              "CREATE TRIGGER fact_claims_command_guard BEFORE INSERT ON truth.fact_claims FOR EACH ROW EXECUTE FUNCTION truth.require_fact_accept_reservation()"
+          },
+          {
+            name: "fact_claims_immutable",
+            table_name: "fact_claims",
+            function_identity: "truth.reject_mutation()",
+            definition:
+              "CREATE TRIGGER fact_claims_immutable BEFORE DELETE OR UPDATE ON truth.fact_claims FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation()"
+          },
+          {
+            name: "fact_claims_support_deferred",
+            table_name: "fact_claims",
+            function_identity: "truth.validate_fact_support()",
+            definition:
+              "CREATE CONSTRAINT TRIGGER fact_claims_support_deferred AFTER INSERT ON truth.fact_claims DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION truth.validate_fact_support()"
+          },
+          {
+            name: "verified_evidence_command_guard",
+            table_name: "verified_evidence_spans",
+            function_identity: "truth.require_reserved_command()",
+            definition:
+              "CREATE TRIGGER verified_evidence_command_guard BEFORE INSERT ON truth.verified_evidence_spans FOR EACH ROW EXECUTE FUNCTION truth.require_reserved_command('claim.create-or-rework.v1')"
+          },
+          {
+            name: "verified_evidence_immutable",
+            table_name: "verified_evidence_spans",
+            function_identity: "truth.reject_mutation()",
+            definition:
+              "CREATE TRIGGER verified_evidence_immutable BEFORE DELETE OR UPDATE ON truth.verified_evidence_spans FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation()"
+          },
+          {
+            name: "verified_evidence_snapshot_guard",
+            table_name: "verified_evidence_spans",
+            function_identity: "truth.verify_evidence_snapshot()",
+            definition:
+              "CREATE TRIGGER verified_evidence_snapshot_guard BEFORE INSERT ON truth.verified_evidence_spans FOR EACH ROW EXECUTE FUNCTION truth.verify_evidence_snapshot()"
+          }
+        ]);
+
+        const privileges = await ownerPool.query<{
+          table_name: string;
+          scope: string;
+          column_name: string | null;
+          grantee: string;
+          privilege: string;
+          grantable: boolean;
+        }>(
+          `SELECT relation.relname AS table_name, 'table'::text AS scope,
+                  NULL::text AS column_name,
+                  CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                       ELSE pg_get_userbyid(acl.grantee) END AS grantee,
+                  acl.privilege_type AS privilege, acl.is_grantable AS grantable
+             FROM pg_class relation
+             CROSS JOIN LATERAL aclexplode(COALESCE(
+               relation.relacl, acldefault('r', relation.relowner)
+             )) acl
+            WHERE relation.oid = ANY($1::regclass[])
+              AND acl.grantee <> relation.relowner
+            UNION ALL
+           SELECT relation.relname, 'column', attribute.attname::text,
+                  CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
+                       ELSE pg_get_userbyid(acl.grantee) END,
+                  acl.privilege_type, acl.is_grantable
+             FROM pg_class relation
+             JOIN pg_attribute attribute ON attribute.attrelid = relation.oid
+             CROSS JOIN LATERAL aclexplode(COALESCE(
+               attribute.attacl, acldefault('c', relation.relowner)
+             )) acl
+            WHERE relation.oid = ANY($1::regclass[])
+              AND attribute.attnum > 0 AND NOT attribute.attisdropped
+              AND acl.grantee <> relation.relowner
+            ORDER BY table_name, scope, column_name NULLS FIRST, grantee, privilege, grantable`,
+          [["truth.accepted_facts", "truth.fact_lifecycle_events"]]
+        );
+        expect(privileges.rows).toEqual(exactPhase6Privileges);
+
+        const appRoleBoundary = await ownerPool.query<{
+          bypass_rls: boolean;
+          privilege_memberships: string[];
+        }>(
+          `SELECT app.rolbypassrls AS bypass_rls,
+                  ARRAY(
+                    SELECT inherited.rolname::text
+                      FROM pg_roles inherited
+                     WHERE inherited.oid <> app.oid
+                       AND pg_has_role(app.oid, inherited.oid, 'MEMBER')
+                       AND (
+                         inherited.rolsuper OR inherited.rolbypassrls OR
+                         has_table_privilege(
+                           inherited.oid,
+                           'truth.accepted_facts',
+                           'UPDATE, DELETE, TRUNCATE'
+                         ) OR has_table_privilege(
+                           inherited.oid,
+                           'truth.fact_lifecycle_events',
+                           'UPDATE, DELETE, TRUNCATE'
+                         )
+                       )
+                     ORDER BY inherited.rolname
+                  ) AS privilege_memberships
+             FROM pg_roles app
+            WHERE app.rolname = 'throughline_app'`
+        );
+        expect(appRoleBoundary.rows).toEqual([{ bypass_rls: false, privilege_memberships: [] }]);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "commits one exact revoke with no successor and exact command, audit, and outbox evidence",
+    async () => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        await executeExactRevokeTransaction(ownerPool, "valid");
+        const committed = await ownerPool.query<{
+          fact: unknown;
+          lifecycle: unknown;
+          command_record: unknown;
+          audit: unknown;
+          outbox: unknown;
+        }>(
+          `SELECT
+             (SELECT jsonb_build_object(
+                'id', fact.id, 'status', fact.status, 'version', fact.version,
+                'lastCausationCommandId', fact.last_causation_command_id
+              ) FROM truth.accepted_facts fact WHERE fact.id = $1) AS fact,
+             (SELECT jsonb_build_object(
+                'predecessorFactId', lifecycle.predecessor_fact_id,
+                'successorFactId', lifecycle.successor_fact_id,
+                'transitionKind', lifecycle.transition_kind,
+                'fromStatus', lifecycle.from_status, 'toStatus', lifecycle.to_status,
+                'reasonCode', lifecycle.reason_code,
+                'reasonRationale', lifecycle.reason_rationale,
+                'authorityBasis', lifecycle.authority_basis,
+                'actorUserId', lifecycle.acted_by_user_id,
+                'actorMembershipId', lifecycle.acted_by_membership_id,
+                'commandId', lifecycle.causation_command_id,
+                'version', lifecycle.version
+              ) FROM truth.fact_lifecycle_events lifecycle
+                WHERE lifecycle.causation_command_id = $2) AS lifecycle,
+             (SELECT jsonb_build_object(
+                'kind', command_record.command_kind,
+                'schemaVersion', command_record.command_schema_version,
+                'state', command_record.state,
+                'safeRequest', command_record.safe_request,
+                'resourceType', command_record.result_resource_type,
+                'resourceId', command_record.result_resource_id,
+                'safeResponse', command_record.safe_response
+              ) FROM ops.domain_command_records command_record
+                WHERE command_record.id = $2) AS command_record,
+             (SELECT jsonb_build_object(
+                'action', audit.action, 'resourceType', audit.resource_type,
+                'resourceId', audit.resource_id, 'schemaVersion', audit.audit_schema_version,
+                'safeDetail', audit.safe_detail
+              ) FROM ops.audit_events audit WHERE audit.causation_command_id = $2) AS audit,
+             (SELECT jsonb_build_object(
+                'eventType', event.event_type,
+                'eventSchemaVersion', event.event_schema_version,
+                'payloadSchemaVersion', event.payload_schema_version,
+                'aggregateType', event.aggregate_type,
+                'aggregateId', event.aggregate_id,
+                'aggregateVersion', event.aggregate_version,
+                'payload', event.payload
+              ) FROM ops.product_outbox_events event
+                WHERE event.causation_command_id = $2) AS outbox`,
+          [adoptionIds.fact, phase6Ids.revokeCommand]
+        );
+        expect(committed.rows).toEqual([
+          {
+            fact: {
+              id: adoptionIds.fact,
+              status: "revoked",
+              version: 2,
+              lastCausationCommandId: phase6Ids.revokeCommand
+            },
+            lifecycle: {
+              predecessorFactId: adoptionIds.fact,
+              successorFactId: null,
+              transitionKind: "revoke",
+              fromStatus: "current",
+              toStatus: "revoked",
+              reasonCode: "no_longer_true",
+              reasonRationale: "The accepted outcome no longer reflects current reality.",
+              authorityBasis: "activity_owner",
+              actorUserId: adoptionIds.user,
+              actorMembershipId: adoptionIds.membership,
+              commandId: phase6Ids.revokeCommand,
+              version: 1
+            },
+            command_record: {
+              kind: "fact.revoke.v1",
+              schemaVersion: 1,
+              state: "completed",
+              safeRequest: {
+                factId: adoptionIds.fact,
+                expectedFactVersion: 1,
+                reason: {
+                  code: "no_longer_true",
+                  rationale: "The accepted outcome no longer reflects current reality."
+                }
+              },
+              resourceType: "accepted_fact",
+              resourceId: adoptionIds.fact,
+              safeResponse: { factId: adoptionIds.fact, status: "revoked", version: 2 }
+            },
+            audit: {
+              action: "fact.revoke",
+              resourceType: "accepted_fact",
+              resourceId: adoptionIds.fact,
+              schemaVersion: 1,
+              safeDetail: {
+                factId: adoptionIds.fact,
+                factVersion: 2,
+                reasonCode: "no_longer_true",
+                status: "revoked"
+              }
+            },
+            outbox: {
+              eventType: "fact.revoked",
+              eventSchemaVersion: 1,
+              payloadSchemaVersion: 1,
+              aggregateType: "accepted_fact",
+              aggregateId: adoptionIds.fact,
+              aggregateVersion: 2,
+              payload: {
+                factId: adoptionIds.fact,
+                factVersion: 2,
+                reasonCode: "no_longer_true",
+                status: "revoked"
+              }
+            }
+          }
+        ]);
+        expect(
+          JSON.stringify({ audit: committed.rows[0]?.audit, outbox: committed.rows[0]?.outbox })
+        ).not.toMatch(/reasonRationale|objectiveText|sourceText|sourceExcerpt|arbitraryText/);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "commits exact supersession lineage A to B with one replacement current slot",
+    async () => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const immutableBefore = await exactPredecessorImmutableDigest(ownerPool);
+        await executeExactSupersedeTransaction(ownerPool, "valid");
+        const lineage = await ownerPool.query<{
+          predecessor_id: string;
+          predecessor_status: string;
+          predecessor_version: number;
+          successor_id: string;
+          successor_status: string;
+          successor_version: number;
+          lifecycle_predecessor: string;
+          lifecycle_successor: string;
+          transition: string;
+          current_slots: number;
+        }>(
+          `SELECT predecessor.id AS predecessor_id,
+                  predecessor.status AS predecessor_status,
+                  predecessor.version AS predecessor_version,
+                  successor.id AS successor_id,
+                  successor.status AS successor_status,
+                  successor.version AS successor_version,
+                  lifecycle.predecessor_fact_id AS lifecycle_predecessor,
+                  lifecycle.successor_fact_id AS lifecycle_successor,
+                  lifecycle.transition_kind AS transition,
+                  (SELECT count(*)::integer FROM truth.accepted_facts current_fact
+                    WHERE current_fact.tenant_id = predecessor.tenant_id
+                      AND current_fact.workspace_id = predecessor.workspace_id
+                      AND current_fact.space_id = predecessor.space_id
+                      AND current_fact.subject_type = predecessor.subject_type
+                      AND current_fact.subject_id = predecessor.subject_id
+                      AND current_fact.predicate = predecessor.predicate
+                      AND current_fact.status = 'current') AS current_slots
+             FROM truth.accepted_facts predecessor
+             JOIN truth.fact_lifecycle_events lifecycle
+               ON lifecycle.predecessor_fact_id = predecessor.id
+             JOIN truth.accepted_facts successor
+               ON successor.id = lifecycle.successor_fact_id
+            WHERE predecessor.id = $1`,
+          [adoptionIds.fact]
+        );
+        expect(lineage.rows).toEqual([
+          {
+            predecessor_id: adoptionIds.fact,
+            predecessor_status: "superseded",
+            predecessor_version: 2,
+            successor_id: adoptionIds.successor,
+            successor_status: "current",
+            successor_version: 1,
+            lifecycle_predecessor: adoptionIds.fact,
+            lifecycle_successor: adoptionIds.successor,
+            transition: "supersede",
+            current_slots: 1
+          }
+        ]);
+        expect(await exactPredecessorImmutableDigest(ownerPool)).toBe(immutableBefore);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects mismatched predecessor/successor subject coordinates and rolls back every write",
+    async () => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6AtomicDigest(ownerPool, phase6Ids.supersedeCommand);
+        await expect(
+          executeExactSupersedeTransaction(ownerPool, "mismatched_lineage")
+        ).rejects.toThrow();
+        expect(await exactPhase6AtomicDigest(ownerPool, phase6Ids.supersedeCommand)).toBe(before);
+        const leakedSubject = await ownerPool.query<{ count: number }>(
+          "SELECT count(*)::integer AS count FROM work.activities WHERE id = $1",
+          [phase6Ids.otherSubject]
+        );
+        expect(leakedSubject.rows).toEqual([{ count: 0 }]);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    ["accepted value", "normalized_text = normalized_text || ' drift'"],
+    ["accepted confidence", "confidence = 'confirmed'"],
+    ["support-derived confidence", "strongest_supporting_confidence = 'confirmed'"],
+    ["Fact coordinate", `subject_id = '${phase6Ids.otherSubject}'::uuid`],
+    ["accepting actor", `accepted_by_user_id = '${devFixtures.userB}'::uuid`],
+    ["acceptance time", "recorded_at = recorded_at + interval '1 second'"],
+    ["access classification", "access_class = 'restricted'"]
+  ])(
+    "rejects a lifecycle-shaped update that also mutates the predecessor %s",
+    async (_field, mutation) => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const before = await exactLifecycleProtectedDigest(ownerPool);
+        await expect(executeForbiddenAcceptedFactMutation(ownerPool, mutation)).rejects.toThrow(
+          "accepted Fact lifecycle transition is not permitted"
+        );
+        expect(await exactLifecycleProtectedDigest(ownerPool)).toBe(before);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    [
+      "Fact support association",
+      `UPDATE truth.fact_claims
+          SET created_at = created_at + interval '1 second'
+        WHERE fact_id = '${adoptionIds.fact}'::uuid`,
+      "truth lineage is immutable"
+    ],
+    [
+      "verified evidence",
+      `UPDATE truth.verified_evidence_spans
+          SET source_excerpt = source_excerpt || ' drift'
+        WHERE id = '${adoptionIds.evidence}'::uuid`,
+      "truth lineage is immutable"
+    ],
+    [
+      "accepted Claim value",
+      `UPDATE truth.claims
+          SET normalized_text = normalized_text || ' drift'
+        WHERE id = '${adoptionIds.claim}'::uuid`,
+      "claim transition is not permitted"
+    ]
+  ])(
+    "preserves the predecessor %s immutability guard during Slice 4A",
+    async (_surface, statement, diagnostic) => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const before = await exactLifecycleProtectedDigest(ownerPool);
+        await expect(executeRolledBackStatement(ownerPool, statement)).rejects.toThrow(diagnostic);
+        expect(await exactLifecycleProtectedDigest(ownerPool)).toBe(before);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    [
+      "reduced-cardinality predecessor FK",
+      `ALTER TABLE truth.fact_lifecycle_events
+         DROP CONSTRAINT fact_lifecycle_events_predecessor_fkey;
+       ALTER TABLE truth.fact_lifecycle_events
+         ADD CONSTRAINT fact_lifecycle_events_predecessor_fkey
+         FOREIGN KEY (predecessor_fact_id)
+         REFERENCES truth.accepted_facts(id)
+         ON UPDATE RESTRICT ON DELETE RESTRICT
+         DEFERRABLE INITIALLY DEFERRED`,
+      /Fact lifecycle foreign key catalog drifted/
+    ],
+    [
+      "wrong predecessor FK action",
+      `ALTER TABLE truth.fact_lifecycle_events
+         DROP CONSTRAINT fact_lifecycle_events_predecessor_fkey;
+       ALTER TABLE truth.fact_lifecycle_events
+         ADD CONSTRAINT fact_lifecycle_events_predecessor_fkey
+         FOREIGN KEY (tenant_id, workspace_id, space_id, predecessor_fact_id)
+         REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id)
+         MATCH FULL ON UPDATE RESTRICT ON DELETE CASCADE
+         DEFERRABLE INITIALLY DEFERRED`,
+      /Fact lifecycle foreign key catalog drifted/
+    ],
+    [
+      "wrong predecessor FK deferrability",
+      `ALTER TABLE truth.fact_lifecycle_events
+         DROP CONSTRAINT fact_lifecycle_events_predecessor_fkey;
+       ALTER TABLE truth.fact_lifecycle_events
+         ADD CONSTRAINT fact_lifecycle_events_predecessor_fkey
+         FOREIGN KEY (tenant_id, workspace_id, space_id, predecessor_fact_id)
+         REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id)
+         MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT NOT DEFERRABLE`,
+      /Fact lifecycle foreign key catalog drifted/
+    ],
+    [
+      "wrong lifecycle transition trigger timing",
+      `DROP TRIGGER accepted_facts_lifecycle_guard ON truth.accepted_facts;
+       CREATE TRIGGER accepted_facts_lifecycle_guard
+         AFTER UPDATE ON truth.accepted_facts
+         FOR EACH ROW EXECUTE FUNCTION truth.enforce_fact_lifecycle_transition()`,
+      /Fact lifecycle trigger catalog drifted/
+    ],
+    [
+      "wrong lifecycle transition trigger event",
+      `DROP TRIGGER accepted_facts_lifecycle_guard ON truth.accepted_facts;
+       CREATE TRIGGER accepted_facts_lifecycle_guard
+         BEFORE INSERT ON truth.accepted_facts
+         FOR EACH ROW EXECUTE FUNCTION truth.enforce_fact_lifecycle_transition()`,
+      /Fact lifecycle trigger catalog drifted/
+    ],
+    [
+      "UPDATE-only lifecycle event immutability",
+      `DROP TRIGGER fact_lifecycle_immutable ON truth.fact_lifecycle_events;
+       CREATE TRIGGER fact_lifecycle_immutable
+         BEFORE UPDATE ON truth.fact_lifecycle_events
+         FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation()`,
+      /Fact lifecycle trigger catalog drifted/
+    ],
+    [
+      "OR-true lifecycle SELECT escape",
+      `DROP POLICY fact_lifecycle_select ON truth.fact_lifecycle_events;
+       CREATE POLICY fact_lifecycle_select ON truth.fact_lifecycle_events
+         FOR SELECT TO throughline_app
+         USING (${exactLifecycleScope} OR true)`,
+      /Fact lifecycle policy catalog drifted/
+    ],
+    [
+      "broad accepted Fact table mutation privileges",
+      `GRANT UPDATE, DELETE, TRUNCATE ON truth.accepted_facts TO throughline_app`,
+      /truth table authority drifted/
+    ],
+    [
+      "missing lifecycle function",
+      `DROP FUNCTION truth.reject_statement_mutation() CASCADE`,
+      /truth function inventory drifted/
+    ],
+    [
+      "extra lifecycle function",
+      `CREATE FUNCTION truth.unexpected_fact_lifecycle_escape()
+         RETURNS trigger LANGUAGE plpgsql
+         SET search_path = pg_catalog
+         AS $function$ BEGIN RETURN NEW; END $function$`,
+      /truth function inventory drifted/
+    ],
+    [
+      "semantically weakened lifecycle function body",
+      `CREATE OR REPLACE FUNCTION truth.enforce_fact_lifecycle_transition()
+         RETURNS trigger LANGUAGE plpgsql
+         SET search_path = pg_catalog
+         AS $function$ BEGIN RETURN NEW; END $function$`,
+      /truth function execution shape or source drifted/
+    ],
+    [
+      "SECURITY DEFINER lifecycle function",
+      `ALTER FUNCTION truth.require_fact_lifecycle_command() SECURITY DEFINER`,
+      /truth function execution shape or source drifted/
+    ],
+    [
+      "wrong lifecycle function owner",
+      `ALTER FUNCTION truth.require_fact_lifecycle_event()
+         OWNER TO throughline_b1_0_integrity`,
+      /truth function execution shape or source drifted/
+    ],
+    [
+      "wrong lifecycle function search_path",
+      `ALTER FUNCTION truth.validate_fact_lifecycle_event()
+         SET search_path = truth, pg_catalog`,
+      /truth function execution shape or source drifted/
+    ],
+    [
+      "lifecycle function app EXECUTE grant",
+      `GRANT EXECUTE ON FUNCTION truth.reject_statement_mutation() TO throughline_app`,
+      /truth function EXECUTE grants drifted/
+    ]
+  ])(
+    "rejects phase-6 catalog drift: %s",
+    async (_label, mutation, diagnostic) => {
+      await expectPhase6CatalogContractRejected(mutation, diagnostic);
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects a throughline_app privilege-bearing role membership escape",
+    async () => {
+      try {
+        await resetToLatest();
+        await applyMigrations(ownerPool);
+        await ownerPool.query("GRANT throughline_b1_0_integrity TO throughline_app");
+        await expect(applyMigrations(ownerPool)).rejects.toThrow(
+          "Protected B1 roles have an inherited capability path"
+        );
+      } finally {
+        await ownerPool.query("REVOKE throughline_b1_0_integrity FROM throughline_app");
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects a throughline_app BYPASSRLS escape",
+    async () => {
+      try {
+        await resetToLatest();
+        await applyMigrations(ownerPool);
+        await ownerPool.query("ALTER ROLE throughline_app BYPASSRLS");
+        await expect(applyMigrations(ownerPool)).rejects.toThrow(
+          "Installed B1 catalog does not match protected B1 role attributes"
+        );
+      } finally {
+        await restoreProductionAppRole();
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "upgrades an exactly journaled populated 0011 database without rewriting Fact evidence or support",
+    async () => {
+      try {
+        await resetPopulatedExact0011(ownerPool);
+        const before = await exactLifecycleProtectedDigest(ownerPool);
+        const predecessorJournal = await ownerPool.query<{ id: string; checksum: string }>(
+          "SELECT id, checksum FROM throughline_migrations.journal ORDER BY id"
+        );
+        expect(predecessorJournal.rows.map(({ id }) => id)).toEqual(postSlice3MigrationIds);
+
+        await expect(applyMigrations(ownerPool)).resolves.toEqual({
+          applied: ["0012_b2_fact_lifecycle.sql"],
+          skipped: [...postSlice3MigrationIds]
+        });
+        expect(await exactLifecycleProtectedDigest(ownerPool)).toBe(before);
+        const preservedJournal = await ownerPool.query<{ id: string; checksum: string }>(
+          "SELECT id, checksum FROM throughline_migrations.journal ORDER BY id LIMIT 11"
+        );
+        expect(preservedJournal.rows).toEqual(predecessorJournal.rows);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "fails before SQL for installed-but-unjournaled 0012 state and preserves catalog and data",
+    async () => {
+      try {
+        await resetPopulatedExact0011(ownerPool);
+        await ownerPool.query("CREATE TABLE truth.fact_lifecycle_events (id uuid PRIMARY KEY)");
+        const before = await exactPhase6FailureSnapshot(ownerPool);
+        await expect(applyMigrations(ownerPool)).rejects.toThrow(
+          /B2 migration state already exists before 0012_b2_fact_lifecycle\.sql/
+        );
+        expect(await exactPhase6FailureSnapshot(ownerPool)).toBe(before);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "fails closed when an installed 0012 catalog loses its final journal row",
+    async () => {
+      try {
+        await resetPopulatedExact0011(ownerPool);
+        await applyMigrations(ownerPool);
+        await ownerPool.query(
+          "DELETE FROM throughline_migrations.journal WHERE id = '0012_b2_fact_lifecycle.sql'"
+        );
+        const before = await exactPhase6FailureSnapshot(ownerPool);
+        await expect(applyMigrations(ownerPool)).rejects.toThrow(
+          /B2 migration state already exists before 0012_b2_fact_lifecycle\.sql/
+        );
+        expect(await exactPhase6FailureSnapshot(ownerPool)).toBe(before);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "enforces exact transaction-local Space RLS for lifecycle rows through the restricted app role",
+    async () => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        await insertLifecycleVisibilityFixture(ownerPool);
+        await ownerPool.query("ALTER TABLE truth.fact_lifecycle_events DISABLE TRIGGER USER");
+        await withTestAppPool(async (pool) => {
+          const client = await pool.connect();
+          const setLocalScope = async (workspaceId: string, spaceId: string) => {
+            await client.query("SELECT set_config('app.tenant_id', $1, true)", [
+              adoptionIds.tenant
+            ]);
+            await client.query("SELECT set_config('app.workspace_id', $1, true)", [workspaceId]);
+            await client.query("SELECT set_config('app.space_id', $1, true)", [spaceId]);
+            await client.query("SELECT set_config('app.user_id', $1, true)", [adoptionIds.user]);
+            await client.query("SELECT set_config('app.membership_id', $1, true)", [
+              adoptionIds.membership
+            ]);
+            await client.query("SELECT set_config('app.policy_version', $1, true)", ["default-v1"]);
+          };
+          const visible = () =>
+            client.query<{ id: string }>(
+              "SELECT id FROM truth.fact_lifecycle_events WHERE id = $1",
+              [phase6Ids.lifecycle]
+            );
+          try {
+            await client.query("BEGIN");
+            await setLocalScope(adoptionIds.workspace, adoptionIds.space);
+            expect((await visible()).rows).toEqual([{ id: phase6Ids.lifecycle }]);
+            await client.query("COMMIT");
+
+            expect((await visible()).rows).toEqual([]);
+
+            await client.query("BEGIN");
+            await setLocalScope(adoptionIds.workspace, devFixtures.restrictedSpaceA);
+            expect((await visible()).rows).toEqual([]);
+            await expect(
+              client.query(
+                `INSERT INTO truth.fact_lifecycle_events (
+                   id, tenant_id, workspace_id, space_id, predecessor_fact_id,
+                   successor_fact_id, transition_kind, from_status, to_status,
+                   reason_code, reason_rationale, authority_basis, policy_version,
+                   acted_by_user_id, acted_by_membership_id, causation_command_id,
+                   recorded_at, version
+                 ) VALUES (
+                   $1,$2,$3,$4,$5,NULL,'revoke','current','revoked',
+                   'no_longer_true','Cross-Space attempt','activity_owner','default-v1',
+                   $6,$7,$8,transaction_timestamp(),1
+                 )`,
+                [
+                  phase6Ids.crossSpaceLifecycle,
+                  adoptionIds.tenant,
+                  adoptionIds.workspace,
+                  adoptionIds.space,
+                  adoptionIds.fact,
+                  adoptionIds.user,
+                  adoptionIds.membership,
+                  adoptionIds.factCommand
+                ]
+              )
+            ).rejects.toThrow(/row-level security policy/);
+            await client.query("ROLLBACK");
+
+            await client.query("BEGIN");
+            await setLocalScope(devFixtures.workspaceB, adoptionIds.space);
+            expect((await visible()).rows).toEqual([]);
+            await client.query("ROLLBACK");
+
+            await client.query("BEGIN");
+            expect((await visible()).rows).toEqual([]);
+            await client.query("ROLLBACK");
+          } finally {
+            client.release();
+          }
+        });
+        await ownerPool.query("ALTER TABLE truth.fact_lifecycle_events ENABLE TRIGGER USER");
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    [
+      "UPDATE truth.fact_lifecycle_events SET reason_rationale = reason_rationale WHERE id = $1",
+      "truth lineage is immutable"
+    ],
+    ["DELETE FROM truth.fact_lifecycle_events WHERE id = $1", "truth lineage is immutable"],
+    ["TRUNCATE truth.fact_lifecycle_events", "truth statement mutation is not permitted"]
+  ])(
+    "blocks lifecycle event mutation at the table surface: %s",
+    async (statement, diagnostic) => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        await insertLifecycleVisibilityFixture(ownerPool);
+        const before = await exactPhase6AtomicDigest(ownerPool);
+        const client = await ownerPool.connect();
+        try {
+          await client.query("BEGIN");
+          await expect(
+            client.query(statement, statement.startsWith("TRUNCATE") ? [] : [phase6Ids.lifecycle])
+          ).rejects.toThrow(diagnostic);
+        } finally {
+          await client.query("ROLLBACK");
+          client.release();
+        }
+        expect(await exactPhase6AtomicDigest(ownerPool)).toBe(before);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "accepts only exact ordinary lifecycle request, response, audit, and outbox shapes",
+    async () => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const revokeRequest = {
+          factId: adoptionIds.fact,
+          expectedFactVersion: 1,
+          reason: {
+            code: "no_longer_true",
+            rationale: "The accepted outcome no longer reflects current reality."
+          }
+        };
+        const revokeResponse = { factId: adoptionIds.fact, status: "revoked", version: 2 };
+        const revokeDetail = {
+          factId: adoptionIds.fact,
+          factVersion: 2,
+          reasonCode: "no_longer_true",
+          status: "revoked"
+        };
+        const supersedeRequest = {
+          factId: adoptionIds.fact,
+          expectedFactVersion: 1,
+          subject: { type: "activity", id: adoptionIds.subject, expectedVersion: 1 },
+          replacementClaims: [{ claimId: adoptionIds.claim, expectedVersion: 1 }],
+          reason: {
+            code: "newer_evidence",
+            rationale: "The later ratified outcome replaces the predecessor."
+          }
+        };
+        const supersedeResponse = {
+          factId: adoptionIds.fact,
+          version: 2,
+          status: "superseded",
+          replacementFactId: adoptionIds.successor,
+          replacementFactVersion: 1,
+          replacementFactStatus: "current"
+        };
+        const supersedeDetail = {
+          factId: adoptionIds.fact,
+          factVersion: 2,
+          reasonCode: "newer_evidence",
+          replacementFactId: adoptionIds.successor,
+          replacementFactVersion: 1,
+          status: "superseded"
+        };
+        const shape = await ownerPool.query<{
+          revoke_request: boolean;
+          revoke_request_extra: boolean;
+          supersede_request: boolean;
+          supersede_request_extra: boolean;
+          revoke_reserved: boolean;
+          supersede_reserved: boolean;
+          revoke_completed: boolean;
+          revoke_response_extra: boolean;
+          supersede_completed: boolean;
+          supersede_response_extra: boolean;
+          revoke_audit: boolean;
+          revoke_audit_raw: boolean;
+          supersede_audit: boolean;
+          supersede_audit_raw: boolean;
+          revoke_outbox: boolean;
+          revoke_outbox_raw: boolean;
+          supersede_outbox: boolean;
+          supersede_outbox_raw: boolean;
+        }>(
+          `SELECT
+             ops.b2_slice1_safe_request_valid('fact.revoke.v1', $1::jsonb)
+               AS revoke_request,
+             ops.b2_slice1_safe_request_valid(
+               'fact.revoke.v1', $1::jsonb || '{"arbitraryText":"escape"}'::jsonb
+             ) AS revoke_request_extra,
+             ops.b2_slice1_safe_request_valid('fact.supersede.v1', $2::jsonb)
+               AS supersede_request,
+             ops.b2_slice1_safe_request_valid(
+               'fact.supersede.v1', $2::jsonb || '{"emergency":true}'::jsonb
+             ) AS supersede_request_extra,
+             ops.product_command_record_valid(
+               'fact.revoke.v1',1,'reserved',NULL,NULL,NULL
+             ) AS revoke_reserved,
+             ops.product_command_record_valid(
+               'fact.supersede.v1',1,'reserved',NULL,NULL,NULL
+             ) AS supersede_reserved,
+             ops.product_command_record_valid(
+               'fact.revoke.v1',1,'completed','accepted_fact',$3,$4::jsonb
+             ) AS revoke_completed,
+             ops.product_command_record_valid(
+               'fact.revoke.v1',1,'completed','accepted_fact',$3,
+               $4::jsonb || '{"reasonRationale":"raw"}'::jsonb
+             ) AS revoke_response_extra,
+             ops.product_command_record_valid(
+               'fact.supersede.v1',1,'completed','accepted_fact',$3,$5::jsonb
+             ) AS supersede_completed,
+             ops.product_command_record_valid(
+               'fact.supersede.v1',1,'completed','accepted_fact',$3,
+               $5::jsonb || '{"reasonRationale":"raw user rationale"}'::jsonb
+             ) AS supersede_response_extra,
+             ops.b2_slice1_audit_detail_valid(
+               'fact.revoke','accepted_fact',1,$3,$6::jsonb
+             ) AS revoke_audit,
+             ops.b2_slice1_audit_detail_valid(
+               'fact.revoke','accepted_fact',1,$3,
+               $6::jsonb || '{"reasonRationale":"raw objective/source excerpt"}'::jsonb
+             ) AS revoke_audit_raw,
+             ops.b2_slice1_audit_detail_valid(
+               'fact.supersede','accepted_fact',1,$3,$7::jsonb
+             ) AS supersede_audit,
+             ops.b2_slice1_audit_detail_valid(
+               'fact.supersede','accepted_fact',1,$3,
+               $7::jsonb || '{"sourceExcerpt":"raw objective/source rationale"}'::jsonb
+             ) AS supersede_audit_raw,
+             ops.b2_slice1_event_payload_valid(
+               'fact.revoked',1,$3,$6::jsonb
+             ) AS revoke_outbox,
+             ops.b2_slice1_event_payload_valid(
+               'fact.revoked',1,$3,
+               $6::jsonb || '{"sourceText":"raw"}'::jsonb
+             ) AS revoke_outbox_raw,
+             ops.b2_slice1_event_payload_valid(
+               'fact.superseded',1,$3,$7::jsonb
+             ) AS supersede_outbox,
+             ops.b2_slice1_event_payload_valid(
+               'fact.superseded',1,$3,
+               $7::jsonb || '{"sourceText":"raw objective/source rationale"}'::jsonb
+             ) AS supersede_outbox_raw`,
+          [
+            JSON.stringify(revokeRequest),
+            JSON.stringify(supersedeRequest),
+            adoptionIds.fact,
+            JSON.stringify(revokeResponse),
+            JSON.stringify(supersedeResponse),
+            JSON.stringify(revokeDetail),
+            JSON.stringify(supersedeDetail)
+          ]
+        );
+        expect(shape.rows).toEqual([
+          {
+            revoke_request: true,
+            revoke_request_extra: false,
+            supersede_request: true,
+            supersede_request_extra: false,
+            revoke_reserved: true,
+            supersede_reserved: true,
+            revoke_completed: true,
+            revoke_response_extra: false,
+            supersede_completed: true,
+            supersede_response_extra: false,
+            revoke_audit: true,
+            revoke_audit_raw: false,
+            supersede_audit: true,
+            supersede_audit_raw: false,
+            revoke_outbox: true,
+            revoke_outbox_raw: false,
+            supersede_outbox: true,
+            supersede_outbox_raw: false
+          }
+        ]);
+
+        const excluded = await ownerPool.query<{
+          vocabulary: string;
+          value: string;
+          accepted: boolean;
+        }>(
+          `SELECT 'command'::text AS vocabulary, value,
+                  ops.b2_slice1_safe_request_valid(value, $1::jsonb) OR
+                  ops.product_command_record_valid(value,1,'reserved',NULL,NULL,NULL)
+                    AS accepted
+             FROM unnest($2::text[]) value
+            UNION ALL
+           SELECT 'audit', value,
+                  ops.b2_slice1_audit_detail_valid(
+                    value,'accepted_fact',1,$3,$4::jsonb
+                  )
+             FROM unnest($5::text[]) value
+            UNION ALL
+           SELECT 'outbox', value,
+                  ops.b2_slice1_event_payload_valid(value,1,$3,$4::jsonb)
+             FROM unnest($6::text[]) value
+            ORDER BY vocabulary, value`,
+          [
+            JSON.stringify(revokeRequest),
+            [
+              "fact.contest.v1",
+              "fact.contest.v2",
+              "fact.uphold.v1",
+              "fact.emergency_contest.v1",
+              "fact.emergency_revoke.v1",
+              "fact.reconcile_source.v1",
+              "fact.source_reconcile.v1",
+              "derived_view.regenerate.v1",
+              "derived_views.regenerate.v2",
+              "fact.revoke.v2",
+              "fact.supersede.v2"
+            ],
+            adoptionIds.fact,
+            JSON.stringify(revokeDetail),
+            [
+              "fact.contest",
+              "fact.uphold",
+              "fact.emergency_revoke",
+              "fact.source_reconcile",
+              "derived_view.regenerate"
+            ],
+            [
+              "fact.contested",
+              "fact.upheld",
+              "fact.emergency_revoked",
+              "fact.source_reconciled",
+              "derived_view.regenerated"
+            ]
+          ]
+        );
+        expect(excluded.rows.length).toBe(21);
+        expect(excluded.rows.every(({ accepted }) => !accepted)).toBe(true);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    "missing_lifecycle",
+    "duplicate_lifecycle",
+    "mismatched_lifecycle",
+    "missing_predecessor",
+    "unexpected_successor",
+    "missing_audit",
+    "duplicate_audit",
+    "mismatched_audit",
+    "missing_outbox",
+    "duplicate_outbox",
+    "mismatched_outbox"
+  ] as const)(
+    "rolls back every write when revoke atomicity is violated: %s",
+    async (fault) => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6AtomicDigest(ownerPool);
+        await expect(executeExactRevokeTransaction(ownerPool, fault)).rejects.toThrow();
+        expect(await exactPhase6AtomicDigest(ownerPool)).toBe(before);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    "missing_lifecycle",
+    "duplicate_lifecycle",
+    "mismatched_lifecycle",
+    "missing_audit",
+    "duplicate_audit",
+    "mismatched_audit",
+    "missing_outbox",
+    "duplicate_outbox",
+    "mismatched_outbox"
+  ] as const)(
+    "rolls back every write when supersede atomicity is violated: %s",
+    async (fault) => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6AtomicDigest(ownerPool, phase6Ids.supersedeCommand);
+        await expect(executeExactSupersedeTransaction(ownerPool, fault)).rejects.toThrow();
+        expect(await exactPhase6AtomicDigest(ownerPool, phase6Ids.supersedeCommand)).toBe(before);
       } finally {
         await resetToLatest();
       }
@@ -1058,7 +3074,11 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         "SELECT id, checksum FROM throughline_migrations.journal ORDER BY id"
       );
 
-      await expect(applyMigrations(ownerPool)).resolves.toMatchObject({
+      await expect(
+        applyMigrations(ownerPool, {
+          through: "0011_b2_primary_objective_proposal_recovery.sql"
+        })
+      ).resolves.toMatchObject({
         applied: [
           "0009_b2_source_truth_lifecycle_interlock.sql",
           "0010_b2_trusted_objective_initiative_lock.sql",
@@ -1886,6 +3906,864 @@ const adoptionIds = {
   objectiveClaim: "0190a000-0000-7000-8000-000000000423",
   initiative: "0190a000-0000-7000-8000-000000000424"
 } as const;
+
+const phase6Ids = {
+  lifecycle: "0190a000-0000-7000-8000-000000000431",
+  crossSpaceLifecycle: "0190a000-0000-7000-8000-000000000432",
+  revokeCommand: "0190a000-0000-7000-8000-000000000433",
+  revokeAudit: "0190a000-0000-7000-8000-000000000434",
+  revokeOutbox: "0190a000-0000-7000-8000-000000000435",
+  duplicateLifecycle: "0190a000-0000-7000-8000-000000000436",
+  duplicateAudit: "0190a000-0000-7000-8000-000000000437",
+  duplicateOutbox: "0190a000-0000-7000-8000-000000000438",
+  supersedeCommand: "0190a000-0000-7000-8000-000000000439",
+  supersedeLifecycle: "0190a000-0000-7000-8000-000000000440",
+  supersedeAudit: "0190a000-0000-7000-8000-000000000441",
+  supersedeOutbox: "0190a000-0000-7000-8000-000000000442",
+  otherSubject: "0190a000-0000-7000-8000-000000000443",
+  mutationCommand: "0190a000-0000-7000-8000-000000000444"
+} as const;
+
+async function resetPopulatedExact0011(pool: pg.Pool): Promise<void> {
+  await applyMigrations(pool, {
+    reset: true,
+    through: "0008_b2_slice1_command_integrity.sql"
+  });
+  await insertExact0008TruthFixture(pool);
+  await applyMigrations(pool, { through: "0011_b2_primary_objective_proposal_recovery.sql" });
+}
+
+async function resetPopulatedPhase6(pool: pg.Pool): Promise<void> {
+  await resetPopulatedExact0011(pool);
+  await applyMigrations(pool);
+}
+
+async function exactLifecycleProtectedDigest(pool: pg.Pool): Promise<string> {
+  const snapshot = await pool.query(
+    `SELECT
+       (SELECT jsonb_agg(to_jsonb(tenant) ORDER BY tenant.id)
+          FROM identity.tenants tenant) AS tenants,
+       (SELECT jsonb_agg(to_jsonb(workspace) ORDER BY workspace.tenant_id, workspace.id)
+          FROM identity.workspaces workspace) AS workspaces,
+       (SELECT jsonb_agg(to_jsonb(user_record) ORDER BY user_record.id)
+          FROM identity.users user_record) AS users,
+       (SELECT jsonb_agg(to_jsonb(person) ORDER BY person.tenant_id, person.workspace_id, person.id)
+          FROM identity.people person) AS people,
+       (SELECT jsonb_agg(to_jsonb(membership)
+          ORDER BY membership.tenant_id, membership.workspace_id, membership.id)
+          FROM identity.memberships membership) AS memberships,
+       (SELECT jsonb_agg(to_jsonb(policy)
+          ORDER BY policy.tenant_id, policy.workspace_id, policy.id)
+          FROM identity.policy_versions policy) AS policy_versions,
+       (SELECT jsonb_agg(to_jsonb(principal)
+          ORDER BY principal.tenant_id, principal.workspace_id, principal.id)
+          FROM identity.service_principals principal) AS service_principals,
+       (SELECT jsonb_agg(to_jsonb(agent)
+          ORDER BY agent.tenant_id, agent.workspace_id, agent.id)
+          FROM identity.agent_principals agent) AS agent_principals,
+       (SELECT jsonb_agg(to_jsonb(space)
+          ORDER BY space.tenant_id, space.workspace_id, space.id)
+          FROM access.spaces space) AS spaces,
+       (SELECT jsonb_agg(to_jsonb(access_relationship)
+          ORDER BY access_relationship.tenant_id, access_relationship.workspace_id,
+                   access_relationship.resource_type, access_relationship.resource_id,
+                   access_relationship.subject_type, access_relationship.subject_id,
+                   access_relationship.relation, access_relationship.id)
+          FROM access.access_relationships access_relationship) AS access_relationships,
+       (SELECT jsonb_agg(to_jsonb(organization)
+          ORDER BY organization.tenant_id, organization.workspace_id, organization.id)
+          FROM work.organizations organization) AS organizations,
+       (SELECT jsonb_agg(to_jsonb(activity)
+          ORDER BY activity.tenant_id, activity.workspace_id, activity.id)
+          FROM work.activities activity) AS activities,
+       (SELECT jsonb_agg(to_jsonb(initiative)
+          ORDER BY initiative.tenant_id, initiative.workspace_id, initiative.id)
+          FROM work.initiatives initiative) AS initiatives,
+       (SELECT jsonb_agg(to_jsonb(activity_source)
+          ORDER BY activity_source.tenant_id, activity_source.workspace_id,
+                   activity_source.activity_id, activity_source.source_artifact_id)
+          FROM work.activity_sources activity_source) AS activity_sources,
+       (SELECT jsonb_agg(to_jsonb(source)
+          ORDER BY source.tenant_id, source.workspace_id, source.id)
+          FROM content.source_artifacts source) AS source_artifacts,
+       (SELECT jsonb_agg(to_jsonb(chunk)
+          ORDER BY chunk.tenant_id, chunk.workspace_id, chunk.source_artifact_id,
+                   chunk.chunk_index, chunk.id)
+          FROM content.source_chunks chunk) AS source_chunks,
+       (SELECT jsonb_agg(to_jsonb(command_record)
+          ORDER BY command_record.tenant_id, command_record.workspace_id, command_record.id)
+          FROM ops.domain_command_records command_record) AS commands,
+       (SELECT jsonb_agg(to_jsonb(audit)
+          ORDER BY audit.tenant_id, audit.workspace_id, audit.id)
+          FROM ops.audit_events audit) AS audits,
+       (SELECT jsonb_agg(to_jsonb(outbox)
+          ORDER BY outbox.tenant_id, outbox.workspace_id, outbox.id)
+          FROM ops.product_outbox_events outbox) AS outbox,
+       (SELECT jsonb_agg(to_jsonb(fact) ORDER BY fact.id)
+          FROM truth.accepted_facts fact) AS facts,
+       (SELECT jsonb_agg(to_jsonb(claim) ORDER BY claim.id)
+          FROM truth.claims claim) AS claims,
+       (SELECT jsonb_agg(to_jsonb(evidence) ORDER BY evidence.id)
+          FROM truth.verified_evidence_spans evidence) AS evidence,
+       (SELECT jsonb_agg(to_jsonb(support) ORDER BY support.fact_id, support.claim_id)
+          FROM truth.fact_claims support) AS support,
+       (SELECT jsonb_agg(to_jsonb(attestation)
+          ORDER BY attestation.tenant_id, attestation.workspace_id, attestation.id)
+          FROM truth.initiative_objective_support_attestations attestation)
+          AS objective_support_attestations,
+       (SELECT jsonb_agg(to_jsonb(recovery)
+          ORDER BY recovery.tenant_id, recovery.workspace_id, recovery.id)
+          FROM truth.initiative_objective_proposal_recoveries recovery)
+          AS objective_proposal_recoveries`
+  );
+  return JSON.stringify(snapshot.rows[0]);
+}
+
+async function exactPhase6FailureSnapshot(pool: pg.Pool): Promise<string> {
+  const [snapshot, durable] = await Promise.all([
+    pool.query(
+      `SELECT
+       (SELECT jsonb_agg(to_jsonb(entry) ORDER BY entry.id)
+          FROM throughline_migrations.journal entry) AS journal,
+       to_regclass('truth.fact_lifecycle_events')::text AS lifecycle_relation,
+       (SELECT CASE WHEN to_regclass('truth.fact_lifecycle_events') IS NULL THEN NULL
+                    ELSE (SELECT count(*)::text FROM truth.fact_lifecycle_events) END)
+          AS lifecycle_rows,
+       (SELECT jsonb_agg(jsonb_build_object(
+          'name', constraint_record.conname,
+          'definition', pg_get_constraintdef(constraint_record.oid, false)
+        ) ORDER BY constraint_record.conname)
+          FROM pg_constraint constraint_record
+         WHERE constraint_record.conrelid =
+               to_regclass('truth.fact_lifecycle_events')) AS lifecycle_constraints,
+       (SELECT jsonb_agg(to_jsonb(relation) ORDER BY namespace.nspname, relation.relname)
+          FROM pg_class relation
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = ANY(ARRAY[
+           'identity','access','work','content','ops','truth'
+         ])) AS protected_relations,
+       (SELECT jsonb_agg(to_jsonb(attribute)
+          ORDER BY namespace.nspname, relation.relname, attribute.attnum)
+          FROM pg_attribute attribute
+          JOIN pg_class relation ON relation.oid = attribute.attrelid
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = ANY(ARRAY[
+           'identity','access','work','content','ops','truth'
+         ])) AS protected_attributes,
+       (SELECT jsonb_agg(to_jsonb(constraint_record)
+          ORDER BY namespace.nspname, relation.relname, constraint_record.conname)
+          FROM pg_constraint constraint_record
+          JOIN pg_class relation ON relation.oid = constraint_record.conrelid
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = ANY(ARRAY[
+           'identity','access','work','content','ops','truth'
+         ])) AS protected_constraints,
+       (SELECT jsonb_agg(to_jsonb(index_record)
+          ORDER BY namespace.nspname, relation.relname, index_record.indexrelid)
+          FROM pg_index index_record
+          JOIN pg_class relation ON relation.oid = index_record.indrelid
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = ANY(ARRAY[
+           'identity','access','work','content','ops','truth'
+         ])) AS protected_indexes,
+       (SELECT jsonb_agg(to_jsonb(policy)
+          ORDER BY namespace.nspname, relation.relname, policy.polname)
+          FROM pg_policy policy
+          JOIN pg_class relation ON relation.oid = policy.polrelid
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = ANY(ARRAY[
+           'identity','access','work','content','ops','truth'
+         ])) AS protected_policies,
+       (SELECT jsonb_agg(to_jsonb(trigger_record)
+          ORDER BY namespace.nspname, relation.relname, trigger_record.tgname)
+          FROM pg_trigger trigger_record
+          JOIN pg_class relation ON relation.oid = trigger_record.tgrelid
+          JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
+         WHERE namespace.nspname = ANY(ARRAY[
+           'identity','access','work','content','ops','truth'
+         ])) AS protected_triggers,
+       (SELECT jsonb_agg(to_jsonb(procedure)
+          ORDER BY namespace.nspname, procedure.oid::regprocedure::text)
+          FROM pg_proc procedure
+          JOIN pg_namespace namespace ON namespace.oid = procedure.pronamespace
+         WHERE namespace.nspname = ANY(ARRAY[
+           'identity','access','work','content','ops','truth'
+         ])) AS protected_functions`
+    ),
+    exactLifecycleProtectedDigest(pool)
+  ]);
+  return JSON.stringify({ catalog: snapshot.rows[0], durable: JSON.parse(durable) });
+}
+
+async function insertLifecycleVisibilityFixture(pool: pg.Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("ALTER TABLE truth.fact_lifecycle_events DISABLE TRIGGER USER");
+    await client.query(
+      `INSERT INTO truth.fact_lifecycle_events (
+         id, tenant_id, workspace_id, space_id, predecessor_fact_id,
+         successor_fact_id, transition_kind, from_status, to_status,
+         reason_code, reason_rationale, authority_basis, policy_version,
+         acted_by_user_id, acted_by_membership_id, causation_command_id,
+         recorded_at, version
+       ) VALUES (
+         $1,$2,$3,$4,$5,NULL,'revoke','current','revoked',
+         'no_longer_true','Visibility fixture','activity_owner','default-v1',
+         $6,$7,$8,transaction_timestamp(),1
+       )`,
+      [
+        phase6Ids.lifecycle,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.fact,
+        adoptionIds.user,
+        adoptionIds.membership,
+        adoptionIds.factCommand
+      ]
+    );
+    await client.query("ALTER TABLE truth.fact_lifecycle_events ENABLE TRIGGER USER");
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+type Phase6AtomicFault =
+  | "valid"
+  | "missing_lifecycle"
+  | "duplicate_lifecycle"
+  | "mismatched_lifecycle"
+  | "missing_predecessor"
+  | "unexpected_successor"
+  | "missing_audit"
+  | "duplicate_audit"
+  | "mismatched_audit"
+  | "missing_outbox"
+  | "duplicate_outbox"
+  | "mismatched_outbox";
+
+type Phase6SupersedeFault =
+  | "valid"
+  | "missing_lifecycle"
+  | "duplicate_lifecycle"
+  | "mismatched_lifecycle"
+  | "mismatched_lineage"
+  | "missing_audit"
+  | "duplicate_audit"
+  | "mismatched_audit"
+  | "missing_outbox"
+  | "duplicate_outbox"
+  | "mismatched_outbox";
+
+async function exactPhase6AtomicDigest(
+  pool: pg.Pool,
+  commandId: string = phase6Ids.revokeCommand
+): Promise<string> {
+  const snapshot = await pool.query(
+    `SELECT
+       (SELECT jsonb_agg(to_jsonb(fact) ORDER BY fact.id)
+          FROM truth.accepted_facts fact) AS facts,
+       (SELECT jsonb_agg(to_jsonb(claim) ORDER BY claim.id)
+          FROM truth.claims claim) AS claims,
+       (SELECT jsonb_agg(to_jsonb(evidence) ORDER BY evidence.id)
+          FROM truth.verified_evidence_spans evidence) AS evidence,
+       (SELECT jsonb_agg(to_jsonb(support) ORDER BY support.fact_id, support.claim_id)
+          FROM truth.fact_claims support) AS support,
+       (SELECT jsonb_agg(to_jsonb(lifecycle) ORDER BY lifecycle.id)
+          FROM truth.fact_lifecycle_events lifecycle) AS lifecycle,
+       (SELECT jsonb_agg(to_jsonb(command_record) ORDER BY command_record.id)
+          FROM ops.domain_command_records command_record
+         WHERE command_record.id = $1) AS commands,
+       (SELECT jsonb_agg(to_jsonb(audit) ORDER BY audit.id)
+          FROM ops.audit_events audit WHERE audit.causation_command_id = $1) AS audit,
+       (SELECT jsonb_agg(to_jsonb(event) ORDER BY event.id)
+          FROM ops.product_outbox_events event WHERE event.causation_command_id = $1) AS outbox`,
+    [commandId]
+  );
+  return JSON.stringify(snapshot.rows[0]);
+}
+
+async function exactPredecessorImmutableDigest(pool: pg.Pool): Promise<string> {
+  const snapshot = await pool.query(
+    `SELECT
+       (SELECT to_jsonb(fact) - ARRAY[
+          'status','last_causation_command_id','updated_at','version'
+        ] FROM truth.accepted_facts fact WHERE fact.id = $1) AS fact_value,
+       (SELECT jsonb_agg(to_jsonb(support) ORDER BY support.claim_id)
+          FROM truth.fact_claims support WHERE support.fact_id = $1) AS support,
+       (SELECT jsonb_agg(to_jsonb(claim) ORDER BY claim.id)
+          FROM truth.claims claim
+          JOIN truth.fact_claims support ON support.tenant_id = claim.tenant_id
+            AND support.workspace_id = claim.workspace_id
+            AND support.claim_id = claim.id
+         WHERE support.fact_id = $1) AS claims,
+       (SELECT jsonb_agg(to_jsonb(evidence) ORDER BY evidence.id)
+          FROM truth.verified_evidence_spans evidence
+          JOIN truth.claims claim ON claim.tenant_id = evidence.tenant_id
+            AND claim.workspace_id = evidence.workspace_id
+            AND claim.verified_evidence_span_id = evidence.id
+          JOIN truth.fact_claims support ON support.tenant_id = claim.tenant_id
+            AND support.workspace_id = claim.workspace_id
+            AND support.claim_id = claim.id
+         WHERE support.fact_id = $1) AS evidence`,
+    [adoptionIds.fact]
+  );
+  return JSON.stringify(snapshot.rows[0]);
+}
+
+async function executeForbiddenAcceptedFactMutation(
+  pool: pg.Pool,
+  mutation: string
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT set_config('app.tenant_id', $1, true)", [adoptionIds.tenant]);
+    await client.query("SELECT set_config('app.workspace_id', $1, true)", [adoptionIds.workspace]);
+    await client.query("SELECT set_config('app.space_id', $1, true)", [adoptionIds.space]);
+    await client.query("SELECT set_config('app.user_id', $1, true)", [adoptionIds.user]);
+    await client.query("SELECT set_config('app.membership_id', $1, true)", [
+      adoptionIds.membership
+    ]);
+    await client.query("SELECT set_config('app.policy_version', 'default-v1', true)");
+    await client.query(
+      `INSERT INTO ops.domain_command_records (
+         id, tenant_id, workspace_id, reservation_space_id, command_kind,
+         command_schema_version, idempotency_key, canonical_request_hash, safe_request,
+         state, actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
+       ) VALUES (
+         $1,$2,$3,$4,'fact.revoke.v1',1,'phase6-immutable-probe',repeat('b',64),$5::jsonb,
+         'reserved',$6,$7,'default-v1','phase6-immutable-probe',
+         '00-00000000000000000000000000000005-0000000000000005-01'
+       )`,
+      [
+        phase6Ids.mutationCommand,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        JSON.stringify({
+          factId: adoptionIds.fact,
+          expectedFactVersion: 1,
+          reason: {
+            code: "no_longer_true",
+            rationale: "Immutability probe"
+          }
+        }),
+        adoptionIds.user,
+        adoptionIds.membership
+      ]
+    );
+    await client.query(
+      `UPDATE truth.accepted_facts
+          SET status = 'revoked', version = 2,
+              last_causation_command_id = $1,
+              updated_at = transaction_timestamp(),
+              ${mutation}
+        WHERE tenant_id = $2 AND workspace_id = $3 AND space_id = $4 AND id = $5`,
+      [
+        phase6Ids.mutationCommand,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.fact
+      ]
+    );
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+}
+
+async function executeRolledBackStatement(pool: pg.Pool, statement: string): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(statement);
+  } finally {
+    await client.query("ROLLBACK").catch(() => undefined);
+    client.release();
+  }
+}
+
+async function executeExactRevokeTransaction(
+  pool: pg.Pool,
+  fault: Phase6AtomicFault
+): Promise<void> {
+  const client = await pool.connect();
+  const request = {
+    factId: adoptionIds.fact,
+    expectedFactVersion: 1,
+    reason: {
+      code: "no_longer_true",
+      rationale: "The accepted outcome no longer reflects current reality."
+    }
+  };
+  const safeDetail = {
+    factId: adoptionIds.fact,
+    factVersion: 2,
+    reasonCode: "no_longer_true",
+    status: "revoked"
+  };
+  try {
+    await client.query("BEGIN");
+    await client.query("SELECT set_config('app.tenant_id', $1, true)", [adoptionIds.tenant]);
+    await client.query("SELECT set_config('app.workspace_id', $1, true)", [adoptionIds.workspace]);
+    await client.query("SELECT set_config('app.space_id', $1, true)", [adoptionIds.space]);
+    await client.query("SELECT set_config('app.user_id', $1, true)", [adoptionIds.user]);
+    await client.query("SELECT set_config('app.membership_id', $1, true)", [
+      adoptionIds.membership
+    ]);
+    await client.query("SELECT set_config('app.policy_version', 'default-v1', true)");
+    await client.query(
+      `INSERT INTO ops.domain_command_records (
+         id, tenant_id, workspace_id, reservation_space_id, command_kind,
+         command_schema_version, idempotency_key, canonical_request_hash, safe_request,
+         state, actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
+       ) VALUES (
+         $1,$2,$3,$4,'fact.revoke.v1',1,'phase6-revoke',repeat('d',64),$5::jsonb,
+         'reserved',$6,$7,'default-v1','phase6-revoke',
+         '00-00000000000000000000000000000004-0000000000000004-01'
+       )`,
+      [
+        phase6Ids.revokeCommand,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        JSON.stringify(request),
+        adoptionIds.user,
+        adoptionIds.membership
+      ]
+    );
+
+    if (fault !== "missing_predecessor") {
+      await client.query(
+        `UPDATE truth.accepted_facts
+            SET status = 'revoked', version = 2,
+                last_causation_command_id = $1, updated_at = transaction_timestamp()
+          WHERE tenant_id = $2 AND workspace_id = $3 AND id = $4`,
+        [phase6Ids.revokeCommand, adoptionIds.tenant, adoptionIds.workspace, adoptionIds.fact]
+      );
+    }
+
+    if (fault !== "missing_lifecycle") {
+      await client.query(
+        `INSERT INTO truth.fact_lifecycle_events (
+           id, tenant_id, workspace_id, space_id, predecessor_fact_id,
+           successor_fact_id, transition_kind, from_status, to_status,
+           reason_code, reason_rationale, authority_basis, policy_version,
+           acted_by_user_id, acted_by_membership_id, causation_command_id,
+           recorded_at, version
+         ) VALUES (
+           $1,$2,$3,$4,$5,$6,'revoke','current','revoked',$7,
+           $8,'activity_owner','default-v1',$9,$10,$11,transaction_timestamp(),1
+         )`,
+        [
+          phase6Ids.lifecycle,
+          adoptionIds.tenant,
+          adoptionIds.workspace,
+          adoptionIds.space,
+          adoptionIds.fact,
+          fault === "unexpected_successor" ? adoptionIds.successor : null,
+          fault === "mismatched_lifecycle" ? "support_invalidated" : "no_longer_true",
+          request.reason.rationale,
+          adoptionIds.user,
+          adoptionIds.membership,
+          phase6Ids.revokeCommand
+        ]
+      );
+      if (fault === "duplicate_lifecycle") {
+        await client.query(
+          `INSERT INTO truth.fact_lifecycle_events
+             SELECT $1, tenant_id, workspace_id, space_id, predecessor_fact_id,
+                    successor_fact_id, transition_kind, from_status, to_status,
+                    reason_code, reason_rationale, authority_basis, policy_version,
+                    acted_by_user_id, acted_by_membership_id, causation_command_id,
+                    recorded_at, version
+               FROM truth.fact_lifecycle_events WHERE id = $2`,
+          [phase6Ids.duplicateLifecycle, phase6Ids.lifecycle]
+        );
+      }
+    }
+
+    if (fault !== "missing_audit") {
+      await client.query(
+        `INSERT INTO ops.audit_events (
+           id, tenant_id, workspace_id, space_id, causation_command_id,
+           action, resource_type, resource_id, actor_user_id, actor_membership_id,
+           policy_version_id, request_id, traceparent, audit_schema_version, safe_detail
+         ) VALUES (
+           $1,$2,$3,$4,$5,'fact.revoke','accepted_fact',$6,$7,$8,'default-v1',
+           'phase6-revoke','00-00000000000000000000000000000004-0000000000000004-01',
+           1,$9::jsonb
+         )`,
+        [
+          phase6Ids.revokeAudit,
+          adoptionIds.tenant,
+          adoptionIds.workspace,
+          adoptionIds.space,
+          phase6Ids.revokeCommand,
+          adoptionIds.fact,
+          adoptionIds.user,
+          adoptionIds.membership,
+          JSON.stringify(
+            fault === "mismatched_audit"
+              ? { ...safeDetail, reasonCode: "entered_in_error" }
+              : safeDetail
+          )
+        ]
+      );
+      if (fault === "duplicate_audit") {
+        await client.query(
+          `INSERT INTO ops.audit_events
+             SELECT $1, tenant_id, workspace_id, space_id, causation_command_id,
+                    action, resource_type, resource_id, actor_user_id, actor_membership_id,
+                    delegating_user_id, delegating_membership_id, agent_principal_id,
+                    policy_version_id, request_id, traceparent, tracestate,
+                    audit_schema_version, safe_detail, created_at
+               FROM ops.audit_events WHERE id = $2`,
+          [phase6Ids.duplicateAudit, phase6Ids.revokeAudit]
+        );
+      }
+    }
+
+    if (fault !== "missing_outbox") {
+      await client.query(
+        `INSERT INTO ops.product_outbox_events (
+           id, tenant_id, workspace_id, space_id, relay_service_principal_id,
+           policy_version_id, event_type, event_schema_version, payload_schema_version,
+           aggregate_type, aggregate_id, aggregate_version, causation_command_id,
+           payload, request_id, traceparent
+         ) VALUES (
+           $1,$2,$3,$4,$5,'default-v1','fact.revoked',1,1,
+           'accepted_fact',$6,2,$7,$8::jsonb,'phase6-revoke',
+           '00-00000000000000000000000000000004-0000000000000004-01'
+         )`,
+        [
+          phase6Ids.revokeOutbox,
+          adoptionIds.tenant,
+          adoptionIds.workspace,
+          adoptionIds.space,
+          devFixtures.relayServicePrincipalA,
+          adoptionIds.fact,
+          phase6Ids.revokeCommand,
+          JSON.stringify(
+            fault === "mismatched_outbox"
+              ? { ...safeDetail, reasonCode: "entered_in_error" }
+              : safeDetail
+          )
+        ]
+      );
+      if (fault === "duplicate_outbox") {
+        await client.query(
+          `INSERT INTO ops.product_outbox_events
+             SELECT $1, tenant_id, workspace_id, space_id, relay_service_principal_id,
+                    policy_version_id, event_type, event_schema_version,
+                    payload_schema_version, aggregate_type, aggregate_id,
+                    aggregate_version, causation_command_id, payload, request_id,
+                    traceparent, tracestate, created_at, publication_state,
+                    publication_attempt, next_attempt_at, claimed_at, claimed_by,
+                    claim_token, claim_expires_at, last_outcome_code, published_at,
+                    published_message_id, terminal_at
+               FROM ops.product_outbox_events WHERE id = $2`,
+          [phase6Ids.duplicateOutbox, phase6Ids.revokeOutbox]
+        );
+      }
+    }
+
+    await client.query(
+      `UPDATE ops.domain_command_records
+          SET state = 'completed', result_resource_type = 'accepted_fact',
+              result_resource_id = $1,
+              safe_response = $2::jsonb,
+              updated_at = transaction_timestamp(), completed_at = transaction_timestamp()
+        WHERE id = $3`,
+      [
+        adoptionIds.fact,
+        JSON.stringify({ factId: adoptionIds.fact, status: "revoked", version: 2 }),
+        phase6Ids.revokeCommand
+      ]
+    );
+    await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function executeExactSupersedeTransaction(
+  pool: pg.Pool,
+  fault: Phase6SupersedeFault
+): Promise<void> {
+  const client = await pool.connect();
+  const rationale = "The later ratified outcome replaces the predecessor.";
+  const safeDetail = {
+    factId: adoptionIds.fact,
+    factVersion: 2,
+    reasonCode: "newer_evidence",
+    replacementFactId: adoptionIds.successor,
+    replacementFactVersion: 1,
+    status: "superseded"
+  };
+  try {
+    await client.query("BEGIN");
+    for (const [setting, value] of [
+      ["app.tenant_id", adoptionIds.tenant],
+      ["app.workspace_id", adoptionIds.workspace],
+      ["app.space_id", adoptionIds.space],
+      ["app.user_id", adoptionIds.user],
+      ["app.membership_id", adoptionIds.membership],
+      ["app.policy_version", "default-v1"]
+    ] as const) {
+      await client.query("SELECT set_config($1, $2, true)", [setting, value]);
+    }
+    if (fault === "mismatched_lineage") {
+      await client.query(
+        `INSERT INTO work.activities (
+           id, tenant_id, workspace_id, space_id, subtype, profile_template_key,
+           title, status, owner_person_id, governing_organization_id
+         ) VALUES (
+           $1,$2,$3,$4,'meeting','meeting','Mismatched lineage subject','captured',$5,$6
+         )`,
+        [
+          phase6Ids.otherSubject,
+          adoptionIds.tenant,
+          adoptionIds.workspace,
+          adoptionIds.space,
+          adoptionIds.person,
+          adoptionIds.organization
+        ]
+      );
+    }
+    await client.query(
+      `INSERT INTO ops.domain_command_records (
+         id, tenant_id, workspace_id, reservation_space_id, command_kind,
+         command_schema_version, idempotency_key, canonical_request_hash, safe_request,
+         state, actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
+       ) VALUES (
+         $1,$2,$3,$4,'fact.supersede.v1',1,'phase6-supersede',repeat('e',64),$5::jsonb,
+         'reserved',$6,$7,'default-v1','phase6-supersede',
+         '00-00000000000000000000000000000005-0000000000000005-01'
+       )`,
+      [
+        phase6Ids.supersedeCommand,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        JSON.stringify({
+          factId: adoptionIds.fact,
+          expectedFactVersion: 1,
+          subject: { type: "activity", id: adoptionIds.subject, expectedVersion: 1 },
+          replacementClaims: [{ claimId: adoptionIds.claim, expectedVersion: 2 }],
+          reason: { code: "newer_evidence", rationale }
+        }),
+        adoptionIds.user,
+        adoptionIds.membership
+      ]
+    );
+    await client.query(
+      `UPDATE truth.accepted_facts
+          SET status = 'superseded', version = 2,
+              last_causation_command_id = $1, updated_at = transaction_timestamp()
+        WHERE id = $2`,
+      [phase6Ids.supersedeCommand, adoptionIds.fact]
+    );
+    await client.query(
+      `INSERT INTO truth.accepted_facts (
+         id, tenant_id, workspace_id, space_id, subject_type, subject_id,
+         predicate_catalog_version, predicate, canonical_value_text, value_hash,
+         normalized_text, confidence, confidence_rule, strongest_supporting_confidence,
+         human_lowered, confidence_lowering_reason_code, confidence_lowering_rationale,
+         valid_from, valid_to, recorded_at, status, access_class,
+         accepted_by_user_id, accepted_by_membership_id, acceptance_scope,
+         authority_basis, acceptance_policy_version, last_causation_command_id,
+         created_at, updated_at, version
+       ) SELECT
+         $1, tenant_id, workspace_id, space_id, subject_type, $4,
+         predicate_catalog_version, predicate, canonical_value_text, value_hash,
+         normalized_text, confidence, confidence_rule, strongest_supporting_confidence,
+         human_lowered, confidence_lowering_reason_code, confidence_lowering_rationale,
+         valid_from, valid_to, transaction_timestamp(), 'current', access_class,
+         accepted_by_user_id, accepted_by_membership_id, acceptance_scope,
+         authority_basis, acceptance_policy_version, $2,
+         transaction_timestamp(), transaction_timestamp(), 1
+           FROM truth.accepted_facts WHERE id = $3`,
+      [
+        adoptionIds.successor,
+        phase6Ids.supersedeCommand,
+        adoptionIds.fact,
+        fault === "mismatched_lineage" ? phase6Ids.otherSubject : adoptionIds.subject
+      ]
+    );
+    await client.query(
+      `INSERT INTO truth.fact_claims (
+         tenant_id, workspace_id, space_id, fact_id, claim_id
+       ) VALUES ($1,$2,$3,$4,$5)`,
+      [
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.successor,
+        adoptionIds.claim
+      ]
+    );
+    if (fault !== "missing_lifecycle") {
+      await client.query(
+        `INSERT INTO truth.fact_lifecycle_events (
+           id, tenant_id, workspace_id, space_id, predecessor_fact_id,
+           successor_fact_id, transition_kind, from_status, to_status,
+           reason_code, reason_rationale, authority_basis, policy_version,
+           acted_by_user_id, acted_by_membership_id, causation_command_id,
+           recorded_at, version
+         ) VALUES (
+           $1,$2,$3,$4,$5,$6,'supersede','current','superseded',$7,$8,
+           'activity_owner','default-v1',$9,$10,$11,transaction_timestamp(),1
+         )`,
+        [
+          phase6Ids.supersedeLifecycle,
+          adoptionIds.tenant,
+          adoptionIds.workspace,
+          adoptionIds.space,
+          adoptionIds.fact,
+          adoptionIds.successor,
+          fault === "mismatched_lifecycle" ? "accepted_value_changed" : "newer_evidence",
+          rationale,
+          adoptionIds.user,
+          adoptionIds.membership,
+          phase6Ids.supersedeCommand
+        ]
+      );
+      if (fault === "duplicate_lifecycle") {
+        await client.query(
+          `INSERT INTO truth.fact_lifecycle_events
+             SELECT $1, tenant_id, workspace_id, space_id, predecessor_fact_id,
+                    successor_fact_id, transition_kind, from_status, to_status,
+                    reason_code, reason_rationale, authority_basis, policy_version,
+                    acted_by_user_id, acted_by_membership_id, causation_command_id,
+                    recorded_at, version
+               FROM truth.fact_lifecycle_events WHERE id = $2`,
+          [phase6Ids.duplicateLifecycle, phase6Ids.supersedeLifecycle]
+        );
+      }
+    }
+    if (fault !== "missing_audit") {
+      await client.query(
+        `INSERT INTO ops.audit_events (
+           id, tenant_id, workspace_id, space_id, causation_command_id,
+           action, resource_type, resource_id, actor_user_id, actor_membership_id,
+           policy_version_id, request_id, traceparent, audit_schema_version, safe_detail
+         ) VALUES (
+           $1,$2,$3,$4,$5,'fact.supersede','accepted_fact',$6,$7,$8,'default-v1',
+           'phase6-supersede','00-00000000000000000000000000000005-0000000000000005-01',
+           1,$9::jsonb
+         )`,
+        [
+          phase6Ids.supersedeAudit,
+          adoptionIds.tenant,
+          adoptionIds.workspace,
+          adoptionIds.space,
+          phase6Ids.supersedeCommand,
+          adoptionIds.fact,
+          adoptionIds.user,
+          adoptionIds.membership,
+          JSON.stringify(
+            fault === "mismatched_audit"
+              ? { ...safeDetail, reasonCode: "accepted_value_changed" }
+              : safeDetail
+          )
+        ]
+      );
+      if (fault === "duplicate_audit") {
+        await client.query(
+          `INSERT INTO ops.audit_events
+             SELECT $1, tenant_id, workspace_id, space_id, causation_command_id,
+                    action, resource_type, resource_id, actor_user_id, actor_membership_id,
+                    delegating_user_id, delegating_membership_id, agent_principal_id,
+                    policy_version_id, request_id, traceparent, tracestate,
+                    audit_schema_version, safe_detail, created_at
+               FROM ops.audit_events WHERE id = $2`,
+          [phase6Ids.duplicateAudit, phase6Ids.supersedeAudit]
+        );
+      }
+    }
+    if (fault !== "missing_outbox") {
+      await client.query(
+        `INSERT INTO ops.product_outbox_events (
+           id, tenant_id, workspace_id, space_id, relay_service_principal_id,
+           policy_version_id, event_type, event_schema_version, payload_schema_version,
+           aggregate_type, aggregate_id, aggregate_version, causation_command_id,
+           payload, request_id, traceparent
+         ) VALUES (
+           $1,$2,$3,$4,$5,'default-v1','fact.superseded',1,1,
+           'accepted_fact',$6,2,$7,$8::jsonb,'phase6-supersede',
+           '00-00000000000000000000000000000005-0000000000000005-01'
+         )`,
+        [
+          phase6Ids.supersedeOutbox,
+          adoptionIds.tenant,
+          adoptionIds.workspace,
+          adoptionIds.space,
+          devFixtures.relayServicePrincipalA,
+          adoptionIds.fact,
+          phase6Ids.supersedeCommand,
+          JSON.stringify(
+            fault === "mismatched_outbox"
+              ? { ...safeDetail, reasonCode: "accepted_value_changed" }
+              : safeDetail
+          )
+        ]
+      );
+      if (fault === "duplicate_outbox") {
+        await client.query(
+          `INSERT INTO ops.product_outbox_events
+             SELECT $1, tenant_id, workspace_id, space_id, relay_service_principal_id,
+                    policy_version_id, event_type, event_schema_version,
+                    payload_schema_version, aggregate_type, aggregate_id,
+                    aggregate_version, causation_command_id, payload, request_id,
+                    traceparent, tracestate, created_at, publication_state,
+                    publication_attempt, next_attempt_at, claimed_at, claimed_by,
+                    claim_token, claim_expires_at, last_outcome_code, published_at,
+                    published_message_id, terminal_at
+               FROM ops.product_outbox_events WHERE id = $2`,
+          [phase6Ids.duplicateOutbox, phase6Ids.supersedeOutbox]
+        );
+      }
+    }
+    await client.query(
+      `UPDATE ops.domain_command_records
+          SET state = 'completed', result_resource_type = 'accepted_fact',
+              result_resource_id = $1, safe_response = $2::jsonb,
+              updated_at = transaction_timestamp(), completed_at = transaction_timestamp()
+        WHERE id = $3`,
+      [
+        adoptionIds.fact,
+        JSON.stringify({
+          factId: adoptionIds.fact,
+          version: 2,
+          status: "superseded",
+          replacementFactId: adoptionIds.successor,
+          replacementFactVersion: 1,
+          replacementFactStatus: "current"
+        }),
+        phase6Ids.supersedeCommand
+      ]
+    );
+    await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
 
 async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
   await seedWaveA2DeterministicData(pool);
