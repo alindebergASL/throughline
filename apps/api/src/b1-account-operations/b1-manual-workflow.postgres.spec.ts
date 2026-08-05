@@ -120,7 +120,7 @@ suite("Wave B1 manual no-integration API and PostgreSQL gate", () => {
     expect(catalog.rows[0]).toEqual({
       b1_tables: "15",
       unsecured: "0",
-      migration_count: "10",
+      migration_count: "11",
       duplicate_ledger: null
     });
     const privileges = await ownerPool.query<{
