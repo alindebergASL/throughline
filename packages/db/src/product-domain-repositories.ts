@@ -103,22 +103,42 @@ export class DomainCommandRepository {
 
   async reserve(input: DomainCommandReservationInput): Promise<DomainCommandReservationResult> {
     validateReservationInput(input);
+    const safeRequest =
+      input.safeRequest === undefined
+        ? undefined
+        : JSON.parse(canonicalJsonStringify(input.safeRequest));
     const inserted = await this.tx.query<{ id: string }>(
-      `INSERT INTO ops.domain_command_records (
-         id, tenant_id, workspace_id, reservation_space_id, command_kind,
-         command_schema_version, idempotency_key, canonical_request_hash, safe_request,
-         actor_user_id, actor_membership_id, delegating_user_id, delegating_membership_id,
-         agent_principal_id, policy_version_id, request_id, traceparent, tracestate
-       ) VALUES (
-         $1, $2, $3, $4, $5,
-         $6, $7, $8, $9,
-         $10, $11, $12, $13,
-         $14, $15, $16, $17, $18
-       )
-       ON CONFLICT (
-         tenant_id, workspace_id, reservation_space_id, command_kind, idempotency_key
-       ) DO NOTHING
-       RETURNING id`,
+      safeRequest === undefined
+        ? `INSERT INTO ops.domain_command_records (
+           id, tenant_id, workspace_id, reservation_space_id, command_kind,
+           command_schema_version, idempotency_key, canonical_request_hash,
+           actor_user_id, actor_membership_id, delegating_user_id, delegating_membership_id,
+           agent_principal_id, policy_version_id, request_id, traceparent, tracestate
+         ) VALUES (
+           $1, $2, $3, $4, $5,
+           $6, $7, $8,
+           $9, $10, $11, $12,
+           $13, $14, $15, $16, $17
+         )
+         ON CONFLICT (
+           tenant_id, workspace_id, reservation_space_id, command_kind, idempotency_key
+         ) DO NOTHING
+         RETURNING id`
+        : `INSERT INTO ops.domain_command_records (
+           id, tenant_id, workspace_id, reservation_space_id, command_kind,
+           command_schema_version, idempotency_key, canonical_request_hash, safe_request,
+           actor_user_id, actor_membership_id, delegating_user_id, delegating_membership_id,
+           agent_principal_id, policy_version_id, request_id, traceparent, tracestate
+         ) VALUES (
+           $1, $2, $3, $4, $5,
+           $6, $7, $8, $9,
+           $10, $11, $12, $13,
+           $14, $15, $16, $17, $18
+         )
+         ON CONFLICT (
+           tenant_id, workspace_id, reservation_space_id, command_kind, idempotency_key
+         ) DO NOTHING
+         RETURNING id`,
       [
         input.id,
         input.tenantId,
@@ -128,7 +148,7 @@ export class DomainCommandRepository {
         input.commandSchemaVersion,
         input.idempotencyKey,
         input.canonicalRequestHash,
-        input.safeRequest ?? null,
+        ...(safeRequest === undefined ? [] : [safeRequest]),
         input.actorUserId,
         input.actorMembershipId,
         input.delegatingUserId ?? null,

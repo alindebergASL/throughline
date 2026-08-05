@@ -83,7 +83,7 @@ describe("transaction-bound product domain repositories", () => {
     ]);
   });
 
-  it("reserves with one fixed parameterized statement and composes only one transaction", async () => {
+  it("omits safe_request and its parameter when reserving a legacy command", async () => {
     const { tx, query } = txWithRows([{ id: ids.command }]);
     const repositories = new ProductDomainTransactionRepositories(tx);
     await expect(repositories.commands.reserve(reservation)).resolves.toEqual({
@@ -91,10 +91,52 @@ describe("transaction-bound product domain repositories", () => {
       commandId: ids.command
     });
     expect(query).toHaveBeenCalledOnce();
-    expect(query.mock.calls[0]?.[0]).toContain("INSERT INTO ops.domain_command_records");
-    expect(query.mock.calls[0]?.[0]).not.toMatch(/\$\{|fixture-command-1/);
+    const [sql, parameters] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("INSERT INTO ops.domain_command_records");
+    expect(sql).not.toContain("safe_request");
+    expect(sql).not.toMatch(/\$\{|fixture-command-1/);
+    expect(parameters).toEqual([
+      ids.command,
+      ids.tenant,
+      ids.workspace,
+      ids.space,
+      "organization.create.v1",
+      1,
+      "fixture-command-1",
+      requestHash,
+      ids.user,
+      ids.membership,
+      null,
+      null,
+      null,
+      "dev-policy-v1",
+      "request-1",
+      "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+      null
+    ]);
     expect(repositories.audit).toBeDefined();
     expect(repositories.outbox).toBeDefined();
+  });
+
+  it("includes safe_request and its exact parameter when reserving a B2 command", async () => {
+    const safeRequest = {
+      subjectType: "initiative",
+      subjectId: ids.aggregate,
+      expectedLatestClaimId: null,
+      supportConfirmed: true
+    } as const;
+    const { tx, query } = txWithRows([{ id: ids.command }]);
+
+    await expect(
+      new DomainCommandRepository(tx).reserve({ ...reservation, safeRequest })
+    ).resolves.toEqual({ status: "reserved", commandId: ids.command });
+
+    expect(query).toHaveBeenCalledOnce();
+    const [sql, parameters] = query.mock.calls[0] as [string, unknown[]];
+    expect(sql).toContain("canonical_request_hash, safe_request");
+    expect(parameters).toHaveLength(18);
+    expect(parameters[8]).toEqual(safeRequest);
+    expect(parameters[9]).toBe(ids.user);
   });
 
   it("returns an exact completed replay and rejects trusted metadata/hash mismatches", async () => {
