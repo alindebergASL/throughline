@@ -11,7 +11,8 @@ export const B2_MIGRATION_IDS = [
   "0008_b2_slice1_command_integrity.sql",
   "0009_b2_source_truth_lifecycle_interlock.sql",
   "0010_b2_trusted_objective_initiative_lock.sql",
-  "0011_b2_primary_objective_proposal_recovery.sql"
+  "0011_b2_primary_objective_proposal_recovery.sql",
+  "0012_b2_fact_lifecycle.sql"
 ] as const;
 
 export type B2MigrationId = (typeof B2_MIGRATION_IDS)[number];
@@ -89,6 +90,26 @@ const truthColumns = {
     "version"
   ],
   fact_claims: ["tenant_id", "workspace_id", "space_id", "fact_id", "claim_id", "created_at"],
+  fact_lifecycle_events: [
+    "id",
+    "tenant_id",
+    "workspace_id",
+    "space_id",
+    "predecessor_fact_id",
+    "successor_fact_id",
+    "transition_kind",
+    "from_status",
+    "to_status",
+    "reason_code",
+    "reason_rationale",
+    "authority_basis",
+    "policy_version",
+    "acted_by_user_id",
+    "acted_by_membership_id",
+    "causation_command_id",
+    "recorded_at",
+    "version"
+  ],
   verified_evidence_spans: [
     "id",
     "tenant_id",
@@ -192,9 +213,13 @@ export async function assertB2MigrationStateAbsent(
                  ) AS installed`,
                 [["initiatives_app_truth_lock", "initiatives_app_permanent_no_write"]]
               )
-            : await client.query(
-                "SELECT to_regclass('truth.initiative_objective_support_attestations')::text AS installed"
-              );
+            : migrationId === "0011_b2_primary_objective_proposal_recovery.sql"
+              ? await client.query(
+                  "SELECT to_regclass('truth.initiative_objective_support_attestations')::text AS installed"
+                )
+              : await client.query(
+                  "SELECT to_regclass('truth.fact_lifecycle_events')::text AS installed"
+                );
   if (installed.rows[0]?.installed) {
     throw new Error(`B2 migration state already exists without journal row for ${migrationId}`);
   }
@@ -219,7 +244,15 @@ export async function validateB2CatalogContract(
   assertNarrowMigrationSources(migrationSources, phase);
   const exactTruthCatalog = exactTruthCatalogForPhase(phase);
   if (phase >= 5) {
-    await validateObjectiveRecoveryCatalog(client, migrationSources.get(B2_MIGRATION_IDS[4])!);
+    await validateObjectiveRecoveryCatalog(
+      client,
+      migrationSources.get(B2_MIGRATION_IDS[4])!,
+      phase
+    );
+  }
+  const factLifecycleSource = migrationSources.get(B2_MIGRATION_IDS[5]);
+  if (phase >= 6 && !factLifecycleSource) {
+    throw new Error("Missing ordinary Fact lifecycle migration source");
   }
   await validateTruthTables(client, exactTruthCatalog.relations);
   await validateTruthColumnsAndConstraints(client, phase, exactTruthCatalog);
@@ -230,6 +263,7 @@ export async function validateB2CatalogContract(
     migrationSources.get(B2_MIGRATION_IDS[0])!,
     migrationSources.get(B2_MIGRATION_IDS[2]),
     migrationSources.get(B2_MIGRATION_IDS[4]),
+    factLifecycleSource,
     phase
   );
   await validateTruthConstraintsAndTriggers(client, phase);
@@ -238,6 +272,7 @@ export async function validateB2CatalogContract(
     migrationSources.get("0008_b2_slice1_command_integrity.sql")!,
     migrationSources.get("0009_b2_source_truth_lifecycle_interlock.sql"),
     migrationSources.get("0011_b2_primary_objective_proposal_recovery.sql"),
+    factLifecycleSource,
     phase
   );
   if (phase >= 3) {
@@ -295,6 +330,27 @@ function assertNarrowMigrationSources(
     ]) {
       if (recovery.includes(forbidden)) {
         throw new Error(`Objective proposal recovery migration broadens into ${forbidden}`);
+      }
+    }
+  }
+  if (phase >= 6) {
+    const factLifecycle = migrationSources.get("0012_b2_fact_lifecycle.sql");
+    if (!factLifecycle) throw new Error("Missing ordinary Fact lifecycle migration source");
+    for (const required of [
+      "fact_lifecycle_events",
+      "newer_evidence",
+      "accepted_value_changed",
+      "corrected_source_revalidated",
+      "no_longer_true",
+      "support_invalidated",
+      "entered_in_error",
+      "fact.supersede.v1",
+      "fact.revoke.v1",
+      "fact.superseded",
+      "fact.revoked"
+    ]) {
+      if (!factLifecycle.includes(required)) {
+        throw new Error(`Ordinary Fact lifecycle migration omits ${required}`);
       }
     }
   }
@@ -359,9 +415,26 @@ function assertNarrowMigrationSources(
   }
 }
 
+function objectiveRecoveryForbiddenRelations(phase: number): readonly string[] {
+  switch (phase) {
+    case 5:
+      return [
+        "conflict_groups",
+        "fact_lifecycle_events",
+        "fact_supersessions",
+        "derived_view_snapshots"
+      ];
+    case 6:
+      return ["conflict_groups", "fact_supersessions", "derived_view_snapshots"];
+    default:
+      throw new Error("Objective recovery catalog received unsupported B2 phase");
+  }
+}
+
 async function validateObjectiveRecoveryCatalog(
   client: PgPoolClient,
-  recoverySource: string
+  recoverySource: string,
+  phase: number
 ): Promise<void> {
   const columns = await client.query<{ table_name: string; columns: string[] }>(
     `SELECT relation.relname AS table_name,
@@ -441,12 +514,13 @@ async function validateObjectiveRecoveryCatalog(
             'claims_status_check','claims_canonical_value_text_valid'
           )
         )
-      )) OR (namespace.nspname = 'ops' AND constraint_record.conname IN (
+      )) OR ($1::boolean AND namespace.nspname = 'ops' AND constraint_record.conname IN (
         'domain_command_records_b2_safe_request_check',
         'audit_events_action_check','audit_events_action_resource_pair_check',
         'product_outbox_events_event_type_check',
         'product_outbox_events_event_aggregate_pair_check'
-      )) ORDER BY relation.relname, constraint_record.contype, definition`
+      )) ORDER BY relation.relname, constraint_record.contype, definition`,
+    [phase < 6]
   );
   const constraintStatement = recoverySource.match(
     /ALTER TABLE ops\.domain_command_records\s+ADD CONSTRAINT domain_command_records_b2_safe_request_check[\s\S]*?\n\s*\);/
@@ -475,6 +549,10 @@ async function validateObjectiveRecoveryCatalog(
   await client.query("DROP TABLE pg_temp.b2_expected_safe_request_constraint");
   const expectedConstraints = exactObjectiveRecoveryConstraints(
     canonicalConstraint.rows[0]?.definition ?? ""
+  ).filter(
+    ({ relation }) =>
+      phase < 6 ||
+      !["domain_command_records", "audit_events", "product_outbox_events"].includes(relation)
   );
   if (
     JSON.stringify(sortExactCatalogRows(constraints.rows)) !==
@@ -752,14 +830,15 @@ async function validateObjectiveRecoveryCatalog(
     throw new Error("Objective recovery least-privilege grants drifted");
   }
 
+  const forbiddenRelations = objectiveRecoveryForbiddenRelations(phase);
   const forbidden = await client.query<{ present: boolean }>(
     `SELECT EXISTS (
        SELECT 1 FROM pg_class relation
        JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
-       WHERE namespace.nspname = 'truth' AND relation.relname IN (
-         'conflict_groups','fact_lifecycle_events','fact_supersessions','derived_view_snapshots'
-       )
-     ) AS present`
+       WHERE namespace.nspname = 'truth'
+         AND relation.relname = ANY($1::text[])
+     ) AS present`,
+    [forbiddenRelations]
   );
   if (forbidden.rows[0]?.present) {
     throw new Error("Objective recovery catalog contains generalized lifecycle storage");
@@ -1147,6 +1226,9 @@ async function validateTruthColumnsAndConstraints(
   phase: number,
   expectedCatalog: ExactTruthCatalog
 ): Promise<void> {
+  const phaseTruthTables: Array<keyof typeof truthColumns> =
+    phase >= 6 ? [...truthTables, "fact_lifecycle_events"] : [...truthTables];
+  phaseTruthTables.sort();
   const columns = await client.query<{ table_name: string; columns: string[] }>(
     `SELECT relation.relname AS table_name,
             array_agg(attribute.attname::text ORDER BY attribute.attnum) AS columns
@@ -1160,9 +1242,9 @@ async function validateTruthColumnsAndConstraints(
         AND NOT attribute.attisdropped
       GROUP BY relation.relname
       ORDER BY relation.relname`,
-    [[...truthTables]]
+    [[...phaseTruthTables]]
   );
-  const expectedColumns = truthTables.map((table_name) => ({
+  const expectedColumns = phaseTruthTables.map((table_name) => ({
     table_name,
     columns: truthColumns[table_name].map((column) =>
       phase >= 3 || column !== "canonical_value_text" ? column : "value_json"
@@ -1228,7 +1310,7 @@ async function validateTruthColumnsAndConstraints(
   const definitions = constraints.rows.map(({ definition }) => definition).join("\n");
   for (const forbidden of [
     ...(phase >= 5 ? [] : ["rejected"]),
-    "revoked",
+    ...(phase >= 6 ? [] : ["revoked"]),
     "redacted",
     "hash_disposition"
   ]) {
@@ -1425,6 +1507,18 @@ async function validateTruthSecurity(
       grantable: false
     });
   }
+  if (phase >= 6) {
+    for (const column_name of ["last_causation_command_id", "status", "updated_at", "version"]) {
+      expectedTablePrivileges.push({
+        table_name: "accepted_facts",
+        scope: "column",
+        column_name,
+        grantee: "throughline_app",
+        privilege: "UPDATE",
+        grantable: false
+      });
+    }
+  }
   expectedTablePrivileges.sort((left, right) =>
     `${left.table_name}|${left.scope}|${left.column_name ?? ""}|${left.grantee}|${left.privilege}`.localeCompare(
       `${right.table_name}|${right.scope}|${right.column_name ?? ""}|${right.grantee}|${right.privilege}`
@@ -1440,6 +1534,7 @@ async function validateTruthFunctions(
   schemaSource: string,
   lifecycleSource: string | undefined,
   recoverySource: string | undefined,
+  factLifecycleSource: string | undefined,
   phase: number
 ): Promise<void> {
   const objectiveRecoveryFunctionIdentities = [
@@ -1449,9 +1544,17 @@ async function validateTruthFunctions(
     "truth.validate_objective_recovery()",
     "truth.validate_objective_support_attestation()"
   ] as const;
+  const factLifecycleFunctionIdentities = [
+    "truth.enforce_fact_lifecycle_transition()",
+    "truth.require_fact_lifecycle_command()",
+    "truth.require_fact_lifecycle_event()",
+    "truth.reject_statement_mutation()",
+    "truth.validate_fact_lifecycle_event()"
+  ] as const;
   const expectedTruthFunctionIdentities = [
     ...truthFunctionIdentities,
-    ...(phase >= 5 ? objectiveRecoveryFunctionIdentities : [])
+    ...(phase >= 5 ? objectiveRecoveryFunctionIdentities : []),
+    ...(phase >= 6 ? factLifecycleFunctionIdentities : [])
   ].sort();
   const inventory = await client.query<{ identity: string }>(
     `SELECT procedure.oid::regprocedure::text AS identity
@@ -1501,6 +1604,15 @@ async function validateTruthFunctions(
         objectiveRecoveryFunction ||
         identity === "truth.enforce_claim_transition()" ||
         identity === "truth.require_reserved_command()";
+      const factLifecycleFunction = factLifecycleFunctionIdentities.includes(
+        identity as (typeof factLifecycleFunctionIdentities)[number]
+      );
+      const phase6BackedFunction =
+        factLifecycleFunction ||
+        identity === "truth.enforce_claim_transition()" ||
+        identity === "truth.require_reserved_command()" ||
+        identity === "truth.require_fact_accept_reservation()" ||
+        identity === "truth.validate_fact_insert()";
       return {
         identity,
         result: accessFunction ? "boolean" : "trigger",
@@ -1513,14 +1625,17 @@ async function validateTruthFunctions(
         parallel: "u",
         kind: "f",
         configuration: ["search_path=pg_catalog"],
-        source: migrationFunctionSource(
-          phase >= 5 && recoveryBackedFunction
-            ? recoverySource!
-            : phase >= 3 && !accessFunction
-              ? lifecycleSource!
-              : schemaSource,
-          accessFunction ? "access.can_read_space" : identity.slice(0, -2)
-        )
+        source:
+          phase >= 6 && phase6BackedFunction
+            ? migrationFunctionSource(factLifecycleSource!, identity.slice(0, -2))
+            : migrationFunctionSource(
+                phase >= 5 && recoveryBackedFunction
+                  ? recoverySource!
+                  : phase >= 3 && !accessFunction
+                    ? lifecycleSource!
+                    : schemaSource,
+                accessFunction ? "access.can_read_space" : identity.slice(0, -2)
+              )
       };
     })
     .sort((left, right) => left.identity.localeCompare(right.identity));
@@ -1583,20 +1698,29 @@ async function validateTruthConstraintsAndTriggers(
     timing_and_events: string;
     deferred?: boolean;
     arguments?: string[];
+    statement?: boolean;
   };
   const triggerContracts: TruthTriggerContract[] = [
+    phase >= 6
+      ? {
+          name: "accepted_facts_command_guard",
+          table_name: "accepted_facts",
+          function_identity: "truth.require_reserved_command()",
+          timing_and_events: "BEFORE INSERT",
+          arguments: ["fact.accept-or-supersede.v1"]
+        }
+      : {
+          name: "accepted_facts_command_guard",
+          table_name: "accepted_facts",
+          function_identity: "truth.require_reserved_command()",
+          timing_and_events: "BEFORE INSERT",
+          arguments: ["fact.accept.v1"]
+        },
     {
-      name: "accepted_facts_command_guard",
-      table_name: "accepted_facts",
-      function_identity: "truth.require_reserved_command()",
-      timing_and_events: "BEFORE INSERT",
-      arguments: ["fact.accept.v1"]
-    },
-    {
-      name: "accepted_facts_immutable",
+      name: phase >= 6 ? "accepted_facts_delete_guard" : "accepted_facts_immutable",
       table_name: "accepted_facts",
       function_identity: "truth.reject_mutation()",
-      timing_and_events: "BEFORE DELETE OR UPDATE"
+      timing_and_events: phase >= 6 ? "BEFORE DELETE" : "BEFORE DELETE OR UPDATE"
     },
     {
       name: "accepted_facts_insert_guard",
@@ -1736,18 +1860,72 @@ async function validateTruthConstraintsAndTriggers(
             timing_and_events: "BEFORE INSERT"
           }
         ]
+      : []),
+    ...(phase >= 6
+      ? [
+          {
+            name: "accepted_facts_lifecycle_deferred",
+            table_name: "accepted_facts",
+            function_identity: "truth.require_fact_lifecycle_event()",
+            timing_and_events: "AFTER UPDATE",
+            deferred: true
+          },
+          {
+            name: "accepted_facts_lifecycle_guard",
+            table_name: "accepted_facts",
+            function_identity: "truth.enforce_fact_lifecycle_transition()",
+            timing_and_events: "BEFORE UPDATE"
+          },
+          {
+            name: "fact_lifecycle_command_guard",
+            table_name: "fact_lifecycle_events",
+            function_identity: "truth.require_fact_lifecycle_command()",
+            timing_and_events: "BEFORE INSERT",
+            arguments: ["fact.supersede-or-revoke.v1"]
+          },
+          {
+            name: "fact_lifecycle_immutable",
+            table_name: "fact_lifecycle_events",
+            function_identity: "truth.reject_mutation()",
+            timing_and_events: "BEFORE DELETE OR UPDATE"
+          },
+          {
+            name: "fact_lifecycle_insert_guard",
+            table_name: "fact_lifecycle_events",
+            function_identity: "truth.validate_fact_lifecycle_event()",
+            timing_and_events: "BEFORE INSERT"
+          },
+          {
+            name: "fact_lifecycle_truncate_guard",
+            table_name: "fact_lifecycle_events",
+            function_identity: "truth.reject_statement_mutation()",
+            timing_and_events: "BEFORE TRUNCATE",
+            statement: true
+          },
+          {
+            name: "fact_lifecycle_valid_deferred",
+            table_name: "fact_lifecycle_events",
+            function_identity: "truth.validate_fact_lifecycle_event()",
+            timing_and_events: "AFTER INSERT",
+            deferred: true
+          }
+        ]
       : [])
   ];
   const expectedTriggers = triggerContracts
-    .map((contract) => ({
-      name: contract.name,
-      table_name: contract.table_name,
-      function_identity: contract.function_identity,
-      enabled: true,
-      deferrable: contract.deferred ?? false,
-      initially_deferred: contract.deferred ?? false,
-      definition: `CREATE ${contract.deferred ? "CONSTRAINT " : ""}TRIGGER ${contract.name} ${contract.timing_and_events} ON truth.${contract.table_name}${contract.deferred ? " DEFERRABLE INITIALLY DEFERRED" : ""} FOR EACH ROW EXECUTE FUNCTION ${contract.function_identity.slice(0, -2)}(${(contract.arguments ?? []).map((argument) => `'${argument}'`).join(", ")})`
-    }))
+    .map((contract) => {
+      const rowInvocation = "FOR EACH ROW EXECUTE FUNCTION";
+      const invocation = contract.statement ? "FOR EACH STATEMENT EXECUTE FUNCTION" : rowInvocation;
+      return {
+        name: contract.name,
+        table_name: contract.table_name,
+        function_identity: contract.function_identity,
+        enabled: true,
+        deferrable: contract.deferred ?? false,
+        initially_deferred: contract.deferred ?? false,
+        definition: `CREATE ${contract.deferred ? "CONSTRAINT " : ""}TRIGGER ${contract.name} ${contract.timing_and_events} ON truth.${contract.table_name}${contract.deferred ? " DEFERRABLE INITIALLY DEFERRED" : ""} ${invocation} ${contract.function_identity.slice(0, -2)}(${(contract.arguments ?? []).map((argument) => `'${argument}'`).join(", ")})`
+      };
+    })
     .sort((left, right) => left.name.localeCompare(right.name));
   const triggers = await client.query<Record<string, unknown>>(
     `SELECT trigger_record.tgname AS name, relation.relname AS table_name,
@@ -1897,6 +2075,7 @@ async function validateCommandBoundary(
   integritySource: string,
   lifecycleSource: string | undefined,
   recoverySource: string | undefined,
+  factLifecycleSource: string | undefined,
   phase: number
 ): Promise<void> {
   const boundary = await client.query<{
@@ -1963,6 +2142,7 @@ async function validateCommandBoundary(
     integritySource,
     lifecycleSource,
     recoverySource,
+    factLifecycleSource,
     phase
   );
   const validClaimResponse =
@@ -2004,7 +2184,7 @@ async function validateCommandBoundary(
            "factId":"0190a000-0000-7000-8000-000000000303",
            "status":"current","version":1}'::jsonb
        ) AS fact_valid,
-       NOT ops.product_command_record_valid(
+       ${phase >= 6 ? "" : "NOT "}ops.product_command_record_valid(
          'fact.revoke.v1', 1, 'reserved', NULL, NULL, NULL
        ) AS future_invalid,
        NOT ops.product_command_record_valid(
@@ -2032,9 +2212,13 @@ async function validateCommandFunctionSecurity(
   integritySource: string,
   lifecycleSource: string | undefined,
   recoverySource: string | undefined,
+  factLifecycleSource: string | undefined,
   phase: number
 ): Promise<void> {
   const safeRequestIdentity = "ops.b2_slice1_safe_request_valid(text,jsonb)" as const;
+  // prettier-ignore
+  const predecessorSafeRequestSource = migrationFunctionSource(recoverySource!, "ops.b2_slice1_safe_request_valid");
+  const predecessorAtomicitySource = phase >= 3 ? lifecycleSource! : integritySource;
   const functionIdentities = [
     "ops.b2_slice1_audit_detail_valid(text,text,integer,uuid,jsonb)",
     "ops.b2_slice1_event_payload_valid(text,integer,uuid,jsonb)",
@@ -2079,7 +2263,7 @@ async function validateCommandFunctionSecurity(
       kind: "f",
       configuration: searchPath,
       source: migrationFunctionSource(
-        phase >= 5 ? recoverySource! : integritySource,
+        phase >= 6 ? factLifecycleSource! : phase >= 5 ? recoverySource! : integritySource,
         "ops.b2_slice1_audit_detail_valid"
       )
     },
@@ -2096,7 +2280,7 @@ async function validateCommandFunctionSecurity(
       kind: "f",
       configuration: searchPath,
       source: migrationFunctionSource(
-        phase >= 5 ? recoverySource! : integritySource,
+        phase >= 6 ? factLifecycleSource! : phase >= 5 ? recoverySource! : integritySource,
         "ops.b2_slice1_event_payload_valid"
       )
     },
@@ -2114,7 +2298,10 @@ async function validateCommandFunctionSecurity(
             parallel: "u",
             kind: "f",
             configuration: searchPath,
-            source: migrationFunctionSource(recoverySource!, "ops.b2_slice1_safe_request_valid")
+            source:
+              phase >= 6
+                ? migrationFunctionSource(factLifecycleSource!, "ops.b2_slice1_safe_request_valid")
+                : predecessorSafeRequestSource
           }
         ]
       : []),
@@ -2131,7 +2318,7 @@ async function validateCommandFunctionSecurity(
       kind: "f",
       configuration: searchPath,
       source: migrationFunctionSource(
-        phase >= 5 ? recoverySource! : integritySource,
+        phase >= 6 ? factLifecycleSource! : phase >= 5 ? recoverySource! : integritySource,
         "ops.product_command_record_valid"
       )
     },
@@ -2148,7 +2335,11 @@ async function validateCommandFunctionSecurity(
       kind: "f",
       configuration: searchPath,
       source: migrationFunctionSource(
-        phase >= 5 ? recoverySource! : phase >= 3 ? lifecycleSource! : integritySource,
+        phase >= 6
+          ? factLifecycleSource!
+          : phase >= 5
+            ? recoverySource!
+            : predecessorAtomicitySource,
         "ops.require_b2_slice1_command_atomicity"
       )
     }

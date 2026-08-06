@@ -1614,6 +1614,263 @@ const phase5IndexAdditions: ExactTruthIndex[] = [
       "CREATE UNIQUE INDEX initiative_objective_support_attestations_pkey ON truth.initiative_objective_support_attestations USING btree (id)"
   }
 ];
+const phase6RelationAdditions: ExactTruthRelation[] = [
+  {
+    name: "fact_lifecycle_events",
+    kind: "r",
+    persistence: "p",
+    rls: true,
+    forced_rls: true,
+    owner: "migration_owner"
+  }
+];
+const phase6PolicyAdditions: ExactTruthPolicy[] = [
+  {
+    table_name: "accepted_facts",
+    policy_name: "accepted_facts_lifecycle_update",
+    operation: "w",
+    permissive: true,
+    roles: ["throughline_app"],
+    using_expression:
+      "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND access.can_read_space(space_id, access_class))",
+    check_expression:
+      "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND access.can_read_space(space_id, access_class))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    policy_name: "fact_lifecycle_insert",
+    operation: "a",
+    permissive: true,
+    roles: ["throughline_app"],
+    using_expression: null,
+    check_expression:
+      "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (acted_by_user_id = ops.current_user_id()) AND (acted_by_membership_id = ops.current_membership_id()) AND (policy_version = ops.current_policy_version()) AND (EXISTS ( SELECT 1\n   FROM truth.accepted_facts predecessor\n  WHERE ((predecessor.tenant_id = fact_lifecycle_events.tenant_id) AND (predecessor.workspace_id = fact_lifecycle_events.workspace_id) AND (predecessor.space_id = fact_lifecycle_events.space_id) AND (predecessor.id = fact_lifecycle_events.predecessor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, predecessor.access_class)))) AND ((successor_fact_id IS NULL) OR (EXISTS ( SELECT 1\n   FROM truth.accepted_facts successor\n  WHERE ((successor.tenant_id = fact_lifecycle_events.tenant_id) AND (successor.workspace_id = fact_lifecycle_events.workspace_id) AND (successor.space_id = fact_lifecycle_events.space_id) AND (successor.id = fact_lifecycle_events.successor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, successor.access_class))))))"
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    policy_name: "fact_lifecycle_integrity_select",
+    operation: "r",
+    permissive: true,
+    roles: ["throughline_b1_0_integrity"],
+    using_expression: "true",
+    check_expression: null
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    policy_name: "fact_lifecycle_select",
+    operation: "r",
+    permissive: true,
+    roles: ["throughline_app"],
+    using_expression:
+      "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (EXISTS ( SELECT 1\n   FROM truth.accepted_facts predecessor\n  WHERE ((predecessor.tenant_id = fact_lifecycle_events.tenant_id) AND (predecessor.workspace_id = fact_lifecycle_events.workspace_id) AND (predecessor.space_id = fact_lifecycle_events.space_id) AND (predecessor.id = fact_lifecycle_events.predecessor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, predecessor.access_class)))) AND ((successor_fact_id IS NULL) OR (EXISTS ( SELECT 1\n   FROM truth.accepted_facts successor\n  WHERE ((successor.tenant_id = fact_lifecycle_events.tenant_id) AND (successor.workspace_id = fact_lifecycle_events.workspace_id) AND (successor.space_id = fact_lifecycle_events.space_id) AND (successor.id = fact_lifecycle_events.successor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, successor.access_class))))))",
+    check_expression: null
+  }
+];
+const phase6ConstraintRemovals: ExactTruthConstraint[] = [
+  {
+    table_name: "accepted_facts",
+    name: "accepted_facts_status_check",
+    type: "c",
+    definition: "CHECK ((status = 'current'::text))",
+    deferrable: false,
+    initially_deferred: false,
+    validated: true
+  },
+  {
+    table_name: "accepted_facts",
+    name: "accepted_facts_version_check",
+    type: "c",
+    definition: "CHECK ((version = 1))",
+    deferrable: false,
+    initially_deferred: false,
+    validated: true
+  }
+];
+const phase6ConstraintAdditions: ExactTruthConstraint[] = [
+  [
+    "accepted_facts",
+    "accepted_facts_lifecycle_deferred",
+    "t",
+    "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+    true
+  ],
+  [
+    "accepted_facts",
+    "accepted_facts_status_check",
+    "c",
+    "CHECK ((status = ANY (ARRAY['current'::text, 'superseded'::text, 'revoked'::text])))",
+    false
+  ],
+  [
+    "accepted_facts",
+    "accepted_facts_version_check",
+    "c",
+    "CHECK ((((status = 'current'::text) AND (version = 1)) OR ((status = ANY (ARRAY['superseded'::text, 'revoked'::text])) AND (version = 2))))",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_actor_membership_fkey",
+    "f",
+    "FOREIGN KEY (tenant_id, workspace_id, acted_by_membership_id, acted_by_user_id) REFERENCES identity.memberships(tenant_id, workspace_id, id, user_id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    true
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_actor_user_fkey",
+    "f",
+    "FOREIGN KEY (acted_by_user_id) REFERENCES identity.users(id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    true
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_authority_check",
+    "c",
+    "CHECK ((authority_basis = ANY (ARRAY['activity_owner'::text, 'initiative_owner'::text])))",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_command_fkey",
+    "f",
+    "FOREIGN KEY (tenant_id, workspace_id, causation_command_id) REFERENCES ops.domain_command_records(tenant_id, workspace_id, id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    true
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_command_key",
+    "u",
+    "UNIQUE (tenant_id, workspace_id, causation_command_id)",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_id_check",
+    "c",
+    "CHECK (ops.is_uuid_v7(id))",
+    false
+  ],
+  ["fact_lifecycle_events", "fact_lifecycle_events_pkey", "p", "PRIMARY KEY (id)", false],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_policy_fkey",
+    "f",
+    "FOREIGN KEY (tenant_id, workspace_id, policy_version) REFERENCES identity.policy_versions(tenant_id, workspace_id, id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    true
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_predecessor_fkey",
+    "f",
+    "FOREIGN KEY (tenant_id, workspace_id, space_id, predecessor_fact_id) REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id) MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    true
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_predecessor_key",
+    "u",
+    "UNIQUE (tenant_id, workspace_id, predecessor_fact_id)",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_rationale_check",
+    "c",
+    "CHECK (((reason_rationale = NORMALIZE(reason_rationale, NFC)) AND (reason_rationale = btrim(reason_rationale)) AND ((length(reason_rationale) >= 1) AND (length(reason_rationale) <= 2000))))",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_reason_check",
+    "c",
+    "CHECK ((((transition_kind = 'supersede'::text) AND (reason_code = ANY (ARRAY['newer_evidence'::text, 'accepted_value_changed'::text, 'corrected_source_revalidated'::text]))) OR ((transition_kind = 'revoke'::text) AND (reason_code = ANY (ARRAY['no_longer_true'::text, 'support_invalidated'::text, 'entered_in_error'::text])))))",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_successor_fkey",
+    "f",
+    "FOREIGN KEY (tenant_id, workspace_id, space_id, successor_fact_id) REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id) ON UPDATE RESTRICT ON DELETE RESTRICT DEFERRABLE INITIALLY DEFERRED",
+    true
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_successor_key",
+    "u",
+    "UNIQUE (tenant_id, workspace_id, successor_fact_id)",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_tenant_workspace_id_key",
+    "u",
+    "UNIQUE (tenant_id, workspace_id, id)",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_tenant_workspace_space_id_key",
+    "u",
+    "UNIQUE (tenant_id, workspace_id, space_id, id)",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_timestamp_check",
+    "c",
+    "CHECK ((recorded_at = transaction_timestamp()))",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_transition_shape_check",
+    "c",
+    "CHECK ((((transition_kind = 'supersede'::text) AND (from_status = 'current'::text) AND (to_status = 'superseded'::text) AND (successor_fact_id IS NOT NULL) AND (successor_fact_id <> predecessor_fact_id)) OR ((transition_kind = 'revoke'::text) AND (from_status = 'current'::text) AND (to_status = 'revoked'::text) AND (successor_fact_id IS NULL))))",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_events_version_check",
+    "c",
+    "CHECK ((version = 1))",
+    false
+  ],
+  [
+    "fact_lifecycle_events",
+    "fact_lifecycle_valid_deferred",
+    "t",
+    "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+    true
+  ]
+].map(([table_name, name, type, definition, deferred]) => ({
+  table_name: table_name as string,
+  name: name as string,
+  type: type as string,
+  definition: definition as string,
+  deferrable: deferred as boolean,
+  initially_deferred: deferred as boolean,
+  validated: true
+}));
+const phase6IndexDefinitions = [
+  ["fact_lifecycle_events_command_key", "tenant_id, workspace_id, causation_command_id"],
+  ["fact_lifecycle_events_pkey", "id"],
+  ["fact_lifecycle_events_predecessor_key", "tenant_id, workspace_id, predecessor_fact_id"],
+  ["fact_lifecycle_events_successor_key", "tenant_id, workspace_id, successor_fact_id"],
+  ["fact_lifecycle_events_tenant_workspace_id_key", "tenant_id, workspace_id, id"],
+  ["fact_lifecycle_events_tenant_workspace_space_id_key", "tenant_id, workspace_id, space_id, id"]
+] as const;
+const phase6IndexAdditions: ExactTruthIndex[] = phase6IndexDefinitions.map(
+  ([index_name, columns]) => ({
+    table_name: "fact_lifecycle_events",
+    index_name,
+    unique: true,
+    primary: index_name === "fact_lifecycle_events_pkey",
+    valid: true,
+    ready: true,
+    live: true,
+    definition: `CREATE UNIQUE INDEX ${index_name} ON truth.fact_lifecycle_events USING btree (${columns})`
+  })
+);
 const withoutRows = <T>(rows: T[], removals: T[]): T[] => {
   const removed = new Set(removals.map((row) => JSON.stringify(row)));
   return rows.filter((row) => !removed.has(JSON.stringify(row)));
@@ -1635,6 +1892,13 @@ export function exactTruthCatalogForPhase(phase: number): ExactTruthCatalog {
     constraints = withoutRows(constraints, phase5ConstraintRemovals);
     constraints.push(...phase5ConstraintAdditions);
     indexes.push(...phase5IndexAdditions);
+  }
+  if (phase >= 6) {
+    relations.push(...phase6RelationAdditions);
+    policies.push(...phase6PolicyAdditions);
+    constraints = withoutRows(constraints, phase6ConstraintRemovals);
+    constraints.push(...phase6ConstraintAdditions);
+    indexes.push(...phase6IndexAdditions);
   }
   relations.sort((left, right) => left.name.localeCompare(right.name));
   policies.sort((left, right) =>

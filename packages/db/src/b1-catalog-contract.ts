@@ -9,7 +9,7 @@ export const B1_MIGRATION_IDS = [
 
 type B1MigrationId = (typeof B1_MIGRATION_IDS)[number];
 type MigrationSources = ReadonlyMap<string, string>;
-type AdditiveB2Phase = 0 | 1 | 2 | 3 | 4 | 5;
+type AdditiveB2Phase = 0 | 1 | 2 | 3 | 4 | 5 | 6;
 
 const B1_PREDECESSOR_IDS = [
   "0001_wave_a2_identity_access_rls.sql",
@@ -20,6 +20,7 @@ const B1_PREDECESSOR_IDS = [
 const B2_INTEGRITY_MIGRATION_ID = "0008_b2_slice1_command_integrity.sql";
 const B2_LIFECYCLE_MIGRATION_ID = "0009_b2_source_truth_lifecycle_interlock.sql";
 const B2_OBJECTIVE_RECOVERY_MIGRATION_ID = "0011_b2_primary_objective_proposal_recovery.sql";
+const B2_FACT_LIFECYCLE_MIGRATION_ID = "0012_b2_fact_lifecycle.sql";
 
 export async function validateMigrationJournal(
   client: PgPoolClient,
@@ -1808,6 +1809,47 @@ async function validateCommandIntegrityObjects(
     );
   }
 
+  if (additiveB2Phase >= 6) {
+    const factLifecycleSource = requireSource(migrationSources, B2_FACT_LIFECYCLE_MIGRATION_ID);
+    const factLifecycleConstraintStatements = [
+      ...factLifecycleSource.matchAll(
+        /ALTER TABLE ops\.domain_command_records\s+DROP CONSTRAINT domain_command_records_b2_safe_request_check,\s+ADD CONSTRAINT domain_command_records_b2_safe_request_check CHECK \([\s\S]*?\n\s*\);/g
+      )
+    ];
+    const dropPhase5B2TriggerStatements = [
+      ...factLifecycleSource.matchAll(
+        /DROP TRIGGER domain_command_records_b2_slice1_atomicity_deferred\s+ON ops\.domain_command_records;/g
+      )
+    ];
+    const replacementPhase6B2TriggerStatements = [
+      ...factLifecycleSource.matchAll(
+        /CREATE CONSTRAINT TRIGGER domain_command_records_b2_slice1_atomicity_deferred[\s\S]*?EXECUTE FUNCTION ops\.require_b2_slice1_command_atomicity\(\);/g
+      )
+    ];
+    if (
+      factLifecycleConstraintStatements.length !== 1 ||
+      dropPhase5B2TriggerStatements.length !== 1 ||
+      replacementPhase6B2TriggerStatements.length !== 1
+    ) {
+      throw new Error("Fixed Fact lifecycle command integrity contract parser failed");
+    }
+    const factLifecycleConstraintStatement = factLifecycleConstraintStatements[0]![0];
+    const dropPhase5B2TriggerStatement = dropPhase5B2TriggerStatements[0]![0];
+    const replacementPhase6B2TriggerStatement = replacementPhase6B2TriggerStatements[0]![0];
+    await client.query(
+      factLifecycleConstraintStatement.replace("ops.domain_command_records", expectedRelation)
+    );
+    await client.query(
+      dropPhase5B2TriggerStatement.replace("ops.domain_command_records", expectedRelation)
+    );
+    await client.query(
+      replacementPhase6B2TriggerStatement.replace(
+        "ON ops.domain_command_records",
+        `ON ${expectedRelation}`
+      )
+    );
+  }
+
   const constraintCatalog = async (relation: string) =>
     (
       await client.query<Record<string, unknown>>(
@@ -1909,6 +1951,7 @@ const objectiveRecoveryIntegrityRelations = [
   "truth.initiative_objective_proposal_recoveries",
   "truth.initiative_objective_support_attestations"
 ] as const;
+const factLifecycleIntegrityRelations = ["truth.fact_lifecycle_events"] as const;
 
 function predecessorAclRows(
   relation: string,
@@ -2122,6 +2165,14 @@ function expectedPredecessorAcl(
       );
     }
   }
+  if (additiveB2Phase >= 6) {
+    for (const relation of factLifecycleIntegrityRelations) {
+      rows.push(
+        ...predecessorAclRows(relation, "table", [], "throughline_app", ["INSERT", "SELECT"]),
+        ...predecessorAclRows(relation, "table", [], "throughline_b1_0_integrity", ["SELECT"])
+      );
+    }
+  }
   return rows;
 }
 
@@ -2214,6 +2265,20 @@ async function validateIntegrityPredecessorAccess(
       `${left.relation}|${left.name}`.localeCompare(`${right.relation}|${right.name}`)
     );
   }
+  if (additiveB2Phase >= 6) {
+    expectedPolicies.push({
+      relation: "truth.fact_lifecycle_events",
+      name: "fact_lifecycle_integrity_select",
+      command: "r",
+      permissive: true,
+      roles: ["throughline_b1_0_integrity"],
+      using_expression: "true",
+      check_expression: null
+    });
+    expectedPolicies.sort((left, right) =>
+      `${left.relation}|${left.name}`.localeCompare(`${right.relation}|${right.name}`)
+    );
+  }
   assertCatalogEqual("B1 integrity policy capability boundary", policies.rows, expectedPolicies);
 
   const aclDiagnostics = await client.query<Record<string, unknown>>(
@@ -2289,7 +2354,8 @@ async function validateIntegrityPredecessorAccess(
     [
       [
         ...predecessorAclRelations,
-        ...(additiveB2Phase >= 5 ? objectiveRecoveryIntegrityRelations : [])
+        ...(additiveB2Phase >= 5 ? objectiveRecoveryIntegrityRelations : []),
+        ...(additiveB2Phase >= 6 ? factLifecycleIntegrityRelations : [])
       ],
       JSON.stringify(expectedPredecessorAcl(integrityInstalled, additiveB2Phase))
     ]

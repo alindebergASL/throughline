@@ -1,9 +1,13 @@
 import pg from "pg";
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { afterAll, describe, expect, it } from "vitest";
 import { devFixtures } from "@throughline/tenancy";
 import { applyMigrations } from "./migrations.js";
+import { provisionProductRelayDirectManagerAccess } from "./product-relay-provisioning.js";
 import { seedWaveA2DeterministicData } from "./seed.js";
 import { provisionTestAppRole } from "./test-database.js";
+import type { TenantDbTransaction } from "./transaction.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -29,11 +33,43 @@ const postSlice3MigrationIds = [
 const postSlice4AMigrationIds = [...postSlice3MigrationIds, "0012_b2_fact_lifecycle.sql"] as const;
 const truthTables = ["accepted_facts", "claims", "fact_claims", "verified_evidence_spans"] as const;
 const PHASE5_TEST_TIMEOUT = 180_000;
+const PHASE6_SUPERSEDE_ROLLBACK_TEST_TIMEOUT = 300_000;
 const normalizeSql = (source: string) => source.trim().replace(/\s+/g, " ");
+const exact0012FunctionBodyDigests = {
+  "ops.b2_slice1_audit_detail_valid(text,text,integer,uuid,jsonb)":
+    "144d82c83595006551ae90b66cb279e0605054470a3b82f89d7d13e53f12475a",
+  "ops.b2_slice1_event_payload_valid(text,integer,uuid,jsonb)":
+    "6d0c4b56de9120cb11375c7cceb92a7871adf2c3cd122e3eaa3c964dd1ea81f0",
+  "ops.b2_slice1_safe_request_valid(text,jsonb)":
+    "411d840a4103fad18a06842df04cf9edca89aeeba166b6b5726fbd183d586eef",
+  "ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)":
+    "e5c46c5b0d47712951dce2d60e55f28bca1e7cca795658c196836b7e8fe7affa",
+  "ops.require_b2_slice1_command_atomicity()":
+    "2ed3c76136938f08846defd78c14ed84d5c50ac915a9fb946b25fbed17819f48",
+  "truth.enforce_claim_transition()":
+    "0bef1037a525126dad73b202c4dd59cd8be26fed48d6fb36657afd59b140bf48",
+  "truth.enforce_fact_lifecycle_transition()":
+    "967ec9269eb34f79e35ba6113f22ec29ba1c5d74819546b4716d982b59336a10",
+  "truth.reject_statement_mutation()":
+    "e8a66bfefb5d061c9981613e9e581872595c6f3fff384c20cd5513d7503902ae",
+  "truth.require_fact_accept_reservation()":
+    "6e3a8170aeb14d4cf474c3ed0acf9b122efa7d732e1530bad205a8c4d17190bb",
+  "truth.require_fact_lifecycle_command()":
+    "9ab571a5144343140ed4511d70c9e2127ec3b68b9c97fdd249c4cfe04e5b0e07",
+  "truth.require_fact_lifecycle_event()":
+    "16e0ece019be747f0ac189bdb092b622ae37d6183990dd2b54e9d02a126135c9",
+  "truth.require_reserved_command()":
+    "91b97c7b7e5efef91129f48ab842e3d5047d1e72f4e353d5514829d90c9f00b7",
+  "truth.validate_fact_insert()":
+    "c27176c6b7a8050c1d98f9c38333864614ee0f85c3dd0ded411a522745c81756",
+  "truth.validate_fact_lifecycle_event()":
+    "40a11b34d6a9cdb43a496523b81c3bade3b340600a6b21b4e97453e1dc55b550"
+} as const;
 const exactPhase6LifecycleFunctionSources = {
   "truth.enforce_fact_lifecycle_transition()": normalizeSql(`
     DECLARE
       required_kind text;
+      subject_version integer;
     BEGIN
       IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION USING ERRCODE = 'TLB22',
@@ -56,6 +92,23 @@ const exactPhase6LifecycleFunctionSources = {
       THEN
         RAISE EXCEPTION 'accepted Fact lifecycle transition is not permitted';
       END IF;
+      IF OLD.subject_type = 'activity' THEN
+        SELECT subject.version INTO subject_version
+          FROM work.activities subject
+         WHERE subject.tenant_id = OLD.tenant_id
+           AND subject.workspace_id = OLD.workspace_id
+           AND subject.space_id = OLD.space_id
+           AND subject.id = OLD.subject_id
+         FOR SHARE;
+      ELSE
+        SELECT subject.version INTO subject_version
+          FROM work.initiatives subject
+         WHERE subject.tenant_id = OLD.tenant_id
+           AND subject.workspace_id = OLD.workspace_id
+           AND subject.space_id = OLD.space_id
+           AND subject.id = OLD.subject_id
+         FOR SHARE;
+      END IF;
       IF NOT EXISTS (
         SELECT 1
           FROM ops.domain_command_records command
@@ -77,6 +130,19 @@ const exactPhase6LifecycleFunctionSources = {
            ))
       ) THEN
         RAISE EXCEPTION 'accepted Fact lifecycle transition requires its exact reserved command';
+      END IF;
+      IF required_kind = 'fact.supersede.v1' AND (
+        subject_version IS NULL OR NOT EXISTS (
+          SELECT 1
+            FROM ops.domain_command_records command
+           WHERE command.tenant_id = NEW.tenant_id
+             AND command.workspace_id = NEW.workspace_id
+             AND command.id = NEW.last_causation_command_id
+             AND (command.safe_request #>> '{subject,expectedVersion}')::integer = subject_version
+        )
+      ) THEN
+        RAISE EXCEPTION USING
+          MESSAGE = 'fact supersede subject version is stale';
       END IF;
       RETURN NEW;
     END
@@ -283,9 +349,9 @@ const exactFactLifecycleColumns = [
 const exactFactScope =
   "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND access.can_read_space(space_id, access_class))";
 const exactLifecycleScope =
-  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND access.can_read_space(space_id, ( SELECT fact.access_class\n   FROM truth.accepted_facts fact\n  WHERE ((fact.tenant_id = fact_lifecycle_events.tenant_id) AND (fact.workspace_id = fact_lifecycle_events.workspace_id) AND (fact.space_id = fact_lifecycle_events.space_id) AND (fact.id = fact_lifecycle_events.predecessor_fact_id)))))";
+  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (EXISTS ( SELECT 1\n   FROM truth.accepted_facts predecessor\n  WHERE ((predecessor.tenant_id = fact_lifecycle_events.tenant_id) AND (predecessor.workspace_id = fact_lifecycle_events.workspace_id) AND (predecessor.space_id = fact_lifecycle_events.space_id) AND (predecessor.id = fact_lifecycle_events.predecessor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, predecessor.access_class)))) AND ((successor_fact_id IS NULL) OR (EXISTS ( SELECT 1\n   FROM truth.accepted_facts successor\n  WHERE ((successor.tenant_id = fact_lifecycle_events.tenant_id) AND (successor.workspace_id = fact_lifecycle_events.workspace_id) AND (successor.space_id = fact_lifecycle_events.space_id) AND (successor.id = fact_lifecycle_events.successor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, successor.access_class))))))";
 const exactLifecycleInsertScope =
-  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (acted_by_user_id = ops.current_user_id()) AND (acted_by_membership_id = ops.current_membership_id()) AND (policy_version = ops.current_policy_version()) AND access.can_read_space(space_id, ( SELECT fact.access_class\n   FROM truth.accepted_facts fact\n  WHERE ((fact.tenant_id = fact_lifecycle_events.tenant_id) AND (fact.workspace_id = fact_lifecycle_events.workspace_id) AND (fact.space_id = fact_lifecycle_events.space_id) AND (fact.id = fact_lifecycle_events.predecessor_fact_id)))))";
+  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (acted_by_user_id = ops.current_user_id()) AND (acted_by_membership_id = ops.current_membership_id()) AND (policy_version = ops.current_policy_version()) AND (EXISTS ( SELECT 1\n   FROM truth.accepted_facts predecessor\n  WHERE ((predecessor.tenant_id = fact_lifecycle_events.tenant_id) AND (predecessor.workspace_id = fact_lifecycle_events.workspace_id) AND (predecessor.space_id = fact_lifecycle_events.space_id) AND (predecessor.id = fact_lifecycle_events.predecessor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, predecessor.access_class)))) AND ((successor_fact_id IS NULL) OR (EXISTS ( SELECT 1\n   FROM truth.accepted_facts successor\n  WHERE ((successor.tenant_id = fact_lifecycle_events.tenant_id) AND (successor.workspace_id = fact_lifecycle_events.workspace_id) AND (successor.space_id = fact_lifecycle_events.space_id) AND (successor.id = fact_lifecycle_events.successor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, successor.access_class))))))";
 const exactPhase6Policies = [
   {
     table_name: "accepted_facts",
@@ -624,6 +690,640 @@ const exactPhase6CommandTrigger = {
     "CREATE CONSTRAINT TRIGGER domain_command_records_b2_slice1_atomicity_deferred AFTER INSERT OR UPDATE ON ops.domain_command_records DEFERRABLE INITIALLY DEFERRED FOR EACH ROW WHEN ((new.command_kind = ANY (ARRAY['claim.create.v1'::text, 'initiative.primary_objective.withdraw.v1'::text, 'initiative.primary_objective.rework.v1'::text, 'fact.accept.v1'::text, 'fact.supersede.v1'::text, 'fact.revoke.v1'::text]))) EXECUTE FUNCTION ops.require_b2_slice1_command_atomicity()"
 } as const;
 
+const readThisSpec = () =>
+  readFile(new URL("./b2-catalog-contract.postgres.spec.ts", import.meta.url), "utf8");
+
+describe("phase-6 connected fixture source contract", () => {
+  it("uses the canonical command state default in both app lifecycle helpers", async () => {
+    const source = await readThisSpec();
+    const revoke = source.slice(
+      source.lastIndexOf("async function executeExactRevokeTransaction"),
+      source.lastIndexOf("async function executeExactSupersedeTransaction")
+    );
+    const supersede = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction")
+    );
+    const commandInsert = (helper: string) => {
+      const match = helper.match(
+        /INSERT INTO ops\.domain_command_records \(\s*([\s\S]*?)\s*\) VALUES \(\s*([\s\S]*?)\s*\)`/
+      );
+
+      expect(match).not.toBeNull();
+      return {
+        columns: match![1]!.split(",").map((column) => column.trim()),
+        values: normalizeSql(match![2]!)
+      };
+    };
+
+    for (const insert of [commandInsert(revoke), commandInsert(supersede)]) {
+      expect(insert.columns).toEqual([
+        "id",
+        "tenant_id",
+        "workspace_id",
+        "reservation_space_id",
+        "command_kind",
+        "command_schema_version",
+        "idempotency_key",
+        "canonical_request_hash",
+        "safe_request",
+        "actor_user_id",
+        "actor_membership_id",
+        "policy_version_id",
+        "request_id",
+        "traceparent"
+      ]);
+      expect(insert.columns).not.toContain("state");
+      expect(insert.values).not.toContain("'reserved'");
+      expect(insert.values).toMatch(/\$5::jsonb, \$6,\$7,'default-v1'/);
+    }
+  });
+
+  it("keeps the supersession request on the predecessor while only the mismatched successor diverges", async () => {
+    const source = await readThisSpec();
+    const supersede = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction")
+    );
+    const commandInsert = supersede.slice(
+      supersede.indexOf("INSERT INTO ops.domain_command_records"),
+      supersede.indexOf("UPDATE truth.accepted_facts")
+    );
+    const successorInsert = supersede.slice(
+      supersede.indexOf("INSERT INTO truth.accepted_facts"),
+      supersede.indexOf("INSERT INTO truth.fact_claims")
+    );
+    const successorSubjectSelector =
+      'fault === "mismatched_lineage" ? phase6Ids.otherSubject : adoptionIds.subject';
+
+    expect(commandInsert).toMatch(
+      /id:\s*adoptionIds\.subject,\s*expectedVersion:\s*fault === "stale_subject_version"/
+    );
+    expect(commandInsert).toContain('expectedVersion: fault === "stale_subject_version" ? 2 : 1');
+    expect(commandInsert).not.toContain(successorSubjectSelector);
+    expect(successorInsert).toContain(successorSubjectSelector);
+    expect(supersede.split(successorSubjectSelector)).toHaveLength(2);
+  });
+
+  it("pins terminal-predecessor support and mismatched-response successor rollback faults", async () => {
+    const source = await readThisSpec();
+    const helper = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction"),
+      source.lastIndexOf("async function insertExact0008TruthFixture")
+    );
+    const suite = source.slice(
+      source.lastIndexOf('maybeDescribe("Wave B2 PostgreSQL catalog contract"'),
+      source.lastIndexOf("const adoptionIds")
+    );
+    const diagnosticTitle =
+      "asserts exact supersede stale/support/row-guard diagnostics and full rollback: %s";
+    const diagnosticTitleIndex = suite.indexOf(`"${diagnosticTitle}"`);
+    const matrixStart = suite.lastIndexOf("it.each([", diagnosticTitleIndex);
+    const matrixEnd = suite.indexOf(
+      '"classifies supersede storage uniqueness failure exactly: %s"',
+      diagnosticTitleIndex
+    );
+    const matrix = suite.slice(matrixStart, matrixEnd);
+    const supportTarget =
+      'fault === "predecessor_support_appended" ? adoptionIds.fact : adoptionIds.successor';
+    const responseSelector =
+      'fault === "mismatched_response_successor"\n              ? phase6Ids.mismatchedResponseSuccessor\n              : adoptionIds.successor';
+
+    expect(helper).toContain(supportTarget);
+    expect(helper.indexOf(supportTarget)).toBeLessThan(helper.indexOf("UPDATE truth.claims"));
+    expect(helper).toContain(responseSelector);
+    expect(helper.split("phase6Ids.mismatchedResponseSuccessor")).toHaveLength(2);
+    expect(helper).toContain("replacementFactId: adoptionIds.successor");
+    expect(matrix).toMatch(
+      /"predecessor_support_appended",\s*"fact support requires its exact reserved command"/
+    );
+    expect(matrix).toMatch(
+      /"mismatched_response_successor",\s*"fact supersede response does not match successor"/
+    );
+    expect(matrix).toContain("expectExactDatabaseFailure(");
+    expect(matrix).toContain("exactPhase6RollbackDigest");
+    expect(matrix).toContain("expectNoPhase6CommandResidue");
+  });
+
+  it("pins executable confidence-lowering fixtures and exact rollback diagnostics", async () => {
+    const source = await readThisSpec();
+    const helper = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction"),
+      source.lastIndexOf("async function insertExact0008TruthFixture")
+    );
+    const suite = source.slice(
+      source.lastIndexOf('maybeDescribe("Wave B2 PostgreSQL catalog contract"'),
+      source.lastIndexOf("const adoptionIds")
+    );
+    const positiveTitle =
+      "commits restricted-app supersession with exact requested confidence lowering provenance";
+    const positiveStart = suite.indexOf(`"${positiveTitle}"`);
+    const positiveEnd = suite.indexOf("\n  it(", positiveStart + positiveTitle.length);
+    const positive = suite.slice(positiveStart, positiveEnd);
+    const negativeTitle =
+      "asserts exact supersede stale/support/row-guard diagnostics and full rollback: %s";
+    const negativeTitleIndex = suite.indexOf(`"${negativeTitle}"`);
+    const negativeStart = suite.lastIndexOf("it.each([", negativeTitleIndex);
+    const negativeEnd = suite.indexOf(
+      '"classifies supersede storage uniqueness failure exactly: %s"',
+      negativeTitleIndex
+    );
+    const negative = suite.slice(negativeStart, negativeEnd);
+    const successorInsert = helper.slice(
+      helper.indexOf("INSERT INTO truth.accepted_facts"),
+      helper.indexOf("INSERT INTO truth.fact_claims")
+    );
+
+    expect(helper).toContain("...(loweringRequested ? { confidenceLowering } : {})");
+    expect(successorInsert).toContain("replacement.normalized_text, $6,");
+    expect(successorInsert).toContain("predecessor.confidence_rule, $10,");
+    expect(successorInsert).toContain("$7, $8, $9, replacement.valid_from");
+    expect(positiveStart).toBeGreaterThan(-1);
+    expect(positive).toContain('"valid_confidence_lowering"');
+    expect(positive).toContain("successor.confidence_lowering_reason_code");
+    expect(positive).toContain('confidence_lowering_reason_code: "residual_uncertainty"');
+    expect(positive).toContain("safe_request: {");
+    expect(negativeTitleIndex).toBeGreaterThan(-1);
+    expect(negativeStart).toBeGreaterThan(-1);
+    expect(negative).toMatch(
+      /"lowering_requested_successor_omitted",\s*"truth mutation requires its exact reserved command"/
+    );
+    expect(negative).toMatch(
+      /"lowering_omitted_successor_lowered",\s*"truth mutation requires its exact reserved command"/
+    );
+    expect(negative).toMatch(
+      /"lowering_confidence_mismatched",\s*"truth mutation requires its exact reserved command"/
+    );
+    expect(negative).toMatch(
+      /"lowering_reason_code_mismatched",\s*"truth mutation requires its exact reserved command"/
+    );
+    expect(negative).toMatch(
+      /"lowering_rationale_mismatched",\s*"truth mutation requires its exact reserved command"/
+    );
+    expect(negative).toMatch(
+      /"requested_confidence_not_lower",\s*"accepted fact support is invalid"/
+    );
+    expect(negative).toMatch(/"stored_strongest_mismatched",\s*"accepted fact support is invalid"/);
+    expect(negative).toContain("expectExactDatabaseFailure(");
+    expect(negative).toContain('{ code: "P0001", message, constraint: null }');
+    expect(negative).toContain("exactPhase6RollbackDigest");
+    expect(negative).toContain("expectNoPhase6CommandResidue");
+  });
+
+  it("classifies unexpected successor as an exact revoke row-guard failure", async () => {
+    const source = await readThisSpec();
+    const suite = source.slice(
+      source.lastIndexOf('maybeDescribe("Wave B2 PostgreSQL catalog contract"'),
+      source.lastIndexOf("const adoptionIds")
+    );
+    const matrixFor = (title: string) => {
+      const titleIndex = suite.indexOf(`"${title}"`);
+      const start = suite.lastIndexOf("it.each([", titleIndex);
+      const end = suite.indexOf("PHASE5_TEST_TIMEOUT", titleIndex);
+
+      expect(titleIndex).toBeGreaterThan(-1);
+      expect(start).toBeGreaterThan(-1);
+      expect(end).toBeGreaterThan(titleIndex);
+      return suite.slice(start, end);
+    };
+    const rowGuard = matrixFor("asserts the exact revoke row-guard layer and full rollback: %s");
+    const storage = matrixFor("classifies revoke storage uniqueness failure exactly: %s");
+    const failureMatrices = suite.slice(
+      suite.indexOf('"forces exact deferred revoke completeness and full rollback: %s"'),
+      suite.indexOf('"rejects a missing phase-5 objective recovery integrity policy"')
+    );
+    const matrixUntil = (title: string, nextTitle: string) => {
+      const titleIndex = suite.indexOf(`"${title}"`);
+      const nextTitleIndex = suite.indexOf(`"${nextTitle}"`, titleIndex + title.length);
+
+      expect(titleIndex).toBeGreaterThan(-1);
+      expect(nextTitleIndex).toBeGreaterThan(titleIndex);
+      return suite.slice(titleIndex, nextTitleIndex);
+    };
+    const supersedeCompleteness = matrixUntil(
+      "forces exact deferred supersede completeness and full rollback: %s",
+      "asserts exact supersede stale/support/row-guard diagnostics and full rollback: %s"
+    );
+    const supersedeRollback = matrixUntil(
+      "asserts exact supersede stale/support/row-guard diagnostics and full rollback: %s",
+      "classifies supersede storage uniqueness failure exactly: %s"
+    );
+    const supersedeStorage = matrixUntil(
+      "classifies supersede storage uniqueness failure exactly: %s",
+      "rejects a missing phase-5 objective recovery integrity policy"
+    );
+
+    expect(rowGuard).toMatch(
+      /"unexpected_successor",\s*"Fact revocation cannot identify a successor"/
+    );
+    expect(rowGuard).toContain('{ code: "P0001", message, constraint: null }');
+    expect(storage).not.toContain('"unexpected_successor"');
+    expect(failureMatrices).not.toContain(".rejects");
+    expect(failureMatrices).not.toContain("toThrow");
+    expect(source).toContain("const PHASE6_SUPERSEDE_ROLLBACK_TEST_TIMEOUT = 300_000;");
+    expect(supersedeCompleteness).toMatch(/},\s*PHASE5_TEST_TIMEOUT\s*\);/);
+    expect(supersedeCompleteness).not.toContain("PHASE6_SUPERSEDE_ROLLBACK_TEST_TIMEOUT");
+    expect(supersedeRollback).toMatch(/},\s*PHASE6_SUPERSEDE_ROLLBACK_TEST_TIMEOUT\s*\);/);
+    expect(supersedeRollback).not.toContain("PHASE5_TEST_TIMEOUT");
+    expect(supersedeStorage).toMatch(/},\s*PHASE5_TEST_TIMEOUT\s*\);/);
+    expect(supersedeStorage).not.toContain("PHASE6_SUPERSEDE_ROLLBACK_TEST_TIMEOUT");
+  });
+
+  it("limits both duplicate-outbox probes to canonical app-writable columns", async () => {
+    const source = await readThisSpec();
+    const revoke = source.slice(
+      source.lastIndexOf("async function executeExactRevokeTransaction"),
+      source.lastIndexOf("async function executeExactSupersedeTransaction")
+    );
+    const supersede = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction"),
+      source.lastIndexOf("async function insertExact0008TruthFixture")
+    );
+    const appWritableColumns = [
+      "id",
+      "tenant_id",
+      "workspace_id",
+      "space_id",
+      "relay_service_principal_id",
+      "policy_version_id",
+      "event_type",
+      "event_schema_version",
+      "payload_schema_version",
+      "aggregate_type",
+      "aggregate_id",
+      "aggregate_version",
+      "causation_command_id",
+      "payload",
+      "request_id",
+      "traceparent",
+      "tracestate"
+    ];
+    const relayOwnedColumns = [
+      "created_at",
+      "publication_state",
+      "publication_attempt",
+      "next_attempt_at",
+      "claimed_at",
+      "claimed_by",
+      "claim_token",
+      "claim_expires_at",
+      "last_outcome_code",
+      "published_at",
+      "published_message_id",
+      "terminal_at"
+    ];
+    const duplicateOutboxProbe = (helper: string) => {
+      const probe = helper.match(
+        /if \(fault === "duplicate_outbox"\) \{\s*await client\.query\(\s*`([\s\S]*?)`\s*,/
+      )?.[1];
+
+      expect(probe).toBeDefined();
+      const insert = probe!.match(
+        /INSERT INTO ops\.product_outbox_events \(\s*([\s\S]*?)\s*\)\s*SELECT\s+([\s\S]*?)\s+FROM ops\.product_outbox_events/
+      );
+      expect(insert).not.toBeNull();
+      return {
+        probe: probe!,
+        columns: insert![1]!.split(",").map((column) => column.trim()),
+        selection: insert![2]!.split(",").map((column) => column.trim())
+      };
+    };
+
+    for (const { probe, columns, selection } of [
+      duplicateOutboxProbe(revoke),
+      duplicateOutboxProbe(supersede)
+    ]) {
+      expect(columns).toEqual(appWritableColumns);
+      expect(selection).toEqual(["$1", ...appWritableColumns.slice(1)]);
+      for (const relayOwnedColumn of relayOwnedColumns) {
+        expect(probe).not.toMatch(new RegExp(`\\b${relayOwnedColumn}\\b`));
+      }
+    }
+  });
+
+  it("keeps phase-6 replacement Claims out of exact-0008/0011 history", async () => {
+    const source = await readThisSpec();
+    const exact0008Fixture = source.slice(
+      source.lastIndexOf("async function insertExact0008TruthFixture"),
+      source.lastIndexOf("function sqlLiteral")
+    );
+    const exact0011Reset = source.slice(
+      source.lastIndexOf("async function resetPopulatedExact0011"),
+      source.lastIndexOf("async function withOwnerTransaction")
+    );
+
+    expect(exact0008Fixture).not.toContain("phase6Ids.replacementClaim");
+    expect(exact0008Fixture).not.toContain("phase6Ids.secondReplacementClaim");
+    expect(exact0008Fixture).not.toContain("phase6Ids.orphanReplacementClaim");
+    expect(exact0008Fixture).not.toContain("phase6Ids.confidentialReplacementClaim");
+    expect(exact0008Fixture).not.toContain("Replacement canonical value");
+    expect(exact0011Reset).toContain('through: "0008_b2_slice1_command_integrity.sql"');
+    expect(exact0011Reset).toContain("await insertExact0008TruthFixture(pool)");
+    expect(exact0011Reset).toContain('through: "0011_b2_primary_objective_proposal_recovery.sql"');
+    expect(exact0011Reset).not.toContain("0012_b2_fact_lifecycle.sql");
+    expect(exact0011Reset).not.toContain("insertOwnerPhase6ReplacementClaims");
+
+    const ownerFixture = source.slice(
+      source.lastIndexOf("async function insertOwnerPhase6ReplacementClaims"),
+      source.lastIndexOf("async function resetPopulatedPhase6")
+    );
+    const phase6Reset = source.slice(
+      source.lastIndexOf("async function resetPopulatedPhase6"),
+      source.lastIndexOf("async function exactLifecycleProtectedDigest")
+    );
+    const migration = phase6Reset.indexOf("await applyMigrations(pool)");
+    const replacementClaims = phase6Reset.indexOf("await insertOwnerPhase6ReplacementClaims(pool)");
+    const provisioning = phase6Reset.indexOf("provisionProductRelayDirectManagerAccess");
+
+    expect(ownerFixture).toContain("phase6Ids.replacementClaim");
+    expect(ownerFixture).toContain("phase6Ids.secondReplacementClaim");
+    expect(ownerFixture).toContain("phase6Ids.orphanReplacementClaim");
+    expect(ownerFixture).toContain("phase6Ids.confidentialReplacementClaim");
+    expect(ownerFixture).toContain("ALTER TABLE truth.claims DISABLE TRIGGER USER");
+    expect(ownerFixture).toContain("ALTER TABLE truth.claims ENABLE TRIGGER USER");
+    expect(ownerFixture.match(/ALTER TABLE/g)).toHaveLength(2);
+    expect(ownerFixture).not.toContain("INSERT INTO ops.domain_command_records");
+    expect(migration).toBeGreaterThan(-1);
+    expect(replacementClaims).toBeGreaterThan(migration);
+    expect(provisioning).toBeGreaterThan(replacementClaims);
+  });
+
+  it("provisions and threads the canonical product relay through lifecycle transactions", async () => {
+    const source = await readThisSpec();
+    const imports = source.slice(0, source.indexOf("const ownerUrl"));
+    const suite = source.slice(
+      source.lastIndexOf('maybeDescribe("Wave B2 PostgreSQL catalog contract"'),
+      source.lastIndexOf("const adoptionIds")
+    );
+    const reset = source.slice(
+      source.lastIndexOf("async function resetPopulatedPhase6"),
+      source.lastIndexOf("async function exactLifecycleProtectedDigest")
+    );
+    const revoke = source.slice(
+      source.lastIndexOf("async function executeExactRevokeTransaction"),
+      source.lastIndexOf("async function executeExactSupersedeTransaction")
+    );
+    const supersede = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction")
+    );
+
+    expect(imports).toContain(
+      'import { provisionProductRelayDirectManagerAccess } from "./product-relay-provisioning.js";'
+    );
+    expect(reset).toContain("async function resetPopulatedPhase6(pool: pg.Pool): Promise<string>");
+    expect(reset).toContain("provisionProductRelayDirectManagerAccess(tx, {");
+    expect(reset).toContain("tenantId: adoptionIds.tenant");
+    expect(reset).toContain("workspaceId: adoptionIds.workspace");
+    expect(reset).toContain("spaceId: adoptionIds.space");
+    expect(reset).toContain("return provisioned.principalId");
+    expect(revoke).toContain("relayServicePrincipalId: string");
+    expect(revoke).not.toContain("devFixtures.relayServicePrincipalA");
+    expect(supersede).toContain("relayServicePrincipalId: string");
+    expect(supersede).not.toContain("devFixtures.relayServicePrincipalA");
+    expect(suite).not.toMatch(
+      /executeExact(?:Revoke|Supersede)Transaction\(\s*ownerPool,\s*"valid"/
+    );
+    expect(suite).toMatch(
+      /withTestAppPool\(\(appPool\) =>\s*executeExactRevokeTransaction\(\s*appPool,\s*"valid",\s*relayServicePrincipalId\s*\)\s*\)/
+    );
+    expect(suite).toMatch(
+      /withTestAppPool\(\(appPool\) =>\s*executeExactSupersedeTransaction\(\s*appPool,\s*"valid",\s*relayServicePrincipalId\s*\)\s*\)/
+    );
+    expect(revoke).toContain("appPool: pg.Pool");
+    expect(supersede).toContain("appPool: pg.Pool");
+    expect(revoke).toContain("current_user = 'throughline_app'");
+    expect(supersede).toContain("current_user = 'throughline_app'");
+    expect(revoke).toContain("NOT rolbypassrls");
+    expect(supersede).toContain("NOT rolbypassrls");
+    expect(
+      suite.match(/'relayServicePrincipalId', event\.relay_service_principal_id/g)
+    ).toHaveLength(3);
+  });
+
+  it("flushes supersede support validation before schema-qualified command atomicity", async () => {
+    const source = await readThisSpec();
+    const revoke = source.slice(
+      source.lastIndexOf("async function executeExactRevokeTransaction"),
+      source.lastIndexOf("async function executeExactSupersedeTransaction")
+    );
+    const supersede = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction"),
+      source.lastIndexOf("async function executeExactSecondSupersedeTransaction")
+    );
+    const atomicityFlush =
+      "SET CONSTRAINTS ops.domain_command_records_b2_slice1_atomicity_deferred IMMEDIATE";
+    const supportFlush = "SET CONSTRAINTS truth.accepted_facts_support_deferred IMMEDIATE";
+    const unqualifiedAtomicityFlush =
+      "SET CONSTRAINTS domain_command_records_b2_slice1_atomicity_deferred IMMEDIATE";
+
+    expect(revoke.match(/SET CONSTRAINTS [^"]+ IMMEDIATE/g)).toEqual([atomicityFlush]);
+    expect(supersede.match(/SET CONSTRAINTS [^"]+ IMMEDIATE/g)).toEqual([
+      supportFlush,
+      atomicityFlush
+    ]);
+    expect(supersede.indexOf(supportFlush)).toBeLessThan(supersede.indexOf(atomicityFlush));
+    expect(revoke).not.toContain(unqualifiedAtomicityFlush);
+    expect(supersede).not.toContain(unqualifiedAtomicityFlush);
+  });
+
+  it("forces deferred visibility-fixture constraints before restoring user triggers", async () => {
+    const source = await readThisSpec();
+    const fixture = source.slice(
+      source.lastIndexOf("async function insertLifecycleVisibilityFixture"),
+      source.lastIndexOf("type Phase6AtomicFault")
+    );
+    const insert = fixture.indexOf("INSERT INTO truth.fact_lifecycle_events");
+    const immediate = fixture.indexOf('client.query("SET CONSTRAINTS ALL IMMEDIATE")');
+    const enable = fixture.indexOf(
+      'client.query("ALTER TABLE truth.fact_lifecycle_events ENABLE TRIGGER USER")'
+    );
+
+    expect(insert).toBeGreaterThan(-1);
+    expect(immediate).toBeGreaterThan(insert);
+    expect(enable).toBeGreaterThan(immediate);
+  });
+
+  it("pins validator-owned lifecycle drift and unjournaled-state diagnostics", async () => {
+    const source = await readThisSpec();
+    const suite = source.slice(
+      source.lastIndexOf('maybeDescribe("Wave B2 PostgreSQL catalog contract"'),
+      source.lastIndexOf("const adoptionIds")
+    );
+    const occurrences = (value: string) => suite.split(value).length - 1;
+
+    expect(occurrences("/B2 Slice 1 exact truth constraint inventory drifted/")).toBe(3);
+    expect(occurrences("/B2 Slice 1 truth trigger inventory drifted/")).toBe(3);
+    expect(occurrences("/B2 Slice 1 truth policy inventory drifted/")).toBe(1);
+    expect(
+      occurrences(
+        "/B2 migration state already exists without journal row for 0012_b2_fact_lifecycle\\.sql/"
+      )
+    ).toBe(2);
+    expect(occurrences("/Fact lifecycle foreign key catalog drifted/")).toBe(0);
+    expect(occurrences("/Fact lifecycle trigger catalog drifted/")).toBe(0);
+    expect(occurrences("/Fact lifecycle policy catalog drifted/")).toBe(0);
+    expect(
+      occurrences("/B2 migration state already exists before 0012_b2_fact_lifecycle\\.sql/")
+    ).toBe(0);
+  });
+
+  it("uses canonical completion clocks in all lifecycle transaction helpers", async () => {
+    const source = await readThisSpec();
+    const revoke = source.slice(
+      source.lastIndexOf("async function executeExactRevokeTransaction"),
+      source.lastIndexOf("async function executeExactSupersedeTransaction")
+    );
+    const supersede = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction"),
+      source.lastIndexOf("async function executeExactSecondSupersedeTransaction")
+    );
+    const chainedSupersede = source.slice(
+      source.lastIndexOf("async function executeExactSecondSupersedeTransaction"),
+      source.lastIndexOf("async function executeOrphanSuccessorInsert")
+    );
+    const completionUpdate = (helper: string) =>
+      helper.slice(
+        helper.lastIndexOf("UPDATE ops.domain_command_records"),
+        helper.lastIndexOf('await client.query("COMMIT")')
+      );
+    const completions = [
+      completionUpdate(revoke),
+      completionUpdate(supersede),
+      completionUpdate(chainedSupersede)
+    ];
+
+    expect(completions).toHaveLength(3);
+    for (const completion of completions) {
+      expect(completion).toMatch(
+        /completed_at = clock_timestamp\(\),\s+updated_at = clock_timestamp\(\)/
+      );
+      expect(completion).not.toContain("transaction_timestamp()");
+    }
+  });
+
+  it("sets the confidential data-class ceiling before the lifecycle visibility query", async () => {
+    const source = await readThisSpec();
+    const rlsTest = source.slice(
+      source.lastIndexOf(
+        '"enforces exact transaction-local Space RLS for lifecycle rows through the restricted app role"'
+      ),
+      source.lastIndexOf('"blocks lifecycle event mutation at the table surface: %s"')
+    );
+    const setLocalScope = rlsTest.slice(
+      rlsTest.indexOf("const setLocalScope"),
+      rlsTest.indexOf("const visible")
+    );
+
+    expect(setLocalScope).toMatch(
+      /client\.query\(\s*"SELECT set_config\('app\.data_class_ceiling', 'confidential', true\)"\s*\)/
+    );
+  });
+
+  it("pins the no-reset A-to-B-to-C history regression and both exact transitions", async () => {
+    const source = await readThisSpec();
+    const test = source.slice(
+      source.lastIndexOf(
+        '"commits connected supersession history A to B to C without resetting the coordinate"'
+      ),
+      source.lastIndexOf(
+        '"rejects an orphan successor INSERT immediately with no residue: %s predecessor"'
+      )
+    );
+    const firstTransition = test.indexOf("executeExactSupersedeTransaction");
+    const secondTransition = test.indexOf("executeExactSecondSupersedeTransaction");
+    const secondHelper = source.slice(
+      source.lastIndexOf("async function executeExactSecondSupersedeTransaction"),
+      source.lastIndexOf("async function executeOrphanSuccessorInsert")
+    );
+
+    expect(firstTransition).toBeGreaterThan(-1);
+    expect(secondTransition).toBeGreaterThan(firstTransition);
+    expect(test.slice(firstTransition, secondTransition)).not.toMatch(/reset/i);
+    expect(test).toContain("phase6Ids.chainSuccessor");
+    expect(test).toContain("phase6Ids.chainLifecycle");
+    expect(test).toContain("current_slots: 1");
+    expect(test).toContain(
+      'immutable_triggers: ["fact_lifecycle_immutable", "fact_lifecycle_truncate_guard"]'
+    );
+    expect(secondHelper).toContain("UPDATE truth.accepted_facts");
+    expect(secondHelper).toContain("INSERT INTO truth.accepted_facts");
+    expect(secondHelper).toContain("INSERT INTO truth.fact_lifecycle_events");
+    expect(secondHelper).toContain(
+      "SET CONSTRAINTS truth.accepted_facts_support_deferred IMMEDIATE"
+    );
+    expect(secondHelper).toContain(
+      "SET CONSTRAINTS ops.domain_command_records_b2_slice1_atomicity_deferred IMMEDIATE"
+    );
+    expect(secondHelper).not.toMatch(/DISABLE TRIGGER|ENABLE TRIGGER/);
+  });
+
+  it("pins orphan INSERT rollback to a same-subject proposed Claim with no decoy failure", async () => {
+    const source = await readThisSpec();
+    const titleIndex = source.lastIndexOf(
+      '"rejects an orphan successor INSERT immediately with no residue: %s predecessor"'
+    );
+    const test = source.slice(
+      source.lastIndexOf("it.each([", titleIndex),
+      source.lastIndexOf(
+        '"commits restricted-app supersession with exact requested confidence lowering provenance"'
+      )
+    );
+    const helper = source.slice(
+      source.lastIndexOf("async function executeOrphanSuccessorInsert"),
+      source.lastIndexOf("async function insertExact0008TruthFixture")
+    );
+    const fixture = source.slice(
+      source.lastIndexOf("async function insertOwnerPhase6ReplacementClaims"),
+      source.lastIndexOf("async function resetPopulatedPhase6")
+    );
+
+    expect(test).toContain('["nonexistent", "unrelated"] as const');
+    expect(test).toContain('message: "truth mutation requires its exact reserved command"');
+    expect(test).toContain("exactPhase6RollbackDigest");
+    expect(test).toContain("expectNoPhase6CommandResidue");
+    expect(helper).toContain("phase6Ids.nonexistentPredecessor");
+    expect(helper).toContain(": adoptionIds.fact");
+    expect(helper).toContain("phase6Ids.orphanReplacementClaim");
+    expect(helper).toContain("claim.subject_id = $9");
+    expect(helper).toContain("phase6Ids.otherSubject");
+    expect(helper).toContain("claim.status = 'proposed'");
+    expect(helper).toContain('throw new Error("orphan successor INSERT unexpectedly succeeded")');
+    expect(helper).not.toMatch(/DISABLE TRIGGER|ENABLE TRIGGER/);
+    expect(fixture).toContain("phase6Ids.orphanReplacementClaim");
+    expect(fixture).toContain("phase6Ids.otherSubject");
+    expect(fixture).toContain('access_class: "workspace"');
+  });
+
+  it("pins mixed-class non-leakage through a NOBYPASSRLS app transaction", async () => {
+    const source = await readThisSpec();
+    const test = source.slice(
+      source.lastIndexOf(
+        '"classifies mixed-access supersession by both predecessor and successor monotonically"'
+      ),
+      source.lastIndexOf('"blocks lifecycle event mutation at the table surface: %s"')
+    );
+    const helper = source.slice(
+      source.lastIndexOf("async function executeExactSupersedeTransaction"),
+      source.lastIndexOf("async function executeExactSecondSupersedeTransaction")
+    );
+
+    expect(test).toContain('"valid_confidential_successor"');
+    expect(test).toContain('readAtCeiling("workspace", adoptionIds.space)');
+    expect(test).toContain('readAtCeiling("confidential", adoptionIds.space)');
+    expect(test).toContain("devFixtures.restrictedSpaceA");
+    expect(test).toContain("NOT rolbypassrls");
+    for (const protectedField of [
+      "replacementFactId",
+      "reasonCode",
+      "reasonRationale",
+      "actorUserId",
+      "actorMembershipId"
+    ]) {
+      expect(test).toContain(protectedField);
+    }
+    expect(helper).toContain("phase6Ids.confidentialReplacementClaim");
+    expect(helper).not.toMatch(/DISABLE TRIGGER|ENABLE TRIGGER/);
+  });
+});
+
 maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
   if (!ownerUrl || !appUrl) {
     it("requires local PostgreSQL DSNs in the authoritative gate", () => {
@@ -725,7 +1425,9 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
       await resetToLatest();
       await applyMigrations(ownerPool);
       await ownerPool.query(mutation);
+      const before = await exactPhase6FailureSnapshot(ownerPool);
       await expect(applyMigrations(ownerPool)).rejects.toThrow(expectedDiagnostic);
+      expect(await exactPhase6FailureSnapshot(ownerPool)).toBe(before);
     } finally {
       await resetToLatest();
     }
@@ -983,7 +1685,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
                   procedure.proparallel::text AS parallel,
                   procedure.prokind::text AS kind,
                   COALESCE(procedure.proconfig, ARRAY[]::text[]) AS configuration,
-                  regexp_replace(btrim(procedure.prosrc), '[[:space:]]+', ' ', 'g') AS source,
+                  btrim(regexp_replace(procedure.prosrc, '[[:space:]]+', ' ', 'g')) AS source,
                   COALESCE((
                     SELECT jsonb_agg(jsonb_build_object(
                              'grantee', CASE WHEN acl.grantee = 0 THEN 'PUBLIC'
@@ -1007,6 +1709,26 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
           [Object.keys(exactPhase6LifecycleFunctionSources)]
         );
         expect(lifecycleFunctions.rows).toEqual(exactPhase6LifecycleFunctionCatalog);
+
+        const installed0012FunctionBodies = await ownerPool.query<{
+          identity: string;
+          source: string;
+        }>(
+          `SELECT procedure.oid::regprocedure::text AS identity,
+                  procedure.prosrc AS source
+             FROM pg_proc procedure
+            WHERE procedure.oid = ANY($1::regprocedure[])
+            ORDER BY procedure.oid::regprocedure::text`,
+          [Object.keys(exact0012FunctionBodyDigests)]
+        );
+        expect(
+          Object.fromEntries(
+            installed0012FunctionBodies.rows.map(({ identity, source }) => [
+              identity,
+              createHash("sha256").update(normalizeSql(source)).digest("hex")
+            ])
+          )
+        ).toEqual(exact0012FunctionBodyDigests);
 
         const columns = await ownerPool.query<{
           column_name: string;
@@ -1111,7 +1833,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         const exactAnyCheck = (column: string, values: readonly string[]) =>
           `CHECK ((${column} = ANY (ARRAY[${values
             .map((value) => `'${value}'::text`)
-            .join(", ")}]))))`;
+            .join(", ")}])))`;
         expect(closedVocabulary.rows).toEqual([
           {
             name: "audit_events_action_check",
@@ -1422,8 +2144,10 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     "commits one exact revoke with no successor and exact command, audit, and outbox evidence",
     async () => {
       try {
-        await resetPopulatedPhase6(ownerPool);
-        await executeExactRevokeTransaction(ownerPool, "valid");
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        await withTestAppPool((appPool) =>
+          executeExactRevokeTransaction(appPool, "valid", relayServicePrincipalId)
+        );
         const committed = await ownerPool.query<{
           fact: unknown;
           lifecycle: unknown;
@@ -1472,6 +2196,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
                 'aggregateType', event.aggregate_type,
                 'aggregateId', event.aggregate_id,
                 'aggregateVersion', event.aggregate_version,
+                'relayServicePrincipalId', event.relay_service_principal_id,
                 'payload', event.payload
               ) FROM ops.product_outbox_events event
                 WHERE event.causation_command_id = $2) AS outbox`,
@@ -1534,6 +2259,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
               aggregateType: "accepted_fact",
               aggregateId: adoptionIds.fact,
               aggregateVersion: 2,
+              relayServicePrincipalId,
               payload: {
                 factId: adoptionIds.fact,
                 factVersion: 2,
@@ -1557,9 +2283,11 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     "commits exact supersession lineage A to B with one replacement current slot",
     async () => {
       try {
-        await resetPopulatedPhase6(ownerPool);
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
         const immutableBefore = await exactPredecessorImmutableDigest(ownerPool);
-        await executeExactSupersedeTransaction(ownerPool, "valid");
+        await withTestAppPool((appPool) =>
+          executeExactSupersedeTransaction(appPool, "valid", relayServicePrincipalId)
+        );
         const lineage = await ownerPool.query<{
           predecessor_id: string;
           predecessor_status: string;
@@ -1571,6 +2299,8 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
           lifecycle_successor: string;
           transition: string;
           current_slots: number;
+          replacement_support: unknown;
+          outbox: unknown;
         }>(
           `SELECT predecessor.id AS predecessor_id,
                   predecessor.status AS predecessor_status,
@@ -1588,14 +2318,30 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
                       AND current_fact.subject_type = predecessor.subject_type
                       AND current_fact.subject_id = predecessor.subject_id
                       AND current_fact.predicate = predecessor.predicate
-                      AND current_fact.status = 'current') AS current_slots
+                      AND current_fact.status = 'current') AS current_slots,
+                  (SELECT jsonb_agg(jsonb_build_object(
+                     'claimId', support.claim_id,
+                     'expectedVersion', claim.version - 1,
+                     'status', claim.status,
+                     'version', claim.version
+                   ) ORDER BY support.claim_id)
+                     FROM truth.fact_claims support
+                     JOIN truth.claims claim
+                       ON claim.tenant_id = support.tenant_id
+                      AND claim.workspace_id = support.workspace_id
+                      AND claim.id = support.claim_id
+                    WHERE support.fact_id = successor.id) AS replacement_support,
+                  (SELECT jsonb_build_object(
+                     'relayServicePrincipalId', event.relay_service_principal_id
+                   ) FROM ops.product_outbox_events event
+                    WHERE event.causation_command_id = $2) AS outbox
              FROM truth.accepted_facts predecessor
              JOIN truth.fact_lifecycle_events lifecycle
                ON lifecycle.predecessor_fact_id = predecessor.id
              JOIN truth.accepted_facts successor
                ON successor.id = lifecycle.successor_fact_id
             WHERE predecessor.id = $1`,
-          [adoptionIds.fact]
+          [adoptionIds.fact, phase6Ids.supersedeCommand]
         );
         expect(lineage.rows).toEqual([
           {
@@ -1608,7 +2354,16 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
             lifecycle_predecessor: adoptionIds.fact,
             lifecycle_successor: adoptionIds.successor,
             transition: "supersede",
-            current_slots: 1
+            current_slots: 1,
+            replacement_support: [
+              {
+                claimId: phase6Ids.replacementClaim,
+                expectedVersion: 1,
+                status: "accepted",
+                version: 2
+              }
+            ],
+            outbox: { relayServicePrincipalId }
           }
         ]);
         expect(await exactPredecessorImmutableDigest(ownerPool)).toBe(immutableBefore);
@@ -1620,20 +2375,390 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
   );
 
   it(
-    "rejects mismatched predecessor/successor subject coordinates and rolls back every write",
+    "commits connected supersession history A to B to C without resetting the coordinate",
     async () => {
       try {
-        await resetPopulatedPhase6(ownerPool);
-        const before = await exactPhase6AtomicDigest(ownerPool, phase6Ids.supersedeCommand);
-        await expect(
-          executeExactSupersedeTransaction(ownerPool, "mismatched_lineage")
-        ).rejects.toThrow();
-        expect(await exactPhase6AtomicDigest(ownerPool, phase6Ids.supersedeCommand)).toBe(before);
-        const leakedSubject = await ownerPool.query<{ count: number }>(
-          "SELECT count(*)::integer AS count FROM work.activities WHERE id = $1",
-          [phase6Ids.otherSubject]
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        await withTestAppPool((appPool) =>
+          executeExactSupersedeTransaction(appPool, "valid", relayServicePrincipalId)
         );
-        expect(leakedSubject.rows).toEqual([{ count: 0 }]);
+        await withTestAppPool((appPool) =>
+          executeExactSecondSupersedeTransaction(appPool, relayServicePrincipalId)
+        );
+
+        const history = await ownerPool.query<{
+          facts: unknown;
+          lifecycle: unknown;
+          commands: unknown;
+          audits: unknown;
+          outbox: unknown;
+          support: unknown;
+          current_slots: number;
+          immutable_triggers: string[];
+        }>(
+          `SELECT
+             (SELECT jsonb_agg(jsonb_build_object(
+                'id', fact.id, 'status', fact.status, 'version', fact.version,
+                'commandId', fact.last_causation_command_id
+              ) ORDER BY fact.id)
+                FROM truth.accepted_facts fact
+               WHERE fact.id = ANY($1::uuid[])) AS facts,
+             (SELECT jsonb_agg(jsonb_build_object(
+                'id', lifecycle.id,
+                'predecessorFactId', lifecycle.predecessor_fact_id,
+                'successorFactId', lifecycle.successor_fact_id,
+                'transitionKind', lifecycle.transition_kind,
+                'fromStatus', lifecycle.from_status,
+                'toStatus', lifecycle.to_status,
+                'reasonCode', lifecycle.reason_code,
+                'reasonRationale', lifecycle.reason_rationale,
+                'actorUserId', lifecycle.acted_by_user_id,
+                'actorMembershipId', lifecycle.acted_by_membership_id,
+                'commandId', lifecycle.causation_command_id,
+                'version', lifecycle.version
+              ) ORDER BY lifecycle.id)
+                FROM truth.fact_lifecycle_events lifecycle
+               WHERE lifecycle.predecessor_fact_id = ANY($1::uuid[])) AS lifecycle,
+             (SELECT jsonb_agg(jsonb_build_object(
+                'id', command.id, 'state', command.state,
+                'resourceId', command.result_resource_id,
+                'response', command.safe_response
+              ) ORDER BY command.id)
+                FROM ops.domain_command_records command
+               WHERE command.id = ANY($2::uuid[])) AS commands,
+             (SELECT jsonb_agg(jsonb_build_object(
+                'commandId', audit.causation_command_id,
+                'action', audit.action,
+                'resourceId', audit.resource_id,
+                'safeDetail', audit.safe_detail
+              ) ORDER BY audit.causation_command_id)
+                FROM ops.audit_events audit
+               WHERE audit.causation_command_id = ANY($2::uuid[])) AS audits,
+             (SELECT jsonb_agg(jsonb_build_object(
+                'commandId', event.causation_command_id,
+                'eventType', event.event_type,
+                'aggregateId', event.aggregate_id,
+                'payload', event.payload,
+                'relayServicePrincipalId', event.relay_service_principal_id
+              ) ORDER BY event.causation_command_id)
+                FROM ops.product_outbox_events event
+               WHERE event.causation_command_id = ANY($2::uuid[])) AS outbox,
+             (SELECT jsonb_agg(jsonb_build_object(
+                'factId', support.fact_id,
+                'claimId', support.claim_id,
+                'claimStatus', claim.status,
+                'claimVersion', claim.version
+              ) ORDER BY support.fact_id, support.claim_id)
+                FROM truth.fact_claims support
+                JOIN truth.claims claim
+                  ON claim.tenant_id = support.tenant_id
+                 AND claim.workspace_id = support.workspace_id
+                 AND claim.id = support.claim_id
+               WHERE support.fact_id = ANY($1::uuid[])) AS support,
+             (SELECT count(*)::integer
+                FROM truth.accepted_facts fact
+               WHERE fact.tenant_id = $3
+                 AND fact.workspace_id = $4
+                 AND fact.space_id = $5
+                 AND fact.subject_type = 'activity'
+                 AND fact.subject_id = $6
+                 AND fact.predicate = 'activity.outcome'
+                 AND fact.status = 'current') AS current_slots,
+             (SELECT array_agg(trigger.tgname::text ORDER BY trigger.tgname)
+                FROM pg_trigger trigger
+               WHERE trigger.tgrelid = 'truth.fact_lifecycle_events'::regclass
+                 AND NOT trigger.tgisinternal
+                 AND trigger.tgenabled = 'O'
+                 AND trigger.tgname IN (
+                   'fact_lifecycle_immutable','fact_lifecycle_truncate_guard'
+                 )) AS immutable_triggers`,
+          [
+            [adoptionIds.fact, adoptionIds.successor, phase6Ids.chainSuccessor],
+            [phase6Ids.supersedeCommand, phase6Ids.chainCommand],
+            adoptionIds.tenant,
+            adoptionIds.workspace,
+            adoptionIds.space,
+            adoptionIds.subject
+          ]
+        );
+        expect(history.rows).toEqual([
+          {
+            facts: [
+              {
+                id: adoptionIds.fact,
+                status: "superseded",
+                version: 2,
+                commandId: phase6Ids.supersedeCommand
+              },
+              {
+                id: adoptionIds.successor,
+                status: "superseded",
+                version: 2,
+                commandId: phase6Ids.chainCommand
+              },
+              {
+                id: phase6Ids.chainSuccessor,
+                status: "current",
+                version: 1,
+                commandId: phase6Ids.chainCommand
+              }
+            ],
+            lifecycle: [
+              {
+                id: phase6Ids.supersedeLifecycle,
+                predecessorFactId: adoptionIds.fact,
+                successorFactId: adoptionIds.successor,
+                transitionKind: "supersede",
+                fromStatus: "current",
+                toStatus: "superseded",
+                reasonCode: "newer_evidence",
+                reasonRationale: "The later ratified outcome replaces the predecessor.",
+                actorUserId: adoptionIds.user,
+                actorMembershipId: adoptionIds.membership,
+                commandId: phase6Ids.supersedeCommand,
+                version: 1
+              },
+              {
+                id: phase6Ids.chainLifecycle,
+                predecessorFactId: adoptionIds.successor,
+                successorFactId: phase6Ids.chainSuccessor,
+                transitionKind: "supersede",
+                fromStatus: "current",
+                toStatus: "superseded",
+                reasonCode: "newer_evidence",
+                reasonRationale: "A later ratified outcome replaces the first successor.",
+                actorUserId: adoptionIds.user,
+                actorMembershipId: adoptionIds.membership,
+                commandId: phase6Ids.chainCommand,
+                version: 1
+              }
+            ],
+            commands: [
+              {
+                id: phase6Ids.supersedeCommand,
+                state: "completed",
+                resourceId: adoptionIds.fact,
+                response: {
+                  factId: adoptionIds.fact,
+                  version: 2,
+                  status: "superseded",
+                  replacementFactId: adoptionIds.successor,
+                  replacementFactVersion: 1,
+                  replacementFactStatus: "current"
+                }
+              },
+              {
+                id: phase6Ids.chainCommand,
+                state: "completed",
+                resourceId: adoptionIds.successor,
+                response: {
+                  factId: adoptionIds.successor,
+                  version: 2,
+                  status: "superseded",
+                  replacementFactId: phase6Ids.chainSuccessor,
+                  replacementFactVersion: 1,
+                  replacementFactStatus: "current"
+                }
+              }
+            ],
+            audits: [
+              {
+                commandId: phase6Ids.supersedeCommand,
+                action: "fact.supersede",
+                resourceId: adoptionIds.fact,
+                safeDetail: {
+                  factId: adoptionIds.fact,
+                  factVersion: 2,
+                  reasonCode: "newer_evidence",
+                  replacementFactId: adoptionIds.successor,
+                  replacementFactVersion: 1,
+                  status: "superseded"
+                }
+              },
+              {
+                commandId: phase6Ids.chainCommand,
+                action: "fact.supersede",
+                resourceId: adoptionIds.successor,
+                safeDetail: {
+                  factId: adoptionIds.successor,
+                  factVersion: 2,
+                  reasonCode: "newer_evidence",
+                  replacementFactId: phase6Ids.chainSuccessor,
+                  replacementFactVersion: 1,
+                  status: "superseded"
+                }
+              }
+            ],
+            outbox: [
+              {
+                commandId: phase6Ids.supersedeCommand,
+                eventType: "fact.superseded",
+                aggregateId: adoptionIds.fact,
+                payload: {
+                  factId: adoptionIds.fact,
+                  factVersion: 2,
+                  reasonCode: "newer_evidence",
+                  replacementFactId: adoptionIds.successor,
+                  replacementFactVersion: 1,
+                  status: "superseded"
+                },
+                relayServicePrincipalId
+              },
+              {
+                commandId: phase6Ids.chainCommand,
+                eventType: "fact.superseded",
+                aggregateId: adoptionIds.successor,
+                payload: {
+                  factId: adoptionIds.successor,
+                  factVersion: 2,
+                  reasonCode: "newer_evidence",
+                  replacementFactId: phase6Ids.chainSuccessor,
+                  replacementFactVersion: 1,
+                  status: "superseded"
+                },
+                relayServicePrincipalId
+              }
+            ],
+            support: [
+              {
+                factId: adoptionIds.fact,
+                claimId: adoptionIds.claim,
+                claimStatus: "accepted",
+                claimVersion: 2
+              },
+              {
+                factId: adoptionIds.successor,
+                claimId: phase6Ids.replacementClaim,
+                claimStatus: "accepted",
+                claimVersion: 2
+              },
+              {
+                factId: phase6Ids.chainSuccessor,
+                claimId: phase6Ids.secondReplacementClaim,
+                claimStatus: "accepted",
+                claimVersion: 2
+              }
+            ],
+            current_slots: 1,
+            immutable_triggers: ["fact_lifecycle_immutable", "fact_lifecycle_truncate_guard"]
+          }
+        ]);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE6_SUPERSEDE_ROLLBACK_TEST_TIMEOUT
+  );
+
+  it.each(["nonexistent", "unrelated"] as const)(
+    "rejects an orphan successor INSERT immediately with no residue: %s predecessor",
+    async (predecessorFault) => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6RollbackDigest(ownerPool, phase6Ids.orphanCommand);
+        await withTestAppPool((appPool) =>
+          expectExactDatabaseFailure(executeOrphanSuccessorInsert(appPool, predecessorFault), {
+            code: "P0001",
+            message: "truth mutation requires its exact reserved command",
+            constraint: null
+          })
+        );
+        expect(await exactPhase6RollbackDigest(ownerPool, phase6Ids.orphanCommand)).toBe(before);
+        await expectNoPhase6CommandResidue(ownerPool, phase6Ids.orphanCommand);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "commits restricted-app supersession with exact requested confidence lowering provenance",
+    async () => {
+      try {
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        await withTestAppPool((appPool) =>
+          executeExactSupersedeTransaction(
+            appPool,
+            "valid_confidence_lowering",
+            relayServicePrincipalId
+          )
+        );
+        const stored = await ownerPool.query<{
+          confidence: string;
+          strongest_supporting_confidence: string;
+          human_lowered: boolean;
+          confidence_lowering_reason_code: string;
+          confidence_lowering_rationale: string;
+          safe_request: unknown;
+        }>(
+          `SELECT successor.confidence, successor.strongest_supporting_confidence,
+                  successor.human_lowered, successor.confidence_lowering_reason_code,
+                  successor.confidence_lowering_rationale, command.safe_request
+             FROM truth.accepted_facts successor
+             JOIN ops.domain_command_records command
+               ON command.tenant_id = successor.tenant_id
+              AND command.workspace_id = successor.workspace_id
+              AND command.id = successor.last_causation_command_id
+            WHERE successor.id = $1`,
+          [adoptionIds.successor]
+        );
+        expect(stored.rows).toEqual([
+          {
+            confidence: "weak",
+            strongest_supporting_confidence: "strong",
+            human_lowered: true,
+            confidence_lowering_reason_code: "residual_uncertainty",
+            confidence_lowering_rationale:
+              "Residual timing uncertainty warrants a conservative confidence.",
+            safe_request: {
+              factId: adoptionIds.fact,
+              expectedFactVersion: 1,
+              subject: { type: "activity", id: adoptionIds.subject, expectedVersion: 1 },
+              replacementClaims: [{ claimId: phase6Ids.replacementClaim, expectedVersion: 1 }],
+              reason: {
+                code: "newer_evidence",
+                rationale: "The later ratified outcome replaces the predecessor."
+              },
+              confidenceLowering: {
+                confidence: "weak",
+                reason: {
+                  code: "residual_uncertainty",
+                  rationale: "Residual timing uncertainty warrants a conservative confidence."
+                }
+              }
+            }
+          }
+        ]);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "rejects mismatched predecessor/successor subjects at the exact-command guard and rolls back every write",
+    async () => {
+      try {
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6RollbackDigest(ownerPool, phase6Ids.supersedeCommand);
+        await withTestAppPool((appPool) =>
+          expectExactDatabaseFailure(
+            executeExactSupersedeTransaction(
+              appPool,
+              "mismatched_lineage",
+              relayServicePrincipalId
+            ),
+            {
+              code: "P0001",
+              message: "truth mutation requires its exact reserved command",
+              constraint: null
+            }
+          )
+        );
+        expect(await exactPhase6RollbackDigest(ownerPool, phase6Ids.supersedeCommand)).toBe(before);
+        await expectNoPhase6CommandResidue(ownerPool, phase6Ids.supersedeCommand);
       } finally {
         await resetToLatest();
       }
@@ -1714,7 +2839,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
          REFERENCES truth.accepted_facts(id)
          ON UPDATE RESTRICT ON DELETE RESTRICT
          DEFERRABLE INITIALLY DEFERRED`,
-      /Fact lifecycle foreign key catalog drifted/
+      /B2 Slice 1 exact truth constraint inventory drifted/
     ],
     [
       "wrong predecessor FK action",
@@ -1726,7 +2851,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
          REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id)
          MATCH FULL ON UPDATE RESTRICT ON DELETE CASCADE
          DEFERRABLE INITIALLY DEFERRED`,
-      /Fact lifecycle foreign key catalog drifted/
+      /B2 Slice 1 exact truth constraint inventory drifted/
     ],
     [
       "wrong predecessor FK deferrability",
@@ -1737,7 +2862,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
          FOREIGN KEY (tenant_id, workspace_id, space_id, predecessor_fact_id)
          REFERENCES truth.accepted_facts(tenant_id, workspace_id, space_id, id)
          MATCH FULL ON UPDATE RESTRICT ON DELETE RESTRICT NOT DEFERRABLE`,
-      /Fact lifecycle foreign key catalog drifted/
+      /B2 Slice 1 exact truth constraint inventory drifted/
     ],
     [
       "wrong lifecycle transition trigger timing",
@@ -1745,7 +2870,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
        CREATE TRIGGER accepted_facts_lifecycle_guard
          AFTER UPDATE ON truth.accepted_facts
          FOR EACH ROW EXECUTE FUNCTION truth.enforce_fact_lifecycle_transition()`,
-      /Fact lifecycle trigger catalog drifted/
+      /B2 Slice 1 truth trigger inventory drifted/
     ],
     [
       "wrong lifecycle transition trigger event",
@@ -1753,7 +2878,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
        CREATE TRIGGER accepted_facts_lifecycle_guard
          BEFORE INSERT ON truth.accepted_facts
          FOR EACH ROW EXECUTE FUNCTION truth.enforce_fact_lifecycle_transition()`,
-      /Fact lifecycle trigger catalog drifted/
+      /B2 Slice 1 truth trigger inventory drifted/
     ],
     [
       "UPDATE-only lifecycle event immutability",
@@ -1761,7 +2886,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
        CREATE TRIGGER fact_lifecycle_immutable
          BEFORE UPDATE ON truth.fact_lifecycle_events
          FOR EACH ROW EXECUTE FUNCTION truth.reject_mutation()`,
-      /Fact lifecycle trigger catalog drifted/
+      /B2 Slice 1 truth trigger inventory drifted/
     ],
     [
       "OR-true lifecycle SELECT escape",
@@ -1769,7 +2894,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
        CREATE POLICY fact_lifecycle_select ON truth.fact_lifecycle_events
          FOR SELECT TO throughline_app
          USING (${exactLifecycleScope} OR true)`,
-      /Fact lifecycle policy catalog drifted/
+      /B2 Slice 1 truth policy inventory drifted/
     ],
     [
       "broad accepted Fact table mutation privileges",
@@ -1818,6 +2943,43 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
       "lifecycle function app EXECUTE grant",
       `GRANT EXECUTE ON FUNCTION truth.reject_statement_mutation() TO throughline_app`,
       /truth function EXECUTE grants drifted/
+    ],
+    [
+      "phase-6 safe-request constraint drift",
+      `ALTER TABLE ops.domain_command_records
+         DROP CONSTRAINT domain_command_records_b2_safe_request_check;
+       ALTER TABLE ops.domain_command_records
+         ADD CONSTRAINT domain_command_records_b2_safe_request_check
+         CHECK (safe_request IS NULL OR safe_request IS NOT NULL)`,
+      /Installed B1 catalog does not match exact domain command constraint inventory/
+    ],
+    [
+      "phase-6 deferred command-trigger drift",
+      `DROP TRIGGER domain_command_records_b2_slice1_atomicity_deferred
+         ON ops.domain_command_records;
+       CREATE CONSTRAINT TRIGGER domain_command_records_b2_slice1_atomicity_deferred
+         AFTER INSERT OR UPDATE ON ops.domain_command_records
+         DEFERRABLE INITIALLY DEFERRED
+         FOR EACH ROW
+         WHEN (NEW.command_kind IN (
+           'claim.create.v1','initiative.primary_objective.withdraw.v1',
+           'initiative.primary_objective.rework.v1','fact.accept.v1',
+           'fact.supersede.v1'
+         ))
+         EXECUTE FUNCTION ops.require_b2_slice1_command_atomicity()`,
+      /Installed B1 catalog does not match exact domain command user-trigger inventory/
+    ],
+    [
+      "missing lifecycle integrity SELECT policy",
+      `DROP POLICY fact_lifecycle_integrity_select
+         ON truth.fact_lifecycle_events`,
+      /Installed B1 catalog does not match B1 integrity policy capability boundary/
+    ],
+    [
+      "missing lifecycle integrity SELECT ACL",
+      `REVOKE SELECT ON truth.fact_lifecycle_events
+         FROM throughline_b1_0_integrity`,
+      /Installed predecessor ACL authority does not match the exact normalized contract/
     ]
   ])(
     "rejects phase-6 catalog drift: %s",
@@ -1898,7 +3060,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         await ownerPool.query("CREATE TABLE truth.fact_lifecycle_events (id uuid PRIMARY KEY)");
         const before = await exactPhase6FailureSnapshot(ownerPool);
         await expect(applyMigrations(ownerPool)).rejects.toThrow(
-          /B2 migration state already exists before 0012_b2_fact_lifecycle\.sql/
+          /B2 migration state already exists without journal row for 0012_b2_fact_lifecycle\.sql/
         );
         expect(await exactPhase6FailureSnapshot(ownerPool)).toBe(before);
       } finally {
@@ -1919,7 +3081,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         );
         const before = await exactPhase6FailureSnapshot(ownerPool);
         await expect(applyMigrations(ownerPool)).rejects.toThrow(
-          /B2 migration state already exists before 0012_b2_fact_lifecycle\.sql/
+          /B2 migration state already exists without journal row for 0012_b2_fact_lifecycle\.sql/
         );
         expect(await exactPhase6FailureSnapshot(ownerPool)).toBe(before);
       } finally {
@@ -1949,6 +3111,7 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
               adoptionIds.membership
             ]);
             await client.query("SELECT set_config('app.policy_version', $1, true)", ["default-v1"]);
+            await client.query("SELECT set_config('app.data_class_ceiling', 'confidential', true)");
           };
           const visible = () =>
             client.query<{ id: string }>(
@@ -2006,6 +3169,114 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
           }
         });
         await ownerPool.query("ALTER TABLE truth.fact_lifecycle_events ENABLE TRIGGER USER");
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "classifies mixed-access supersession by both predecessor and successor monotonically",
+    async () => {
+      try {
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        await withTestAppPool((appPool) =>
+          executeExactSupersedeTransaction(
+            appPool,
+            "valid_confidential_successor",
+            relayServicePrincipalId
+          )
+        );
+        await withTestAppPool(async (pool) => {
+          const client = await pool.connect();
+          const readAtCeiling = async (ceiling: "workspace" | "confidential", spaceId: string) => {
+            await client.query("BEGIN");
+            try {
+              for (const [setting, value] of [
+                ["app.tenant_id", adoptionIds.tenant],
+                ["app.workspace_id", adoptionIds.workspace],
+                ["app.space_id", spaceId],
+                ["app.user_id", adoptionIds.user],
+                ["app.membership_id", adoptionIds.membership],
+                ["app.policy_version", "default-v1"],
+                ["app.data_class_ceiling", ceiling]
+              ] as const) {
+                await client.query("SELECT set_config($1, $2, true)", [setting, value]);
+              }
+              const identity = await client.query<{
+                current_user: string;
+                rolbypassrls: boolean;
+              }>(
+                `SELECT current_user, rolbypassrls
+                   FROM pg_roles
+                  WHERE rolname = current_user
+                    AND current_user = 'throughline_app'
+                    AND NOT rolbypassrls`
+              );
+              expect(identity.rows).toEqual([
+                { current_user: "throughline_app", rolbypassrls: false }
+              ]);
+              const visible = await client.query<{
+                predecessor: unknown;
+                successor: unknown;
+                lifecycle: unknown;
+              }>(
+                `SELECT
+                   (SELECT jsonb_build_object('id', fact.id, 'accessClass', fact.access_class)
+                      FROM truth.accepted_facts fact WHERE fact.id = $1) AS predecessor,
+                   (SELECT jsonb_build_object('id', fact.id, 'accessClass', fact.access_class)
+                      FROM truth.accepted_facts fact WHERE fact.id = $2) AS successor,
+                   (SELECT jsonb_build_object(
+                      'id', lifecycle.id,
+                      'replacementFactId', lifecycle.successor_fact_id,
+                      'reasonCode', lifecycle.reason_code,
+                      'reasonRationale', lifecycle.reason_rationale,
+                      'actorUserId', lifecycle.acted_by_user_id,
+                      'actorMembershipId', lifecycle.acted_by_membership_id
+                    ) FROM truth.fact_lifecycle_events lifecycle
+                     WHERE lifecycle.id = $3) AS lifecycle`,
+                [adoptionIds.fact, adoptionIds.successor, phase6Ids.supersedeLifecycle]
+              );
+              return visible.rows;
+            } finally {
+              await client.query("ROLLBACK");
+            }
+          };
+
+          try {
+            expect(await readAtCeiling("workspace", adoptionIds.space)).toEqual([
+              {
+                predecessor: { id: adoptionIds.fact, accessClass: "workspace" },
+                successor: null,
+                lifecycle: null
+              }
+            ]);
+            expect(await readAtCeiling("confidential", adoptionIds.space)).toEqual([
+              {
+                predecessor: { id: adoptionIds.fact, accessClass: "workspace" },
+                successor: { id: adoptionIds.successor, accessClass: "confidential" },
+                lifecycle: {
+                  id: phase6Ids.supersedeLifecycle,
+                  replacementFactId: adoptionIds.successor,
+                  reasonCode: "newer_evidence",
+                  reasonRationale: "The later ratified outcome replaces the predecessor.",
+                  actorUserId: adoptionIds.user,
+                  actorMembershipId: adoptionIds.membership
+                }
+              }
+            ]);
+            expect(await readAtCeiling("confidential", devFixtures.restrictedSpaceA)).toEqual([
+              {
+                predecessor: { id: adoptionIds.fact, accessClass: "workspace" },
+                successor: { id: adoptionIds.successor, accessClass: "confidential" },
+                lifecycle: null
+              }
+            ]);
+          } finally {
+            client.release();
+          }
+        });
       } finally {
         await resetToLatest();
       }
@@ -2094,22 +3365,39 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
         const shape = await ownerPool.query<{
           revoke_request: boolean;
           revoke_request_extra: boolean;
+          revoke_request_string_version: boolean;
+          revoke_request_numeric_rationale: boolean;
+          revoke_request_null_fact_id: boolean;
           supersede_request: boolean;
           supersede_request_extra: boolean;
+          supersede_request_string_fact_version: boolean;
+          supersede_request_string_subject_version: boolean;
+          supersede_request_numeric_rationale: boolean;
+          supersede_request_null_subject_id: boolean;
           revoke_reserved: boolean;
           supersede_reserved: boolean;
           revoke_completed: boolean;
           revoke_response_extra: boolean;
+          revoke_response_string_version: boolean;
+          revoke_response_null_status: boolean;
           supersede_completed: boolean;
           supersede_response_extra: boolean;
+          supersede_response_string_version: boolean;
+          supersede_response_string_replacement_version: boolean;
+          supersede_response_null_replacement_id: boolean;
+          supersede_response_other_valid_successor: boolean;
           revoke_audit: boolean;
           revoke_audit_raw: boolean;
+          revoke_audit_string_version: boolean;
           supersede_audit: boolean;
           supersede_audit_raw: boolean;
+          supersede_audit_string_version: boolean;
           revoke_outbox: boolean;
           revoke_outbox_raw: boolean;
+          revoke_outbox_string_version: boolean;
           supersede_outbox: boolean;
           supersede_outbox_raw: boolean;
+          supersede_outbox_string_version: boolean;
         }>(
           `SELECT
              ops.b2_slice1_safe_request_valid('fact.revoke.v1', $1::jsonb)
@@ -2117,11 +3405,34 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
              ops.b2_slice1_safe_request_valid(
                'fact.revoke.v1', $1::jsonb || '{"arbitraryText":"escape"}'::jsonb
              ) AS revoke_request_extra,
+             ops.b2_slice1_safe_request_valid(
+               'fact.revoke.v1', jsonb_set($1::jsonb,'{expectedFactVersion}',to_jsonb('1'::text))
+             ) AS revoke_request_string_version,
+             ops.b2_slice1_safe_request_valid(
+               'fact.revoke.v1', jsonb_set($1::jsonb,'{reason,rationale}',to_jsonb(7))
+             ) AS revoke_request_numeric_rationale,
+             ops.b2_slice1_safe_request_valid(
+               'fact.revoke.v1', jsonb_set($1::jsonb,'{factId}','null'::jsonb)
+             ) AS revoke_request_null_fact_id,
              ops.b2_slice1_safe_request_valid('fact.supersede.v1', $2::jsonb)
                AS supersede_request,
              ops.b2_slice1_safe_request_valid(
                'fact.supersede.v1', $2::jsonb || '{"emergency":true}'::jsonb
              ) AS supersede_request_extra,
+             ops.b2_slice1_safe_request_valid(
+               'fact.supersede.v1',
+               jsonb_set($2::jsonb,'{expectedFactVersion}',to_jsonb('1'::text))
+             ) AS supersede_request_string_fact_version,
+             ops.b2_slice1_safe_request_valid(
+               'fact.supersede.v1',
+               jsonb_set($2::jsonb,'{subject,expectedVersion}',to_jsonb('1'::text))
+             ) AS supersede_request_string_subject_version,
+             ops.b2_slice1_safe_request_valid(
+               'fact.supersede.v1', jsonb_set($2::jsonb,'{reason,rationale}',to_jsonb(7))
+             ) AS supersede_request_numeric_rationale,
+             ops.b2_slice1_safe_request_valid(
+               'fact.supersede.v1', jsonb_set($2::jsonb,'{subject,id}','null'::jsonb)
+             ) AS supersede_request_null_subject_id,
              ops.product_command_record_valid(
                'fact.revoke.v1',1,'reserved',NULL,NULL,NULL
              ) AS revoke_reserved,
@@ -2136,12 +3447,36 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
                $4::jsonb || '{"reasonRationale":"raw"}'::jsonb
              ) AS revoke_response_extra,
              ops.product_command_record_valid(
+               'fact.revoke.v1',1,'completed','accepted_fact',$3,
+               jsonb_set($4::jsonb,'{version}',to_jsonb('2'::text))
+             ) AS revoke_response_string_version,
+             ops.product_command_record_valid(
+               'fact.revoke.v1',1,'completed','accepted_fact',$3,
+               jsonb_set($4::jsonb,'{status}','null'::jsonb)
+             ) AS revoke_response_null_status,
+             ops.product_command_record_valid(
                'fact.supersede.v1',1,'completed','accepted_fact',$3,$5::jsonb
              ) AS supersede_completed,
              ops.product_command_record_valid(
                'fact.supersede.v1',1,'completed','accepted_fact',$3,
                $5::jsonb || '{"reasonRationale":"raw user rationale"}'::jsonb
              ) AS supersede_response_extra,
+             ops.product_command_record_valid(
+               'fact.supersede.v1',1,'completed','accepted_fact',$3,
+               jsonb_set($5::jsonb,'{version}',to_jsonb('2'::text))
+             ) AS supersede_response_string_version,
+             ops.product_command_record_valid(
+               'fact.supersede.v1',1,'completed','accepted_fact',$3,
+               jsonb_set($5::jsonb,'{replacementFactVersion}',to_jsonb('1'::text))
+             ) AS supersede_response_string_replacement_version,
+             ops.product_command_record_valid(
+               'fact.supersede.v1',1,'completed','accepted_fact',$3,
+               jsonb_set($5::jsonb,'{replacementFactId}','null'::jsonb)
+             ) AS supersede_response_null_replacement_id,
+             ops.product_command_record_valid(
+               'fact.supersede.v1',1,'completed','accepted_fact',$3,
+               jsonb_set($5::jsonb,'{replacementFactId}',to_jsonb($8::text))
+             ) AS supersede_response_other_valid_successor,
              ops.b2_slice1_audit_detail_valid(
                'fact.revoke','accepted_fact',1,$3,$6::jsonb
              ) AS revoke_audit,
@@ -2150,12 +3485,20 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
                $6::jsonb || '{"reasonRationale":"raw objective/source excerpt"}'::jsonb
              ) AS revoke_audit_raw,
              ops.b2_slice1_audit_detail_valid(
+               'fact.revoke','accepted_fact',1,$3,
+               jsonb_set($6::jsonb,'{factVersion}',to_jsonb('2'::text))
+             ) AS revoke_audit_string_version,
+             ops.b2_slice1_audit_detail_valid(
                'fact.supersede','accepted_fact',1,$3,$7::jsonb
              ) AS supersede_audit,
              ops.b2_slice1_audit_detail_valid(
                'fact.supersede','accepted_fact',1,$3,
                $7::jsonb || '{"sourceExcerpt":"raw objective/source rationale"}'::jsonb
              ) AS supersede_audit_raw,
+             ops.b2_slice1_audit_detail_valid(
+               'fact.supersede','accepted_fact',1,$3,
+               jsonb_set($7::jsonb,'{replacementFactVersion}',to_jsonb('1'::text))
+             ) AS supersede_audit_string_version,
              ops.b2_slice1_event_payload_valid(
                'fact.revoked',1,$3,$6::jsonb
              ) AS revoke_outbox,
@@ -2164,12 +3507,20 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
                $6::jsonb || '{"sourceText":"raw"}'::jsonb
              ) AS revoke_outbox_raw,
              ops.b2_slice1_event_payload_valid(
+               'fact.revoked',1,$3,
+               jsonb_set($6::jsonb,'{factVersion}',to_jsonb('2'::text))
+             ) AS revoke_outbox_string_version,
+             ops.b2_slice1_event_payload_valid(
                'fact.superseded',1,$3,$7::jsonb
              ) AS supersede_outbox,
              ops.b2_slice1_event_payload_valid(
                'fact.superseded',1,$3,
                $7::jsonb || '{"sourceText":"raw objective/source rationale"}'::jsonb
-             ) AS supersede_outbox_raw`,
+             ) AS supersede_outbox_raw,
+             ops.b2_slice1_event_payload_valid(
+               'fact.superseded',1,$3,
+               jsonb_set($7::jsonb,'{factVersion}',to_jsonb('2'::text))
+             ) AS supersede_outbox_string_version`,
           [
             JSON.stringify(revokeRequest),
             JSON.stringify(supersedeRequest),
@@ -2177,29 +3528,47 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
             JSON.stringify(revokeResponse),
             JSON.stringify(supersedeResponse),
             JSON.stringify(revokeDetail),
-            JSON.stringify(supersedeDetail)
+            JSON.stringify(supersedeDetail),
+            phase6Ids.mismatchedResponseSuccessor
           ]
         );
         expect(shape.rows).toEqual([
           {
             revoke_request: true,
             revoke_request_extra: false,
+            revoke_request_string_version: false,
+            revoke_request_numeric_rationale: false,
+            revoke_request_null_fact_id: false,
             supersede_request: true,
             supersede_request_extra: false,
+            supersede_request_string_fact_version: false,
+            supersede_request_string_subject_version: false,
+            supersede_request_numeric_rationale: false,
+            supersede_request_null_subject_id: false,
             revoke_reserved: true,
             supersede_reserved: true,
             revoke_completed: true,
             revoke_response_extra: false,
+            revoke_response_string_version: false,
+            revoke_response_null_status: false,
             supersede_completed: true,
             supersede_response_extra: false,
+            supersede_response_string_version: false,
+            supersede_response_string_replacement_version: false,
+            supersede_response_null_replacement_id: false,
+            supersede_response_other_valid_successor: true,
             revoke_audit: true,
             revoke_audit_raw: false,
+            revoke_audit_string_version: false,
             supersede_audit: true,
             supersede_audit_raw: false,
+            supersede_audit_string_version: false,
             revoke_outbox: true,
             revoke_outbox_raw: false,
+            revoke_outbox_string_version: false,
             supersede_outbox: true,
-            supersede_outbox_raw: false
+            supersede_outbox_raw: false,
+            supersede_outbox_string_version: false
           }
         ]);
 
@@ -2266,26 +3635,211 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
     PHASE5_TEST_TIMEOUT
   );
 
-  it.each([
-    "missing_lifecycle",
-    "duplicate_lifecycle",
-    "mismatched_lifecycle",
-    "missing_predecessor",
-    "unexpected_successor",
-    "missing_audit",
-    "duplicate_audit",
-    "mismatched_audit",
-    "missing_outbox",
-    "duplicate_outbox",
-    "mismatched_outbox"
-  ] as const)(
-    "rolls back every write when revoke atomicity is violated: %s",
-    async (fault) => {
+  it(
+    "matches parseSortedClaimRefs cardinality, key, uniqueness, sort, and version semantics",
+    async () => {
       try {
         await resetPopulatedPhase6(ownerPool);
-        const before = await exactPhase6AtomicDigest(ownerPool);
-        await expect(executeExactRevokeTransaction(ownerPool, fault)).rejects.toThrow();
-        expect(await exactPhase6AtomicDigest(ownerPool)).toBe(before);
+        const requestWith = (replacementClaims: Array<Record<string, unknown>>) => ({
+          factId: adoptionIds.fact,
+          expectedFactVersion: 1,
+          subject: { type: "activity", id: adoptionIds.subject, expectedVersion: 1 },
+          replacementClaims,
+          reason: {
+            code: "newer_evidence",
+            rationale: "The later ratified outcome replaces the predecessor."
+          }
+        });
+        const first = { claimId: phase6Ids.replacementClaim, expectedVersion: 1 };
+        const second = { claimId: phase6Ids.secondReplacementClaim, expectedVersion: 2 };
+        const parserCases = {
+          duplicate_ids: requestWith([first, first]),
+          empty: requestWith([]),
+          extra_claim_key: requestWith([{ ...first, arbitraryText: "escape" }]),
+          over_100: requestWith(
+            Array.from({ length: 101 }, (_, index) => ({
+              claimId: `0190a000-0000-7000-8000-${(1000 + index).toString(16).padStart(12, "0")}`,
+              expectedVersion: 1
+            }))
+          ),
+          string_version: requestWith([{ ...first, expectedVersion: "1" }]),
+          unsorted: requestWith([second, first]),
+          uppercase_id: requestWith([{ ...first, claimId: first.claimId.toUpperCase() }]),
+          valid: requestWith([first, second]),
+          zero_version: requestWith([{ ...first, expectedVersion: 0 }])
+        };
+
+        const rows = await withTestAppPool((appPool) =>
+          appPool.query<{ label: string; valid: boolean }>(
+            `SELECT request.label,
+                    ops.b2_slice1_safe_request_valid(
+                      'fact.supersede.v1', request.request_value
+                    ) AS valid
+               FROM jsonb_each($1::jsonb) request(label, request_value)
+              ORDER BY request.label`,
+            [JSON.stringify(parserCases)]
+          )
+        );
+        expect(rows.rows).toEqual([
+          { label: "duplicate_ids", valid: false },
+          { label: "empty", valid: false },
+          { label: "extra_claim_key", valid: false },
+          { label: "over_100", valid: false },
+          { label: "string_version", valid: false },
+          { label: "unsorted", valid: false },
+          { label: "uppercase_id", valid: false },
+          { label: "valid", valid: true },
+          { label: "zero_version", valid: false }
+        ]);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it(
+    "matches the canonical confidenceLowering parser shape and fails malformed requests closed",
+    async () => {
+      try {
+        await resetPopulatedPhase6(ownerPool);
+        const baseRequest = {
+          factId: adoptionIds.fact,
+          expectedFactVersion: 1,
+          subject: { type: "activity", id: adoptionIds.subject, expectedVersion: 1 },
+          replacementClaims: [{ claimId: phase6Ids.replacementClaim, expectedVersion: 1 }],
+          reason: {
+            code: "newer_evidence",
+            rationale: "The later ratified outcome replaces the predecessor."
+          }
+        };
+        const validLowering = {
+          confidence: "weak",
+          reason: {
+            code: "residual_uncertainty",
+            rationale: "Residual timing uncertainty warrants a conservative confidence."
+          }
+        };
+        const parserCases = {
+          blank_rationale: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { ...validLowering.reason, rationale: "" }
+            }
+          },
+          conflict_out_of_scope: {
+            ...baseRequest,
+            conflict: { conflictId: phase6Ids.lifecycle, expectedVersion: 1 }
+          },
+          explicit_null: { ...baseRequest, confidenceLowering: null },
+          extra_lowering_key: {
+            ...baseRequest,
+            confidenceLowering: { ...validLowering, arbitraryText: "escape" }
+          },
+          extra_reason_key: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { ...validLowering.reason, arbitraryText: "escape" }
+            }
+          },
+          extra_top_level: { ...baseRequest, confidenceLowering: validLowering, emergency: true },
+          malformed: { ...baseRequest, confidenceLowering: [validLowering] },
+          missing_confidence: {
+            ...baseRequest,
+            confidenceLowering: { reason: validLowering.reason }
+          },
+          missing_rationale: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { code: validLowering.reason.code }
+            }
+          },
+          missing_reason: {
+            ...baseRequest,
+            confidenceLowering: { confidence: validLowering.confidence }
+          },
+          missing_reason_code: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { rationale: validLowering.reason.rationale }
+            }
+          },
+          non_nfc_rationale: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { ...validLowering.reason, rationale: "Cafe\u0301 uncertainty" }
+            }
+          },
+          numeric_rationale: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { ...validLowering.reason, rationale: 17 }
+            }
+          },
+          overlong_rationale: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { ...validLowering.reason, rationale: "x".repeat(2001) }
+            }
+          },
+          unknown_confidence: {
+            ...baseRequest,
+            confidenceLowering: { ...validLowering, confidence: "certain" }
+          },
+          unknown_reason: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { ...validLowering.reason, code: "manager_preference" }
+            }
+          },
+          untrimmed_rationale: {
+            ...baseRequest,
+            confidenceLowering: {
+              ...validLowering,
+              reason: { ...validLowering.reason, rationale: " leading whitespace" }
+            }
+          },
+          valid: { ...baseRequest, confidenceLowering: validLowering }
+        };
+        const rows = await withTestAppPool((appPool) =>
+          appPool.query<{ label: string; valid: boolean }>(
+            `SELECT request.label,
+                    ops.b2_slice1_safe_request_valid(
+                      'fact.supersede.v1', request.request_value
+                    ) AS valid
+               FROM jsonb_each($1::jsonb) request(label, request_value)
+              ORDER BY request.label`,
+            [JSON.stringify(parserCases)]
+          )
+        );
+        expect(rows.rows).toEqual([
+          { label: "blank_rationale", valid: false },
+          { label: "conflict_out_of_scope", valid: false },
+          { label: "explicit_null", valid: false },
+          { label: "extra_lowering_key", valid: false },
+          { label: "extra_reason_key", valid: false },
+          { label: "extra_top_level", valid: false },
+          { label: "malformed", valid: false },
+          { label: "missing_confidence", valid: false },
+          { label: "missing_rationale", valid: false },
+          { label: "missing_reason", valid: false },
+          { label: "missing_reason_code", valid: false },
+          { label: "non_nfc_rationale", valid: false },
+          { label: "numeric_rationale", valid: false },
+          { label: "overlong_rationale", valid: false },
+          { label: "unknown_confidence", valid: false },
+          { label: "unknown_reason", valid: false },
+          { label: "untrimmed_rationale", valid: false },
+          { label: "valid", valid: true }
+        ]);
       } finally {
         await resetToLatest();
       }
@@ -2294,23 +3848,184 @@ maybeDescribe("Wave B2 PostgreSQL catalog contract", () => {
   );
 
   it.each([
-    "missing_lifecycle",
-    "duplicate_lifecycle",
-    "mismatched_lifecycle",
-    "missing_audit",
-    "duplicate_audit",
-    "mismatched_audit",
-    "missing_outbox",
-    "duplicate_outbox",
-    "mismatched_outbox"
+    ["missing_lifecycle", "fact revoke result is incomplete"],
+    ["missing_audit", "truth command requires exact audit and product outbox rows"],
+    ["duplicate_audit", "truth command requires exact audit and product outbox rows"],
+    ["missing_outbox", "truth command requires exact audit and product outbox rows"]
   ] as const)(
-    "rolls back every write when supersede atomicity is violated: %s",
-    async (fault) => {
+    "forces exact deferred revoke completeness and full rollback: %s",
+    async (fault, message) => {
       try {
-        await resetPopulatedPhase6(ownerPool);
-        const before = await exactPhase6AtomicDigest(ownerPool, phase6Ids.supersedeCommand);
-        await expect(executeExactSupersedeTransaction(ownerPool, fault)).rejects.toThrow();
-        expect(await exactPhase6AtomicDigest(ownerPool, phase6Ids.supersedeCommand)).toBe(before);
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6RollbackDigest(ownerPool);
+        await withTestAppPool((appPool) =>
+          expectExactDatabaseFailure(
+            executeExactRevokeTransaction(appPool, fault, relayServicePrincipalId),
+            { code: "P0001", message, constraint: null }
+          )
+        );
+        expect(await exactPhase6RollbackDigest(ownerPool)).toBe(before);
+        await expectNoPhase6CommandResidue(ownerPool, phase6Ids.revokeCommand);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    ["mismatched_lifecycle", "Fact lifecycle event requires its exact reserved command"],
+    ["missing_predecessor", "Fact lifecycle event requires its exact reserved command"],
+    ["unexpected_successor", "Fact revocation cannot identify a successor"],
+    ["mismatched_audit", "truth command requires exact audit and product outbox rows"],
+    ["mismatched_outbox", "truth command requires exact audit and product outbox rows"]
+  ] as const)(
+    "asserts the exact revoke row-guard layer and full rollback: %s",
+    async (fault, message) => {
+      try {
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6RollbackDigest(ownerPool);
+        await withTestAppPool((appPool) =>
+          expectExactDatabaseFailure(
+            executeExactRevokeTransaction(appPool, fault, relayServicePrincipalId),
+            { code: "P0001", message, constraint: null }
+          )
+        );
+        expect(await exactPhase6RollbackDigest(ownerPool)).toBe(before);
+        await expectNoPhase6CommandResidue(ownerPool, phase6Ids.revokeCommand);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    [
+      "duplicate_lifecycle",
+      "23505",
+      'duplicate key value violates unique constraint "fact_lifecycle_events_predecessor_key"',
+      "fact_lifecycle_events_predecessor_key"
+    ],
+    [
+      "duplicate_outbox",
+      "23505",
+      'duplicate key value violates unique constraint "product_outbox_events_semantic_unique"',
+      "product_outbox_events_semantic_unique"
+    ]
+  ] as const)(
+    "classifies revoke storage uniqueness failure exactly: %s",
+    async (fault, code, message, constraint) => {
+      try {
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6RollbackDigest(ownerPool);
+        await withTestAppPool((appPool) =>
+          expectExactDatabaseFailure(
+            executeExactRevokeTransaction(appPool, fault, relayServicePrincipalId),
+            { code, message, constraint }
+          )
+        );
+        expect(await exactPhase6RollbackDigest(ownerPool)).toBe(before);
+        await expectNoPhase6CommandResidue(ownerPool, phase6Ids.revokeCommand);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    ["missing_lifecycle", "fact supersede result is incomplete"],
+    ["missing_audit", "truth command requires exact audit and product outbox rows"],
+    ["duplicate_audit", "truth command requires exact audit and product outbox rows"],
+    ["missing_outbox", "truth command requires exact audit and product outbox rows"],
+    ["requested_support_omitted", "fact supersede support set does not match replacementClaims"]
+  ] as const)(
+    "forces exact deferred supersede completeness and full rollback: %s",
+    async (fault, message) => {
+      try {
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6RollbackDigest(ownerPool, phase6Ids.supersedeCommand);
+        await withTestAppPool((appPool) =>
+          expectExactDatabaseFailure(
+            executeExactSupersedeTransaction(appPool, fault, relayServicePrincipalId),
+            { code: "P0001", message, constraint: null }
+          )
+        );
+        expect(await exactPhase6RollbackDigest(ownerPool, phase6Ids.supersedeCommand)).toBe(before);
+        await expectNoPhase6CommandResidue(ownerPool, phase6Ids.supersedeCommand);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE5_TEST_TIMEOUT
+  );
+
+  it.each([
+    ["mismatched_lifecycle", "Fact lifecycle event requires its exact reserved command"],
+    ["mismatched_audit", "truth command requires exact audit and product outbox rows"],
+    ["mismatched_outbox", "truth command requires exact audit and product outbox rows"],
+    ["stale_subject_version", "fact supersede subject version is stale"],
+    ["stale_replacement_claim_version", "fact supersede replacement Claim version is stale"],
+    [
+      "unrequested_support_persisted",
+      "fact supersede support set does not match replacementClaims"
+    ],
+    ["predecessor_support_appended", "fact support requires its exact reserved command"],
+    ["mismatched_response_successor", "fact supersede response does not match successor"],
+    ["lowering_requested_successor_omitted", "truth mutation requires its exact reserved command"],
+    ["lowering_omitted_successor_lowered", "truth mutation requires its exact reserved command"],
+    ["lowering_confidence_mismatched", "truth mutation requires its exact reserved command"],
+    ["lowering_reason_code_mismatched", "truth mutation requires its exact reserved command"],
+    ["lowering_rationale_mismatched", "truth mutation requires its exact reserved command"],
+    ["requested_confidence_not_lower", "accepted fact support is invalid"],
+    ["stored_strongest_mismatched", "accepted fact support is invalid"]
+  ] as const)(
+    "asserts exact supersede stale/support/row-guard diagnostics and full rollback: %s",
+    async (fault, message) => {
+      try {
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6RollbackDigest(ownerPool, phase6Ids.supersedeCommand);
+        await withTestAppPool((appPool) =>
+          expectExactDatabaseFailure(
+            executeExactSupersedeTransaction(appPool, fault, relayServicePrincipalId),
+            { code: "P0001", message, constraint: null }
+          )
+        );
+        expect(await exactPhase6RollbackDigest(ownerPool, phase6Ids.supersedeCommand)).toBe(before);
+        await expectNoPhase6CommandResidue(ownerPool, phase6Ids.supersedeCommand);
+      } finally {
+        await resetToLatest();
+      }
+    },
+    PHASE6_SUPERSEDE_ROLLBACK_TEST_TIMEOUT
+  );
+
+  it.each([
+    [
+      "duplicate_lifecycle",
+      'duplicate key value violates unique constraint "fact_lifecycle_events_predecessor_key"',
+      "fact_lifecycle_events_predecessor_key"
+    ],
+    [
+      "duplicate_outbox",
+      'duplicate key value violates unique constraint "product_outbox_events_semantic_unique"',
+      "product_outbox_events_semantic_unique"
+    ]
+  ] as const)(
+    "classifies supersede storage uniqueness failure exactly: %s",
+    async (fault, message, constraint) => {
+      try {
+        const relayServicePrincipalId = await resetPopulatedPhase6(ownerPool);
+        const before = await exactPhase6RollbackDigest(ownerPool, phase6Ids.supersedeCommand);
+        await withTestAppPool((appPool) =>
+          expectExactDatabaseFailure(
+            executeExactSupersedeTransaction(appPool, fault, relayServicePrincipalId),
+            { code: "23505", message, constraint }
+          )
+        );
+        expect(await exactPhase6RollbackDigest(ownerPool, phase6Ids.supersedeCommand)).toBe(before);
+        await expectNoPhase6CommandResidue(ownerPool, phase6Ids.supersedeCommand);
       } finally {
         await resetToLatest();
       }
@@ -3921,7 +5636,20 @@ const phase6Ids = {
   supersedeAudit: "0190a000-0000-7000-8000-000000000441",
   supersedeOutbox: "0190a000-0000-7000-8000-000000000442",
   otherSubject: "0190a000-0000-7000-8000-000000000443",
-  mutationCommand: "0190a000-0000-7000-8000-000000000444"
+  mutationCommand: "0190a000-0000-7000-8000-000000000444",
+  replacementClaim: "0190a000-0000-7000-8000-000000000445",
+  secondReplacementClaim: "0190a000-0000-7000-8000-000000000446",
+  mismatchedResponseSuccessor: "0190a000-0000-7000-8000-000000000447",
+  chainSuccessor: "0190a000-0000-7000-8000-000000000448",
+  chainCommand: "0190a000-0000-7000-8000-000000000449",
+  chainLifecycle: "0190a000-0000-7000-8000-000000000450",
+  chainAudit: "0190a000-0000-7000-8000-000000000451",
+  chainOutbox: "0190a000-0000-7000-8000-000000000452",
+  orphanReplacementClaim: "0190a000-0000-7000-8000-000000000453",
+  orphanSuccessor: "0190a000-0000-7000-8000-000000000454",
+  orphanCommand: "0190a000-0000-7000-8000-000000000455",
+  nonexistentPredecessor: "0190a000-0000-7000-8000-000000000456",
+  confidentialReplacementClaim: "0190a000-0000-7000-8000-000000000457"
 } as const;
 
 async function resetPopulatedExact0011(pool: pg.Pool): Promise<void> {
@@ -3931,11 +5659,224 @@ async function resetPopulatedExact0011(pool: pg.Pool): Promise<void> {
   });
   await insertExact0008TruthFixture(pool);
   await applyMigrations(pool, { through: "0011_b2_primary_objective_proposal_recovery.sql" });
+  const causedClaims = await pool.query<{ command_id: string; caused_claim_count: number }>(
+    `SELECT command.id AS command_id, count(claim.id)::integer AS caused_claim_count
+       FROM ops.domain_command_records command
+       LEFT JOIN truth.claims claim
+         ON claim.tenant_id = command.tenant_id
+        AND claim.workspace_id = command.workspace_id
+        AND claim.causation_command_id = command.id
+      WHERE command.command_kind = 'claim.create.v1'
+      GROUP BY command.id
+      ORDER BY command.id`
+  );
+  expect(causedClaims.rows).toEqual([
+    { command_id: adoptionIds.command, caused_claim_count: 1 },
+    { command_id: adoptionIds.objectiveCommand, caused_claim_count: 1 }
+  ]);
 }
 
-async function resetPopulatedPhase6(pool: pg.Pool): Promise<void> {
+async function withOwnerTransaction<T>(
+  pool: pg.Pool,
+  operation: (tx: TenantDbTransaction) => Promise<T>
+): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const tx: TenantDbTransaction = {
+      client,
+      query: (text, values) => client.query(text, values ? [...values] : undefined)
+    };
+    const result = await operation(tx);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function insertOwnerPhase6ReplacementClaims(pool: pg.Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("ALTER TABLE truth.claims DISABLE TRIGGER USER");
+    await client.query(
+      `INSERT INTO truth.claims (
+         id,tenant_id,workspace_id,space_id,subject_type,subject_id,
+         predicate_catalog_version,predicate,canonical_value_text,value_hash,normalized_text,
+         verified_evidence_span_id,asserted_by_type,asserted_by_id,confidence,status,
+         access_class,created_by_user_id,created_by_membership_id,causation_command_id,version
+       ) VALUES (
+         $1,$3,$4,$5,'activity',$6,'truth-predicate-catalog.v1','activity.outcome',
+         $7,encode(public.digest(convert_to($7,'UTF8'),'sha256'),'hex'),
+         $7,$8,'person',$9,'strong','proposed','workspace',$10,$11,$12,1
+       ), (
+         $2,$3,$4,$5,'activity',$6,'truth-predicate-catalog.v1','activity.outcome',
+         $7,encode(public.digest(convert_to($7,'UTF8'),'sha256'),'hex'),
+         $7,$8,'person',$9,'strong','proposed','workspace',$10,$11,$12,1
+       ), (
+         $13,$3,$4,$5,'activity',$14,'truth-predicate-catalog.v1','activity.outcome',
+         $15,encode(public.digest(convert_to($15,'UTF8'),'sha256'),'hex'),
+         $15,$8,'person',$9,'strong','proposed','workspace',$10,$11,$12,1
+       ), (
+         $16,$3,$4,$5,'activity',$6,'truth-predicate-catalog.v1','activity.outcome',
+         $17,encode(public.digest(convert_to($17,'UTF8'),'sha256'),'hex'),
+         $17,$8,'person',$9,'strong','proposed','confidential',$10,$11,$12,1
+       )`,
+      [
+        phase6Ids.replacementClaim,
+        phase6Ids.secondReplacementClaim,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.subject,
+        "Replacement canonical value",
+        adoptionIds.evidence,
+        adoptionIds.person,
+        adoptionIds.user,
+        adoptionIds.membership,
+        adoptionIds.command,
+        phase6Ids.orphanReplacementClaim,
+        phase6Ids.otherSubject,
+        "Orphan replacement canonical value",
+        phase6Ids.confidentialReplacementClaim,
+        "Confidential replacement canonical value"
+      ]
+    );
+    await client.query("ALTER TABLE truth.claims ENABLE TRIGGER USER");
+    await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+    const replacementClaims = await client.query<{
+      claim_id: string;
+      tenant_id: string;
+      workspace_id: string;
+      space_id: string;
+      subject_type: string;
+      subject_id: string;
+      predicate: string;
+      canonical_value_text: string;
+      verified_evidence_span_id: string;
+      asserted_by_type: string;
+      asserted_by_id: string;
+      confidence: string;
+      status: string;
+      access_class: string;
+      created_by_user_id: string;
+      created_by_membership_id: string;
+      causation_command_id: string;
+      version: number;
+    }>(
+      `SELECT id AS claim_id, tenant_id, workspace_id, space_id, subject_type, subject_id,
+              predicate, canonical_value_text, verified_evidence_span_id, asserted_by_type,
+              asserted_by_id, confidence, status, access_class, created_by_user_id,
+              created_by_membership_id, causation_command_id, version
+         FROM truth.claims
+        WHERE tenant_id = $1
+          AND workspace_id = $2
+          AND space_id = $3
+          AND subject_type = 'activity'
+          AND subject_id = $4
+          AND predicate = 'activity.outcome'
+          AND canonical_value_text = $5
+        ORDER BY id`,
+      [
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.subject,
+        "Replacement canonical value"
+      ]
+    );
+    expect(replacementClaims.rows).toEqual(
+      [phase6Ids.replacementClaim, phase6Ids.secondReplacementClaim].map((claimId) => ({
+        claim_id: claimId,
+        tenant_id: adoptionIds.tenant,
+        workspace_id: adoptionIds.workspace,
+        space_id: adoptionIds.space,
+        subject_type: "activity",
+        subject_id: adoptionIds.subject,
+        predicate: "activity.outcome",
+        canonical_value_text: "Replacement canonical value",
+        verified_evidence_span_id: adoptionIds.evidence,
+        asserted_by_type: "person",
+        asserted_by_id: adoptionIds.person,
+        confidence: "strong",
+        status: "proposed",
+        access_class: "workspace",
+        created_by_user_id: adoptionIds.user,
+        created_by_membership_id: adoptionIds.membership,
+        causation_command_id: adoptionIds.command,
+        version: 1
+      }))
+    );
+    const specializedClaims = await client.query<{
+      claim_id: string;
+      subject_id: string;
+      predicate: string;
+      canonical_value_text: string;
+      status: string;
+      access_class: string;
+      version: number;
+    }>(
+      `SELECT id AS claim_id, subject_id, predicate, canonical_value_text,
+              status, access_class, version
+         FROM truth.claims
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id`,
+      [[phase6Ids.orphanReplacementClaim, phase6Ids.confidentialReplacementClaim]]
+    );
+    expect(specializedClaims.rows).toEqual([
+      {
+        claim_id: phase6Ids.orphanReplacementClaim,
+        subject_id: phase6Ids.otherSubject,
+        predicate: "activity.outcome",
+        canonical_value_text: "Orphan replacement canonical value",
+        status: "proposed",
+        access_class: "workspace",
+        version: 1
+      },
+      {
+        claim_id: phase6Ids.confidentialReplacementClaim,
+        subject_id: adoptionIds.subject,
+        predicate: "activity.outcome",
+        canonical_value_text: "Confidential replacement canonical value",
+        status: "proposed",
+        access_class: "confidential",
+        version: 1
+      }
+    ]);
+    const disabledUserTriggers = await client.query<{ name: string }>(
+      `SELECT trigger.tgname AS name
+         FROM pg_trigger trigger
+        WHERE trigger.tgrelid = 'truth.claims'::regclass
+          AND NOT trigger.tgisinternal
+          AND trigger.tgenabled <> 'O'
+        ORDER BY trigger.tgname`
+    );
+    expect(disabledUserTriggers.rows).toEqual([]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function resetPopulatedPhase6(pool: pg.Pool): Promise<string> {
   await resetPopulatedExact0011(pool);
   await applyMigrations(pool);
+  await insertOwnerPhase6ReplacementClaims(pool);
+  const provisioned = await withOwnerTransaction(pool, (tx) =>
+    provisionProductRelayDirectManagerAccess(tx, {
+      tenantId: adoptionIds.tenant,
+      workspaceId: adoptionIds.workspace,
+      spaceId: adoptionIds.space
+    })
+  );
+  return provisioned.principalId;
 }
 
 async function exactLifecycleProtectedDigest(pool: pg.Pool): Promise<string> {
@@ -4123,6 +6064,7 @@ async function insertLifecycleVisibilityFixture(pool: pg.Pool): Promise<void> {
         adoptionIds.factCommand
       ]
     );
+    await client.query("SET CONSTRAINTS ALL IMMEDIATE");
     await client.query("ALTER TABLE truth.fact_lifecycle_events ENABLE TRIGGER USER");
     await client.query("COMMIT");
   } catch (error) {
@@ -4149,6 +6091,21 @@ type Phase6AtomicFault =
 
 type Phase6SupersedeFault =
   | "valid"
+  | "valid_confidential_successor"
+  | "valid_confidence_lowering"
+  | "lowering_requested_successor_omitted"
+  | "lowering_omitted_successor_lowered"
+  | "lowering_confidence_mismatched"
+  | "lowering_reason_code_mismatched"
+  | "lowering_rationale_mismatched"
+  | "requested_confidence_not_lower"
+  | "stored_strongest_mismatched"
+  | "stale_subject_version"
+  | "stale_replacement_claim_version"
+  | "requested_support_omitted"
+  | "unrequested_support_persisted"
+  | "predecessor_support_appended"
+  | "mismatched_response_successor"
   | "missing_lifecycle"
   | "duplicate_lifecycle"
   | "mismatched_lifecycle"
@@ -4159,6 +6116,31 @@ type Phase6SupersedeFault =
   | "missing_outbox"
   | "duplicate_outbox"
   | "mismatched_outbox";
+
+type ExactDatabaseFailure = {
+  code: string;
+  message: string;
+  constraint: string | null;
+};
+
+async function expectExactDatabaseFailure(
+  operation: Promise<unknown>,
+  expected: ExactDatabaseFailure
+): Promise<void> {
+  let caught: unknown;
+  try {
+    await operation;
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(Error);
+  const databaseError = caught as Error & { code?: string; constraint?: string };
+  expect({
+    code: databaseError.code,
+    message: databaseError.message,
+    constraint: databaseError.constraint ?? null
+  }).toEqual(expected);
+}
 
 async function exactPhase6AtomicDigest(
   pool: pg.Pool,
@@ -4186,6 +6168,49 @@ async function exactPhase6AtomicDigest(
     [commandId]
   );
   return JSON.stringify(snapshot.rows[0]);
+}
+
+async function exactPhase6RollbackDigest(
+  pool: pg.Pool,
+  commandId: string = phase6Ids.revokeCommand
+): Promise<string> {
+  return JSON.stringify({
+    fullState: JSON.parse(await exactLifecycleProtectedDigest(pool)),
+    commandState: JSON.parse(await exactPhase6AtomicDigest(pool, commandId)),
+    predecessor: JSON.parse(await exactPredecessorImmutableDigest(pool))
+  });
+}
+
+async function expectNoPhase6CommandResidue(pool: pg.Pool, commandId: string): Promise<void> {
+  const residue = await pool.query<{
+    command_count: number;
+    lifecycle_count: number;
+    audit_count: number;
+    outbox_count: number;
+    successor_count: number;
+  }>(
+    `SELECT
+       (SELECT count(*)::integer FROM ops.domain_command_records WHERE id = $1)
+         AS command_count,
+       (SELECT count(*)::integer FROM truth.fact_lifecycle_events
+         WHERE causation_command_id = $1) AS lifecycle_count,
+       (SELECT count(*)::integer FROM ops.audit_events
+         WHERE causation_command_id = $1) AS audit_count,
+       (SELECT count(*)::integer FROM ops.product_outbox_events
+         WHERE causation_command_id = $1) AS outbox_count,
+       (SELECT count(*)::integer FROM truth.accepted_facts
+         WHERE last_causation_command_id = $1) AS successor_count`,
+    [commandId]
+  );
+  expect(residue.rows).toEqual([
+    {
+      command_count: 0,
+      lifecycle_count: 0,
+      audit_count: 0,
+      outbox_count: 0,
+      successor_count: 0
+    }
+  ]);
 }
 
 async function exactPredecessorImmutableDigest(pool: pg.Pool): Promise<string> {
@@ -4291,10 +6316,11 @@ async function executeRolledBackStatement(pool: pg.Pool, statement: string): Pro
 }
 
 async function executeExactRevokeTransaction(
-  pool: pg.Pool,
-  fault: Phase6AtomicFault
+  appPool: pg.Pool,
+  fault: Phase6AtomicFault,
+  relayServicePrincipalId: string
 ): Promise<void> {
-  const client = await pool.connect();
+  const client = await appPool.connect();
   const request = {
     factId: adoptionIds.fact,
     expectedFactVersion: 1,
@@ -4311,6 +6337,14 @@ async function executeExactRevokeTransaction(
   };
   try {
     await client.query("BEGIN");
+    const appIdentity = await client.query<{ current_user: string; rolbypassrls: boolean }>(
+      `SELECT current_user, rolbypassrls
+         FROM pg_roles
+        WHERE rolname = current_user
+          AND current_user = 'throughline_app'
+          AND NOT rolbypassrls`
+    );
+    expect(appIdentity.rows).toEqual([{ current_user: "throughline_app", rolbypassrls: false }]);
     await client.query("SELECT set_config('app.tenant_id', $1, true)", [adoptionIds.tenant]);
     await client.query("SELECT set_config('app.workspace_id', $1, true)", [adoptionIds.workspace]);
     await client.query("SELECT set_config('app.space_id', $1, true)", [adoptionIds.space]);
@@ -4319,14 +6353,15 @@ async function executeExactRevokeTransaction(
       adoptionIds.membership
     ]);
     await client.query("SELECT set_config('app.policy_version', 'default-v1', true)");
+    await client.query("SELECT set_config('app.data_class_ceiling', 'confidential', true)");
     await client.query(
       `INSERT INTO ops.domain_command_records (
          id, tenant_id, workspace_id, reservation_space_id, command_kind,
          command_schema_version, idempotency_key, canonical_request_hash, safe_request,
-         state, actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
+         actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
        ) VALUES (
          $1,$2,$3,$4,'fact.revoke.v1',1,'phase6-revoke',repeat('d',64),$5::jsonb,
-         'reserved',$6,$7,'default-v1','phase6-revoke',
+         $6,$7,'default-v1','phase6-revoke',
          '00-00000000000000000000000000000004-0000000000000004-01'
        )`,
       [
@@ -4448,7 +6483,7 @@ async function executeExactRevokeTransaction(
           adoptionIds.tenant,
           adoptionIds.workspace,
           adoptionIds.space,
-          devFixtures.relayServicePrincipalA,
+          relayServicePrincipalId,
           adoptionIds.fact,
           phase6Ids.revokeCommand,
           JSON.stringify(
@@ -4460,15 +6495,17 @@ async function executeExactRevokeTransaction(
       );
       if (fault === "duplicate_outbox") {
         await client.query(
-          `INSERT INTO ops.product_outbox_events
+          `INSERT INTO ops.product_outbox_events (
+             id, tenant_id, workspace_id, space_id, relay_service_principal_id,
+             policy_version_id, event_type, event_schema_version, payload_schema_version,
+             aggregate_type, aggregate_id, aggregate_version, causation_command_id,
+             payload, request_id, traceparent, tracestate
+           )
              SELECT $1, tenant_id, workspace_id, space_id, relay_service_principal_id,
                     policy_version_id, event_type, event_schema_version,
                     payload_schema_version, aggregate_type, aggregate_id,
                     aggregate_version, causation_command_id, payload, request_id,
-                    traceparent, tracestate, created_at, publication_state,
-                    publication_attempt, next_attempt_at, claimed_at, claimed_by,
-                    claim_token, claim_expires_at, last_outcome_code, published_at,
-                    published_message_id, terminal_at
+                    traceparent, tracestate
                FROM ops.product_outbox_events WHERE id = $2`,
           [phase6Ids.duplicateOutbox, phase6Ids.revokeOutbox]
         );
@@ -4480,7 +6517,7 @@ async function executeExactRevokeTransaction(
           SET state = 'completed', result_resource_type = 'accepted_fact',
               result_resource_id = $1,
               safe_response = $2::jsonb,
-              updated_at = transaction_timestamp(), completed_at = transaction_timestamp()
+              completed_at = clock_timestamp(), updated_at = clock_timestamp()
         WHERE id = $3`,
       [
         adoptionIds.fact,
@@ -4488,7 +6525,9 @@ async function executeExactRevokeTransaction(
         phase6Ids.revokeCommand
       ]
     );
-    await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+    await client.query(
+      "SET CONSTRAINTS ops.domain_command_records_b2_slice1_atomicity_deferred IMMEDIATE"
+    );
     await client.query("COMMIT");
   } catch (error) {
     await client.query("ROLLBACK");
@@ -4499,11 +6538,59 @@ async function executeExactRevokeTransaction(
 }
 
 async function executeExactSupersedeTransaction(
-  pool: pg.Pool,
-  fault: Phase6SupersedeFault
+  appPool: pg.Pool,
+  fault: Phase6SupersedeFault,
+  relayServicePrincipalId: string
 ): Promise<void> {
-  const client = await pool.connect();
+  const client = await appPool.connect();
   const rationale = "The later ratified outcome replaces the predecessor.";
+  const confidenceLowering = {
+    confidence: fault === "requested_confidence_not_lower" ? "strong" : "weak",
+    reason: {
+      code: "residual_uncertainty",
+      rationale: "Residual timing uncertainty warrants a conservative confidence."
+    }
+  };
+  const loweringRequested =
+    fault === "valid_confidence_lowering" ||
+    fault === "lowering_requested_successor_omitted" ||
+    fault === "lowering_confidence_mismatched" ||
+    fault === "lowering_reason_code_mismatched" ||
+    fault === "lowering_rationale_mismatched" ||
+    fault === "requested_confidence_not_lower" ||
+    fault === "stored_strongest_mismatched";
+  const successorLowered =
+    fault === "valid_confidence_lowering" ||
+    fault === "lowering_omitted_successor_lowered" ||
+    fault === "lowering_confidence_mismatched" ||
+    fault === "lowering_reason_code_mismatched" ||
+    fault === "lowering_rationale_mismatched" ||
+    fault === "requested_confidence_not_lower" ||
+    fault === "stored_strongest_mismatched";
+  const successorConfidence =
+    fault === "lowering_confidence_mismatched"
+      ? "unknown"
+      : successorLowered
+        ? confidenceLowering.confidence
+        : "strong";
+  const successorLoweringReason =
+    fault === "lowering_reason_code_mismatched"
+      ? {
+          code: "evidence_quality",
+          rationale: confidenceLowering.reason.rationale
+        }
+      : fault === "lowering_rationale_mismatched"
+        ? {
+            code: confidenceLowering.reason.code,
+            rationale: "A different valid rationale must not be accepted."
+          }
+        : confidenceLowering.reason;
+  const successorStrongestConfidence =
+    fault === "stored_strongest_mismatched" ? "confirmed" : "strong";
+  const replacementClaimId =
+    fault === "valid_confidential_successor"
+      ? phase6Ids.confidentialReplacementClaim
+      : phase6Ids.replacementClaim;
   const safeDetail = {
     factId: adoptionIds.fact,
     factVersion: 2,
@@ -4514,42 +6601,42 @@ async function executeExactSupersedeTransaction(
   };
   try {
     await client.query("BEGIN");
+    const appIdentity = await client.query<{ current_user: string; rolbypassrls: boolean }>(
+      `SELECT current_user, rolbypassrls
+         FROM pg_roles
+        WHERE rolname = current_user
+          AND current_user = 'throughline_app'
+          AND NOT rolbypassrls`
+    );
+    expect(appIdentity.rows).toEqual([{ current_user: "throughline_app", rolbypassrls: false }]);
     for (const [setting, value] of [
       ["app.tenant_id", adoptionIds.tenant],
       ["app.workspace_id", adoptionIds.workspace],
       ["app.space_id", adoptionIds.space],
       ["app.user_id", adoptionIds.user],
       ["app.membership_id", adoptionIds.membership],
-      ["app.policy_version", "default-v1"]
+      ["app.policy_version", "default-v1"],
+      ["app.data_class_ceiling", "confidential"]
     ] as const) {
       await client.query("SELECT set_config($1, $2, true)", [setting, value]);
     }
-    if (fault === "mismatched_lineage") {
-      await client.query(
-        `INSERT INTO work.activities (
-           id, tenant_id, workspace_id, space_id, subtype, profile_template_key,
-           title, status, owner_person_id, governing_organization_id
-         ) VALUES (
-           $1,$2,$3,$4,'meeting','meeting','Mismatched lineage subject','captured',$5,$6
-         )`,
-        [
-          phase6Ids.otherSubject,
-          adoptionIds.tenant,
-          adoptionIds.workspace,
-          adoptionIds.space,
-          adoptionIds.person,
-          adoptionIds.organization
-        ]
-      );
-    }
+    const replacementClaims = [
+      {
+        claimId: replacementClaimId,
+        expectedVersion: fault === "stale_replacement_claim_version" ? 2 : 1
+      },
+      ...(fault === "requested_support_omitted"
+        ? [{ claimId: phase6Ids.secondReplacementClaim, expectedVersion: 1 }]
+        : [])
+    ];
     await client.query(
       `INSERT INTO ops.domain_command_records (
          id, tenant_id, workspace_id, reservation_space_id, command_kind,
          command_schema_version, idempotency_key, canonical_request_hash, safe_request,
-         state, actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
+         actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
        ) VALUES (
          $1,$2,$3,$4,'fact.supersede.v1',1,'phase6-supersede',repeat('e',64),$5::jsonb,
-         'reserved',$6,$7,'default-v1','phase6-supersede',
+         $6,$7,'default-v1','phase6-supersede',
          '00-00000000000000000000000000000005-0000000000000005-01'
        )`,
       [
@@ -4560,9 +6647,14 @@ async function executeExactSupersedeTransaction(
         JSON.stringify({
           factId: adoptionIds.fact,
           expectedFactVersion: 1,
-          subject: { type: "activity", id: adoptionIds.subject, expectedVersion: 1 },
-          replacementClaims: [{ claimId: adoptionIds.claim, expectedVersion: 2 }],
-          reason: { code: "newer_evidence", rationale }
+          subject: {
+            type: "activity",
+            id: adoptionIds.subject,
+            expectedVersion: fault === "stale_subject_version" ? 2 : 1
+          },
+          replacementClaims,
+          reason: { code: "newer_evidence", rationale },
+          ...(loweringRequested ? { confidenceLowering } : {})
         }),
         adoptionIds.user,
         adoptionIds.membership
@@ -4586,20 +6678,34 @@ async function executeExactSupersedeTransaction(
          authority_basis, acceptance_policy_version, last_causation_command_id,
          created_at, updated_at, version
        ) SELECT
-         $1, tenant_id, workspace_id, space_id, subject_type, $4,
-         predicate_catalog_version, predicate, canonical_value_text, value_hash,
-         normalized_text, confidence, confidence_rule, strongest_supporting_confidence,
-         human_lowered, confidence_lowering_reason_code, confidence_lowering_rationale,
-         valid_from, valid_to, transaction_timestamp(), 'current', access_class,
-         accepted_by_user_id, accepted_by_membership_id, acceptance_scope,
-         authority_basis, acceptance_policy_version, $2,
+         $1, predecessor.tenant_id, predecessor.workspace_id, predecessor.space_id,
+         predecessor.subject_type, $4, predecessor.predicate_catalog_version,
+         predecessor.predicate, replacement.canonical_value_text, replacement.value_hash,
+         replacement.normalized_text, $6,
+         predecessor.confidence_rule, $10,
+         $7, $8, $9, replacement.valid_from, replacement.valid_to,
+         transaction_timestamp(), 'current', replacement.access_class,
+         predecessor.accepted_by_user_id, predecessor.accepted_by_membership_id,
+         predecessor.acceptance_scope, predecessor.authority_basis,
+         predecessor.acceptance_policy_version, $2,
          transaction_timestamp(), transaction_timestamp(), 1
-           FROM truth.accepted_facts WHERE id = $3`,
+           FROM truth.accepted_facts predecessor
+           JOIN truth.claims replacement
+             ON replacement.tenant_id = predecessor.tenant_id
+            AND replacement.workspace_id = predecessor.workspace_id
+            AND replacement.id = $5
+          WHERE predecessor.id = $3`,
       [
         adoptionIds.successor,
         phase6Ids.supersedeCommand,
         adoptionIds.fact,
-        fault === "mismatched_lineage" ? phase6Ids.otherSubject : adoptionIds.subject
+        fault === "mismatched_lineage" ? phase6Ids.otherSubject : adoptionIds.subject,
+        replacementClaimId,
+        successorConfidence,
+        successorLowered,
+        successorLowered ? successorLoweringReason.code : null,
+        successorLowered ? successorLoweringReason.rationale : null,
+        successorStrongestConfidence
       ]
     );
     await client.query(
@@ -4610,9 +6716,30 @@ async function executeExactSupersedeTransaction(
         adoptionIds.tenant,
         adoptionIds.workspace,
         adoptionIds.space,
-        adoptionIds.successor,
-        adoptionIds.claim
+        fault === "predecessor_support_appended" ? adoptionIds.fact : adoptionIds.successor,
+        replacementClaimId
       ]
+    );
+    if (fault === "unrequested_support_persisted") {
+      await client.query(
+        `INSERT INTO truth.fact_claims (
+           tenant_id, workspace_id, space_id, fact_id, claim_id
+         ) VALUES ($1,$2,$3,$4,$5)`,
+        [
+          adoptionIds.tenant,
+          adoptionIds.workspace,
+          adoptionIds.space,
+          adoptionIds.successor,
+          phase6Ids.secondReplacementClaim
+        ]
+      );
+    }
+    await client.query(
+      `UPDATE truth.claims
+          SET status = 'accepted', version = 2,
+              updated_at = transaction_timestamp()
+        WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3 AND id = $4`,
+      [adoptionIds.tenant, adoptionIds.workspace, adoptionIds.space, replacementClaimId]
     );
     if (fault !== "missing_lifecycle") {
       await client.query(
@@ -4710,7 +6837,7 @@ async function executeExactSupersedeTransaction(
           adoptionIds.tenant,
           adoptionIds.workspace,
           adoptionIds.space,
-          devFixtures.relayServicePrincipalA,
+          relayServicePrincipalId,
           adoptionIds.fact,
           phase6Ids.supersedeCommand,
           JSON.stringify(
@@ -4722,15 +6849,17 @@ async function executeExactSupersedeTransaction(
       );
       if (fault === "duplicate_outbox") {
         await client.query(
-          `INSERT INTO ops.product_outbox_events
+          `INSERT INTO ops.product_outbox_events (
+             id, tenant_id, workspace_id, space_id, relay_service_principal_id,
+             policy_version_id, event_type, event_schema_version, payload_schema_version,
+             aggregate_type, aggregate_id, aggregate_version, causation_command_id,
+             payload, request_id, traceparent, tracestate
+           )
              SELECT $1, tenant_id, workspace_id, space_id, relay_service_principal_id,
                     policy_version_id, event_type, event_schema_version,
                     payload_schema_version, aggregate_type, aggregate_id,
                     aggregate_version, causation_command_id, payload, request_id,
-                    traceparent, tracestate, created_at, publication_state,
-                    publication_attempt, next_attempt_at, claimed_at, claimed_by,
-                    claim_token, claim_expires_at, last_outcome_code, published_at,
-                    published_message_id, terminal_at
+                    traceparent, tracestate
                FROM ops.product_outbox_events WHERE id = $2`,
           [phase6Ids.duplicateOutbox, phase6Ids.supersedeOutbox]
         );
@@ -4740,7 +6869,7 @@ async function executeExactSupersedeTransaction(
       `UPDATE ops.domain_command_records
           SET state = 'completed', result_resource_type = 'accepted_fact',
               result_resource_id = $1, safe_response = $2::jsonb,
-              updated_at = transaction_timestamp(), completed_at = transaction_timestamp()
+              completed_at = clock_timestamp(), updated_at = clock_timestamp()
         WHERE id = $3`,
       [
         adoptionIds.fact,
@@ -4748,15 +6877,348 @@ async function executeExactSupersedeTransaction(
           factId: adoptionIds.fact,
           version: 2,
           status: "superseded",
-          replacementFactId: adoptionIds.successor,
+          replacementFactId:
+            fault === "mismatched_response_successor"
+              ? phase6Ids.mismatchedResponseSuccessor
+              : adoptionIds.successor,
           replacementFactVersion: 1,
           replacementFactStatus: "current"
         }),
         phase6Ids.supersedeCommand
       ]
     );
-    await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+    await client.query("SET CONSTRAINTS truth.accepted_facts_support_deferred IMMEDIATE");
+    await client.query(
+      "SET CONSTRAINTS ops.domain_command_records_b2_slice1_atomicity_deferred IMMEDIATE"
+    );
     await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function executeExactSecondSupersedeTransaction(
+  appPool: pg.Pool,
+  relayServicePrincipalId: string
+): Promise<void> {
+  const client = await appPool.connect();
+  const rationale = "A later ratified outcome replaces the first successor.";
+  const safeDetail = {
+    factId: adoptionIds.successor,
+    factVersion: 2,
+    reasonCode: "newer_evidence",
+    replacementFactId: phase6Ids.chainSuccessor,
+    replacementFactVersion: 1,
+    status: "superseded"
+  };
+  try {
+    await client.query("BEGIN");
+    for (const [setting, value] of [
+      ["app.tenant_id", adoptionIds.tenant],
+      ["app.workspace_id", adoptionIds.workspace],
+      ["app.space_id", adoptionIds.space],
+      ["app.user_id", adoptionIds.user],
+      ["app.membership_id", adoptionIds.membership],
+      ["app.policy_version", "default-v1"],
+      ["app.data_class_ceiling", "confidential"]
+    ] as const) {
+      await client.query("SELECT set_config($1, $2, true)", [setting, value]);
+    }
+    await client.query(
+      `INSERT INTO ops.domain_command_records (
+         id, tenant_id, workspace_id, reservation_space_id, command_kind,
+         command_schema_version, idempotency_key, canonical_request_hash, safe_request,
+         actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
+       ) VALUES (
+         $1,$2,$3,$4,'fact.supersede.v1',1,'phase6-chain-supersede',repeat('f',64),$5::jsonb,
+         $6,$7,'default-v1','phase6-chain-supersede',
+         '00-00000000000000000000000000000006-0000000000000006-01'
+       )`,
+      [
+        phase6Ids.chainCommand,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        JSON.stringify({
+          factId: adoptionIds.successor,
+          expectedFactVersion: 1,
+          subject: { type: "activity", id: adoptionIds.subject, expectedVersion: 1 },
+          replacementClaims: [{ claimId: phase6Ids.secondReplacementClaim, expectedVersion: 1 }],
+          reason: { code: "newer_evidence", rationale }
+        }),
+        adoptionIds.user,
+        adoptionIds.membership
+      ]
+    );
+    await client.query(
+      `UPDATE truth.accepted_facts
+          SET status = 'superseded', version = 2,
+              last_causation_command_id = $1, updated_at = transaction_timestamp()
+        WHERE tenant_id = $2 AND workspace_id = $3 AND space_id = $4 AND id = $5`,
+      [
+        phase6Ids.chainCommand,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.successor
+      ]
+    );
+    await client.query(
+      `INSERT INTO truth.accepted_facts (
+         id, tenant_id, workspace_id, space_id, subject_type, subject_id,
+         predicate_catalog_version, predicate, canonical_value_text, value_hash,
+         normalized_text, confidence, confidence_rule, strongest_supporting_confidence,
+         human_lowered, confidence_lowering_reason_code, confidence_lowering_rationale,
+         valid_from, valid_to, recorded_at, status, access_class,
+         accepted_by_user_id, accepted_by_membership_id, acceptance_scope,
+         authority_basis, acceptance_policy_version, last_causation_command_id,
+         created_at, updated_at, version
+       ) SELECT
+         $1, predecessor.tenant_id, predecessor.workspace_id, predecessor.space_id,
+         predecessor.subject_type, predecessor.subject_id, predecessor.predicate_catalog_version,
+         predecessor.predicate, replacement.canonical_value_text, replacement.value_hash,
+         replacement.normalized_text, replacement.confidence,
+         predecessor.confidence_rule, replacement.confidence,
+         false, NULL, NULL, replacement.valid_from, replacement.valid_to,
+         transaction_timestamp(), 'current', replacement.access_class,
+         predecessor.accepted_by_user_id, predecessor.accepted_by_membership_id,
+         predecessor.acceptance_scope, predecessor.authority_basis,
+         predecessor.acceptance_policy_version, $2,
+         transaction_timestamp(), transaction_timestamp(), 1
+           FROM truth.accepted_facts predecessor
+           JOIN truth.claims replacement
+             ON replacement.tenant_id = predecessor.tenant_id
+            AND replacement.workspace_id = predecessor.workspace_id
+            AND replacement.id = $4
+          WHERE predecessor.tenant_id = $5
+            AND predecessor.workspace_id = $6
+            AND predecessor.space_id = $7
+            AND predecessor.id = $3`,
+      [
+        phase6Ids.chainSuccessor,
+        phase6Ids.chainCommand,
+        adoptionIds.successor,
+        phase6Ids.secondReplacementClaim,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space
+      ]
+    );
+    await client.query(
+      `INSERT INTO truth.fact_claims (
+         tenant_id, workspace_id, space_id, fact_id, claim_id
+       ) VALUES ($1,$2,$3,$4,$5)`,
+      [
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        phase6Ids.chainSuccessor,
+        phase6Ids.secondReplacementClaim
+      ]
+    );
+    await client.query(
+      `UPDATE truth.claims
+          SET status = 'accepted', version = 2,
+              updated_at = transaction_timestamp()
+        WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3 AND id = $4`,
+      [
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        phase6Ids.secondReplacementClaim
+      ]
+    );
+    await client.query(
+      `INSERT INTO truth.fact_lifecycle_events (
+         id, tenant_id, workspace_id, space_id, predecessor_fact_id,
+         successor_fact_id, transition_kind, from_status, to_status,
+         reason_code, reason_rationale, authority_basis, policy_version,
+         acted_by_user_id, acted_by_membership_id, causation_command_id,
+         recorded_at, version
+       ) VALUES (
+         $1,$2,$3,$4,$5,$6,'supersede','current','superseded',
+         'newer_evidence',$7,'activity_owner','default-v1',
+         $8,$9,$10,transaction_timestamp(),1
+       )`,
+      [
+        phase6Ids.chainLifecycle,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.successor,
+        phase6Ids.chainSuccessor,
+        rationale,
+        adoptionIds.user,
+        adoptionIds.membership,
+        phase6Ids.chainCommand
+      ]
+    );
+    await client.query(
+      `INSERT INTO ops.audit_events (
+         id, tenant_id, workspace_id, space_id, causation_command_id,
+         action, resource_type, resource_id, actor_user_id, actor_membership_id,
+         policy_version_id, request_id, traceparent, audit_schema_version, safe_detail
+       ) VALUES (
+         $1,$2,$3,$4,$5,'fact.supersede','accepted_fact',$6,$7,$8,'default-v1',
+         'phase6-chain-supersede',
+         '00-00000000000000000000000000000006-0000000000000006-01',1,$9::jsonb
+       )`,
+      [
+        phase6Ids.chainAudit,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        phase6Ids.chainCommand,
+        adoptionIds.successor,
+        adoptionIds.user,
+        adoptionIds.membership,
+        JSON.stringify(safeDetail)
+      ]
+    );
+    await client.query(
+      `INSERT INTO ops.product_outbox_events (
+         id, tenant_id, workspace_id, space_id, relay_service_principal_id,
+         policy_version_id, event_type, event_schema_version, payload_schema_version,
+         aggregate_type, aggregate_id, aggregate_version, causation_command_id,
+         payload, request_id, traceparent
+       ) VALUES (
+         $1,$2,$3,$4,$5,'default-v1','fact.superseded',1,1,
+         'accepted_fact',$6,2,$7,$8::jsonb,'phase6-chain-supersede',
+         '00-00000000000000000000000000000006-0000000000000006-01'
+       )`,
+      [
+        phase6Ids.chainOutbox,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        relayServicePrincipalId,
+        adoptionIds.successor,
+        phase6Ids.chainCommand,
+        JSON.stringify(safeDetail)
+      ]
+    );
+    await client.query(
+      `UPDATE ops.domain_command_records
+          SET state = 'completed', result_resource_type = 'accepted_fact',
+              result_resource_id = $1, safe_response = $2::jsonb,
+              completed_at = clock_timestamp(), updated_at = clock_timestamp()
+        WHERE id = $3`,
+      [
+        adoptionIds.successor,
+        JSON.stringify({
+          factId: adoptionIds.successor,
+          version: 2,
+          status: "superseded",
+          replacementFactId: phase6Ids.chainSuccessor,
+          replacementFactVersion: 1,
+          replacementFactStatus: "current"
+        }),
+        phase6Ids.chainCommand
+      ]
+    );
+    await client.query("SET CONSTRAINTS truth.accepted_facts_support_deferred IMMEDIATE");
+    await client.query(
+      "SET CONSTRAINTS ops.domain_command_records_b2_slice1_atomicity_deferred IMMEDIATE"
+    );
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function executeOrphanSuccessorInsert(
+  appPool: pg.Pool,
+  predecessorFault: "nonexistent" | "unrelated"
+): Promise<void> {
+  const client = await appPool.connect();
+  const factId =
+    predecessorFault === "nonexistent" ? phase6Ids.nonexistentPredecessor : adoptionIds.fact;
+  try {
+    await client.query("BEGIN");
+    for (const [setting, value] of [
+      ["app.tenant_id", adoptionIds.tenant],
+      ["app.workspace_id", adoptionIds.workspace],
+      ["app.space_id", adoptionIds.space],
+      ["app.user_id", adoptionIds.user],
+      ["app.membership_id", adoptionIds.membership],
+      ["app.policy_version", "default-v1"],
+      ["app.data_class_ceiling", "confidential"]
+    ] as const) {
+      await client.query("SELECT set_config($1, $2, true)", [setting, value]);
+    }
+    await client.query(
+      `INSERT INTO ops.domain_command_records (
+         id, tenant_id, workspace_id, reservation_space_id, command_kind,
+         command_schema_version, idempotency_key, canonical_request_hash, safe_request,
+         actor_user_id, actor_membership_id, policy_version_id, request_id, traceparent
+       ) VALUES (
+         $1,$2,$3,$4,'fact.supersede.v1',1,'phase6-orphan-supersede',repeat('9',64),$5::jsonb,
+         $6,$7,'default-v1','phase6-orphan-supersede',
+         '00-00000000000000000000000000000007-0000000000000007-01'
+       )`,
+      [
+        phase6Ids.orphanCommand,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        JSON.stringify({
+          factId,
+          expectedFactVersion: 1,
+          subject: { type: "activity", id: phase6Ids.otherSubject, expectedVersion: 1 },
+          replacementClaims: [{ claimId: phase6Ids.orphanReplacementClaim, expectedVersion: 1 }],
+          reason: {
+            code: "newer_evidence",
+            rationale: "An orphan successor must never establish a current coordinate."
+          }
+        }),
+        adoptionIds.user,
+        adoptionIds.membership
+      ]
+    );
+    await client.query(
+      `INSERT INTO truth.accepted_facts (
+         id, tenant_id, workspace_id, space_id, subject_type, subject_id,
+         predicate_catalog_version, predicate, canonical_value_text, value_hash,
+         normalized_text, confidence, confidence_rule, strongest_supporting_confidence,
+         human_lowered, recorded_at, status, access_class,
+         accepted_by_user_id, accepted_by_membership_id, acceptance_scope,
+         authority_basis, acceptance_policy_version, last_causation_command_id, version
+       ) SELECT
+         $1, claim.tenant_id, claim.workspace_id, claim.space_id,
+         claim.subject_type, claim.subject_id, claim.predicate_catalog_version,
+         claim.predicate, claim.canonical_value_text, claim.value_hash,
+         claim.normalized_text, claim.confidence, 'strongest-selected-valid-claim.v1',
+         claim.confidence, false, transaction_timestamp(), 'current', claim.access_class,
+         $2,$3,'engagement','activity_owner','default-v1',$4,1
+           FROM truth.claims claim
+          WHERE claim.tenant_id = $5
+            AND claim.workspace_id = $6
+            AND claim.space_id = $7
+            AND claim.id = $8
+            AND claim.subject_type = 'activity'
+            AND claim.subject_id = $9
+            AND claim.predicate = 'activity.outcome'
+            AND claim.status = 'proposed'
+            AND claim.version = 1`,
+      [
+        phase6Ids.orphanSuccessor,
+        adoptionIds.user,
+        adoptionIds.membership,
+        phase6Ids.orphanCommand,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        phase6Ids.orphanReplacementClaim,
+        phase6Ids.otherSubject
+      ]
+    );
+    throw new Error("orphan successor INSERT unexpectedly succeeded");
   } catch (error) {
     await client.query("ROLLBACK");
     throw error;
@@ -4802,6 +7264,22 @@ async function insertExact0008TruthFixture(pool: pg.Pool): Promise<void> {
        )`,
       [
         adoptionIds.subject,
+        adoptionIds.tenant,
+        adoptionIds.workspace,
+        adoptionIds.space,
+        adoptionIds.person,
+        adoptionIds.organization
+      ]
+    );
+    await client.query(
+      `INSERT INTO work.activities (
+         id, tenant_id, workspace_id, space_id, subtype, profile_template_key,
+         title, status, owner_person_id, governing_organization_id
+       ) VALUES (
+         $1,$2,$3,$4,'meeting','meeting','Mismatched lineage subject','captured',$5,$6
+       )`,
+      [
+        phase6Ids.otherSubject,
         adoptionIds.tenant,
         adoptionIds.workspace,
         adoptionIds.space,

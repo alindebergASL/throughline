@@ -38,6 +38,7 @@ const exactPhase6LifecycleFunctionSources = {
   "truth.enforce_fact_lifecycle_transition()": normalizeSql(`
     DECLARE
       required_kind text;
+      subject_version integer;
     BEGIN
       IF pg_catalog.current_setting('transaction_isolation') <> 'read committed' THEN
         RAISE EXCEPTION USING ERRCODE = 'TLB22',
@@ -60,6 +61,23 @@ const exactPhase6LifecycleFunctionSources = {
       THEN
         RAISE EXCEPTION 'accepted Fact lifecycle transition is not permitted';
       END IF;
+      IF OLD.subject_type = 'activity' THEN
+        SELECT subject.version INTO subject_version
+          FROM work.activities subject
+         WHERE subject.tenant_id = OLD.tenant_id
+           AND subject.workspace_id = OLD.workspace_id
+           AND subject.space_id = OLD.space_id
+           AND subject.id = OLD.subject_id
+         FOR SHARE;
+      ELSE
+        SELECT subject.version INTO subject_version
+          FROM work.initiatives subject
+         WHERE subject.tenant_id = OLD.tenant_id
+           AND subject.workspace_id = OLD.workspace_id
+           AND subject.space_id = OLD.space_id
+           AND subject.id = OLD.subject_id
+         FOR SHARE;
+      END IF;
       IF NOT EXISTS (
         SELECT 1
           FROM ops.domain_command_records command
@@ -81,6 +99,19 @@ const exactPhase6LifecycleFunctionSources = {
            ))
       ) THEN
         RAISE EXCEPTION 'accepted Fact lifecycle transition requires its exact reserved command';
+      END IF;
+      IF required_kind = 'fact.supersede.v1' AND (
+        subject_version IS NULL OR NOT EXISTS (
+          SELECT 1
+            FROM ops.domain_command_records command
+           WHERE command.tenant_id = NEW.tenant_id
+             AND command.workspace_id = NEW.workspace_id
+             AND command.id = NEW.last_causation_command_id
+             AND (command.safe_request #>> '{subject,expectedVersion}')::integer = subject_version
+        )
+      ) THEN
+        RAISE EXCEPTION USING
+          MESSAGE = 'fact supersede subject version is stale';
       END IF;
       RETURN NEW;
     END
@@ -226,9 +257,9 @@ const exactPhase6LifecycleFunctionSources = {
 const exactFactScope =
   "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND access.can_read_space(space_id, access_class))";
 const exactLifecycleScope =
-  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND access.can_read_space(space_id, ( SELECT fact.access_class\n   FROM truth.accepted_facts fact\n  WHERE ((fact.tenant_id = fact_lifecycle_events.tenant_id) AND (fact.workspace_id = fact_lifecycle_events.workspace_id) AND (fact.space_id = fact_lifecycle_events.space_id) AND (fact.id = fact_lifecycle_events.predecessor_fact_id)))))";
+  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (EXISTS ( SELECT 1\n   FROM truth.accepted_facts predecessor\n  WHERE ((predecessor.tenant_id = fact_lifecycle_events.tenant_id) AND (predecessor.workspace_id = fact_lifecycle_events.workspace_id) AND (predecessor.space_id = fact_lifecycle_events.space_id) AND (predecessor.id = fact_lifecycle_events.predecessor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, predecessor.access_class)))) AND ((successor_fact_id IS NULL) OR (EXISTS ( SELECT 1\n   FROM truth.accepted_facts successor\n  WHERE ((successor.tenant_id = fact_lifecycle_events.tenant_id) AND (successor.workspace_id = fact_lifecycle_events.workspace_id) AND (successor.space_id = fact_lifecycle_events.space_id) AND (successor.id = fact_lifecycle_events.successor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, successor.access_class))))))";
 const exactLifecycleInsertScope =
-  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (acted_by_user_id = ops.current_user_id()) AND (acted_by_membership_id = ops.current_membership_id()) AND (policy_version = ops.current_policy_version()) AND access.can_read_space(space_id, ( SELECT fact.access_class\n   FROM truth.accepted_facts fact\n  WHERE ((fact.tenant_id = fact_lifecycle_events.tenant_id) AND (fact.workspace_id = fact_lifecycle_events.workspace_id) AND (fact.space_id = fact_lifecycle_events.space_id) AND (fact.id = fact_lifecycle_events.predecessor_fact_id)))))";
+  "((tenant_id = ops.current_tenant_id()) AND (workspace_id = ops.current_workspace_id()) AND (space_id = ops.current_space_id()) AND (acted_by_user_id = ops.current_user_id()) AND (acted_by_membership_id = ops.current_membership_id()) AND (policy_version = ops.current_policy_version()) AND (EXISTS ( SELECT 1\n   FROM truth.accepted_facts predecessor\n  WHERE ((predecessor.tenant_id = fact_lifecycle_events.tenant_id) AND (predecessor.workspace_id = fact_lifecycle_events.workspace_id) AND (predecessor.space_id = fact_lifecycle_events.space_id) AND (predecessor.id = fact_lifecycle_events.predecessor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, predecessor.access_class)))) AND ((successor_fact_id IS NULL) OR (EXISTS ( SELECT 1\n   FROM truth.accepted_facts successor\n  WHERE ((successor.tenant_id = fact_lifecycle_events.tenant_id) AND (successor.workspace_id = fact_lifecycle_events.workspace_id) AND (successor.space_id = fact_lifecycle_events.space_id) AND (successor.id = fact_lifecycle_events.successor_fact_id) AND access.can_read_space(fact_lifecycle_events.space_id, successor.access_class))))))";
 
 const exactPhase6PolicyAdditions = [
   {
@@ -270,6 +301,15 @@ const exactPhase6PolicyAdditions = [
 ] as const;
 
 const exactPhase6ConstraintAdditions = [
+  {
+    table_name: "accepted_facts",
+    name: "accepted_facts_lifecycle_deferred",
+    type: "t",
+    definition: "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+    deferrable: true,
+    initially_deferred: true,
+    validated: true
+  },
   {
     table_name: "accepted_facts",
     name: "accepted_facts_status_check",
@@ -470,6 +510,15 @@ const exactPhase6ConstraintAdditions = [
     deferrable: false,
     initially_deferred: false,
     validated: true
+  },
+  {
+    table_name: "fact_lifecycle_events",
+    name: "fact_lifecycle_valid_deferred",
+    type: "t",
+    definition: "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+    deferrable: true,
+    initially_deferred: true,
+    validated: true
   }
 ] as const;
 
@@ -664,6 +713,42 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(objectiveCatalog).not.toMatch(/active_index_(?:definition|predicate).*\.includes/);
   });
 
+  it("keeps generalized objective-recovery storage exclusions exact across phases 5 and 6", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+    const phaseForbiddenContract =
+      contract.match(
+        /function objectiveRecoveryForbiddenRelations[\s\S]*?\n}\n\nasync function validateObjectiveRecoveryCatalog/
+      )?.[0] ?? "";
+    const objectiveCatalog = contract.slice(
+      contract.indexOf("async function validateObjectiveRecoveryCatalog"),
+      contract.indexOf("function exactObjectiveRecoveryPolicies")
+    );
+
+    expect
+      .soft(phaseForbiddenContract)
+      .toMatch(
+        /case 5:\s+return \[\s*"conflict_groups",\s*"fact_lifecycle_events",\s*"fact_supersessions",\s*"derived_view_snapshots"\s*\];/
+      );
+    expect
+      .soft(phaseForbiddenContract)
+      .toMatch(
+        /case 6:\s+return \[\s*"conflict_groups",\s*"fact_supersessions",\s*"derived_view_snapshots"\s*\];/
+      );
+    expect
+      .soft(phaseForbiddenContract)
+      .toMatch(
+        /default:\s+throw new Error\("Objective recovery catalog received unsupported B2 phase"\);/
+      );
+    expect
+      .soft(objectiveCatalog)
+      .toContain("const forbiddenRelations = objectiveRecoveryForbiddenRelations(phase);");
+    expect.soft(objectiveCatalog).toContain("relation.relname = ANY($1::text[])");
+    expect.soft(objectiveCatalog).toMatch(/AS present`,\s*\[forbiddenRelations\]\s*\);/);
+    expect
+      .soft(objectiveCatalog)
+      .not.toMatch(/relation\.relname IN \(\s*'conflict_groups','fact_lifecycle_events'/);
+  });
+
   it("closes every non-index truth relation and ACL without expected-name filtering", async () => {
     const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
     const relationInventory = contract.slice(
@@ -702,7 +787,7 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
       [4, 13, 68, 13],
       [4, 13, 68, 13],
       [6, 19, 100, 23],
-      [7, 23, 119, 29]
+      [7, 23, 121, 29]
     ]);
     expect(exactTruthCatalogForPhase(6).relations.map(({ owner }) => owner)).toEqual(
       Array(7).fill("migration_owner")
@@ -728,6 +813,17 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
       }
     ]);
     expect(addedRows(phase6.policies, phase5.policies)).toEqual(exactPhase6PolicyAdditions);
+    for (const policyName of ["fact_lifecycle_insert", "fact_lifecycle_select"]) {
+      const policy = phase6.policies.find(({ policy_name }) => policy_name === policyName);
+      const expression = policy?.check_expression ?? policy?.using_expression;
+      expect(expression).toContain("predecessor.id = fact_lifecycle_events.predecessor_fact_id");
+      expect(expression).toContain("access.can_read_space(");
+      expect(expression).toContain("((successor_fact_id IS NULL) OR (EXISTS ( SELECT 1");
+      expect(expression).toContain("successor.id = fact_lifecycle_events.successor_fact_id");
+      expect(expression).toContain(
+        "access.can_read_space(fact_lifecycle_events.space_id, successor.access_class)"
+      );
+    }
     expect(addedRows(phase6.constraints, phase5.constraints)).toEqual(
       exactPhase6ConstraintAdditions
     );
@@ -793,6 +889,61 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(triggerContract).toContain("fact.supersede-or-revoke.v1");
   });
 
+  it("pins canonical lifecycle UNIQUE names and deferred trigger constraints", async () => {
+    const migration = await readFile(factLifecycleUrl, "utf8");
+    const phase6 = exactTruthCatalogForPhase(6);
+    const namedUniqueConstraints = [
+      ...migration.matchAll(/CONSTRAINT (fact_lifecycle_events_[a-z_]+)\s+UNIQUE \(([^)]+)\)/g)
+    ].map((match) => [match[1], match[2]]);
+
+    expect(namedUniqueConstraints).toEqual([
+      ["fact_lifecycle_events_tenant_workspace_id_key", "tenant_id, workspace_id, id"],
+      [
+        "fact_lifecycle_events_tenant_workspace_space_id_key",
+        "tenant_id, workspace_id, space_id, id"
+      ],
+      ["fact_lifecycle_events_predecessor_key", "tenant_id, workspace_id, predecessor_fact_id"],
+      ["fact_lifecycle_events_successor_key", "tenant_id, workspace_id, successor_fact_id"],
+      ["fact_lifecycle_events_command_key", "tenant_id, workspace_id, causation_command_id"]
+    ]);
+    expect([...migration.matchAll(/\bUNIQUE \(/g)]).toHaveLength(5);
+
+    expect(
+      phase6.constraints.filter(({ name }) =>
+        ["accepted_facts_lifecycle_deferred", "fact_lifecycle_valid_deferred"].includes(name)
+      )
+    ).toEqual([
+      {
+        table_name: "accepted_facts",
+        name: "accepted_facts_lifecycle_deferred",
+        type: "t",
+        definition: "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+        deferrable: true,
+        initially_deferred: true,
+        validated: true
+      },
+      {
+        table_name: "fact_lifecycle_events",
+        name: "fact_lifecycle_valid_deferred",
+        type: "t",
+        definition: "TRIGGER DEFERRABLE INITIALLY DEFERRED",
+        deferrable: true,
+        initially_deferred: true,
+        validated: true
+      }
+    ]);
+
+    for (const autoGeneratedName of [
+      "fact_lifecycle_events_tenant_id_workspace_id_causation_comm_key",
+      "fact_lifecycle_events_tenant_id_workspace_id_id_key",
+      "fact_lifecycle_events_tenant_id_workspace_id_predecessor_fa_key",
+      "fact_lifecycle_events_tenant_id_workspace_id_space_id_id_key",
+      "fact_lifecycle_events_tenant_id_workspace_id_successor_fact_key"
+    ]) {
+      expect(phase6.constraints.map(({ name }) => name)).not.toContain(autoGeneratedName);
+    }
+  });
+
   it("pins every Slice 4A lifecycle function row and body independently", async () => {
     const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
     const functionContract = contract.slice(
@@ -832,6 +983,49 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
         ])
       )
     ).toEqual(exactPhase6LifecycleFunctionSources);
+  });
+
+  it("trims the connected phase-6 lifecycle prosrc after collapsing whitespace", async () => {
+    const connectedContract = await readFile(
+      new URL("./b2-catalog-contract.postgres.spec.ts", import.meta.url),
+      "utf8"
+    );
+    const lifecycleQuery = connectedContract.slice(
+      connectedContract.indexOf("const lifecycleFunctions = await ownerPool.query"),
+      connectedContract.indexOf(
+        "expect(lifecycleFunctions.rows).toEqual(exactPhase6LifecycleFunctionCatalog)"
+      )
+    );
+
+    expect(lifecycleQuery).toContain(
+      "btrim(regexp_replace(procedure.prosrc, '[[:space:]]+', ' ', 'g')) AS source"
+    );
+    expect(lifecycleQuery).not.toContain(
+      "regexp_replace(btrim(procedure.prosrc), '[[:space:]]+', ' ', 'g') AS source"
+    );
+    expect(lifecycleQuery).not.toMatch(
+      /(?<!btrim\()regexp_replace\(procedure\.prosrc, '\[\[:space:\]\]\+', ' ', 'g'\) AS source/
+    );
+  });
+
+  it("builds the connected closed vocabulary with the exact PostgreSQL CHECK shape", async () => {
+    const connectedContract = await readFile(
+      new URL("./b2-catalog-contract.postgres.spec.ts", import.meta.url),
+      "utf8"
+    );
+    const closedVocabularyContract = connectedContract.slice(
+      connectedContract.indexOf("const closedVocabulary = await ownerPool.query"),
+      connectedContract.indexOf("const policies = await ownerPool.query", 1100)
+    );
+
+    expect(closedVocabularyContract).toMatch(/\.join\(", "\)\}\]\)\)\)`;/);
+    expect(closedVocabularyContract).not.toMatch(/\.join\(", "\)\}\]\)\)\)\)`;/);
+    expect(closedVocabularyContract).toContain(
+      'definition: exactAnyCheck("action", exactPhase6AuditActions)'
+    );
+    expect(closedVocabularyContract).toContain(
+      'definition: exactAnyCheck("event_type", exactPhase6OutboxEvents)'
+    );
   });
 
   it("uses exact policy, constraint, index, and safe-request function rows", async () => {
@@ -935,8 +1129,12 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     );
   });
 
-  it("casts PostgreSQL name columns to text before aggregating the exact inventory", async () => {
+  it("casts PostgreSQL name columns to text before aggregating exact inventories", async () => {
     const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+    const connectedContract = await readFile(
+      new URL("./b2-catalog-contract.postgres.spec.ts", import.meta.url),
+      "utf8"
+    );
 
     expect(contract).toContain(
       "array_agg(attribute.attname::text ORDER BY attribute.attnum) AS columns"
@@ -944,6 +1142,8 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(contract).not.toMatch(
       /array_agg\(attribute\.attname ORDER BY attribute\.attnum\) AS columns/
     );
+    expect(connectedContract).toContain("array_agg(trigger.tgname::text ORDER BY trigger.tgname)");
+    expect(connectedContract).not.toMatch(/array_agg\(trigger\.tgname ORDER BY trigger\.tgname\)/);
   });
 
   it("inspects PUBLIC through expanded PostgreSQL ACLs instead of role-name helpers", async () => {
@@ -957,6 +1157,33 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(contract).toContain("namespace.nspacl, acldefault('n', namespace.nspowner)");
     expect(contract).toContain("procedure.proacl, acldefault('f', procedure.proowner)");
     expect(contract).toContain("acl_record.grantee = 0");
+  });
+
+  it("adds exactly the four phase-6 accepted Fact lifecycle UPDATE columns", async () => {
+    const contract = await readFile(new URL("./b2-catalog-contract.ts", import.meta.url), "utf8");
+    const truthSecurityContract = contract.slice(
+      contract.indexOf("async function validateTruthSecurity"),
+      contract.indexOf("async function validateTruthFunctions")
+    );
+    const phase6AclContract =
+      truthSecurityContract.match(
+        /if \(phase >= 6\) \{[\s\S]*?table_name: "accepted_facts"[\s\S]*?\n[ ]{2}}/
+      )?.[0] ?? "";
+
+    expect
+      .soft(phase6AclContract)
+      .toMatch(
+        /for \(const column_name of \[\s*"last_causation_command_id",\s*"status",\s*"updated_at",\s*"version"\s*\]\)/
+      );
+    expect.soft(phase6AclContract).toContain('table_name: "accepted_facts"');
+    expect.soft(phase6AclContract).toContain('scope: "column"');
+    expect.soft(phase6AclContract).toContain('grantee: "throughline_app"');
+    expect.soft(phase6AclContract).toContain('privilege: "UPDATE"');
+    expect.soft(phase6AclContract).toContain("grantable: false");
+    expect(truthSecurityContract).toMatch(
+      /for \(const column_name of \["status", "updated_at", "version"\]\) \{\s*expectedTablePrivileges\.push\(\{\s*table_name: "claims"/
+    );
+    expect(truthSecurityContract.match(/table_name: "accepted_facts"/g)).toHaveLength(1);
   });
 
   it("closes the B2 command function catalog and direct EXECUTE ACLs exactly", async () => {
