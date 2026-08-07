@@ -957,6 +957,9 @@ describe("B2 Slice 1 catalog contract unit boundary", () => {
     expect(functionContract).toContain(
       "migrationFunctionSource(factLifecycleSource!, identity.slice(0, -2))"
     );
+    expect(functionContract).toMatch(
+      /const phase6BackedFunction =[\s\S]*?identity === "truth\.validate_fact_insert\(\)" \|\|[\s\S]*?identity === "truth\.validate_fact_support\(\)";/
+    );
     for (const field of [
       "pg_get_function_result(procedure.oid) AS result",
       "language.lanname AS language",

@@ -59,9 +59,11 @@ const exact0012FunctionBodyDigests = {
   "truth.require_fact_lifecycle_event()":
     "16e0ece019be747f0ac189bdb092b622ae37d6183990dd2b54e9d02a126135c9",
   "truth.require_reserved_command()":
-    "91b97c7b7e5efef91129f48ab842e3d5047d1e72f4e353d5514829d90c9f00b7",
+    "5d5ebd2c3623d64c51f6a393ddcf593149cd3ef5d0e474a157e86ca534d83c36",
   "truth.validate_fact_insert()":
-    "c27176c6b7a8050c1d98f9c38333864614ee0f85c3dd0ded411a522745c81756",
+    "0b8110b64ae04d0c3140d3a338f5d0d056695d5612080ba6b6d94abd1464f8ef",
+  "truth.validate_fact_support()":
+    "a8ad48c8b431bf21e11f6468f40e34eeb148d1fe50fa1637602e2e9f7c02f046",
   "truth.validate_fact_lifecycle_event()":
     "40a11b34d6a9cdb43a496523b81c3bade3b340600a6b21b4e97453e1dc55b550"
 } as const;

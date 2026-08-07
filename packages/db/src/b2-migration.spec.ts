@@ -50,9 +50,11 @@ const exact0012FunctionBodyDigests = {
   "truth.require_fact_lifecycle_event()":
     "16e0ece019be747f0ac189bdb092b622ae37d6183990dd2b54e9d02a126135c9",
   "truth.require_reserved_command()":
-    "91b97c7b7e5efef91129f48ab842e3d5047d1e72f4e353d5514829d90c9f00b7",
+    "5d5ebd2c3623d64c51f6a393ddcf593149cd3ef5d0e474a157e86ca534d83c36",
   "truth.validate_fact_insert()":
-    "c27176c6b7a8050c1d98f9c38333864614ee0f85c3dd0ded411a522745c81756",
+    "0b8110b64ae04d0c3140d3a338f5d0d056695d5612080ba6b6d94abd1464f8ef",
+  "truth.validate_fact_support()":
+    "a8ad48c8b431bf21e11f6468f40e34eeb148d1fe50fa1637602e2e9f7c02f046",
   "truth.validate_fact_lifecycle_event()":
     "40a11b34d6a9cdb43a496523b81c3bade3b340600a6b21b4e97453e1dc55b550"
 } as const;
@@ -692,8 +694,8 @@ describe("B2 Slice 1 additive migration contract", () => {
     const reservation = migrationFunctionBody(sql, "truth.require_reserved_command");
 
     expect(reservation).toBeDefined();
-    expect(reservation).toContain(
-      "TG_TABLE_NAME = 'accepted_facts' AND actual_kind = 'fact.supersede.v1'"
+    expect(reservation).toMatch(
+      /ELSIF TG_TABLE_NAME = 'accepted_facts' THEN\s+IF actual_kind = 'fact\.supersede\.v1' AND/
     );
     expect(reservation).toContain("command_request ? 'confidenceLowering'");
     expect(reservation).toMatch(
@@ -707,6 +709,28 @@ describe("B2 Slice 1 additive migration contract", () => {
     );
   });
 
+  it("keeps the shared reservation trigger shape-safe for every attached truth row", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const reservation = migrationFunctionBody(sql, "truth.require_reserved_command");
+
+    expect(reservation).toBeDefined();
+    expect(reservation).toContain("row_data jsonb := to_jsonb(NEW)");
+    expect(
+      [...reservation!.matchAll(/\bNEW\.([a-z][a-z0-9_]*)/g)].map((match) => match[1])
+    ).toEqual([]);
+    for (const field of [
+      "tenant_id",
+      "workspace_id",
+      "space_id",
+      "subject_type",
+      "subject_id",
+      "predicate",
+      "last_causation_command_id"
+    ]) {
+      expect(reservation).toContain(`row_data ->> '${field}'`);
+    }
+  });
+
   it("positively binds successor insertion to the exact terminalized predecessor", async () => {
     const sql = await readFile(factLifecycleUrl, "utf8");
     const reservation = migrationFunctionBody(sql, "truth.require_reserved_command");
@@ -714,12 +738,10 @@ describe("B2 Slice 1 additive migration contract", () => {
 
     expect(reservation).toBeDefined();
     const successorReservation = reservation!.slice(
-      reservation!.indexOf(
-        "ELSIF TG_TABLE_NAME = 'accepted_facts' AND actual_kind = 'fact.supersede.v1'"
-      )
+      reservation!.indexOf("ELSIF TG_TABLE_NAME = 'accepted_facts' THEN")
     );
     expect(successorReservation).toMatch(
-      /NOT EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts predecessor[\s\S]*?predecessor\.tenant_id = NEW\.tenant_id[\s\S]*?predecessor\.workspace_id = NEW\.workspace_id[\s\S]*?predecessor\.space_id = NEW\.space_id[\s\S]*?predecessor\.id::text = command_request ->> 'factId'[\s\S]*?predecessor\.subject_type = NEW\.subject_type[\s\S]*?predecessor\.subject_id = NEW\.subject_id[\s\S]*?predecessor\.predicate = NEW\.predicate[\s\S]*?predecessor\.status = 'superseded'[\s\S]*?predecessor\.version = 2[\s\S]*?predecessor\.last_causation_command_id = NEW\.last_causation_command_id/
+      /NOT EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts predecessor[\s\S]*?predecessor\.tenant_id = \(row_data ->> 'tenant_id'\)::uuid[\s\S]*?predecessor\.workspace_id = \(row_data ->> 'workspace_id'\)::uuid[\s\S]*?predecessor\.space_id = \(row_data ->> 'space_id'\)::uuid[\s\S]*?predecessor\.id::text = command_request ->> 'factId'[\s\S]*?predecessor\.subject_type = row_data ->> 'subject_type'[\s\S]*?predecessor\.subject_id = \(row_data ->> 'subject_id'\)::uuid[\s\S]*?predecessor\.predicate = row_data ->> 'predicate'[\s\S]*?predecessor\.status = 'superseded'[\s\S]*?predecessor\.version = 2[\s\S]*?predecessor\.last_causation_command_id =\s*\(row_data ->> 'last_causation_command_id'\)::uuid/
     );
     expect(successorReservation).toContain(
       "RAISE EXCEPTION 'truth mutation requires its exact reserved command'"
@@ -742,6 +764,52 @@ describe("B2 Slice 1 additive migration contract", () => {
     expect(authority).not.toMatch(
       /EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts prior[\s\S]*?AND NOT \(command_kind_value = 'fact\.supersede\.v1'/
     );
+  });
+
+  it("rejects every accepted or successor Fact below its current non-archived Space class", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const authority = migrationFunctionBody(sql, "truth.validate_fact_insert");
+
+    expect(authority).toBeDefined();
+    expect(authority).toMatch(
+      /SELECT space\.access_class INTO current_space_access_class[\s\S]*?FROM access\.spaces space[\s\S]*?space\.tenant_id = NEW\.tenant_id[\s\S]*?space\.workspace_id = NEW\.workspace_id[\s\S]*?space\.id = NEW\.space_id[\s\S]*?space\.archived_at IS NULL[\s\S]*?FOR SHARE/
+    );
+    expect(authority).toContain("current_space_access_class IS NULL");
+    expect(authority).toMatch(
+      /content\.access_class_rank\(NEW\.access_class\)\s*<\s*content\.access_class_rank\(current_space_access_class\)/
+    );
+    expect(authority).toContain(
+      "RAISE EXCEPTION 'fact access class is below current Space classification'"
+    );
+    const spaceCheck = authority!.indexOf("current_space_access_class IS NULL");
+    expect(spaceCheck).toBeGreaterThan(-1);
+    expect(spaceCheck).toBeLessThan(authority!.indexOf("command_kind_value = 'fact.accept.v1'"));
+    expect(spaceCheck).toBeLessThan(authority!.indexOf("command_kind_value = 'fact.supersede.v1'"));
+  });
+
+  it("requires exact Fact classification from current Space plus persisted Claim evidence", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const support = migrationFunctionBody(sql, "truth.validate_fact_support");
+
+    expect(support).toBeDefined();
+    expect(support).toContain("row_data jsonb := to_jsonb(NEW)");
+    expect(support).toContain("WHEN 'accepted_facts' THEN row_data ->> 'id'");
+    expect(support).toContain("WHEN 'fact_claims' THEN row_data ->> 'fact_id'");
+    expect(support).toMatch(
+      /SELECT content\.access_class_rank\(space\.access_class\)[\s\S]*?FROM access\.spaces space[\s\S]*?space\.tenant_id = fact_record\.tenant_id[\s\S]*?space\.workspace_id = fact_record\.workspace_id[\s\S]*?space\.id = fact_record\.space_id[\s\S]*?space\.archived_at IS NULL/
+    );
+    expect(support).toMatch(
+      /LEFT JOIN truth\.verified_evidence_spans evidence[\s\S]*?evidence\.id = claim\.verified_evidence_span_id/
+    );
+    expect(support).toContain("evidence.access_class <> claim.access_class");
+    expect(support).toMatch(
+      /max\(GREATEST\([\s\S]*?content\.access_class_rank\(claim\.access_class\)[\s\S]*?content\.access_class_rank\(evidence\.access_class\)[\s\S]*?INTO support_count, invalid_count, strongest_rank, support_access/
+    );
+    expect(support).toContain("required_access := GREATEST(required_access, support_access)");
+    expect(support).toContain(
+      "content.access_class_rank(fact_record.access_class) <> required_access"
+    );
+    expect(support).toContain("RAISE EXCEPTION 'accepted fact support is invalid'");
   });
 
   it("classifies lifecycle rows by predecessor and optional successor visibility", async () => {

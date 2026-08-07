@@ -429,9 +429,10 @@ BEGIN
   END;
   SELECT command.command_kind, command.safe_request INTO actual_kind, command_request
     FROM ops.domain_command_records command
-   WHERE command.tenant_id = NEW.tenant_id AND command.workspace_id = NEW.workspace_id
+   WHERE command.tenant_id = (row_data ->> 'tenant_id')::uuid
+     AND command.workspace_id = (row_data ->> 'workspace_id')::uuid
      AND command.id = command_id AND command.state = 'reserved'
-     AND command.reservation_space_id = NEW.space_id
+     AND command.reservation_space_id = (row_data ->> 'space_id')::uuid
      AND command.actor_user_id = ops.current_user_id()
      AND command.actor_membership_id = ops.current_membership_id()
      AND command.policy_version_id = ops.current_policy_version();
@@ -478,47 +479,50 @@ BEGIN
       OR command_request ->> 'excerptHash' <> row_data ->> 'excerpt_hash'
       OR command_request ->> 'supportConfirmed' <> 'true'
     ) THEN RAISE EXCEPTION 'truth mutation requires its exact reserved command';
-  ELSIF TG_TABLE_NAME = 'accepted_facts' AND actual_kind = 'fact.supersede.v1' AND (
-      command_request #>> '{subject,type}' <> row_data ->> 'subject_type'
-      OR command_request #>> '{subject,id}' <> row_data ->> 'subject_id'
-      OR row_data ->> 'status' <> 'current'
-      OR (row_data ->> 'version')::integer <> 1
-      OR NOT EXISTS (
-        SELECT 1 FROM truth.accepted_facts predecessor
-         WHERE predecessor.tenant_id = NEW.tenant_id
-           AND predecessor.workspace_id = NEW.workspace_id
-           AND predecessor.space_id = NEW.space_id
-           AND predecessor.id::text = command_request ->> 'factId'
-           AND predecessor.subject_type = NEW.subject_type
-           AND predecessor.subject_id = NEW.subject_id
-           AND predecessor.predicate = NEW.predicate
-           AND predecessor.status = 'superseded'
-           AND predecessor.version = 2
-           AND predecessor.last_causation_command_id = NEW.last_causation_command_id
-      )
-      OR (
-        command_request ? 'confidenceLowering'
-        AND (
-          command_request #>> '{confidenceLowering,confidence}' IS DISTINCT FROM
-            row_data ->> 'confidence'
-          OR (row_data ->> 'human_lowered')::boolean IS DISTINCT FROM true
-          OR command_request #>> '{confidenceLowering,reason,code}' IS DISTINCT FROM
-            row_data ->> 'confidence_lowering_reason_code'
-          OR command_request #>> '{confidenceLowering,reason,rationale}' IS DISTINCT FROM
-            row_data ->> 'confidence_lowering_rationale'
+  ELSIF TG_TABLE_NAME = 'accepted_facts' THEN
+    IF actual_kind = 'fact.supersede.v1' AND (
+        command_request #>> '{subject,type}' <> row_data ->> 'subject_type'
+        OR command_request #>> '{subject,id}' <> row_data ->> 'subject_id'
+        OR row_data ->> 'status' <> 'current'
+        OR (row_data ->> 'version')::integer <> 1
+        OR NOT EXISTS (
+          SELECT 1 FROM truth.accepted_facts predecessor
+           WHERE predecessor.tenant_id = (row_data ->> 'tenant_id')::uuid
+             AND predecessor.workspace_id = (row_data ->> 'workspace_id')::uuid
+             AND predecessor.space_id = (row_data ->> 'space_id')::uuid
+             AND predecessor.id::text = command_request ->> 'factId'
+             AND predecessor.subject_type = row_data ->> 'subject_type'
+             AND predecessor.subject_id = (row_data ->> 'subject_id')::uuid
+             AND predecessor.predicate = row_data ->> 'predicate'
+             AND predecessor.status = 'superseded'
+             AND predecessor.version = 2
+             AND predecessor.last_causation_command_id =
+               (row_data ->> 'last_causation_command_id')::uuid
         )
-      )
-      OR (
-        NOT (command_request ? 'confidenceLowering')
-        AND (
-          row_data ->> 'confidence' IS DISTINCT FROM
-            row_data ->> 'strongest_supporting_confidence'
-          OR (row_data ->> 'human_lowered')::boolean IS DISTINCT FROM false
-          OR row_data ->> 'confidence_lowering_reason_code' IS NOT NULL
-          OR row_data ->> 'confidence_lowering_rationale' IS NOT NULL
+        OR (
+          command_request ? 'confidenceLowering'
+          AND (
+            command_request #>> '{confidenceLowering,confidence}' IS DISTINCT FROM
+              row_data ->> 'confidence'
+            OR (row_data ->> 'human_lowered')::boolean IS DISTINCT FROM true
+            OR command_request #>> '{confidenceLowering,reason,code}' IS DISTINCT FROM
+              row_data ->> 'confidence_lowering_reason_code'
+            OR command_request #>> '{confidenceLowering,reason,rationale}' IS DISTINCT FROM
+              row_data ->> 'confidence_lowering_rationale'
+          )
         )
-      )
-    ) THEN RAISE EXCEPTION 'truth mutation requires its exact reserved command';
+        OR (
+          NOT (command_request ? 'confidenceLowering')
+          AND (
+            row_data ->> 'confidence' IS DISTINCT FROM
+              row_data ->> 'strongest_supporting_confidence'
+            OR (row_data ->> 'human_lowered')::boolean IS DISTINCT FROM false
+            OR row_data ->> 'confidence_lowering_reason_code' IS NOT NULL
+            OR row_data ->> 'confidence_lowering_rationale' IS NOT NULL
+          )
+        )
+      ) THEN RAISE EXCEPTION 'truth mutation requires its exact reserved command';
+    END IF;
   END IF;
   RETURN NEW;
 END
@@ -679,6 +683,7 @@ RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $function$
 DECLARE
   subject_owner uuid;
   subject_space uuid;
+  current_space_access_class text;
   command_kind_value text;
   command_request jsonb;
 BEGIN
@@ -690,6 +695,19 @@ BEGIN
     SELECT owner_person_id, space_id INTO subject_owner, subject_space
       FROM work.initiatives WHERE tenant_id = NEW.tenant_id
        AND workspace_id = NEW.workspace_id AND id = NEW.subject_id FOR SHARE;
+  END IF;
+  SELECT space.access_class INTO current_space_access_class
+    FROM access.spaces space
+   WHERE space.tenant_id = NEW.tenant_id
+     AND space.workspace_id = NEW.workspace_id
+     AND space.id = NEW.space_id
+     AND space.archived_at IS NULL
+   FOR SHARE;
+  IF current_space_access_class IS NULL
+    OR content.access_class_rank(NEW.access_class) <
+       content.access_class_rank(current_space_access_class)
+  THEN
+    RAISE EXCEPTION 'fact access class is below current Space classification';
   END IF;
   SELECT command.command_kind, command.safe_request INTO command_kind_value, command_request
     FROM ops.domain_command_records command
@@ -733,6 +751,106 @@ BEGIN
       pg_catalog.convert_to(NEW.canonical_value_text, 'UTF8'), 'sha256'
     ), 'hex')
   THEN RAISE EXCEPTION 'fact acceptance authority is invalid'; END IF;
+  RETURN NEW;
+END
+$function$;
+
+CREATE OR REPLACE FUNCTION truth.validate_fact_support()
+RETURNS trigger LANGUAGE plpgsql SET search_path = pg_catalog AS $function$
+DECLARE
+  row_data jsonb := to_jsonb(NEW);
+  selected_fact_id uuid;
+  fact_record record;
+  support_count integer;
+  invalid_count integer;
+  strongest_rank integer;
+  stored_strongest_rank integer;
+  fact_rank integer;
+  required_access integer;
+  support_access integer;
+BEGIN
+  selected_fact_id := (
+    CASE TG_TABLE_NAME
+      WHEN 'accepted_facts' THEN row_data ->> 'id'
+      WHEN 'fact_claims' THEN row_data ->> 'fact_id'
+      ELSE NULL
+    END
+  )::uuid;
+  SELECT * INTO fact_record
+    FROM truth.accepted_facts fact
+   WHERE fact.tenant_id = NEW.tenant_id
+     AND fact.workspace_id = NEW.workspace_id
+     AND fact.id = selected_fact_id;
+  IF fact_record IS NULL THEN
+    RAISE EXCEPTION 'accepted fact support is missing';
+  END IF;
+
+  SELECT content.access_class_rank(space.access_class)
+    INTO required_access
+    FROM access.spaces space
+   WHERE space.tenant_id = fact_record.tenant_id
+     AND space.workspace_id = fact_record.workspace_id
+     AND space.id = fact_record.space_id
+     AND space.archived_at IS NULL;
+  IF required_access IS NULL THEN
+    RAISE EXCEPTION 'accepted fact support is invalid';
+  END IF;
+
+  SELECT count(*),
+         count(*) FILTER (
+           WHERE claim.status <> 'accepted'
+             OR claim.space_id <> fact_record.space_id
+             OR claim.subject_type <> fact_record.subject_type
+             OR claim.subject_id <> fact_record.subject_id
+             OR claim.predicate <> fact_record.predicate
+             OR claim.canonical_value_text <> fact_record.canonical_value_text
+             OR claim.normalized_text <> fact_record.normalized_text
+             OR claim.valid_from IS DISTINCT FROM fact_record.valid_from
+             OR claim.valid_to IS DISTINCT FROM fact_record.valid_to
+             OR evidence.id IS NULL
+             OR evidence.space_id <> fact_record.space_id
+             OR evidence.access_class <> claim.access_class
+         ),
+         max(CASE claim.confidence
+           WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
+           WHEN 'weak' THEN 1 ELSE 0 END),
+         max(GREATEST(
+           content.access_class_rank(claim.access_class),
+           content.access_class_rank(evidence.access_class)
+         ))
+    INTO support_count, invalid_count, strongest_rank, support_access
+    FROM truth.fact_claims support
+    JOIN truth.claims claim
+      ON claim.tenant_id = support.tenant_id
+     AND claim.workspace_id = support.workspace_id
+     AND claim.id = support.claim_id
+    LEFT JOIN truth.verified_evidence_spans evidence
+      ON evidence.tenant_id = claim.tenant_id
+     AND evidence.workspace_id = claim.workspace_id
+     AND evidence.space_id = claim.space_id
+     AND evidence.id = claim.verified_evidence_span_id
+   WHERE support.tenant_id = NEW.tenant_id
+     AND support.workspace_id = NEW.workspace_id
+     AND support.fact_id = selected_fact_id;
+
+  IF support_access IS NOT NULL THEN
+    required_access := GREATEST(required_access, support_access);
+  END IF;
+  fact_rank := CASE fact_record.confidence
+    WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
+    WHEN 'weak' THEN 1 ELSE 0 END;
+  stored_strongest_rank := CASE fact_record.strongest_supporting_confidence
+    WHEN 'confirmed' THEN 3 WHEN 'strong' THEN 2
+    WHEN 'weak' THEN 1 ELSE 0 END;
+  IF support_count < 1 OR invalid_count <> 0
+    OR fact_rank > strongest_rank
+    OR fact_record.confidence_rule <> 'strongest-selected-valid-claim.v1'
+    OR stored_strongest_rank <> strongest_rank
+    OR fact_record.human_lowered <> (fact_rank < strongest_rank)
+    OR content.access_class_rank(fact_record.access_class) <> required_access
+  THEN
+    RAISE EXCEPTION 'accepted fact support is invalid';
+  END IF;
   RETURN NEW;
 END
 $function$;

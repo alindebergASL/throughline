@@ -1612,7 +1612,8 @@ async function validateTruthFunctions(
         identity === "truth.enforce_claim_transition()" ||
         identity === "truth.require_reserved_command()" ||
         identity === "truth.require_fact_accept_reservation()" ||
-        identity === "truth.validate_fact_insert()";
+        identity === "truth.validate_fact_insert()" ||
+        identity === "truth.validate_fact_support()";
       return {
         identity,
         result: accessFunction ? "boolean" : "trigger",
