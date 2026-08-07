@@ -608,7 +608,9 @@ const b1Actions = new Set<AuthorizationAction>([
   "initiative.primary_objective.proposal.reject",
   "initiative.primary_objective.proposal.rework",
   "fact.read",
-  "fact.accept"
+  "fact.accept",
+  "fact.supersede",
+  "fact.revoke"
 ]);
 
 function isB1Action(action: AuthorizationAction): boolean {
@@ -620,7 +622,9 @@ const truthMutationActions = new Set<AuthorizationAction>([
   "initiative.primary_objective.proposal.withdraw",
   "initiative.primary_objective.proposal.reject",
   "initiative.primary_objective.proposal.rework",
-  "fact.accept"
+  "fact.accept",
+  "fact.supersede",
+  "fact.revoke"
 ]);
 
 function isTruthMutationAction(action: AuthorizationAction): boolean {
@@ -642,6 +646,9 @@ async function truthMutationDecision(
   }
   if (action.startsWith("initiative.primary_objective.proposal.")) {
     return objectiveProposalMutationDecision(tx, context, role, action, resource, options, actor);
+  }
+  if (action === "fact.supersede" || action === "fact.revoke") {
+    return factLifecycleMutationDecision(tx, context, role, resource, options, actor);
   }
   const target = await loadTruthAuthorityTarget(tx, context, action, resource, options);
   if (!target || !canReadDataClass(context.dataClassCeiling, target.accessClass)) {
@@ -676,6 +683,78 @@ async function truthMutationDecision(
         readable.authorityTokens
       )
     : nonLeakingB1Deny(context.policyVersion);
+}
+
+async function factLifecycleMutationDecision(
+  tx: TenantQueryExecutor,
+  context: SecurityContext,
+  role: MembershipRole,
+  resource: ResourceRef,
+  options: TransactionAuthorizationDecisionOptions,
+  actor: { personId: string }
+): Promise<AuthorizationDecision> {
+  if (resource.type !== "fact") return nonLeakingB1Deny(context.policyVersion);
+
+  const factResult = await tx.query<{
+    space_id: string;
+    subject_type: "activity" | "initiative";
+    subject_id: string;
+    predicate: "activity.outcome" | "initiative.primary_objective";
+    access_class: AccessClass;
+  }>(
+    `SELECT fact.space_id, fact.subject_type, fact.subject_id, fact.predicate,
+            CASE GREATEST(
+              CASE space.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END,
+              CASE fact.access_class WHEN 'public' THEN 0 WHEN 'workspace' THEN 1 WHEN 'restricted' THEN 2 ELSE 3 END
+            ) WHEN 0 THEN 'public' WHEN 1 THEN 'workspace' WHEN 2 THEN 'restricted' ELSE 'confidential' END AS access_class
+       FROM truth.accepted_facts fact
+       JOIN access.spaces space
+         ON space.tenant_id = fact.tenant_id
+        AND space.workspace_id = fact.workspace_id
+        AND space.id = fact.space_id
+      WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.id = $3
+        AND fact.status = 'current' AND fact.version = 1
+        AND ((fact.subject_type = 'activity' AND fact.predicate = 'activity.outcome')
+          OR (fact.subject_type = 'initiative' AND fact.predicate = 'initiative.primary_objective'))
+        AND space.archived_at IS NULL
+      LIMIT 1 ${options.lockAuthority === true ? "FOR SHARE OF fact, space" : ""}`,
+    [context.tenantId, context.workspaceId, resource.id]
+  );
+  const fact = factResult.rows[0];
+  if (
+    !fact ||
+    context.requestedSpaceIds.length !== 1 ||
+    context.requestedSpaceIds[0] !== fact.space_id ||
+    !canReadDataClass(context.dataClassCeiling, fact.access_class)
+  ) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+
+  const subjectTable = fact.subject_type === "activity" ? "work.activities" : "work.initiatives";
+  const subjectResult = await tx.query<{ owner_person_id: string }>(
+    `SELECT subject.owner_person_id
+       FROM ${subjectTable} subject
+      WHERE subject.tenant_id = $1 AND subject.workspace_id = $2
+        AND subject.id = $3 AND subject.space_id = $4
+      LIMIT 1 ${options.lockAuthority === true ? "FOR SHARE OF subject" : ""}`,
+    [context.tenantId, context.workspaceId, fact.subject_id, fact.space_id]
+  );
+  const subject = subjectResult.rows[0];
+  if (!subject || subject.owner_person_id !== actor.personId) {
+    return nonLeakingB1Deny(context.policyVersion);
+  }
+
+  const readable = await canReadSpaceResource(tx, context, fact.space_id, role, {
+    lockAuthority: options.lockAuthority === true
+  });
+  if (!readable.allowed) return nonLeakingB1Deny(context.policyVersion);
+
+  return allow(
+    context.policyVersion,
+    fact.subject_type === "activity" ? "b2_activity_owner" : "b2_initiative_owner",
+    undefined,
+    readable.authorityTokens
+  );
 }
 
 async function objectiveProposalMutationDecision(

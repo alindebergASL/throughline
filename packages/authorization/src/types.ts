@@ -42,7 +42,9 @@ export type AuthorizationAction =
   | "initiative.primary_objective.proposal.reject"
   | "initiative.primary_objective.proposal.rework"
   | "fact.read"
-  | "fact.accept";
+  | "fact.accept"
+  | "fact.supersede"
+  | "fact.revoke";
 
 export interface WorkerAuthorizationBinding {
   referenceId: string;
