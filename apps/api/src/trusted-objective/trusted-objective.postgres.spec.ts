@@ -1406,7 +1406,7 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
     const corruptAccessClass =
       acceptedFact.access_class === "confidential" ? "public" : "confidential";
     await ownerPool.query(
-      "ALTER TABLE truth.accepted_facts DISABLE TRIGGER accepted_facts_immutable"
+      "ALTER TABLE truth.accepted_facts DISABLE TRIGGER accepted_facts_lifecycle_guard"
     );
     try {
       await ownerPool.query(`UPDATE truth.accepted_facts SET access_class = $2 WHERE id = $1`, [
@@ -1415,7 +1415,7 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
       ]);
     } finally {
       await ownerPool.query(
-        "ALTER TABLE truth.accepted_facts ENABLE TRIGGER accepted_facts_immutable"
+        "ALTER TABLE truth.accepted_facts ENABLE TRIGGER accepted_facts_lifecycle_guard"
       );
     }
     const unprojectable = await getAs("tenant-a-owner", initiativeId);

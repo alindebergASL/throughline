@@ -1179,7 +1179,10 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       input.policyVersion !== state.policyVersion ||
       !isUuidV7(input.lifecycleEventId) ||
       !isUuidV7(input.commandId) ||
-      maxAccessClass(fact.accessClass, input.target.subjectAccessClass) !== fact.accessClass ||
+      maxAccessClass(
+        fact.accessClass,
+        maxAccessClass(input.target.subjectAccessClass, input.target.factAccessClass)
+      ) !== fact.accessClass ||
       !sameSortedIds(fact.supportingClaimIds, state.replacementClaimIds)
     ) {
       throw new TruthLedgerConflictError();

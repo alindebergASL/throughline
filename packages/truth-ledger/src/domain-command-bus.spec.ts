@@ -6,8 +6,10 @@ import {
   type PgPoolClient,
   type TenantDbTransaction
 } from "@throughline/db";
+import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { parseB2Command } from "./command-schemas.js";
 import { B2AuthorizationError, TruthLedgerDomainCommandBus } from "./domain-command-bus.js";
 import { TruthLedgerConflictError, TruthLedgerRepository } from "./repository.js";
 import { VerifiedClaimSourceSpanAdmission } from "./source-span.js";
@@ -18,23 +20,189 @@ const spaceId = id("3");
 describe.sequential("durable truth command boundary", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("does not execute dormant PR 1 lifecycle command contracts", async () => {
+  it("does not execute dormant conflict, emergency, or derived-view command contracts", async () => {
     const pool = transactionPool(true).pool;
+
+    for (const command of dormantCommands()) {
+      await expect(
+        new TruthLedgerDomainCommandBus(pool).execute(command, context())
+      ).rejects.toThrow("B2 command request is invalid");
+    }
+
+    expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["fact.supersede", supersedeCommand, supersedeResult()],
+    ["fact.revoke", revokeCommand, revokeResult()]
+  ] as const)(
+    "executes the activated %s contract through the durable reservation boundary",
+    async (kind, buildCommand, durableResult) => {
+      const { pool } = transactionPool(true);
+      const prelock = vi.spyOn(TruthLedgerRepository.prototype, "prelockCurrentFact");
+      const reserve = vi.spyOn(DomainCommandRepository.prototype, "reserve").mockResolvedValue({
+        status: "replay",
+        command: {
+          id: id("12"),
+          safeResponse: durableResult,
+          completedAt: new Date("2026-08-07T00:01:00.000Z")
+        }
+      });
+      const auth = authorization(true);
+
+      await expect(
+        new TruthLedgerDomainCommandBus(pool, auth).execute(buildCommand(), context())
+      ).resolves.toEqual(durableResult);
+
+      expect(reserve).toHaveBeenCalledWith(
+        expect.objectContaining({
+          commandKind: `${kind}.v1`,
+          commandSchemaVersion: 1,
+          reservationSpaceId: spaceId,
+          safeRequest: safeLifecycleRequest(kind)
+        })
+      );
+      expect(prelock).not.toHaveBeenCalled();
+      expect(auth.canInTransaction).toHaveBeenCalledOnce();
+      expect(auth.canInTransaction).toHaveBeenCalledWith(
+        expect.anything(),
+        kind,
+        { type: "fact", id: id("20") },
+        expect.anything(),
+        { lockAuthority: true, factLifecycleReplay: true }
+      );
+      expect(vi.mocked(auth.canInTransaction).mock.invocationCallOrder[0]).toBeGreaterThan(
+        reserve.mock.invocationCallOrder[0]!
+      );
+    }
+  );
+
+  it.each([
+    ["fact.supersede", supersedeCommand, supersedeResult()],
+    ["fact.revoke", revokeCommand, revokeResult()]
+  ] as const)(
+    "withholds the durable %s result when the replaying actor lost lifecycle authority",
+    async (_kind, buildCommand, durableResult) => {
+      const { pool, client } = transactionPool(true);
+      const prelock = vi.spyOn(TruthLedgerRepository.prototype, "prelockCurrentFact");
+      vi.spyOn(DomainCommandRepository.prototype, "reserve").mockResolvedValue({
+        status: "replay",
+        command: {
+          id: id("12"),
+          safeResponse: durableResult,
+          completedAt: new Date("2026-08-07T00:01:00.000Z")
+        }
+      });
+      const auth = authorization(false);
+
+      const error = await captureError(
+        new TruthLedgerDomainCommandBus(pool, auth).execute(buildCommand(), context())
+      );
+
+      expect({ name: error.name, message: error.message }).toEqual({
+        name: "TruthLedgerConflictError",
+        message: "Truth command precondition failed"
+      });
+      expect(auth.canInTransaction).toHaveBeenCalledOnce();
+      expect(prelock).not.toHaveBeenCalled();
+      expect(client.query).toHaveBeenCalledWith("ROLLBACK");
+    }
+  );
+
+  it("rejects a successor classified below the predecessor Fact before the lifecycle mutation", async () => {
+    const { pool, client } = transactionPool(true);
+    vi.spyOn(DomainCommandRepository.prototype, "reserve").mockImplementation(async (input) => ({
+      status: "reserved",
+      commandId: input.id
+    }));
+    const prelock = vi
+      .spyOn(TruthLedgerRepository.prototype, "prelockCurrentFact")
+      .mockResolvedValue({ factId: id("20") } as never);
+    vi.spyOn(
+      TruthLedgerRepository.prototype,
+      "refreshCurrentFactAfterAuthorization"
+    ).mockResolvedValue(confidentialPredecessorInWorkspaceSpace() as never);
+    const lockReplacements = vi
+      .spyOn(TruthLedgerRepository.prototype, "lockReplacementClaimsForSupersession")
+      .mockResolvedValue([workspaceReplacementClaim()] as never);
+    vi.spyOn(
+      TruthLedgerRepository.prototype,
+      "getAuthorizedClaimEvidenceSnapshot"
+    ).mockResolvedValue(workspaceEvidenceSnapshot() as never);
+    vi.spyOn(TruthLedgerRepository.prototype, "transactionTimestamp").mockResolvedValue(
+      "2026-08-07T00:00:00.000Z"
+    );
+    const supersede = vi.spyOn(TruthLedgerRepository.prototype, "supersedePrelockedFact");
+
+    const error = await captureError(
+      new TruthLedgerDomainCommandBus(pool, authorization(true)).execute(
+        supersedeCommand(),
+        context()
+      )
+    );
+
+    expect({ name: error.name, message: error.message }).toEqual({
+      name: "TruthLedgerConflictError",
+      message: "Truth command precondition failed"
+    });
+    expect(prelock).toHaveBeenCalledOnce();
+    expect(lockReplacements).toHaveBeenCalledOnce();
+    expect(supersede).not.toHaveBeenCalled();
+    expect(client.query).toHaveBeenCalledWith("ROLLBACK");
+  });
+
+  it("fails a supersession that names deferred conflict lifecycle closed before connecting", async () => {
+    const { pool } = transactionPool(true);
+    const baseline = supersedeCommand();
     const command = {
-      kind: "fact.revoke",
-      idempotencyKey: "future-command",
-      predicateCatalogVersion: "truth-predicate-catalog.v1",
+      ...baseline,
       payload: {
-        factId: id("20"),
-        expectedFactVersion: 1,
-        reason: { code: "no_longer_true", rationale: "The statement changed." }
+        ...baseline.payload,
+        conflict: { conflictId: id("22"), expectedVersion: 1 }
       }
-    } as unknown as B2AuthorizedDomainCommand<"claim.create">;
+    } as B2AuthorizedDomainCommand<"fact.supersede">;
 
     await expect(new TruthLedgerDomainCommandBus(pool).execute(command, context())).rejects.toThrow(
       "B2 command request is invalid"
     );
     expect(pool.connect).not.toHaveBeenCalled();
+  });
+
+  it("uses one generic conflict for absent, denied, and non-human lifecycle requests", async () => {
+    const absent = await captureError(
+      new TruthLedgerDomainCommandBus(transactionPool(false).pool, authorization(true)).execute(
+        revokeCommand(),
+        context()
+      )
+    );
+    vi.spyOn(DomainCommandRepository.prototype, "reserve").mockImplementation(async (input) => ({
+      status: "reserved",
+      commandId: input.id
+    }));
+    vi.spyOn(TruthLedgerRepository.prototype, "prelockCurrentFact").mockResolvedValue({
+      factId: id("20")
+    } as never);
+    const denied = await captureError(
+      new TruthLedgerDomainCommandBus(transactionPool(true).pool, authorization(false)).execute(
+        revokeCommand(),
+        context()
+      )
+    );
+    const servicePool = transactionPool(true).pool;
+    const nonHuman = await captureError(
+      new TruthLedgerDomainCommandBus(servicePool, authorization(true)).execute(revokeCommand(), {
+        ...context(),
+        servicePrincipalId: id("23")
+      })
+    );
+
+    for (const error of [absent, denied, nonHuman]) {
+      expect({ name: error.name, message: error.message }).toEqual({
+        name: "TruthLedgerConflictError",
+        message: "Truth command precondition failed"
+      });
+    }
+    expect(servicePool.connect).not.toHaveBeenCalled();
   });
 
   it("rejects a stale subject version before authorization or mutation", async () => {
@@ -553,6 +721,261 @@ function claimCommand(expectedVersion: number): B2AuthorizedDomainCommand<"claim
   };
 }
 
+function supersedeCommand(): B2AuthorizedDomainCommand<"fact.supersede"> {
+  return {
+    kind: "fact.supersede",
+    idempotencyKey: "fact-supersede-command",
+    predicateCatalogVersion: "truth-predicate-catalog.v1",
+    payload: {
+      factId: id("20"),
+      expectedFactVersion: 1,
+      subject: { type: "activity", id: id("4"), expectedVersion: 3 },
+      replacementClaims: [{ claimId: id("10"), expectedVersion: 1 }],
+      reason: { code: "newer_evidence", rationale: "Newer evidence replaces prior truth." }
+    }
+  };
+}
+
+function revokeCommand(): B2AuthorizedDomainCommand<"fact.revoke"> {
+  return {
+    kind: "fact.revoke",
+    idempotencyKey: "fact-revoke-command",
+    predicateCatalogVersion: "truth-predicate-catalog.v1",
+    payload: {
+      factId: id("20"),
+      expectedFactVersion: 1,
+      reason: { code: "no_longer_true", rationale: "The accepted statement is no longer true." }
+    }
+  };
+}
+
+const lifecycleSourceText = "Outcome agreed";
+const lifecycleExcerpt = "Outcome";
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function workspaceReplacementEvidence() {
+  return {
+    sourceArtifactId: id("5"),
+    sourceChunkId: id("6"),
+    expectedSourceVersion: 1,
+    expectedChunkVersion: 1,
+    normalizationVersion: "source-normalization.v1",
+    chunkingVersion: "source-chunking.v1",
+    startOffset: 0,
+    endOffset: lifecycleExcerpt.length,
+    excerpt: lifecycleExcerpt,
+    sourceContentHash: sha256Hex(lifecycleSourceText),
+    sourceNormalizedContentHash: sha256Hex(lifecycleSourceText),
+    chunkContentHash: sha256Hex(lifecycleSourceText),
+    excerptHash: sha256Hex(lifecycleExcerpt)
+  };
+}
+
+function workspaceEvidenceSnapshot() {
+  return {
+    tenantId: id("1"),
+    workspaceId: id("2"),
+    spaceId,
+    subject: {
+      type: "activity",
+      id: id("4"),
+      tenantId: id("1"),
+      workspaceId: id("2"),
+      spaceId,
+      version: 3,
+      accessClass: "workspace"
+    },
+    sourceActivityLink: {
+      tenantId: id("1"),
+      workspaceId: id("2"),
+      spaceId,
+      sourceArtifactId: id("5"),
+      activityId: id("4"),
+      governingInitiativeId: null
+    },
+    source: {
+      id: id("5"),
+      tenantId: id("1"),
+      workspaceId: id("2"),
+      spaceId,
+      version: 1,
+      immutableText: lifecycleSourceText,
+      contentHash: sha256Hex(lifecycleSourceText),
+      normalizedContentHash: sha256Hex(lifecycleSourceText),
+      normalizationVersion: "source-normalization.v1",
+      chunkingVersion: "source-chunking.v1",
+      accessClass: "workspace",
+      deletedAt: null,
+      successorSourceArtifactId: null
+    },
+    chunks: [
+      {
+        id: id("6"),
+        tenantId: id("1"),
+        workspaceId: id("2"),
+        spaceId,
+        sourceArtifactId: id("5"),
+        version: 1,
+        normalizationVersion: "source-normalization.v1",
+        chunkingVersion: "source-chunking.v1",
+        chunkIndex: 0,
+        startOffset: 0,
+        endOffset: lifecycleSourceText.length,
+        normalizedText: lifecycleSourceText,
+        contentHash: sha256Hex(lifecycleSourceText),
+        accessClass: "workspace"
+      }
+    ],
+    explicitPolicyAccessClass: "workspace"
+  };
+}
+
+function workspaceReplacementClaim() {
+  return {
+    claim: {
+      id: id("10"),
+      version: 1,
+      tenantId: id("1"),
+      workspaceId: id("2"),
+      spaceId,
+      subjectType: "activity",
+      subjectId: id("4"),
+      predicate: "activity.outcome",
+      canonicalValue: lifecycleSourceText,
+      normalizedText: lifecycleSourceText,
+      assertedByType: "person",
+      assertedById: id("9"),
+      confidence: "strong",
+      status: "proposed",
+      accessClass: "workspace",
+      createdAt: "2026-08-07T00:00:00.000Z"
+    },
+    evidence: workspaceReplacementEvidence(),
+    evidenceSpanId: id("11"),
+    sourceArtifactId: id("5"),
+    claimVersion: 1
+  };
+}
+
+function confidentialPredecessorInWorkspaceSpace() {
+  return Object.freeze({
+    tenantId: id("1"),
+    workspaceId: id("2"),
+    spaceId,
+    factId: id("20"),
+    version: 1,
+    status: "current",
+    subjectType: "activity",
+    subjectId: id("4"),
+    predicate: "activity.outcome",
+    subjectVersion: 3,
+    factAccessClass: "confidential",
+    subjectAccessClass: "workspace",
+    acceptanceScope: "engagement",
+    authorityBasis: "activity_owner"
+  });
+}
+
+function supersedeResult() {
+  return {
+    factId: id("20"),
+    version: 2,
+    status: "superseded",
+    replacementFactId: id("21"),
+    replacementFactVersion: 1,
+    replacementFactStatus: "current"
+  };
+}
+
+function revokeResult() {
+  return { factId: id("20"), version: 2, status: "revoked" };
+}
+
+function safeLifecycleRequest(kind: "fact.supersede" | "fact.revoke") {
+  if (kind === "fact.revoke") {
+    return {
+      factId: id("20"),
+      expectedFactVersion: 1,
+      reason: revokeCommand().payload.reason
+    };
+  }
+  return {
+    factId: id("20"),
+    expectedFactVersion: 1,
+    subject: supersedeCommand().payload.subject,
+    replacementClaims: supersedeCommand().payload.replacementClaims,
+    reason: supersedeCommand().payload.reason
+  };
+}
+
+function dormantCommands(): B2AuthorizedDomainCommand<"claim.create">[] {
+  const commands = [
+    {
+      kind: "fact.contest",
+      idempotencyKey: "dormant-contest",
+      predicateCatalogVersion: "truth-predicate-catalog.v1",
+      payload: {
+        factId: id("20"),
+        expectedFactVersion: 1,
+        competingClaim: { claimId: id("10"), expectedVersion: 1 },
+        reason: { code: "conflicting_evidence", rationale: "Sources disagree." }
+      }
+    },
+    {
+      kind: "fact.uphold",
+      idempotencyKey: "dormant-uphold",
+      predicateCatalogVersion: "truth-predicate-catalog.v1",
+      payload: {
+        factId: id("20"),
+        expectedFactVersion: 1,
+        conflict: { conflictId: id("24"), expectedVersion: 1 },
+        challengerClaim: { claimId: id("10"), expectedVersion: 1 },
+        reason: { code: "challenger_not_supported", rationale: "The challenger lacks support." }
+      }
+    },
+    {
+      kind: "fact.emergency_contest",
+      idempotencyKey: "dormant-emergency-contest",
+      predicateCatalogVersion: "truth-predicate-catalog.v1",
+      payload: {
+        factId: id("20"),
+        expectedFactVersion: 1,
+        competingClaim: { claimId: id("10"), expectedVersion: 1 },
+        reason: { code: "safety_risk", rationale: "Immediate safety risk." }
+      }
+    },
+    {
+      kind: "fact.emergency_revoke",
+      idempotencyKey: "dormant-emergency-revoke",
+      predicateCatalogVersion: "truth-predicate-catalog.v1",
+      payload: {
+        factId: id("20"),
+        expectedFactVersion: 1,
+        reason: { code: "security_incident", rationale: "Security incident response." }
+      }
+    },
+    {
+      kind: "derived_view.regenerate",
+      idempotencyKey: "dormant-derived-view",
+      predicateCatalogVersion: "truth-predicate-catalog.v1",
+      payload: {
+        target: { type: "initiative", id: id("15"), expectedVersion: 1 },
+        viewType: "initiative_summary",
+        renderer: { id: "truth-ledger.cited-current-truth", version: "v1" },
+        expectedAudienceFingerprint: "a".repeat(64),
+        expectedInputRevisionHash: "b".repeat(64)
+      }
+    }
+  ];
+  for (const command of commands) {
+    expect(parseB2Command(command).kind).toBe(command.kind);
+  }
+  return commands as unknown as B2AuthorizedDomainCommand<"claim.create">[];
+}
+
 function factCommand(): B2AuthorizedDomainCommand<"fact.accept"> {
   return {
     kind: "fact.accept",
@@ -601,6 +1024,9 @@ function transactionPool(subjectExists: boolean): { pool: PgPool; client: PgPool
     }
     if (sql.includes("FROM work.activities") && sql.includes("SELECT space_id")) {
       return { rows: subjectExists ? [{ space_id: spaceId }] : [] };
+    }
+    if (sql.includes("FROM truth.accepted_facts fact") && sql.includes("SELECT fact.id")) {
+      return { rows: subjectExists ? [{ id: id("20"), space_id: spaceId }] : [] };
     }
     if (sql.includes("AS settings_cleared")) return { rows: [{ settings_cleared: true }] };
     if (sql === "BEGIN ISOLATION LEVEL READ COMMITTED" || sql === "COMMIT" || sql === "ROLLBACK")

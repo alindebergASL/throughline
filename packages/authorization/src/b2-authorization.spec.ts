@@ -155,6 +155,273 @@ describe("central B2 Slice 1 authorization", () => {
     }
   );
 
+  it.each(lifecycleCases)(
+    "re-authorizes a durable $action replay against the terminal $subjectType Fact",
+    async ({ action, subjectType, subjectId: lifecycleSubjectId, predicate, reasonCode }) => {
+      const service = new PostgresAuthorizationService({} as never);
+      const harness = executor({
+        factSubjectType: subjectType,
+        factSubjectId: lifecycleSubjectId,
+        factPredicate: predicate,
+        factStatus: action === "fact.supersede" ? "superseded" : "revoked",
+        factVersion: 2
+      });
+
+      await expect(
+        service.canInTransaction(
+          lifecycleContext(),
+          action,
+          { type: "fact", id: factId },
+          harness.tx,
+          { lockAuthority: true, factLifecycleReplay: true }
+        )
+      ).resolves.toMatchObject({ allowed: true, reasonCode });
+
+      const [factSql, factParameters] = queryCalls(harness.query, "fact-space")[0]!;
+      expect(factParameters).toEqual([devFixtures.tenantA, devFixtures.workspaceA, factId]);
+      expect(factSql).toContain("fact.status IN ('superseded', 'revoked') AND fact.version = 2");
+      expect(factSql).not.toContain("fact.status = 'current'");
+      expect(factSql).toContain("space.archived_at IS NULL");
+      expect(factSql).toMatch(/FOR SHARE OF fact, space\b/u);
+      expect(lifecycleQueryTrace(harness.query)).toEqual([
+        "policy",
+        "membership-user",
+        "fact-space",
+        `${subjectType}-subject`,
+        "current-space"
+      ]);
+      expectReadOnlySql(harness.query);
+    }
+  );
+
+  it.each([
+    {
+      name: "a current version-1 Fact under replay re-authorization",
+      replay: true,
+      options: { factStatus: "current" as const, factVersion: 1 }
+    },
+    {
+      name: "a terminal Fact under ordinary mutation authorization",
+      replay: false,
+      options: { factStatus: "superseded" as const, factVersion: 2 }
+    },
+    {
+      name: "a terminal Fact at an unexpected version",
+      replay: true,
+      options: { factStatus: "revoked" as const, factVersion: 3 }
+    },
+    {
+      name: "a current Fact at an unexpected version",
+      replay: true,
+      options: { factStatus: "current" as const, factVersion: 2 }
+    },
+    {
+      name: "a terminal Fact at the pre-terminal version",
+      replay: true,
+      options: { factStatus: "superseded" as const, factVersion: 1 }
+    },
+    {
+      name: "a missing replay Fact",
+      replay: true,
+      options: { factPresent: false }
+    },
+    {
+      name: "a replay Fact in another tenant",
+      replay: true,
+      options: {
+        factStatus: "superseded" as const,
+        factVersion: 2,
+        factTenantId: devFixtures.tenantB
+      }
+    },
+    {
+      name: "a replay Fact in another workspace",
+      replay: true,
+      options: {
+        factStatus: "superseded" as const,
+        factVersion: 2,
+        factWorkspaceId: devFixtures.workspaceB
+      }
+    },
+    {
+      name: "an archived Space at replay",
+      replay: true,
+      options: { factStatus: "superseded" as const, factVersion: 2, spaceArchived: true }
+    },
+    {
+      name: "a non-owner Workspace admin at replay",
+      replay: true,
+      options: {
+        factStatus: "superseded" as const,
+        factVersion: 2,
+        role: "admin" as const,
+        subjectOwnerPersonId: devFixtures.personBInTenantA
+      }
+    },
+    {
+      name: "an invalid replay subject type",
+      replay: true,
+      options: {
+        factStatus: "superseded" as const,
+        factVersion: 2,
+        factSubjectType: "organization" as const
+      }
+    },
+    {
+      name: "a wrong replay predicate",
+      replay: true,
+      options: {
+        factStatus: "superseded" as const,
+        factVersion: 2,
+        factPredicate: "initiative.primary_objective"
+      }
+    }
+  ])("denies lifecycle replay re-authorization for $name", async ({ replay, options }) => {
+    const service = new PostgresAuthorizationService({} as never);
+    const harness = executor(options);
+
+    await expect(
+      service.canInTransaction(
+        lifecycleContext(),
+        "fact.supersede",
+        { type: "fact", id: factId },
+        harness.tx,
+        { lockAuthority: true, ...(replay ? { factLifecycleReplay: true } : {}) }
+      )
+    ).resolves.toEqual(genericTargetDenial());
+    expectReadOnlySql(harness.query);
+  });
+
+  it("denies replay re-authorization when the terminal Fact's Space is unreadable", async () => {
+    const service = new PostgresAuthorizationService({} as never);
+    const harness = executor({
+      membershipId: devFixtures.membershipAViewer,
+      membershipUserId: devFixtures.userB,
+      membershipPersonId: devFixtures.personBInTenantA,
+      role: "viewer",
+      factStatus: "superseded",
+      factVersion: 2,
+      factSpaceId: devFixtures.restrictedSpaceA,
+      subjectSpaceId: devFixtures.restrictedSpaceA,
+      subjectOwnerPersonId: devFixtures.personBInTenantA,
+      spaceReadable: false
+    });
+
+    await expect(
+      service.canInTransaction(
+        lifecycleContext({
+          identity: "tenant-a-viewer",
+          requestedSpaceIds: [devFixtures.restrictedSpaceA]
+        }),
+        "fact.supersede",
+        { type: "fact", id: factId },
+        harness.tx,
+        { lockAuthority: true, factLifecycleReplay: true }
+      )
+    ).resolves.toEqual(genericTargetDenial());
+    expectReadOnlySql(harness.query);
+  });
+
+  it("holds the replay data-class ceiling against the max of Space and Fact classification", async () => {
+    const service = new PostgresAuthorizationService({} as never);
+    const factCeilingBreach = executor({
+      factStatus: "superseded",
+      factVersion: 2,
+      factAccessClass: "confidential",
+      spaceAccessClass: "public"
+    });
+    const spaceCeilingBreach = executor({
+      factStatus: "superseded",
+      factVersion: 2,
+      factAccessClass: "public",
+      spaceAccessClass: "confidential"
+    });
+
+    for (const harness of [factCeilingBreach, spaceCeilingBreach]) {
+      await expect(
+        service.canInTransaction(
+          lifecycleContext({ dataClassCeiling: "restricted" }),
+          "fact.supersede",
+          { type: "fact", id: factId },
+          harness.tx,
+          { lockAuthority: true, factLifecycleReplay: true }
+        )
+      ).resolves.toEqual(genericTargetDenial());
+      expect(lifecycleQueryTrace(harness.query)).toEqual([
+        "policy",
+        "membership-user",
+        "fact-space"
+      ]);
+      expectReadOnlySql(harness.query);
+    }
+  });
+
+  it.each([
+    { name: "the wrong requested Space", requestedSpaceIds: [devFixtures.restrictedSpaceA] },
+    { name: "no requested Space", requestedSpaceIds: [] },
+    {
+      name: "multiple requested Spaces",
+      requestedSpaceIds: [devFixtures.rootSpaceA, devFixtures.restrictedSpaceA]
+    }
+  ])(
+    "requires exactly the terminal Fact's Space on replay: $name",
+    async ({ requestedSpaceIds }) => {
+      const service = new PostgresAuthorizationService({} as never);
+      const harness = executor({ factStatus: "superseded", factVersion: 2 });
+
+      await expect(
+        service.canInTransaction(
+          lifecycleContext({ requestedSpaceIds }),
+          "fact.revoke",
+          { type: "fact", id: factId },
+          harness.tx,
+          { lockAuthority: true, factLifecycleReplay: true }
+        )
+      ).resolves.toEqual(genericTargetDenial());
+      expectReadOnlySql(harness.query);
+    }
+  );
+
+  it.each(["tenant-a-service", "tenant-a-agent"] as const)(
+    "default-denies %s before any replay re-authorization lookup",
+    async (identity) => {
+      const service = new PostgresAuthorizationService({} as never);
+      const harness = executor({ factStatus: "superseded", factVersion: 2 });
+
+      await expect(
+        service.canInTransaction(
+          createDevSecurityContext(identity),
+          "fact.supersede",
+          { type: "fact", id: factId },
+          harness.tx,
+          { lockAuthority: true, factLifecycleReplay: true }
+        )
+      ).resolves.toMatchObject({ allowed: false, reasonCode: "principal_default_denied" });
+      expect(queryCalls(harness.query, "fact-space")).toHaveLength(0);
+      expectReadOnlySql(harness.query);
+    }
+  );
+
+  it("denies replay re-authorization for a foreign-tenant principal before the Fact lookup", async () => {
+    const service = new PostgresAuthorizationService({} as never);
+    const harness = executor({ factStatus: "superseded", factVersion: 2 });
+
+    await expect(
+      service.canInTransaction(
+        {
+          ...createDevSecurityContext("tenant-b-viewer"),
+          requestedSpaceIds: [devFixtures.rootSpaceA]
+        },
+        "fact.supersede",
+        { type: "fact", id: factId },
+        harness.tx,
+        { lockAuthority: true, factLifecycleReplay: true }
+      )
+    ).resolves.toMatchObject({ allowed: false });
+    expect(queryCalls(harness.query, "fact-space")).toHaveLength(0);
+    expectReadOnlySql(harness.query);
+  });
+
   it("locks and revalidates the exact direct Space grant for a lower-role Fact owner", async () => {
     const service = new PostgresAuthorizationService({} as never);
     const harness = executor({
@@ -845,19 +1112,22 @@ function executor(
       };
     }
     if (sql.includes("FROM truth.accepted_facts fact")) {
-      assertLifecycleFactQuery(sql, parameters);
+      const generation = assertLifecycleFactQuery(sql, parameters);
       const canonicalPair =
         (factSubjectType === "activity" && factPredicate === "activity.outcome") ||
         (factSubjectType === "initiative" && factPredicate === "initiative.primary_objective");
       const exactFactScope = parametersEqual(parameters, [factTenantId, factWorkspaceId, factId]);
+      const generationMatches =
+        generation === "replay"
+          ? (factStatus === "superseded" || factStatus === "revoked") && factVersion === 2
+          : factStatus === "current" && factVersion === 1;
       return {
         rows:
           (options.factPresent ?? true) &&
           exactFactScope &&
           factTenantId === devFixtures.tenantA &&
           factWorkspaceId === devFixtures.workspaceA &&
-          factStatus === "current" &&
-          factVersion === 1 &&
+          generationMatches &&
           canonicalPair &&
           !(options.spaceArchived ?? false)
             ? [
@@ -1042,13 +1312,21 @@ function parametersEqual(actual: readonly unknown[], expected: readonly unknown[
   return JSON.stringify(actual) === JSON.stringify(expected);
 }
 
-function assertLifecycleFactQuery(sql: string, parameters: readonly unknown[]): void {
+function assertLifecycleFactQuery(
+  sql: string,
+  parameters: readonly unknown[]
+): "current" | "replay" {
+  const pinsCurrentGeneration = sql.includes("fact.status = 'current' AND fact.version = 1");
+  const pinsReplayGeneration = sql.includes(
+    "fact.status IN ('superseded', 'revoked') AND fact.version = 2"
+  );
+  if (pinsCurrentGeneration === pinsReplayGeneration) {
+    throw new Error("Lifecycle Fact query must pin exactly one Fact generation");
+  }
   const requiredFragments = [
     "fact.tenant_id = $1",
     "fact.workspace_id = $2",
     "fact.id = $3",
-    "fact.status = 'current'",
-    "fact.version = 1",
     "fact.subject_type = 'activity'",
     "fact.predicate = 'activity.outcome'",
     "fact.subject_type = 'initiative'",
@@ -1068,6 +1346,7 @@ function assertLifecycleFactQuery(sql: string, parameters: readonly unknown[]): 
       `Lifecycle Fact query used unexpected parameters: ${JSON.stringify(parameters)}`
     );
   }
+  return pinsCurrentGeneration ? "current" : "replay";
 }
 
 function assertLifecycleSubjectQuery(

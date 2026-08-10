@@ -648,7 +648,15 @@ async function truthMutationDecision(
     return objectiveProposalMutationDecision(tx, context, role, action, resource, options, actor);
   }
   if (action === "fact.supersede" || action === "fact.revoke") {
-    return factLifecycleMutationDecision(tx, context, role, resource, options, actor);
+    return factLifecycleMutationDecision(
+      tx,
+      context,
+      role,
+      resource,
+      options,
+      actor,
+      options.factLifecycleReplay === true ? "replay" : "current"
+    );
   }
   const target = await loadTruthAuthorityTarget(tx, context, action, resource, options);
   if (!target || !canReadDataClass(context.dataClassCeiling, target.accessClass)) {
@@ -685,15 +693,31 @@ async function truthMutationDecision(
     : nonLeakingB1Deny(context.policyVersion);
 }
 
+/**
+ * Authorizes an ordinary Fact lifecycle mutation, or — in `replay` mode — the re-authorization of a
+ * durable lifecycle replay whose Fact is already terminal. The only difference between the two
+ * modes is which generation of the Fact is admitted: `current` pins the live version-1 Fact a
+ * mutation may still touch, `replay` pins the version-2 terminal Fact a completed lifecycle command
+ * left behind. Every other check — Fact resource shape, canonical predicate/subject pair, unarchived
+ * Space, exact requested Space, data-class ceiling over max(Space, Fact), owner-person match, and
+ * `FOR SHARE` authority locking — is shared, so replay can never widen authority: the generations
+ * are disjoint, and a terminal Fact is unmutatable because every mutation seam prelocks a current
+ * version-1 row.
+ */
 async function factLifecycleMutationDecision(
   tx: TenantQueryExecutor,
   context: SecurityContext,
   role: MembershipRole,
   resource: ResourceRef,
   options: TransactionAuthorizationDecisionOptions,
-  actor: { personId: string }
+  actor: { personId: string },
+  mode: "current" | "replay"
 ): Promise<AuthorizationDecision> {
   if (resource.type !== "fact") return nonLeakingB1Deny(context.policyVersion);
+  const generationPredicate =
+    mode === "replay"
+      ? "fact.status IN ('superseded', 'revoked') AND fact.version = 2"
+      : "fact.status = 'current' AND fact.version = 1";
 
   const factResult = await tx.query<{
     space_id: string;
@@ -713,7 +737,7 @@ async function factLifecycleMutationDecision(
         AND space.workspace_id = fact.workspace_id
         AND space.id = fact.space_id
       WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.id = $3
-        AND fact.status = 'current' AND fact.version = 1
+        AND ${generationPredicate}
         AND ((fact.subject_type = 'activity' AND fact.predicate = 'activity.outcome')
           OR (fact.subject_type = 'initiative' AND fact.predicate = 'initiative.primary_objective'))
         AND space.archived_at IS NULL

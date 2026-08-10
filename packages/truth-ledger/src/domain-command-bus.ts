@@ -1,3 +1,4 @@
+import { maxAccessClass } from "@throughline/core-types";
 import type {
   B2AuthorizedDomainCommand,
   B2CommandPayloadMap,
@@ -43,7 +44,9 @@ export type DurableTruthCommandKind =
   | "claim.create"
   | "initiative.primary_objective.withdraw"
   | "initiative.primary_objective.rework"
-  | "fact.accept";
+  | "fact.accept"
+  | "fact.supersede"
+  | "fact.revoke";
 type InternalCreateClaimCommand = Omit<B2AuthorizedDomainCommand<"claim.create">, "payload"> & {
   payload: Omit<B2CommandPayloadMap["claim.create"], "valueJson"> & {
     canonicalValue: string;
@@ -57,11 +60,14 @@ type InternalReworkPrimaryObjectiveCommand = Omit<
     canonicalValue: string;
   };
 };
+type FactLifecycleCommandKind = "fact.supersede" | "fact.revoke";
+type FactLifecycleCommand = B2AuthorizedDomainCommand<FactLifecycleCommandKind>;
 type DurableTruthCommand =
   | InternalCreateClaimCommand
   | InternalReworkPrimaryObjectiveCommand
   | B2AuthorizedDomainCommand<"initiative.primary_objective.withdraw">
-  | B2AuthorizedDomainCommand<"fact.accept">;
+  | B2AuthorizedDomainCommand<"fact.accept">
+  | FactLifecycleCommand;
 type DurableTruthResult = B2CommandResultMap[DurableTruthCommandKind];
 
 export class B2AuthorizationError extends Error {
@@ -97,12 +103,24 @@ export class TruthLedgerDomainCommandBus {
       parsed.kind !== "claim.create" &&
       parsed.kind !== "initiative.primary_objective.withdraw" &&
       parsed.kind !== "initiative.primary_objective.rework" &&
-      parsed.kind !== "fact.accept"
+      parsed.kind !== "fact.accept" &&
+      parsed.kind !== "fact.supersede" &&
+      parsed.kind !== "fact.revoke"
     ) {
+      throw new B2CommandValidationError();
+    }
+    if (parsed.kind === "fact.supersede" && parsed.payload.conflict !== undefined) {
       throw new B2CommandValidationError();
     }
     const requestHash = hashB2CommandIdentity(parsed);
     const command = toDurableTruthCommand(parsed);
+    if (command.kind === "fact.supersede" || command.kind === "fact.revoke") {
+      return (await this.executeFactLifecycle(
+        command,
+        requestHash,
+        context
+      )) as B2CommandResultMap[K];
+    }
     requireHumanActor(context);
     const reservationSpaceId = await this.resolveReservationSpace(command, context);
     const mutationContext = { ...context, requestedSpaceIds: [reservationSpaceId] };
@@ -122,10 +140,52 @@ export class TruthLedgerDomainCommandBus {
     return parseB2CommandResult(command.kind, result) as B2CommandResultMap[K];
   }
 
+  private async executeFactLifecycle(
+    command: FactLifecycleCommand,
+    requestHash: string,
+    context: SecurityContext
+  ): Promise<DurableTruthResult> {
+    try {
+      requireHumanActor(context);
+      const reservationSpaceId = await this.resolveReservationSpace(command, context);
+      const mutationContext = { ...context, requestedSpaceIds: [reservationSpaceId] };
+      const result = await withTenantTransaction(
+        { pool: this.pool, context: mutationContext },
+        async (tx) => {
+          await assertApplicationRole(tx);
+          return this.executeInTransaction(
+            tx,
+            command,
+            requestHash,
+            mutationContext,
+            reservationSpaceId
+          );
+        }
+      );
+      return parseB2CommandResult(command.kind, result);
+    } catch {
+      throw new TruthLedgerConflictError();
+    }
+  }
+
   private async resolveReservationSpace(
     command: DurableTruthCommand,
     context: SecurityContext
   ): Promise<string> {
+    if (command.kind === "fact.supersede" || command.kind === "fact.revoke") {
+      const factId = command.payload.factId;
+      const expectedVersion = command.payload.expectedFactVersion;
+      return withTenantTransaction({ pool: this.pool, context }, async (tx) => {
+        await assertApplicationRole(tx);
+        const reservation = await new TruthLedgerRepository(tx).readFactLifecycleReservation({
+          tenantId: context.tenantId,
+          workspaceId: context.workspaceId,
+          factId,
+          expectedVersion
+        });
+        return reservation.spaceId;
+      });
+    }
     return withTenantTransaction({ pool: this.pool, context }, async (tx) => {
       await assertApplicationRole(tx);
       const table =
@@ -154,6 +214,19 @@ export class TruthLedgerDomainCommandBus {
     const ledger = new TruthLedgerRepository(tx);
     const domain = new ProductDomainTransactionRepositories(tx);
     const traceparent = traceparentFor(context);
+    if (command.kind === "fact.supersede" || command.kind === "fact.revoke") {
+      return this.executeFactLifecycleInTransaction({
+        tx,
+        ledger,
+        domain,
+        command,
+        requestHash,
+        context,
+        reservationSpaceId,
+        traceparent,
+        actor
+      });
+    }
     const subject = await ledger
       .getSubjectScope(
         context.tenantId,
@@ -689,15 +762,207 @@ export class TruthLedgerDomainCommandBus {
     return result;
   }
 
+  private async executeFactLifecycleInTransaction(input: {
+    tx: TenantDbTransaction;
+    ledger: TruthLedgerRepository;
+    domain: ProductDomainTransactionRepositories;
+    command: FactLifecycleCommand;
+    requestHash: string;
+    context: SecurityContext;
+    reservationSpaceId: string;
+    traceparent: string;
+    actor: { userId: string; membershipId: string; displayPersonId: string };
+  }): Promise<DurableTruthResult> {
+    const { tx, ledger, domain, command, context, reservationSpaceId, traceparent, actor } = input;
+    const reservationTarget = await ledger.readFactLifecycleReservation({
+      tenantId: context.tenantId,
+      workspaceId: context.workspaceId,
+      factId: command.payload.factId,
+      expectedVersion: command.payload.expectedFactVersion
+    });
+    if (reservationTarget.spaceId !== reservationSpaceId) throw new TruthLedgerConflictError();
+    const reservation = await reserveCommand(
+      domain.commands,
+      command,
+      context,
+      input.requestHash,
+      traceparent,
+      reservationSpaceId
+    );
+    if (reservation.replay) {
+      await this.authorize(
+        tx,
+        context,
+        command.kind,
+        { type: "fact", id: command.payload.factId },
+        true,
+        { factLifecycleReplay: true }
+      );
+      return reservation.result;
+    }
+
+    const prelockedTarget = await ledger.prelockCurrentFact({
+      tenantId: context.tenantId,
+      workspaceId: context.workspaceId,
+      factId: command.payload.factId,
+      expectedVersion: command.payload.expectedFactVersion
+    });
+    await this.authorize(
+      tx,
+      context,
+      command.kind,
+      { type: "fact", id: prelockedTarget.factId },
+      true
+    );
+    const target = await ledger.refreshCurrentFactAfterAuthorization({ target: prelockedTarget });
+
+    let result: B2CommandResultMap[FactLifecycleCommandKind];
+    let safeDetail: Record<string, unknown>;
+    if (command.kind === "fact.supersede") {
+      if (
+        command.payload.subject.type !== target.subjectType ||
+        command.payload.subject.id !== target.subjectId ||
+        command.payload.subject.expectedVersion !== target.subjectVersion
+      ) {
+        throw new TruthLedgerConflictError();
+      }
+      const persistedClaims = await ledger.lockReplacementClaimsForSupersession({
+        target,
+        replacementClaims: command.payload.replacementClaims
+      });
+      const admittedClaims: Claim[] = [];
+      for (const replacement of persistedClaims) {
+        await this.authorize(
+          tx,
+          context,
+          "claim.read",
+          { type: "claim", id: replacement.claim.id },
+          true
+        );
+        await this.authorize(
+          tx,
+          context,
+          "source.read",
+          { type: "source", id: replacement.sourceArtifactId },
+          true
+        );
+        const sourceSpan = await new VerifiedClaimSourceSpanAdmission(
+          tx,
+          bindClaimEvidenceSnapshotLookupToTransaction(tx, ledger),
+          { tenantId: context.tenantId, workspaceId: context.workspaceId }
+        ).admit({
+          subject: {
+            type: target.subjectType,
+            id: target.subjectId,
+            expectedVersion: target.subjectVersion
+          },
+          evidence: replacement.evidence
+        });
+        if (
+          maxAccessClass(sourceSpan.effectiveAccessClass, target.subjectAccessClass) !==
+          sourceSpan.effectiveAccessClass
+        ) {
+          throw new TruthLedgerConflictError();
+        }
+        admittedClaims.push(Object.freeze({ ...replacement.claim, sourceSpan }));
+      }
+      const timestamp = await ledger.transactionTimestamp();
+      const successor = constructAcceptedFactAtTrustedBoundary({
+        id: generateUuidV7(),
+        claims: admittedClaims,
+        subjectAccessClass: target.subjectAccessClass,
+        explicitPolicyAccessClass: target.subjectAccessClass,
+        acceptedByUserId: actor.userId,
+        acceptedByMembershipId: actor.membershipId,
+        acceptanceScope: target.acceptanceScope,
+        authorityBasis: target.authorityBasis,
+        policyVersion: context.policyVersion,
+        recordedAt: timestamp,
+        createdAt: timestamp,
+        supersedesFactId: target.factId,
+        ...(command.payload.confidenceLowering === undefined
+          ? {}
+          : { confidenceLowering: command.payload.confidenceLowering })
+      });
+      if (maxAccessClass(successor.accessClass, target.factAccessClass) !== successor.accessClass) {
+        throw new TruthLedgerConflictError();
+      }
+      result = await ledger.supersedePrelockedFact({
+        target,
+        replacementFact: successor,
+        lifecycleEventId: generateUuidV7(),
+        commandId: reservation.commandId,
+        reason: command.payload.reason,
+        actorUserId: actor.userId,
+        actorMembershipId: actor.membershipId,
+        policyVersion: context.policyVersion
+      });
+      safeDetail = {
+        factId: result.factId,
+        factVersion: 2,
+        reasonCode: command.payload.reason.code,
+        replacementFactId: result.replacementFactId,
+        replacementFactVersion: 1,
+        status: "superseded"
+      };
+    } else {
+      result = await ledger.revokePrelockedFact({
+        target,
+        lifecycleEventId: generateUuidV7(),
+        commandId: reservation.commandId,
+        reason: command.payload.reason,
+        actorUserId: actor.userId,
+        actorMembershipId: actor.membershipId,
+        policyVersion: context.policyVersion
+      });
+      safeDetail = {
+        factId: result.factId,
+        factVersion: 2,
+        reasonCode: command.payload.reason.code,
+        status: "revoked"
+      };
+    }
+    await writeAuditAndOutbox({
+      tx,
+      ledger,
+      context,
+      commandId: reservation.commandId,
+      traceparent,
+      spaceId: target.spaceId,
+      action: command.kind,
+      resourceType: "accepted_fact",
+      resourceId: result.factId,
+      eventType: command.kind === "fact.supersede" ? "fact.superseded" : "fact.revoked",
+      aggregateType: "accepted_fact",
+      aggregateVersion: 2,
+      payload: safeDetail,
+      auditDetail: safeDetail
+    });
+    await completeCommand(
+      domain.commands,
+      command,
+      context,
+      input.requestHash,
+      reservationSpaceId,
+      reservation.commandId,
+      "accepted_fact",
+      result.factId,
+      result
+    );
+    return result;
+  }
+
   private async authorize(
     tx: TenantDbTransaction,
     context: SecurityContext,
     action: AuthorizationAction,
     resource: ResourceRef,
-    lockAuthority: boolean
+    lockAuthority: boolean,
+    options: { factLifecycleReplay?: boolean } = {}
   ): Promise<void> {
     const decision = await this.authorization.canInTransaction(context, action, resource, tx, {
-      lockAuthority
+      lockAuthority,
+      ...options
     });
     if (!decision.allowed) throw new B2AuthorizationError();
   }
@@ -706,7 +971,12 @@ export class TruthLedgerDomainCommandBus {
 function toDurableTruthCommand(
   command: B2AuthorizedDomainCommand<DurableTruthCommandKind>
 ): DurableTruthCommand {
-  if (command.kind === "fact.accept" || command.kind === "initiative.primary_objective.withdraw") {
+  if (
+    command.kind === "fact.accept" ||
+    command.kind === "initiative.primary_objective.withdraw" ||
+    command.kind === "fact.supersede" ||
+    command.kind === "fact.revoke"
+  ) {
     return command;
   }
   const { valueJson, ...payload } = command.payload;
@@ -767,6 +1037,25 @@ function safeRequestForCommand(
   command: DurableTruthCommand
 ): Readonly<Record<string, unknown>> | undefined {
   if (command.kind === "fact.accept") return undefined;
+  if (command.kind === "fact.revoke") {
+    return {
+      factId: command.payload.factId,
+      expectedFactVersion: command.payload.expectedFactVersion,
+      reason: command.payload.reason
+    };
+  }
+  if (command.kind === "fact.supersede") {
+    return {
+      factId: command.payload.factId,
+      expectedFactVersion: command.payload.expectedFactVersion,
+      subject: command.payload.subject,
+      replacementClaims: command.payload.replacementClaims,
+      reason: command.payload.reason,
+      ...(command.payload.confidenceLowering === undefined
+        ? {}
+        : { confidenceLowering: command.payload.confidenceLowering })
+    };
+  }
   const subject = {
     subjectType: command.payload.subject.type,
     subjectId: command.payload.subject.id,
@@ -861,7 +1150,9 @@ async function writeAuditAndOutbox(input: {
     | "initiative.primary_objective.withdraw"
     | "initiative.primary_objective.reject"
     | "initiative.primary_objective.rework"
-    | "fact.accept";
+    | "fact.accept"
+    | "fact.supersede"
+    | "fact.revoke";
   resourceType: "claim" | "accepted_fact";
   resourceId: string;
   eventType:
@@ -869,7 +1160,9 @@ async function writeAuditAndOutbox(input: {
     | "initiative.primary_objective.proposal_withdrawn"
     | "initiative.primary_objective.proposal_rejected"
     | "initiative.primary_objective.proposal_reworked"
-    | "fact.accepted";
+    | "fact.accepted"
+    | "fact.superseded"
+    | "fact.revoked";
   aggregateType: "claim" | "accepted_fact";
   aggregateVersion: number;
   payload: Record<string, unknown>;

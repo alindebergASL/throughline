@@ -5651,7 +5651,8 @@ const phase6Ids = {
   orphanSuccessor: "0190a000-0000-7000-8000-000000000454",
   orphanCommand: "0190a000-0000-7000-8000-000000000455",
   nonexistentPredecessor: "0190a000-0000-7000-8000-000000000456",
-  confidentialReplacementClaim: "0190a000-0000-7000-8000-000000000457"
+  confidentialReplacementClaim: "0190a000-0000-7000-8000-000000000457",
+  confidentialEvidence: "0190a000-0000-7000-8000-000000000458"
 } as const;
 
 async function resetPopulatedExact0011(pool: pg.Pool): Promise<void> {
@@ -5700,6 +5701,68 @@ async function withOwnerTransaction<T>(
   }
 }
 
+async function insertOwnerPhase6ConfidentialEvidence(pool: pg.Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("ALTER TABLE truth.verified_evidence_spans DISABLE TRIGGER USER");
+    await client.query(
+      `INSERT INTO truth.verified_evidence_spans (
+         id, tenant_id, workspace_id, space_id, source_artifact_id, source_chunk_id,
+         source_version, chunk_version, normalization_version, chunking_version,
+         source_start_offset, source_end_offset, source_excerpt,
+         source_content_hash, source_normalized_content_hash, chunk_content_hash,
+         excerpt_hash, access_class, created_by_user_id, created_by_membership_id,
+         causation_command_id
+       ) SELECT
+         $1,tenant_id,workspace_id,space_id,source_artifact_id,source_chunk_id,
+         source_version,chunk_version,normalization_version,chunking_version,
+         source_start_offset,source_end_offset,source_excerpt,
+         source_content_hash,source_normalized_content_hash,chunk_content_hash,
+         excerpt_hash,'confidential',created_by_user_id,created_by_membership_id,
+         causation_command_id
+       FROM truth.verified_evidence_spans WHERE id = $2`,
+      [phase6Ids.confidentialEvidence, adoptionIds.evidence]
+    );
+    await client.query("ALTER TABLE truth.verified_evidence_spans ENABLE TRIGGER USER");
+    await client.query("SET CONSTRAINTS ALL IMMEDIATE");
+    const confidentialEvidence = await client.query<{
+      evidence_id: string;
+      space_id: string;
+      source_artifact_id: string;
+      source_chunk_id: string;
+      access_class: string;
+      created_by_user_id: string;
+      created_by_membership_id: string;
+      causation_command_id: string;
+    }>(
+      `SELECT id AS evidence_id, space_id, source_artifact_id, source_chunk_id, access_class,
+              created_by_user_id, created_by_membership_id, causation_command_id
+         FROM truth.verified_evidence_spans
+        WHERE id = $1`,
+      [phase6Ids.confidentialEvidence]
+    );
+    expect(confidentialEvidence.rows).toEqual([
+      {
+        evidence_id: phase6Ids.confidentialEvidence,
+        space_id: adoptionIds.space,
+        source_artifact_id: adoptionIds.source,
+        source_chunk_id: adoptionIds.chunk,
+        access_class: "confidential",
+        created_by_user_id: adoptionIds.user,
+        created_by_membership_id: adoptionIds.membership,
+        causation_command_id: adoptionIds.command
+      }
+    ]);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function insertOwnerPhase6ReplacementClaims(pool: pg.Pool): Promise<void> {
   const client = await pool.connect();
   try {
@@ -5726,7 +5789,7 @@ async function insertOwnerPhase6ReplacementClaims(pool: pg.Pool): Promise<void> 
        ), (
          $16,$3,$4,$5,'activity',$6,'truth-predicate-catalog.v1','activity.outcome',
          $17,encode(public.digest(convert_to($17,'UTF8'),'sha256'),'hex'),
-         $17,$8,'person',$9,'strong','proposed','confidential',$10,$11,$12,1
+         $17,$18,'person',$9,'strong','proposed','confidential',$10,$11,$12,1
        )`,
       [
         phase6Ids.replacementClaim,
@@ -5745,7 +5808,8 @@ async function insertOwnerPhase6ReplacementClaims(pool: pg.Pool): Promise<void> 
         phase6Ids.otherSubject,
         "Orphan replacement canonical value",
         phase6Ids.confidentialReplacementClaim,
-        "Confidential replacement canonical value"
+        "Confidential replacement canonical value",
+        phase6Ids.confidentialEvidence
       ]
     );
     await client.query("ALTER TABLE truth.claims ENABLE TRIGGER USER");
@@ -5870,6 +5934,7 @@ async function insertOwnerPhase6ReplacementClaims(pool: pg.Pool): Promise<void> 
 async function resetPopulatedPhase6(pool: pg.Pool): Promise<string> {
   await resetPopulatedExact0011(pool);
   await applyMigrations(pool);
+  await insertOwnerPhase6ConfidentialEvidence(pool);
   await insertOwnerPhase6ReplacementClaims(pool);
   const provisioned = await withOwnerTransaction(pool, (tx) =>
     provisionProductRelayDirectManagerAccess(tx, {

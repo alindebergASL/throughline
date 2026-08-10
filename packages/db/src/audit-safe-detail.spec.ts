@@ -107,6 +107,30 @@ describe("closed B1.0 audit safe-detail language", () => {
         resourceType: "accepted_fact",
         resourceId,
         safeDetail: { factId: resourceId }
+      },
+      {
+        action: "fact.supersede",
+        resourceType: "accepted_fact",
+        resourceId,
+        safeDetail: {
+          factId: resourceId,
+          factVersion: 2,
+          reasonCode: "newer_evidence",
+          replacementFactId: relatedId,
+          replacementFactVersion: 1,
+          status: "superseded"
+        }
+      },
+      {
+        action: "fact.revoke",
+        resourceType: "accepted_fact",
+        resourceId,
+        safeDetail: {
+          factId: resourceId,
+          factVersion: 2,
+          reasonCode: "no_longer_true",
+          status: "revoked"
+        }
       }
     ];
 
@@ -125,6 +149,88 @@ describe("closed B1.0 audit safe-detail language", () => {
           ...vector.safeDetail,
           unexpected: true
         })
+      ).toThrow(ProductAuditDetailValidationError);
+    }
+  });
+
+  it("rejects malformed ordinary Fact lifecycle audit fields", () => {
+    const factId = "77abcdef-abcd-7abc-8def-abcdef000001";
+    const replacementFactId = "77abcdef-abcd-7abc-8def-abcdef000002";
+    const invalidVectors: Array<{
+      action: ProductAuditAction;
+      safeDetail: Record<string, unknown>;
+    }> = [
+      {
+        action: "fact.supersede",
+        safeDetail: {
+          factId,
+          factVersion: 1,
+          reasonCode: "newer_evidence",
+          replacementFactId,
+          replacementFactVersion: 1,
+          status: "superseded"
+        }
+      },
+      {
+        action: "fact.supersede",
+        safeDetail: {
+          factId,
+          factVersion: 2,
+          reasonCode: "no_longer_true",
+          replacementFactId,
+          replacementFactVersion: 1,
+          status: "superseded"
+        }
+      },
+      {
+        action: "fact.supersede",
+        safeDetail: {
+          factId,
+          factVersion: 2,
+          reasonCode: "newer_evidence",
+          replacementFactId,
+          replacementFactVersion: 2,
+          status: "superseded"
+        }
+      },
+      {
+        action: "fact.supersede",
+        safeDetail: {
+          factId,
+          factVersion: 2,
+          reasonCode: "newer_evidence",
+          replacementFactId,
+          replacementFactVersion: 1,
+          status: "revoked"
+        }
+      },
+      {
+        action: "fact.revoke",
+        safeDetail: {
+          factId,
+          factVersion: 2,
+          reasonCode: "newer_evidence",
+          status: "revoked"
+        }
+      },
+      {
+        action: "fact.revoke",
+        safeDetail: {
+          factId,
+          factVersion: 2,
+          reasonCode: "no_longer_true",
+          replacementFactId,
+          status: "revoked"
+        }
+      }
+    ];
+
+    for (const vector of invalidVectors) {
+      expect(() =>
+        parseProductAuditSafeDetail(vector.action, "accepted_fact", factId, 1, vector.safeDetail)
+      ).toThrow(ProductAuditDetailValidationError);
+      expect(() =>
+        parseProductAuditSafeDetail(vector.action, "claim", factId, 1, vector.safeDetail)
       ).toThrow(ProductAuditDetailValidationError);
     }
   });

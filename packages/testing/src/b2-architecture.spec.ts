@@ -81,7 +81,7 @@ describe("B2 Slice 1 architecture boundaries", () => {
     expect(implementation).toContain("initiative.primary_objective.withdraw");
     expect(implementation).toContain("initiative.primary_objective.rework");
     expect(implementation).not.toMatch(
-      /claim\.(?:update|delete|manage)|@Controller\(["'](?:claims|proposals|lifecycle)|fact\.(?:supersede|revoke|contest)|CREATE TABLE truth\.(?:claim_lifecycle|fact_lifecycle|conflict_groups)|model\.generate|OpenAI|sendEmail|scheduleMeeting/i
+      /claim\.(?:update|delete|manage)|@Controller\(["'](?:claims|proposals|lifecycle)|fact\.contest|CREATE TABLE truth\.(?:claim_lifecycle|fact_lifecycle|conflict_groups)|model\.generate|OpenAI|sendEmail|scheduleMeeting/i
     );
   });
 
@@ -135,10 +135,9 @@ describe("B2 Slice 1 architecture boundaries", () => {
       expect(schema).toContain(field);
       expect(repository).toContain(field);
     }
-    expect(repository).not.toContain("fact_lifecycle_events");
   });
 
-  it("executes only canonical claim.create and fact.accept", async () => {
+  it("executes canonical claim.create, fact.accept, and activated fact lifecycle kinds", async () => {
     const implementation = await combined([
       "packages/truth-ledger/src/domain-command-bus.ts",
       "packages/truth-ledger/src/repository.ts",
@@ -150,9 +149,13 @@ describe("B2 Slice 1 architecture boundaries", () => {
     expect(implementation).toContain('"fact.accept"');
     expect(implementation).toContain('"claim.proposed"');
     expect(implementation).toContain('"fact.accepted"');
+    expect(implementation).toContain('"fact.supersede"');
+    expect(implementation).toContain('"fact.revoke"');
+    expect(implementation).toContain('"fact.superseded"');
+    expect(implementation).toContain('"fact.revoked"');
     expect(implementation).not.toMatch(/claim\.propose["']/);
     expect(implementation).not.toMatch(
-      /fact\.(?:contest|uphold|supersede|revoke|emergency)|derived_view\.regenerate/
+      /fact\.(?:contest|uphold|emergency)|derived_view\.regenerate/
     );
   });
 

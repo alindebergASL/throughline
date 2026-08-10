@@ -1720,6 +1720,8 @@ type B1DomainNotificationEventType = Exclude<
   | "initiative.primary_objective.proposal_rejected"
   | "initiative.primary_objective.proposal_reworked"
   | "fact.accepted"
+  | "fact.superseded"
+  | "fact.revoked"
 >;
 
 function notification(

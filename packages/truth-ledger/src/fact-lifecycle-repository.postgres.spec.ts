@@ -347,13 +347,24 @@ describe("Fact lifecycle repository query contract", () => {
     expect(lifecycleSection).toContain("INSERT INTO truth.fact_lifecycle_events");
   });
 
-  it("keeps Task 4A.5 command-bus activation outside the production change", async () => {
+  it("activates Task 4A.5 command-bus execution for exactly the two lifecycle kinds", async () => {
     const commandBus = await readFile(commandBusUrl, "utf8");
     const durableKinds = commandBus.slice(
       commandBus.indexOf("export type DurableTruthCommandKind"),
       commandBus.indexOf("type InternalCreateClaimCommand")
     );
-    expect(durableKinds).not.toMatch(/fact\.supersede|fact\.revoke/);
+
+    expect(durableKinds).toContain('"fact.supersede"');
+    expect(durableKinds).toContain('"fact.revoke"');
+    expect(durableKinds).toContain('"claim.create"');
+    expect(durableKinds).toContain('"fact.accept"');
+    expect(durableKinds).toContain('"initiative.primary_objective.withdraw"');
+    expect(durableKinds).toContain('"initiative.primary_objective.rework"');
+    expect(durableKinds).not.toMatch(
+      /fact\.contest|fact\.uphold|fact\.emergency|derived_view\.regenerate/
+    );
+    expect(commandBus).toContain('parsed.kind !== "fact.supersede"');
+    expect(commandBus).toContain('parsed.kind !== "fact.revoke"');
   });
 });
 

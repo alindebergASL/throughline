@@ -113,6 +113,22 @@ function payload(eventType: string): Record<string, unknown> {
       };
     case "fact.accepted":
       return { factId: ids.aggregate };
+    case "fact.superseded":
+      return {
+        factId: ids.aggregate,
+        factVersion: 2,
+        reasonCode: "newer_evidence",
+        replacementFactId: ids.source,
+        replacementFactVersion: 1,
+        status: "superseded"
+      };
+    case "fact.revoked":
+      return {
+        factId: ids.aggregate,
+        factVersion: 2,
+        reasonCode: "no_longer_true",
+        status: "revoked"
+      };
     default:
       throw new Error("test event is not allowlisted");
   }
@@ -136,7 +152,9 @@ describe("DomainNotificationEnvelope", () => {
       "initiative.primary_objective.proposal_withdrawn",
       "initiative.primary_objective.proposal_rejected",
       "initiative.primary_objective.proposal_reworked",
-      "fact.accepted"
+      "fact.accepted",
+      "fact.superseded",
+      "fact.revoked"
     ]);
     expect(DOMAIN_NOTIFICATION_AGGREGATE_TYPES).toEqual([
       "organization",
@@ -186,7 +204,13 @@ describe("DomainNotificationEnvelope", () => {
           ...payload("initiative.primary_objective.proposal_reworked"),
           predecessorVersion: 1
         }
-      ]
+      ],
+      ["fact.superseded", { ...payload("fact.superseded"), factVersion: 1 }],
+      ["fact.superseded", { ...payload("fact.superseded"), reasonCode: "no_longer_true" }],
+      ["fact.superseded", { ...payload("fact.superseded"), replacementFactVersion: 2 }],
+      ["fact.superseded", { ...payload("fact.superseded"), status: "revoked" }],
+      ["fact.revoked", { ...payload("fact.revoked"), reasonCode: "newer_evidence" }],
+      ["fact.revoked", { ...payload("fact.revoked"), replacementFactId: ids.source }]
     ] as const) {
       expect(() =>
         parseDomainNotificationEnvelope({ ...envelope(eventType), payload: payloadOverride })
