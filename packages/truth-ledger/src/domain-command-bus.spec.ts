@@ -9,9 +9,15 @@ import {
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as publicApi from "./index.js";
 import { parseB2Command } from "./command-schemas.js";
 import { B2AuthorizationError, TruthLedgerDomainCommandBus } from "./domain-command-bus.js";
-import { TruthLedgerConflictError, TruthLedgerRepository } from "./repository.js";
+import {
+  TruthLedgerConflictError,
+  TruthLedgerInvariantError,
+  TruthLedgerRepository,
+  TruthLedgerUnavailableError
+} from "./repository.js";
 import { VerifiedClaimSourceSpanAdmission } from "./source-span.js";
 
 const id = (suffix: string) => `0190a000-0000-7000-8000-${suffix.padStart(12, "0")}`;
@@ -99,10 +105,8 @@ describe.sequential("durable truth command boundary", () => {
         new TruthLedgerDomainCommandBus(pool, auth).execute(buildCommand(), context())
       );
 
-      expect({ name: error.name, message: error.message }).toEqual({
-        name: "TruthLedgerConflictError",
-        message: "Truth command precondition failed"
-      });
+      expect(error).toEqual(new B2AuthorizationError());
+      expect(error.message).not.toMatch(/fact|claim|evidence|0190a000/iu);
       expect(auth.canInTransaction).toHaveBeenCalledOnce();
       expect(prelock).not.toHaveBeenCalled();
       expect(client.query).toHaveBeenCalledWith("ROLLBACK");
@@ -168,7 +172,7 @@ describe.sequential("durable truth command boundary", () => {
     expect(pool.connect).not.toHaveBeenCalled();
   });
 
-  it("uses one generic conflict for absent, denied, and non-human lifecycle requests", async () => {
+  it("uses one generic unavailable error for absent or hidden, denied, and non-human lifecycle requests", async () => {
     const absent = await captureError(
       new TruthLedgerDomainCommandBus(transactionPool(false).pool, authorization(true)).execute(
         revokeCommand(),
@@ -197,12 +201,71 @@ describe.sequential("durable truth command boundary", () => {
     );
 
     for (const error of [absent, denied, nonHuman]) {
-      expect({ name: error.name, message: error.message }).toEqual({
-        name: "TruthLedgerConflictError",
-        message: "Truth command precondition failed"
-      });
+      expect(error).toEqual(new B2AuthorizationError());
+      expect(error.message).not.toMatch(/fact|claim|evidence|0190a000/iu);
     }
     expect(servicePool.connect).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    [new TruthLedgerUnavailableError(), B2AuthorizationError],
+    [new TruthLedgerConflictError(), TruthLedgerConflictError]
+  ] as const)(
+    "classifies a replacement-row failure at the bus boundary without weakening semantic conflicts",
+    async (repositoryFailure, expectedClass) => {
+      const { pool, client } = transactionPool(true);
+      vi.spyOn(DomainCommandRepository.prototype, "reserve").mockImplementation(async (input) => ({
+        status: "reserved",
+        commandId: input.id
+      }));
+      vi.spyOn(TruthLedgerRepository.prototype, "prelockCurrentFact").mockResolvedValue({
+        factId: id("20")
+      } as never);
+      vi.spyOn(
+        TruthLedgerRepository.prototype,
+        "refreshCurrentFactAfterAuthorization"
+      ).mockResolvedValue(workspacePredecessor() as never);
+      vi.spyOn(
+        TruthLedgerRepository.prototype,
+        "lockReplacementClaimsForSupersession"
+      ).mockRejectedValue(repositoryFailure);
+
+      const error = await captureError(
+        new TruthLedgerDomainCommandBus(pool, authorization(true)).execute(
+          supersedeCommand(),
+          context()
+        )
+      );
+
+      expect(error).toBeInstanceOf(expectedClass);
+      expect(client.query).toHaveBeenCalledWith("ROLLBACK");
+      expect(error.message).not.toMatch(/0190a000|replacement/i);
+    }
+  );
+
+  it("preserves an injected lifecycle repository failure and rolls the transaction back exactly", async () => {
+    const { pool, client } = transactionPool(true);
+    vi.spyOn(DomainCommandRepository.prototype, "reserve").mockImplementation(async (input) => ({
+      status: "reserved",
+      commandId: input.id
+    }));
+    const failure = new TruthLedgerInvariantError();
+    vi.spyOn(TruthLedgerRepository.prototype, "prelockCurrentFact").mockRejectedValue(failure);
+
+    const error = await captureError(
+      new TruthLedgerDomainCommandBus(pool, authorization(true)).execute(revokeCommand(), context())
+    );
+
+    expect(error).toBe(failure);
+    expect(error).not.toBeInstanceOf(TruthLedgerConflictError);
+    expect(vi.mocked(client.query).mock.calls.filter(([sql]) => sql === "COMMIT")).toHaveLength(1);
+    expect(vi.mocked(client.query).mock.calls.filter(([sql]) => sql === "ROLLBACK")).toHaveLength(
+      1
+    );
+  });
+
+  it("keeps the internal unavailable classification out of the public root export inventory", () => {
+    expect(Object.keys(publicApi)).not.toContain("TruthLedgerUnavailableError");
   });
 
   it("rejects a stale subject version before authorization or mutation", async () => {
@@ -876,6 +939,13 @@ function confidentialPredecessorInWorkspaceSpace() {
     subjectAccessClass: "workspace",
     acceptanceScope: "engagement",
     authorityBasis: "activity_owner"
+  });
+}
+
+function workspacePredecessor() {
+  return Object.freeze({
+    ...confidentialPredecessorInWorkspaceSpace(),
+    factAccessClass: "workspace" as const
   });
 }
 

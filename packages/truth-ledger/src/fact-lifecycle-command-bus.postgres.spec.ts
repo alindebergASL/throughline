@@ -23,13 +23,19 @@ import {
 import { createDevSecurityContext, devFixtures, generateUuidV7 } from "@throughline/tenancy";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { B2CommandValidationError } from "./command-schemas.js";
-import { TruthLedgerDomainCommandBus } from "./domain-command-bus.js";
+import {
+  B2AuthorizationError,
+  B2IdempotencyConflictError,
+  TruthLedgerDomainCommandBus
+} from "./domain-command-bus.js";
 import { TruthLedgerConflictError } from "./repository.js";
 
 const ownerDatabaseUrl = process.env.TEST_DATABASE_URL;
 const appDatabaseUrl = process.env.TEST_APP_DATABASE_URL;
 const connectedSuite = ownerDatabaseUrl && appDatabaseUrl ? describe.sequential : describe.skip;
 const genericConflict = "TruthLedgerConflictError: Truth command precondition failed";
+const genericIdempotencyConflict = "B2IdempotencyConflictError: Truth command precondition failed";
+const genericUnavailable = "B2AuthorizationError: Truth resource is unavailable";
 
 connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
   let ownerPool: PgPool;
@@ -89,7 +95,8 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
     expect(outcome.status).toBe("rejected");
     if (outcome.status !== "rejected")
       throw new Error("Owner-role lifecycle unexpectedly executed");
-    expect(String(outcome.error)).toBe(genericConflict);
+    expect(outcome.error).toBeInstanceOf(B2AuthorizationError);
+    expect(String(outcome.error)).toBe(genericUnavailable);
     expect(await residue(fixture, ["owner-role-denied"])).toEqual(cleanResidue(1));
   });
 
@@ -231,7 +238,8 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
     const outcome = await settle(execute(drift, context(fixture)));
     expect(outcome.status).toBe("rejected");
     if (outcome.status !== "rejected") throw new Error("Lifecycle payload drift unexpectedly ran");
-    expect(String(outcome.error)).toBe(genericConflict);
+    expect(outcome.error).toBeInstanceOf(B2IdempotencyConflictError);
+    expect(String(outcome.error)).toBe(genericIdempotencyConflict);
     expect(await snapshot(fixture.factId)).toEqual(after);
   });
 
@@ -239,9 +247,14 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
     const fixture = await createFixture(1);
     const foreign = await createFixture(1);
     const baseline = supersedeCommand(fixture, "unused");
-    const cases: Array<{ key: string; command: B2AuthorizedDomainCommand<"fact.supersede"> }> = [
+    const cases: Array<{
+      key: string;
+      expected: "unavailable" | "conflict";
+      command: B2AuthorizedDomainCommand<"fact.supersede">;
+    }> = [
       {
         key: "absent-fact",
+        expected: "unavailable",
         command: {
           ...baseline,
           idempotencyKey: "absent-fact",
@@ -250,6 +263,7 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
       },
       {
         key: "stale-fact-version",
+        expected: "conflict",
         command: {
           ...baseline,
           idempotencyKey: "stale-fact-version",
@@ -258,6 +272,7 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
       },
       {
         key: "forged-subject",
+        expected: "conflict",
         command: {
           ...baseline,
           idempotencyKey: "forged-subject",
@@ -269,6 +284,7 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
       },
       {
         key: "stale-subject-version",
+        expected: "conflict",
         command: {
           ...baseline,
           idempotencyKey: "stale-subject-version",
@@ -280,6 +296,7 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
       },
       {
         key: "stale-replacement-version",
+        expected: "conflict",
         command: {
           ...baseline,
           idempotencyKey: "stale-replacement-version",
@@ -294,20 +311,40 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
       },
       {
         key: "foreign-replacement-claims",
+        expected: "unavailable",
         command: {
           ...baseline,
           idempotencyKey: "foreign-replacement-claims",
           payload: { ...baseline.payload, replacementClaims: foreign.replacementClaims }
         }
+      },
+      {
+        key: "absent-replacement-claim",
+        expected: "unavailable",
+        command: {
+          ...baseline,
+          idempotencyKey: "absent-replacement-claim",
+          payload: {
+            ...baseline.payload,
+            replacementClaims: [{ claimId: generateUuidV7(), expectedVersion: 1 }]
+          }
+        }
       }
     ];
 
-    for (const { command } of cases) {
+    for (const { key, command, expected } of cases) {
       const outcome = await settle(execute(command, context(fixture)));
-      expect(outcome.status).toBe("rejected");
-      if (outcome.status !== "rejected") throw new Error("Forged lifecycle input unexpectedly ran");
-      expect(outcome.error).toBeInstanceOf(TruthLedgerConflictError);
-      expect(String(outcome.error)).toBe(genericConflict);
+      expect(outcome.status, key).toBe("rejected");
+      if (outcome.status !== "rejected") {
+        throw new Error(`Forged lifecycle input unexpectedly ran: ${key}`);
+      }
+      expect(outcome.error, key).toBeInstanceOf(
+        expected === "unavailable" ? B2AuthorizationError : TruthLedgerConflictError
+      );
+      expect(String(outcome.error), key).toBe(
+        expected === "unavailable" ? genericUnavailable : genericConflict
+      );
+      expect(String(outcome.error), key).not.toMatch(/0190a000|replacement/i);
     }
 
     expect(
@@ -361,28 +398,32 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
     ["an agent principal", "tenant-a-agent"],
     ["a non-owner workspace admin", "tenant-a-viewer"],
     ["a foreign tenant member", "tenant-b-viewer"]
-  ] as const)("denies %s with the same generic lifecycle conflict", async (_name, identity) => {
-    const fixture = await createFixture(1);
-    const key = `denied-${identity}-${fixtureSequence}`;
-    let restore: () => Promise<void> = async () => undefined;
-    if (identity === "tenant-a-viewer") restore = await promoteViewerToSpaceAdmin(fixture);
-    try {
-      const actorContext: SecurityContext = {
-        ...createDevSecurityContext(identity),
-        requestId: `fact-lifecycle-bus-${generateUuidV7()}`,
-        requestedSpaceIds: [fixture.spaceId]
-      };
-      const outcome = await settle(execute(supersedeCommand(fixture, key), actorContext));
+  ] as const)(
+    "denies %s with the same generic lifecycle unavailable error",
+    async (_name, identity) => {
+      const fixture = await createFixture(1);
+      const key = `denied-${identity}-${fixtureSequence}`;
+      let restore: () => Promise<void> = async () => undefined;
+      if (identity === "tenant-a-viewer") restore = await promoteViewerToSpaceAdmin(fixture);
+      try {
+        const actorContext: SecurityContext = {
+          ...createDevSecurityContext(identity),
+          requestId: `fact-lifecycle-bus-${generateUuidV7()}`,
+          requestedSpaceIds: [fixture.spaceId]
+        };
+        const outcome = await settle(execute(supersedeCommand(fixture, key), actorContext));
 
-      expect(outcome.status).toBe("rejected");
-      if (outcome.status !== "rejected") throw new Error("Unauthorized lifecycle unexpectedly ran");
-      expect(outcome.error).toBeInstanceOf(TruthLedgerConflictError);
-      expect(String(outcome.error)).toBe(genericConflict);
-      expect(await residue(fixture, [key])).toEqual(cleanResidue(1));
-    } finally {
-      await restore();
+        expect(outcome.status).toBe("rejected");
+        if (outcome.status !== "rejected")
+          throw new Error("Unauthorized lifecycle unexpectedly ran");
+        expect(outcome.error).toBeInstanceOf(B2AuthorizationError);
+        expect(String(outcome.error)).toBe(genericUnavailable);
+        expect(await residue(fixture, [key])).toEqual(cleanResidue(1));
+      } finally {
+        await restore();
+      }
     }
-  });
+  );
 
   it.each(["owner change", "Space archive", "Membership suspension", "User disable"] as const)(
     "denies the lifecycle command when %s races the prelock seam",
@@ -410,7 +451,8 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
 
         expect(settled.status).toBe("rejected");
         if (settled.status !== "rejected") throw new Error("Raced lifecycle unexpectedly executed");
-        expect(String(settled.error)).toBe(genericConflict);
+        expect(settled.error).toBeInstanceOf(B2AuthorizationError);
+        expect(String(settled.error)).toBe(genericUnavailable);
         expect(await residue(fixture, [key])).toEqual(cleanResidue(1));
       } finally {
         gate.release();
@@ -520,8 +562,8 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
         if (outcome.status !== "rejected") {
           throw new Error("De-authorized replay unexpectedly returned the durable result");
         }
-        expect(outcome.error).toBeInstanceOf(TruthLedgerConflictError);
-        expect(String(outcome.error)).toBe(genericConflict);
+        expect(outcome.error).toBeInstanceOf(B2AuthorizationError);
+        expect(String(outcome.error)).toBe(genericUnavailable);
         expect(String(outcome.error)).not.toContain(first.replacementFactId);
         expect(await snapshot(fixture.factId)).toEqual(after);
         expect(await commandStates(key)).toEqual(["completed"]);
@@ -591,7 +633,7 @@ connectedSuite("Ordinary Fact lifecycle durable command bus", () => {
     expect(outcome.status).toBe("rejected");
     if (outcome.status !== "rejected") throw new Error("Injected lifecycle fault did not fail");
     expect(injected).toBe(fault);
-    expect(String(outcome.error)).toBe(genericConflict);
+    expect(outcome.error).not.toBeInstanceOf(TruthLedgerConflictError);
     expect(await residue(fixture, [key])).toEqual(cleanResidue(1));
   });
 

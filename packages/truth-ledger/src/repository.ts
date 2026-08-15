@@ -32,6 +32,25 @@ export class TruthLedgerConflictError extends Error {
   }
 }
 
+export class TruthLedgerUnavailableError extends Error {
+  constructor() {
+    super("Truth resource is unavailable");
+    this.name = "TruthLedgerUnavailableError";
+  }
+}
+
+function hasExactErrorCode(error: unknown, expectedCode: string): boolean {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) {
+    return false;
+  }
+  try {
+    if (!Object.hasOwn(error, "code")) return false;
+    return Reflect.get(error, "code") === expectedCode;
+  } catch {
+    return false;
+  }
+}
+
 export interface TruthSubjectScope {
   subjectType: "activity" | "initiative";
   subjectId: string;
@@ -263,7 +282,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       )
     );
     const row = result.rows[0];
-    if (!row || row.id !== input.factId) throw new TruthLedgerConflictError();
+    if (!row || row.id !== input.factId) throw new TruthLedgerUnavailableError();
     return { spaceId: row.space_id };
   }
 
@@ -739,7 +758,8 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     tenantId: string,
     workspaceId: string,
     claimIds: readonly string[],
-    excludeClaimsSupportingActiveFact = false
+    excludeClaimsSupportingActiveFact = false,
+    allowIncompleteResult = false
   ): Promise<PersistedClaimForAcceptance[]> {
     const result = await this.tx.query<AcceptanceRow>(
       `SELECT claim.id, claim.space_id, claim.subject_type, claim.subject_id,
@@ -804,7 +824,9 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
        FOR SHARE OF source`,
       [tenantId, workspaceId, [...claimIds].sort()]
     );
-    if (result.rows.length !== claimIds.length) throw new TruthLedgerConflictError();
+    if (!allowIncompleteResult && result.rows.length !== claimIds.length) {
+      throw new TruthLedgerConflictError();
+    }
     return result.rows.map((row) => ({
       claim: {
         id: row.id,
@@ -1099,8 +1121,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       if (
         !reference ||
         !isUuidV7(reference.claimId) ||
-        !Number.isSafeInteger(reference.expectedVersion) ||
-        reference.expectedVersion < 1 ||
+        reference.expectedVersion !== 1 ||
         expectedVersions.has(reference.claimId)
       ) {
         throw new TruthLedgerConflictError();
@@ -1109,10 +1130,16 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     }
     const claimIds = [...expectedVersions.keys()].sort();
     const persistedClaims = await this.guardLifecycleDatabaseOperation(() =>
-      this.loadClaimsForAcceptance(input.target.tenantId, input.target.workspaceId, claimIds, true)
+      this.loadClaimsForAcceptance(
+        input.target.tenantId,
+        input.target.workspaceId,
+        claimIds,
+        true,
+        true
+      )
     );
+    if (persistedClaims.length !== claimIds.length) throw new TruthLedgerUnavailableError();
     if (
-      persistedClaims.length !== claimIds.length ||
       persistedClaims.some(
         ({ claim, claimVersion }) =>
           claim.status !== "proposed" ||
@@ -1371,9 +1398,14 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     try {
       return await operation();
     } catch (error) {
-      if (error instanceof TruthLedgerConflictError || error instanceof TruthLedgerInvariantError) {
+      if (
+        error instanceof TruthLedgerConflictError ||
+        error instanceof TruthLedgerInvariantError ||
+        error instanceof TruthLedgerUnavailableError
+      ) {
         throw error;
       }
+      if (hasExactErrorCode(error, "P0001")) throw new TruthLedgerConflictError();
       throw new TruthLedgerInvariantError();
     }
   }

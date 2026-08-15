@@ -2,10 +2,12 @@ import "reflect-metadata";
 import { createHash } from "node:crypto";
 import { NestFactory } from "@nestjs/core";
 import { FastifyAdapter, type NestFastifyApplication } from "@nestjs/platform-fastify";
+import { Test } from "@nestjs/testing";
 import {
   AccountOperationsDomainCommandBus,
   B1CommandInvariantError
 } from "@throughline/account-operations";
+import { PostgresAuthorizationService } from "@throughline/authorization";
 import {
   applyMigrations,
   createPgPool,
@@ -14,11 +16,16 @@ import {
   seedWaveA2DeterministicData,
   withTenantTransaction,
   type PgPool,
+  type PgPoolClient,
   type TenantDbTransaction
 } from "@throughline/db";
-import { createDevSecurityContext, devFixtures } from "@throughline/tenancy";
+import { createDevSecurityContext, devFixtures, generateUuidV7 } from "@throughline/tenancy";
+import { TruthLedgerDomainCommandBus } from "@throughline/truth-ledger";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { AppModule } from "../app.module.js";
+import { B2TruthController } from "./b2-truth.controller.js";
+import { B2TruthGuard } from "./b2-truth.guard.js";
+import { B2TruthRuntime } from "./b2-truth.runtime.js";
 
 const ownerUrl = process.env.TEST_DATABASE_URL;
 const appUrl = process.env.TEST_APP_DATABASE_URL;
@@ -1566,6 +1573,437 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
     ]);
   }, 60_000);
 
+  it("registers both lifecycle routes and rejects missing or non-JSON content before execution", async () => {
+    const fixture = await createAcceptedFact(
+      "b2-api-json-only",
+      "The accepted outcome remains current while transport is rejected."
+    );
+    const payload = revokePayload(fixture.factId);
+    const keys = ["b2-api-missing-content-type", "b2-api-text-content-type"];
+
+    const missing = await app.inject({
+      method: "POST",
+      url: "/internal/v1/facts/revoke",
+      headers: {
+        "x-throughline-dev-identity": "tenant-a-owner",
+        "x-request-id": keys[0]!,
+        "idempotency-key": keys[0]!
+      },
+      payload: JSON.stringify(payload)
+    });
+    const wrong = await app.inject({
+      method: "POST",
+      url: "/internal/v1/facts/supersede",
+      headers: {
+        ...requestHeaders("tenant-a-owner", keys[1]!, keys[1]!),
+        "content-type": "text/plain"
+      },
+      payload: JSON.stringify({
+        ...supersedePayload(fixture, [{ claimId: fixture.claimId, expectedVersion: 2 }])
+      })
+    });
+
+    expect(missing.statusCode, missing.body).toBe(415);
+    expect(missing.json()).toEqual({
+      message: "Unsupported Media Type",
+      statusCode: 415
+    });
+    expect(wrong.statusCode, wrong.body).toBe(400);
+    expect(wrong.json()).toEqual({
+      message: "Request is invalid",
+      error: "Bad Request",
+      statusCode: 400
+    });
+    expect(missing.body).not.toContain(fixture.factId);
+    expect(wrong.body).not.toContain(fixture.factId);
+    const after = await apiLifecycleSnapshot(ownerPool, fixture.factId, keys);
+    expect(after.predecessor).toMatchObject({ status: "current", version: 1 });
+    expect(after.lifecycle).toEqual([]);
+    expect(after.commands).toEqual([]);
+    expect(after.audits).toEqual([]);
+    expect(after.outbox).toEqual([]);
+  }, 60_000);
+
+  it("supersedes through the API with durable replay, drift rejection, and exact cardinalities", async () => {
+    const fixture = await createAcceptedFact(
+      "b2-api-supersede",
+      "The prior accepted outcome is supported by the original evidence."
+    );
+    const replacement = await createClaimCandidateForActivity(
+      fixture.activityId,
+      "b2-api-supersede-replacement",
+      "Newer evidence supports a replacement accepted outcome."
+    );
+    const replacementResponse = await post(
+      "/internal/v1/claims",
+      "b2-api-supersede-replacement-claim",
+      replacement.claimPayload
+    );
+    expect(replacementResponse.statusCode, replacementResponse.body).toBe(201);
+    const replacementClaimId = replacementResponse.json<{ claimId: string }>().claimId;
+    const key = "b2-api-supersede-command";
+    const payload = supersedePayload(fixture, [
+      { claimId: replacementClaimId, expectedVersion: 1 }
+    ]);
+
+    const first = await post("/internal/v1/facts/supersede", key, payload);
+    const replay = await post("/internal/v1/facts/supersede", key, payload);
+    const drift = await post("/internal/v1/facts/supersede", key, {
+      ...payload,
+      reason: {
+        code: "accepted_value_changed",
+        rationale: "A drifted command must not replace the durable response."
+      }
+    });
+
+    expect(first.statusCode, first.body).toBe(201);
+    expect(replay.statusCode, replay.body).toBe(201);
+    expect(replay.body).toBe(first.body);
+    const result = first.json<{
+      factId: string;
+      version: number;
+      status: string;
+      replacementFactId: string;
+      replacementFactVersion: number;
+      replacementFactStatus: string;
+    }>();
+    expect(result).toEqual({
+      factId: fixture.factId,
+      version: 2,
+      status: "superseded",
+      replacementFactId: expect.any(String),
+      replacementFactVersion: 1,
+      replacementFactStatus: "current"
+    });
+    expect(drift.statusCode, drift.body).toBe(409);
+    expect(drift.json()).toEqual({
+      message: "Command precondition failed",
+      error: "Conflict",
+      statusCode: 409
+    });
+
+    const after = await apiLifecycleSnapshot(ownerPool, fixture.factId, [key]);
+    expect(after.predecessor).toMatchObject({
+      id: fixture.factId,
+      status: "superseded",
+      version: 2
+    });
+    expect(after.currentFacts).toEqual([
+      expect.objectContaining({ id: result.replacementFactId, status: "current", version: 1 })
+    ]);
+    expect(after.currentSupport).toEqual([replacementClaimId]);
+    expect(after.lifecycle).toEqual([
+      expect.objectContaining({
+        predecessor_fact_id: fixture.factId,
+        successor_fact_id: result.replacementFactId,
+        transition_kind: "supersede",
+        from_status: "current",
+        to_status: "superseded",
+        reason_code: "newer_evidence"
+      })
+    ]);
+    expect(after.commands).toEqual([
+      expect.objectContaining({
+        command_kind: "fact.supersede.v1",
+        state: "completed",
+        safe_response: result
+      })
+    ]);
+    expect(after.audits).toEqual([expect.objectContaining({ action: "fact.supersede" })]);
+    expect(after.outbox).toEqual([expect.objectContaining({ event_type: "fact.superseded" })]);
+  }, 60_000);
+
+  it("revokes through the API with durable replay, drift rejection, and exact cardinalities", async () => {
+    const fixture = await createAcceptedFact(
+      "b2-api-revoke",
+      "The accepted outcome can later become no longer true."
+    );
+    const key = "b2-api-revoke-command";
+    const payload = revokePayload(fixture.factId);
+
+    const first = await post("/internal/v1/facts/revoke", key, payload);
+    const replay = await post("/internal/v1/facts/revoke", key, payload);
+    const drift = await post("/internal/v1/facts/revoke", key, {
+      ...payload,
+      reason: {
+        code: "entered_in_error",
+        rationale: "A drifted revocation must not replace the durable response."
+      }
+    });
+
+    expect(first.statusCode, first.body).toBe(201);
+    expect(replay.statusCode, replay.body).toBe(201);
+    expect(replay.body).toBe(first.body);
+    expect(first.json()).toEqual({ factId: fixture.factId, version: 2, status: "revoked" });
+    expect(drift.statusCode, drift.body).toBe(409);
+    expect(drift.json()).toEqual({
+      message: "Command precondition failed",
+      error: "Conflict",
+      statusCode: 409
+    });
+
+    const after = await apiLifecycleSnapshot(ownerPool, fixture.factId, [key]);
+    expect(after.predecessor).toMatchObject({ id: fixture.factId, status: "revoked", version: 2 });
+    expect(after.currentFacts).toEqual([]);
+    expect(after.currentSupport).toEqual([]);
+    expect(after.lifecycle).toEqual([
+      expect.objectContaining({
+        predecessor_fact_id: fixture.factId,
+        successor_fact_id: null,
+        transition_kind: "revoke",
+        from_status: "current",
+        to_status: "revoked",
+        reason_code: "no_longer_true"
+      })
+    ]);
+    expect(after.commands).toEqual([
+      expect.objectContaining({
+        command_kind: "fact.revoke.v1",
+        state: "completed",
+        safe_response: { factId: fixture.factId, version: 2, status: "revoked" }
+      })
+    ]);
+    expect(after.audits).toEqual([expect.objectContaining({ action: "fact.revoke" })]);
+    expect(after.outbox).toEqual([expect.objectContaining({ event_type: "fact.revoked" })]);
+  }, 60_000);
+
+  it("rejects unavailable, stale, and invalid replacement inputs generically with zero residue", async () => {
+    const fixture = await createAcceptedFact(
+      "b2-api-denied",
+      "The lifecycle denial fixture starts with one current accepted outcome."
+    );
+    const replacement = await createClaimCandidateForActivity(
+      fixture.activityId,
+      "b2-api-denied-replacement",
+      "A valid replacement exists only to isolate denial cases."
+    );
+    const replacementResponse = await post(
+      "/internal/v1/claims",
+      "b2-api-denied-replacement-claim",
+      replacement.claimPayload
+    );
+    expect(replacementResponse.statusCode, replacementResponse.body).toBe(201);
+    const replacementClaimId = replacementResponse.json<{ claimId: string }>().claimId;
+    const valid = supersedePayload(fixture, [{ claimId: replacementClaimId, expectedVersion: 1 }]);
+    const foreignCoordinate = await createClaimCandidateSource(
+      "b2-api-foreign-coordinate",
+      "This replacement evidence belongs to a different fact coordinate."
+    );
+    const foreignClaimResponse = await post(
+      "/internal/v1/claims",
+      "b2-api-foreign-coordinate-claim",
+      foreignCoordinate.claimPayload
+    );
+    expect(foreignClaimResponse.statusCode, foreignClaimResponse.body).toBe(201);
+    const foreignClaimId = foreignClaimResponse.json<{ claimId: string }>().claimId;
+    const cases = [
+      {
+        key: "b2-api-unauthorized",
+        expectedStatus: 404,
+        run: () =>
+          postAs("tenant-a-viewer", "/internal/v1/facts/supersede", "b2-api-unauthorized", valid)
+      },
+      {
+        key: "b2-api-cross-tenant",
+        expectedStatus: 404,
+        run: () =>
+          postAs("tenant-b-viewer", "/internal/v1/facts/supersede", "b2-api-cross-tenant", valid)
+      },
+      {
+        key: "b2-api-missing-fact",
+        expectedStatus: 404,
+        run: () =>
+          post("/internal/v1/facts/revoke", "b2-api-missing-fact", {
+            ...revokePayload(fixture.factId),
+            factId: generateUuidV7()
+          })
+      },
+      {
+        key: "b2-api-stale-version",
+        expectedStatus: 409,
+        run: () =>
+          post("/internal/v1/facts/supersede", "b2-api-stale-version", {
+            ...valid,
+            expectedFactVersion: 2
+          })
+      },
+      {
+        key: "b2-api-missing-replacement",
+        expectedStatus: 404,
+        run: () =>
+          post("/internal/v1/facts/supersede", "b2-api-missing-replacement", {
+            ...valid,
+            replacementClaims: [{ claimId: generateUuidV7(), expectedVersion: 1 }]
+          })
+      },
+      {
+        key: "b2-api-wrong-coordinate",
+        expectedStatus: 409,
+        run: () =>
+          post("/internal/v1/facts/supersede", "b2-api-wrong-coordinate", {
+            ...valid,
+            replacementClaims: [{ claimId: foreignClaimId, expectedVersion: 1 }]
+          })
+      },
+      {
+        key: "b2-api-ineligible-evidence",
+        expectedStatus: 409,
+        run: () =>
+          post("/internal/v1/facts/supersede", "b2-api-ineligible-evidence", {
+            ...valid,
+            replacementClaims: [{ claimId: fixture.claimId, expectedVersion: 2 }]
+          })
+      }
+    ];
+
+    for (const test of cases) {
+      const response = await test.run();
+      expect(response.statusCode, response.body).toBe(test.expectedStatus);
+      expect(response.json()).toEqual(
+        test.expectedStatus === 404
+          ? { message: "Resource unavailable", error: "Not Found", statusCode: 404 }
+          : { message: "Command precondition failed", error: "Conflict", statusCode: 409 }
+      );
+      expect(response.body).not.toContain(fixture.factId);
+      expect(response.body).not.toContain(replacementClaimId);
+    }
+
+    const after = await apiLifecycleSnapshot(
+      ownerPool,
+      fixture.factId,
+      cases.map(({ key }) => key)
+    );
+    expect(after.predecessor).toMatchObject({ status: "current", version: 1 });
+    expect(after.currentFacts).toHaveLength(1);
+    expect(after.lifecycle).toEqual([]);
+    expect(after.commands).toEqual([]);
+    expect(after.audits).toEqual([]);
+    expect(after.outbox).toEqual([]);
+
+    const terminal = await createAcceptedFact(
+      "b2-api-stale-status",
+      "This fact is revoked before the stale-status attempt."
+    );
+    const completedKey = "b2-api-stale-status-completed";
+    const attemptKey = "b2-api-stale-status-attempt";
+    expect(
+      (await post("/internal/v1/facts/revoke", completedKey, revokePayload(terminal.factId)))
+        .statusCode
+    ).toBe(201);
+    const beforeAttempt = await apiLifecycleSnapshot(ownerPool, terminal.factId, [
+      completedKey,
+      attemptKey
+    ]);
+    const staleStatus = await post(
+      "/internal/v1/facts/revoke",
+      attemptKey,
+      revokePayload(terminal.factId, 2)
+    );
+    expect(staleStatus.statusCode, staleStatus.body).toBe(409);
+    expect(
+      await apiLifecycleSnapshot(ownerPool, terminal.factId, [completedKey, attemptKey])
+    ).toEqual(beforeAttempt);
+  }, 90_000);
+
+  it("conceals reuse of the active Fact's accepted supporting Claim with exact zero residue", async () => {
+    const fixture = await createAcceptedFact(
+      "b2-api-active-support",
+      "The predecessor's accepted support cannot also support its successor."
+    );
+    const evidence = await ownerPool.query<{ evidence_span_id: string }>(
+      `SELECT verified_evidence_span_id::text AS evidence_span_id
+         FROM truth.claims
+        WHERE id = $1`,
+      [fixture.claimId]
+    );
+    const evidenceSpanId = evidence.rows[0]!.evidence_span_id;
+    const key = "b2-api-active-support-command";
+    const before = await apiLifecycleSnapshot(ownerPool, fixture.factId, [key]);
+
+    const response = await post(
+      "/internal/v1/facts/supersede",
+      key,
+      supersedePayload(fixture, [{ claimId: fixture.claimId, expectedVersion: 1 }])
+    );
+
+    expect(response.statusCode, response.body).toBe(404);
+    expect(response.json()).toEqual({
+      message: "Resource unavailable",
+      error: "Not Found",
+      statusCode: 404
+    });
+    for (const concealedId of [fixture.factId, fixture.claimId, evidenceSpanId]) {
+      expect(response.body).not.toContain(concealedId);
+    }
+
+    const after = await apiLifecycleSnapshot(ownerPool, fixture.factId, [key]);
+    expect(after).toEqual(before);
+    expect(after.predecessor).toMatchObject({
+      id: fixture.factId,
+      status: "current",
+      version: 1
+    });
+    expect(after.currentFacts).toEqual([
+      expect.objectContaining({ id: fixture.factId, status: "current", version: 1 })
+    ]);
+    expect(after.currentSupport).toEqual([fixture.claimId]);
+    expect(after.lifecycle).toEqual([]);
+    expect(after.commands).toEqual([]);
+    expect(after.audits).toEqual([]);
+    expect(after.outbox).toEqual([]);
+  }, 60_000);
+
+  it("rolls back every lifecycle write when an API-level audit fault is injected", async () => {
+    const fixture = await createAcceptedFact(
+      "b2-api-fault",
+      "The predecessor must survive a failure after its lifecycle update."
+    );
+    const replacement = await createClaimCandidateForActivity(
+      fixture.activityId,
+      "b2-api-fault-replacement",
+      "The replacement must not survive the injected transaction fault."
+    );
+    const replacementResponse = await post(
+      "/internal/v1/claims",
+      "b2-api-fault-replacement-claim",
+      replacement.claimPayload
+    );
+    expect(replacementResponse.statusCode, replacementResponse.body).toBe(201);
+    const replacementClaimId = replacementResponse.json<{ claimId: string }>().claimId;
+    const key = "b2-api-fault-command";
+    let injected = false;
+    const faultApp = await createFaultApi(appPool, () => {
+      injected = true;
+    });
+    try {
+      const response = await faultApp.inject({
+        method: "POST",
+        url: "/internal/v1/facts/supersede",
+        headers: requestHeaders("tenant-a-owner", key, key),
+        payload: supersedePayload(fixture, [{ claimId: replacementClaimId, expectedVersion: 1 }])
+      });
+      expect(injected).toBe(true);
+      expect(response.statusCode, response.body).toBe(500);
+      expect(response.json()).toEqual({
+        message: "Request could not be completed",
+        error: "Internal Server Error",
+        statusCode: 500
+      });
+      expect(response.body).not.toContain(fixture.factId);
+      expect(response.body).not.toContain(replacementClaimId);
+    } finally {
+      await faultApp.close();
+    }
+
+    const after = await apiLifecycleSnapshot(ownerPool, fixture.factId, [key]);
+    expect(after.predecessor).toMatchObject({ status: "current", version: 1 });
+    expect(after.currentFacts).toHaveLength(1);
+    expect(after.lifecycle).toEqual([]);
+    expect(after.commands).toEqual([]);
+    expect(after.audits).toEqual([]);
+    expect(after.outbox).toEqual([]);
+  }, 60_000);
+
   it("exposes no Fact read or current-truth route", async () => {
     for (const url of [
       `/v1/facts/${factId}`,
@@ -1595,12 +2033,25 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
     }
   });
 
+  async function createAcceptedFact(key: string, text: string) {
+    const proposed = await createProposedClaimSource(key, text);
+    const fact = await post("/internal/v1/facts", `${key}-fact`, proposed.factPayload);
+    expect(fact.statusCode, fact.body).toBe(201);
+    return {
+      activityId: proposed.activityId,
+      claimId: proposed.claimId,
+      factId: fact.json<{ factId: string }>().factId
+    };
+  }
+
   async function createProposedClaimSource(key: string, text: string) {
     const candidate = await createClaimCandidateSource(key, text);
     const claim = await post("/internal/v1/claims", `${key}-claim`, candidate.claimPayload);
     expect(claim.statusCode, claim.body).toBe(201);
     const createdClaimId = claim.json<{ claimId: string }>().claimId;
     return {
+      activityId: candidate.activityId,
+      claimId: createdClaimId,
       sourceArtifactId: candidate.sourceArtifactId,
       factPayload: {
         subject: { type: "activity", id: candidate.activityId, expectedVersion: 1 },
@@ -1714,6 +2165,168 @@ suite("B2 Slice 1 PostgreSQL API golden path", () => {
     });
   }
 });
+
+interface ApiLifecycleFixture {
+  activityId: string;
+  factId: string;
+}
+
+function supersedePayload(
+  fixture: ApiLifecycleFixture,
+  replacementClaims: Array<{ claimId: string; expectedVersion: number }>
+) {
+  return {
+    factId: fixture.factId,
+    expectedFactVersion: 1,
+    subject: { type: "activity", id: fixture.activityId, expectedVersion: 1 },
+    replacementClaims,
+    reason: {
+      code: "newer_evidence",
+      rationale: "Newer evidence replaces the prior accepted outcome."
+    }
+  };
+}
+
+function revokePayload(factId: string, expectedFactVersion = 1) {
+  return {
+    factId,
+    expectedFactVersion,
+    reason: {
+      code: "no_longer_true",
+      rationale: "The accepted outcome is no longer true."
+    }
+  };
+}
+
+interface ApiLifecycleSnapshot {
+  predecessor: Record<string, unknown> | null;
+  currentFacts: Array<Record<string, unknown>>;
+  currentSupport: string[];
+  lifecycle: Array<Record<string, unknown>>;
+  commands: Array<Record<string, unknown>>;
+  audits: Array<Record<string, unknown>>;
+  outbox: Array<Record<string, unknown>>;
+}
+
+async function apiLifecycleSnapshot(
+  pool: PgPool,
+  factId: string,
+  idempotencyKeys: readonly string[]
+): Promise<ApiLifecycleSnapshot> {
+  const result = await pool.query<ApiLifecycleSnapshot>(
+    `SELECT
+       (SELECT to_jsonb(predecessor)
+          FROM truth.accepted_facts predecessor
+         WHERE predecessor.id = $1) AS predecessor,
+       COALESCE((
+         SELECT jsonb_agg(to_jsonb(current_fact) ORDER BY current_fact.id)
+           FROM truth.accepted_facts predecessor
+           JOIN truth.accepted_facts current_fact
+             ON current_fact.tenant_id = predecessor.tenant_id
+            AND current_fact.workspace_id = predecessor.workspace_id
+            AND current_fact.space_id = predecessor.space_id
+            AND current_fact.subject_type = predecessor.subject_type
+            AND current_fact.subject_id = predecessor.subject_id
+            AND current_fact.predicate = predecessor.predicate
+            AND current_fact.status = 'current'
+          WHERE predecessor.id = $1
+       ), '[]'::jsonb) AS "currentFacts",
+       COALESCE((
+         SELECT jsonb_agg(support.claim_id::text ORDER BY support.claim_id)
+           FROM truth.accepted_facts predecessor
+           JOIN truth.accepted_facts current_fact
+             ON current_fact.tenant_id = predecessor.tenant_id
+            AND current_fact.workspace_id = predecessor.workspace_id
+            AND current_fact.space_id = predecessor.space_id
+            AND current_fact.subject_type = predecessor.subject_type
+            AND current_fact.subject_id = predecessor.subject_id
+            AND current_fact.predicate = predecessor.predicate
+            AND current_fact.status = 'current'
+           JOIN truth.fact_claims support
+             ON support.tenant_id = current_fact.tenant_id
+            AND support.workspace_id = current_fact.workspace_id
+            AND support.fact_id = current_fact.id
+          WHERE predecessor.id = $1
+       ), '[]'::jsonb) AS "currentSupport",
+       COALESCE((
+         SELECT jsonb_agg(to_jsonb(lifecycle) ORDER BY lifecycle.id)
+           FROM truth.fact_lifecycle_events lifecycle
+          WHERE lifecycle.predecessor_fact_id = $1
+       ), '[]'::jsonb) AS lifecycle,
+       COALESCE((
+         SELECT jsonb_agg(to_jsonb(command) ORDER BY command.id)
+           FROM ops.domain_command_records command
+          WHERE command.idempotency_key = ANY($2::text[])
+       ), '[]'::jsonb) AS commands,
+       COALESCE((
+         SELECT jsonb_agg(to_jsonb(audit) ORDER BY audit.id)
+           FROM ops.audit_events audit
+          WHERE audit.causation_command_id IN (
+            SELECT command.id
+              FROM ops.domain_command_records command
+             WHERE command.idempotency_key = ANY($2::text[])
+          )
+       ), '[]'::jsonb) AS audits,
+       COALESCE((
+         SELECT jsonb_agg(to_jsonb(event) ORDER BY event.id)
+           FROM ops.product_outbox_events event
+          WHERE event.causation_command_id IN (
+            SELECT command.id
+              FROM ops.domain_command_records command
+             WHERE command.idempotency_key = ANY($2::text[])
+          )
+       ), '[]'::jsonb) AS outbox`,
+    [factId, [...idempotencyKeys]]
+  );
+  return result.rows[0]!;
+}
+
+async function createFaultApi(
+  pool: PgPool,
+  onFaultInjected: () => void
+): Promise<NestFastifyApplication> {
+  const faultPool = instrumentedLifecyclePool(pool, () => {
+    onFaultInjected();
+  });
+  const bus = new TruthLedgerDomainCommandBus(
+    faultPool,
+    new PostgresAuthorizationService(faultPool)
+  );
+  const runtime = { execute: bus.execute.bind(bus) };
+  const moduleRef = await Test.createTestingModule({
+    controllers: [B2TruthController],
+    providers: [B2TruthGuard, { provide: B2TruthRuntime, useValue: runtime }]
+  }).compile();
+  const app = moduleRef.createNestApplication<NestFastifyApplication>(
+    new FastifyAdapter({ logger: false })
+  );
+  await app.init();
+  return app;
+}
+
+function instrumentedLifecyclePool(pool: PgPool, onFaultInjected: () => void): PgPool {
+  return {
+    connect: async () => {
+      const client = await pool.connect();
+      const instrumented = {
+        query: async (text: string, values?: readonly unknown[]) => {
+          const result = await client.query(text, values === undefined ? undefined : [...values]);
+          if (compactSql(text).startsWith("INSERT INTO ops.audit_events")) {
+            onFaultInjected();
+            throw new Error("Injected lifecycle audit fault");
+          }
+          return result;
+        },
+        release: (destroy?: boolean) => client.release(destroy)
+      };
+      return instrumented as unknown as PgPoolClient;
+    }
+  } as unknown as PgPool;
+}
+
+function compactSql(value: string): string {
+  return value.replace(/\s+/gu, " ").trim();
+}
 
 async function createApi(): Promise<NestFastifyApplication> {
   const app = await NestFactory.create<NestFastifyApplication>(

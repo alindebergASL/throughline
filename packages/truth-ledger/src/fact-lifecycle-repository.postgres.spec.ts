@@ -25,7 +25,9 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { hashB2CommandIdentity, parseB2Command, parseB2CommandResult } from "./command-schemas.js";
 import {
   TruthLedgerConflictError,
+  TruthLedgerInvariantError,
   TruthLedgerRepository,
+  TruthLedgerUnavailableError,
   type PostAuthorizationCurrentFact,
   type PrelockedCurrentFact
 } from "./repository.js";
@@ -48,6 +50,123 @@ const claimA = "018f0000-0000-7000-8000-000000000011";
 const claimB = "018f0000-0000-7000-8000-000000000012";
 
 describe("Fact lifecycle repository query contract", () => {
+  it("classifies only PostgreSQL P0001 lifecycle failures as generic conflicts", async () => {
+    const classify = async (error: unknown) => {
+      const repository = new TruthLedgerRepository(
+        transactionStub(() => {
+          throw error;
+        })
+      );
+      return settle(
+        repository.readFactLifecycleReservation({
+          tenantId,
+          workspaceId,
+          factId,
+          expectedVersion: 1
+        })
+      );
+    };
+    const databaseMessage = "sensitive database trigger detail";
+    const connectionMessage = "sensitive connection detail";
+    const injectedMessage = "sensitive injected failure detail";
+    const accessorMessage = "sensitive accessor failure detail";
+    const inheritedError = Object.create({ code: "P0001" }) as object;
+    const throwingAccessorError = Object.defineProperty({}, "code", {
+      get() {
+        throw new Error(accessorMessage);
+      }
+    });
+
+    const triggerFailure = await classify({ code: "P0001", message: databaseMessage });
+    const inheritedFailure = await classify(inheritedError);
+    const accessorFailure = await classify(throwingAccessorError);
+    const customFailure = await classify({ code: "TLB22", message: databaseMessage });
+    const connectionFailure = await classify({ code: "08006", message: connectionMessage });
+    const injectedFailure = await classify(new Error(injectedMessage));
+
+    expect(triggerFailure.status).toBe("rejected");
+    expect(inheritedFailure.status).toBe("rejected");
+    expect(accessorFailure.status).toBe("rejected");
+    expect(customFailure.status).toBe("rejected");
+    expect(connectionFailure.status).toBe("rejected");
+    expect(injectedFailure.status).toBe("rejected");
+    if (
+      triggerFailure.status !== "rejected" ||
+      inheritedFailure.status !== "rejected" ||
+      accessorFailure.status !== "rejected" ||
+      customFailure.status !== "rejected" ||
+      connectionFailure.status !== "rejected" ||
+      injectedFailure.status !== "rejected"
+    ) {
+      throw new Error("Lifecycle database failure unexpectedly resolved");
+    }
+
+    expect(triggerFailure.error).toBeInstanceOf(TruthLedgerConflictError);
+    expect(String(triggerFailure.error)).toBe(
+      "TruthLedgerConflictError: Truth command precondition failed"
+    );
+    for (const outcome of [
+      inheritedFailure,
+      accessorFailure,
+      customFailure,
+      connectionFailure,
+      injectedFailure
+    ]) {
+      expect(outcome.error).toBeInstanceOf(TruthLedgerInvariantError);
+      expect(String(outcome.error)).toBe(
+        "TruthLedgerInvariantError: Truth ledger transaction invariant failed"
+      );
+    }
+    expect(
+      [
+        triggerFailure,
+        inheritedFailure,
+        accessorFailure,
+        customFailure,
+        connectionFailure,
+        injectedFailure
+      ]
+        .map(({ error }) => String(error))
+        .join("\n")
+    ).not.toMatch(
+      /sensitive (database trigger|connection|injected failure|accessor failure) detail/
+    );
+  });
+
+  it("separates an unavailable lifecycle reservation from stale input and database failure", async () => {
+    const unavailable = new TruthLedgerRepository(transactionStub(() => ({ rows: [] })));
+    const failed = new TruthLedgerRepository(
+      transactionStub(() => {
+        throw new Error("database unavailable");
+      })
+    );
+
+    await expect(
+      unavailable.readFactLifecycleReservation({
+        tenantId,
+        workspaceId,
+        factId,
+        expectedVersion: 1
+      })
+    ).rejects.toEqual(new TruthLedgerUnavailableError());
+    await expect(
+      unavailable.readFactLifecycleReservation({
+        tenantId,
+        workspaceId,
+        factId,
+        expectedVersion: 2
+      })
+    ).rejects.toEqual(new TruthLedgerConflictError());
+    await expect(
+      failed.readFactLifecycleReservation({
+        tenantId,
+        workspaceId,
+        factId,
+        expectedVersion: 1
+      })
+    ).rejects.toEqual(new TruthLedgerInvariantError());
+  });
+
   it("derives the canonical coordinate, takes its advisory lock, then prelocks the exact Fact", async () => {
     const statements: Array<{ sql: string; values: readonly unknown[] | undefined }> = [];
     const repository = new TruthLedgerRepository(
@@ -188,7 +307,7 @@ describe("Fact lifecycle repository query contract", () => {
           { claimId: claimA, expectedVersion: 1 }
         ]
       })
-    ).rejects.toBeInstanceOf(TruthLedgerConflictError);
+    ).rejects.toBeInstanceOf(TruthLedgerUnavailableError);
 
     const claimLock = statements.find(({ sql }) => sql.includes("FOR UPDATE OF claim"));
     expect(claimLock?.values?.[2]).toEqual([claimA, claimB]);

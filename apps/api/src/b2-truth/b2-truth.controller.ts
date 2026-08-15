@@ -61,6 +61,38 @@ export class B2TruthController {
     );
   }
 
+  @Post("facts/supersede")
+  supersedeFact(@Req() request: B2TruthRequest, @Body() body: JsonBody) {
+    return this.safe(() => {
+      requireJsonContentType(request);
+      return this.runtime.execute(
+        {
+          kind: "fact.supersede",
+          idempotencyKey: requireIdempotencyKey(request),
+          predicateCatalogVersion: B2_TRUTH_PREDICATE_CATALOG_VERSION,
+          payload: body as never
+        },
+        requireContext(request)
+      );
+    });
+  }
+
+  @Post("facts/revoke")
+  revokeFact(@Req() request: B2TruthRequest, @Body() body: JsonBody) {
+    return this.safe(() => {
+      requireJsonContentType(request);
+      return this.runtime.execute(
+        {
+          kind: "fact.revoke",
+          idempotencyKey: requireIdempotencyKey(request),
+          predicateCatalogVersion: B2_TRUTH_PREDICATE_CATALOG_VERSION,
+          payload: body as never
+        },
+        requireContext(request)
+      );
+    });
+  }
+
   private async safe<T>(
     callback: () => Promise<T>,
     concealValidationAsUnavailable = false
@@ -93,6 +125,17 @@ export class B2TruthController {
 function requireContext(request: B2TruthRequest) {
   if (!request.b2Context) throw new BadRequestException("Request context is unavailable");
   return request.b2Context;
+}
+
+function requireJsonContentType(request: B2TruthRequest): void {
+  const value = request.headers["content-type"];
+  const contentType = Array.isArray(value) ? (value.length === 1 ? value[0] : undefined) : value;
+  if (
+    contentType === undefined ||
+    !/^\s*application\/json\s*(?:;\s*charset\s*=\s*(?:"utf-8"|utf-8))?\s*$/iu.test(contentType)
+  ) {
+    throw new BadRequestException("Request is invalid");
+  }
 }
 
 function requireIdempotencyKey(request: B2TruthRequest): string {

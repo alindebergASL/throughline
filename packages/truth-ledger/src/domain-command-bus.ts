@@ -28,7 +28,11 @@ import {
   parseB2Command,
   parseB2CommandResult
 } from "./command-schemas.js";
-import { TruthLedgerConflictError, TruthLedgerRepository } from "./repository.js";
+import {
+  TruthLedgerConflictError,
+  TruthLedgerRepository,
+  TruthLedgerUnavailableError
+} from "./repository.js";
 import { resolvePredicateDefinition } from "./predicate-registry.js";
 import {
   VerifiedClaimSourceSpanAdmission,
@@ -163,8 +167,9 @@ export class TruthLedgerDomainCommandBus {
         }
       );
       return parseB2CommandResult(command.kind, result);
-    } catch {
-      throw new TruthLedgerConflictError();
+    } catch (error) {
+      if (error instanceof TruthLedgerUnavailableError) throw new B2AuthorizationError();
+      throw error;
     }
   }
 
