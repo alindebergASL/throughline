@@ -5,7 +5,7 @@ export const TRUSTED_OBJECTIVE_UNAVAILABLE_BODY = Object.freeze({
 });
 
 export interface TrustedObjectiveState {
-  state: "empty" | "captured" | "proposed" | "accepted";
+  state: "empty" | "captured" | "proposed" | "accepted" | "revoked";
   proposalGenerationAnchor: string;
   sourceRevisionAnchor: string | null;
   initiative: {
@@ -55,6 +55,8 @@ export interface TrustedObjectiveState {
     reworkedAt: string;
   }>;
   acceptedMemory: null | {
+    factId: string;
+    version: number;
     objective: string;
     status: "Accepted";
     exactExcerpt: string;
@@ -64,7 +66,38 @@ export interface TrustedObjectiveState {
     acceptedBy: string;
     acceptedAt: string;
     effectiveVisibility: "Public" | "Workspace" | "Restricted" | "Confidential";
+    canRevoke: boolean;
   };
+  replacementReview: null | {
+    status: "Replacement proposed, not accepted.";
+    currentFactId: string;
+    currentFactVersion: number;
+    replacementClaimId: string;
+    replacementClaimVersion: number;
+    exactExcerpt: string;
+    sourceTitle: string;
+    changePreview: {
+      from: string;
+      to: string;
+    };
+    reworkLineage: Array<{
+      predecessorClaimId: string;
+      successorClaimId: string;
+      disposition: "reworked";
+      reasonCode: "reworked";
+      reworkedAt: string;
+    }>;
+    canSupersede: boolean;
+  };
+  history: Array<{
+    factId: string;
+    availability: "available" | "redacted";
+    objective: string | null;
+    status: "Superseded" | "Revoked";
+    transition: "Accepted → Superseded" | "Accepted → Revoked";
+    acceptedAt: string;
+    changedAt: string;
+  }>;
 }
 
 export interface TrustedObjectiveDraft {
@@ -198,6 +231,92 @@ export function parseAcceptBody(input: unknown): {
   };
 }
 
+export type TrustedObjectiveSupersedeReasonCode =
+  | "newer_evidence"
+  | "accepted_value_changed"
+  | "corrected_source_revalidated";
+
+export type TrustedObjectiveRevokeReasonCode =
+  | "no_longer_true"
+  | "support_invalidated"
+  | "entered_in_error";
+
+export function parseSupersedeBody(input: unknown): {
+  factId: string;
+  expectedFactVersion: number;
+  replacementClaimId: string;
+  expectedReplacementClaimVersion: number;
+  expectedInitiativeVersion: number;
+  reasonCode: TrustedObjectiveSupersedeReasonCode;
+  rationale: string;
+} {
+  const value = exactObject(input, [
+    "factId",
+    "expectedFactVersion",
+    "replacementClaimId",
+    "expectedReplacementClaimVersion",
+    "expectedInitiativeVersion",
+    "reasonCode",
+    "rationale"
+  ]);
+  const reasonCodes = [
+    "newer_evidence",
+    "accepted_value_changed",
+    "corrected_source_revalidated"
+  ] as const;
+  if (
+    typeof value.factId !== "string" ||
+    !UUID_PATTERN.test(value.factId) ||
+    !Number.isInteger(value.expectedFactVersion) ||
+    (value.expectedFactVersion as number) < 1 ||
+    typeof value.replacementClaimId !== "string" ||
+    !UUID_PATTERN.test(value.replacementClaimId) ||
+    !Number.isInteger(value.expectedReplacementClaimVersion) ||
+    value.expectedReplacementClaimVersion !== 1 ||
+    !Number.isInteger(value.expectedInitiativeVersion) ||
+    (value.expectedInitiativeVersion as number) < 1 ||
+    !reasonCodes.includes(value.reasonCode as never) ||
+    !validRationale(value.rationale)
+  ) {
+    throw new TrustedObjectiveInputError();
+  }
+  return {
+    factId: value.factId.toLowerCase(),
+    expectedFactVersion: value.expectedFactVersion as number,
+    replacementClaimId: value.replacementClaimId.toLowerCase(),
+    expectedReplacementClaimVersion: 1,
+    expectedInitiativeVersion: value.expectedInitiativeVersion as number,
+    reasonCode: value.reasonCode as TrustedObjectiveSupersedeReasonCode,
+    rationale: value.rationale as string
+  };
+}
+
+export function parseRevokeBody(input: unknown): {
+  factId: string;
+  expectedFactVersion: number;
+  reasonCode: TrustedObjectiveRevokeReasonCode;
+  rationale: string;
+} {
+  const value = exactObject(input, ["factId", "expectedFactVersion", "reasonCode", "rationale"]);
+  const reasonCodes = ["no_longer_true", "support_invalidated", "entered_in_error"] as const;
+  if (
+    typeof value.factId !== "string" ||
+    !UUID_PATTERN.test(value.factId) ||
+    !Number.isInteger(value.expectedFactVersion) ||
+    (value.expectedFactVersion as number) < 1 ||
+    !reasonCodes.includes(value.reasonCode as never) ||
+    !validRationale(value.rationale)
+  ) {
+    throw new TrustedObjectiveInputError();
+  }
+  return {
+    factId: value.factId.toLowerCase(),
+    expectedFactVersion: value.expectedFactVersion as number,
+    reasonCode: value.reasonCode as TrustedObjectiveRevokeReasonCode,
+    rationale: value.rationale as string
+  };
+}
+
 function parseProposalFields(value: Record<string, unknown>): {
   objective: string;
   exactExcerpt: string;
@@ -282,12 +401,32 @@ function exactObject(input: unknown, keys: readonly string[]): Record<string, un
     throw new TrustedObjectiveInputError();
   }
   const value = input as Record<string, unknown>;
-  const actual = Object.keys(value).sort();
+  if (Object.getPrototypeOf(value) !== Object.prototype) throw new TrustedObjectiveInputError();
+  const ownKeys = Reflect.ownKeys(value);
+  if (ownKeys.some((key) => typeof key !== "string")) throw new TrustedObjectiveInputError();
+  const actual = (ownKeys as string[]).sort();
   const expected = [...keys].sort();
-  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+  if (
+    actual.length !== expected.length ||
+    actual.some((key, index) => key !== expected[index]) ||
+    actual.some((key) => {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      return !descriptor?.enumerable || !("value" in descriptor);
+    })
+  ) {
     throw new TrustedObjectiveInputError();
   }
   return value;
+}
+
+function validRationale(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= 2_000 &&
+    value.trim() !== "" &&
+    value === value.normalize("NFC") &&
+    value === value.trim()
+  );
 }
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

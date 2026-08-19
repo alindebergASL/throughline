@@ -35,7 +35,9 @@ import {
   parseCaptureBody,
   parseEmptyBody,
   parseProposalBody,
+  parseRevokeBody,
   parseReworkBody,
+  parseSupersedeBody,
   parseWithdrawBody
 } from "./trusted-objective.contract.js";
 import { TrustedObjectiveGuard, type TrustedObjectiveRequest } from "./trusted-objective.guard.js";
@@ -110,6 +112,30 @@ export class TrustedObjectiveController {
     return this.safe(() => {
       const input = parseAcceptBody(body);
       return this.runtime.accept(requireContext(request), requireUuid(initiativeId), input);
+    });
+  }
+
+  @Post("supersede")
+  supersede(
+    @Req() request: TrustedObjectiveRequest,
+    @Param("initiativeId") initiativeId: string,
+    @Body() body: unknown
+  ) {
+    return this.safe(() => {
+      const input = parseSupersedeBody(body);
+      return this.runtime.supersede(requireContext(request), requireUuid(initiativeId), input);
+    });
+  }
+
+  @Post("revoke")
+  revoke(
+    @Req() request: TrustedObjectiveRequest,
+    @Param("initiativeId") initiativeId: string,
+    @Body() body: unknown
+  ) {
+    return this.safe(() => {
+      const input = parseRevokeBody(body);
+      return this.runtime.revoke(requireContext(request), requireUuid(initiativeId), input);
     });
   }
 

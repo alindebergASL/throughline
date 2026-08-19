@@ -2,7 +2,11 @@ import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { GET, POST } from "../app/api/demo/initiatives/[initiativeId]/trusted-objective/route";
 import { forwardDemoRequest } from "./demo-bff";
-import { demoActionEnvelope, nextActionForState } from "./trusted-objective";
+import {
+  demoActionEnvelope,
+  nextActionForState,
+  type TrustedObjectiveState
+} from "./trusted-objective";
 
 const initiativeId = "70000000-0000-7000-8000-000000000204";
 const objective = "Reduce response time.";
@@ -13,6 +17,7 @@ const routeContext = { params: Promise.resolve({ initiativeId }) };
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.unstubAllEnvs();
+  vi.useRealTimers();
 });
 
 describe("trusted-objective UI and BFF contracts", () => {
@@ -39,6 +44,21 @@ describe("trusted-objective UI and BFF contracts", () => {
       expectedClaimVersion: 1,
       expectedInitiativeVersion: 2
     });
+    const supersede = demoActionEnvelope("supersede" as never, {
+      factId: "70000000-0000-7000-8000-000000000501",
+      expectedFactVersion: 1,
+      replacementClaimId: "70000000-0000-7000-8000-000000000402",
+      expectedReplacementClaimVersion: 1,
+      expectedInitiativeVersion: 2,
+      reasonCode: "accepted_value_changed",
+      rationale: "The accepted objective changed."
+    });
+    const revoke = demoActionEnvelope("revoke" as never, {
+      factId: "70000000-0000-7000-8000-000000000502",
+      expectedFactVersion: 1,
+      reasonCode: "no_longer_true",
+      rationale: "The objective is no longer current."
+    });
 
     expect(source).toEqual({ action: "source", note: "Maya: reduce response time." });
     expect(proposal).toEqual({
@@ -60,9 +80,85 @@ describe("trusted-objective UI and BFF contracts", () => {
       expectedClaimVersion: 1,
       expectedInitiativeVersion: 2
     });
-    expect(JSON.stringify([source, proposal, rework, accept])).not.toMatch(
+    expect(supersede).toEqual({
+      action: "supersede",
+      factId: "70000000-0000-7000-8000-000000000501",
+      expectedFactVersion: 1,
+      replacementClaimId: "70000000-0000-7000-8000-000000000402",
+      expectedReplacementClaimVersion: 1,
+      expectedInitiativeVersion: 2,
+      reasonCode: "accepted_value_changed",
+      rationale: "The accepted objective changed."
+    });
+    expect(revoke).toEqual({
+      action: "revoke",
+      factId: "70000000-0000-7000-8000-000000000502",
+      expectedFactVersion: 1,
+      reasonCode: "no_longer_true",
+      rationale: "The objective is no longer current."
+    });
+    expect(JSON.stringify([source, proposal, rework, accept, supersede, revoke])).not.toMatch(
       /persona|identity|user|tenant|workspace|membership|role|permission|policy|visibility|accessClass|evidence(?:Hash|Offset)|excerptHash|startOffset|endOffset|acceptedBy|acceptanceScope|authority/i
     );
+  });
+
+  it("constructs lifecycle envelopes field by field and drops exotic or authority-looking keys", () => {
+    const inherited = Object.create({ tenantId: "inherited-tenant" }) as Record<
+      string,
+      string | number | boolean
+    >;
+    Object.assign(inherited, {
+      factId: "70000000-0000-7000-8000-000000000501",
+      expectedFactVersion: 1,
+      reasonCode: "no_longer_true",
+      rationale: "The objective is no longer current.",
+      actorUserId: "browser-owned"
+    });
+    Object.defineProperty(inherited, "policyVersion", {
+      value: "hidden-policy",
+      enumerable: false
+    });
+    Object.defineProperty(inherited, Symbol("authority"), {
+      value: "symbol-authority",
+      enumerable: true
+    });
+    const revoke = demoActionEnvelope("revoke", inherited);
+    const supersede = demoActionEnvelope("supersede", {
+      factId: "70000000-0000-7000-8000-000000000501",
+      expectedFactVersion: 1,
+      replacementClaimId: "70000000-0000-7000-8000-000000000402",
+      expectedReplacementClaimVersion: 1,
+      expectedInitiativeVersion: 2,
+      reasonCode: "accepted_value_changed",
+      rationale: "The accepted objective changed.",
+      authorityBasis: "browser-owned",
+      __proto__: "browser-prototype"
+    });
+
+    expect(revoke).toEqual({
+      action: "revoke",
+      factId: "70000000-0000-7000-8000-000000000501",
+      expectedFactVersion: 1,
+      reasonCode: "no_longer_true",
+      rationale: "The objective is no longer current."
+    });
+    expect(supersede).toEqual({
+      action: "supersede",
+      factId: "70000000-0000-7000-8000-000000000501",
+      expectedFactVersion: 1,
+      replacementClaimId: "70000000-0000-7000-8000-000000000402",
+      expectedReplacementClaimVersion: 1,
+      expectedInitiativeVersion: 2,
+      reasonCode: "accepted_value_changed",
+      rationale: "The accepted objective changed."
+    });
+    expect(Reflect.ownKeys(revoke)).toEqual([
+      "action",
+      "factId",
+      "expectedFactVersion",
+      "reasonCode",
+      "rationale"
+    ]);
   });
 
   it("maps trust states to one deterministic primary action", () => {
@@ -76,11 +172,70 @@ describe("trusted-objective UI and BFF contracts", () => {
     expect(
       nextActionForState({
         ...base,
+        state: "accepted",
+        replacementReview: { canSupersede: true }
+      } as never)
+    ).toBe("Supersede trusted objective");
+    expect(nextActionForState({ ...base, state: "revoked" } as never)).toBe(
+      "Capture updated objective"
+    );
+    expect(
+      nextActionForState({
+        ...base,
+        state: "proposed",
+        initiative: { ...base.initiative, canAccept: true },
+        proposal: { supportConfirmed: true } as never,
+        history: [{ availability: "redacted", objective: null, status: "Revoked" }]
+      } as never)
+    ).toBe("Accept trusted objective");
+    expect(
+      nextActionForState({
+        ...base,
         state: "proposed",
         initiative: { ...base.initiative, canAccept: false },
         proposal: { supportConfirmed: true, canRework: true } as never
       })
     ).toBe("Rework proposed objective");
+  });
+
+  it("keeps accepted and replacement rework lineage explicitly attributed in the Web shape", () => {
+    const acceptedLineage = [
+      {
+        predecessorClaimId: "70000000-0000-7000-8000-000000000399",
+        successorClaimId: "70000000-0000-7000-8000-000000000401",
+        disposition: "reworked" as const,
+        reasonCode: "reworked" as const,
+        reworkedAt: "2026-07-31T00:00:00.000Z"
+      }
+    ];
+    const replacementLineage = [
+      {
+        predecessorClaimId: "70000000-0000-7000-8000-000000000400",
+        successorClaimId: "70000000-0000-7000-8000-000000000402",
+        disposition: "reworked" as const,
+        reasonCode: "reworked" as const,
+        reworkedAt: "2026-08-02T00:00:00.000Z"
+      }
+    ];
+    const mapped = {
+      reworkLineage: acceptedLineage,
+      replacementReview: {
+        status: "Replacement proposed, not accepted." as const,
+        currentFactId: "70000000-0000-7000-8000-000000000501",
+        currentFactVersion: 1,
+        replacementClaimId: "70000000-0000-7000-8000-000000000402",
+        replacementClaimVersion: 1,
+        exactExcerpt: "exact evidence for B",
+        sourceTitle: "Engagement note",
+        changePreview: { from: "Objective A", to: "Objective B" },
+        reworkLineage: replacementLineage,
+        canSupersede: true
+      }
+    } satisfies Pick<TrustedObjectiveState, "reworkLineage" | "replacementReview">;
+
+    expect(mapped.reworkLineage).toEqual(acceptedLineage);
+    expect(mapped.replacementReview.reworkLineage).toEqual(replacementLineage);
+    expect(mapped.reworkLineage).not.toEqual(mapped.replacementReview.reworkLineage);
   });
 
   it("forwards correlation metadata but no identity or authority", async () => {
@@ -96,12 +251,102 @@ describe("trusted-objective UI and BFF contracts", () => {
     const response = await forwardDemoRequest({ initiativeId });
 
     expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toContain("no-store");
     const headers = fetchMock.mock.calls[0]![1]!.headers as Record<string, string>;
     expect(headers["x-request-id"]).toMatch(/^demo-/);
     expect(headers["x-trace-id"]).toMatch(/^[a-f0-9]{32}$/);
     expect(headers).not.toHaveProperty("x-throughline-dev-identity");
     expect(headers).not.toHaveProperty("x-throughline-tenant-id");
     expect(headers).not.toHaveProperty("x-throughline-membership-id");
+    expect(fetchMock.mock.calls[0]![1]!.signal).toBeInstanceOf(AbortSignal);
+  });
+
+  it("propagates caller abort and bounds a stalled loopback fetch", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    vi.useFakeTimers();
+    const seenSignals: AbortSignal[] = [];
+    const fetchMock = vi.fn(
+      async (_url: string, init: RequestInit): Promise<Response> =>
+        new Promise((_resolve, reject) => {
+          const signal = init.signal as AbortSignal;
+          seenSignals.push(signal);
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const caller = new AbortController();
+    const callerRequest = forwardDemoRequest({ initiativeId, signal: caller.signal });
+    caller.abort();
+    await expect(callerRequest).resolves.toMatchObject({ status: 404 });
+    expect(seenSignals[0]?.aborted).toBe(true);
+
+    const timeoutRequest = forwardDemoRequest({ initiativeId });
+    await vi.advanceTimersByTimeAsync(5_000);
+    await expect(timeoutRequest).resolves.toMatchObject({ status: 404 });
+    expect(seenSignals[1]?.aborted).toBe(true);
+  });
+
+  it("keeps the timeout active while a JSON body stalls after headers", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    vi.useFakeTimers();
+    let upstreamSignal: AbortSignal | undefined;
+    let bodyReadStarted = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        upstreamSignal = init.signal as AbortSignal;
+        return stalledJsonResponse(upstreamSignal, () => {
+          bodyReadStarted = true;
+        });
+      })
+    );
+
+    const pending = forwardDemoRequest({ initiativeId });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(bodyReadStarted).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    const response = await pending;
+
+    expect(upstreamSignal?.aborted).toBe(true);
+    expect(response.status).toBe(404);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(await response.json()).toEqual({
+      statusCode: 404,
+      message: "Resource unavailable",
+      error: "Not Found"
+    });
+  });
+
+  it("propagates caller abort while a JSON body stalls after headers", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    const caller = new AbortController();
+    let upstreamSignal: AbortSignal | undefined;
+    let bodyReadStarted = false;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: RequestInit) => {
+        upstreamSignal = init.signal as AbortSignal;
+        return stalledJsonResponse(upstreamSignal, () => {
+          bodyReadStarted = true;
+        });
+      })
+    );
+
+    const pending = forwardDemoRequest({ initiativeId, signal: caller.signal });
+    await vi.waitFor(() => expect(bodyReadStarted).toBe(true));
+    caller.abort();
+    const response = await withTestDeadline(pending);
+
+    expect(upstreamSignal?.aborted).toBe(true);
+    expect(response.status).toBe(404);
+    expect(response.headers.get("cache-control")).toContain("no-store");
+    expect(await response.json()).toEqual({
+      statusCode: 404,
+      message: "Resource unavailable",
+      error: "Not Found"
+    });
   });
 
   it.each(["http://127.0.0.1:3001", "http://localhost:3001", "http://[::1]:3001"])(
@@ -175,6 +420,33 @@ describe("trusted-objective UI and BFF contracts", () => {
     }
   );
 
+  it("preserves the trusted API generic validation response without details", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ internal: "must not pass through" }), {
+          status: 400,
+          headers: { "content-type": "application/json" }
+        })
+      )
+    );
+
+    const response = await forwardDemoRequest({
+      initiativeId,
+      action: "revoke" as never,
+      body: {}
+    });
+
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({
+      statusCode: 400,
+      message: "Request is invalid",
+      error: "Bad Request"
+    });
+    expect(response.headers.get("cache-control")).toContain("no-store");
+  });
+
   it.each([
     ["malformed JSON", "not-json", "application/json"],
     ["non-JSON", "plain text", "text/plain"]
@@ -231,6 +503,114 @@ describe("trusted-objective UI and BFF contracts", () => {
     expect(queryBody).toEqual(injectedBody);
     expect(injectedBody).toEqual(authorityBody);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects authority-bearing headers, invalid UUIDs, and lifecycle envelope extras before upstream", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const headerInjection = await GET(
+      new Request(routeUrl, { headers: { "x-throughline-tenant-id": "tenant-a" } }),
+      routeContext
+    );
+    const nonLoopbackGet = await GET(
+      new Request(`https://app.example/api/demo/initiatives/${initiativeId}/trusted-objective`),
+      routeContext
+    );
+    const nonLoopbackPost = await POST(
+      new Request(`https://app.example/api/demo/initiatives/${initiativeId}/trusted-objective`, {
+        method: "POST",
+        headers: {
+          host: "localhost:3000",
+          origin: "http://localhost:3000",
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ action: "source", note: "Exact source note" })
+      }),
+      routeContext
+    );
+    const queryPost = await POST(
+      new Request(`${routeUrl}?tenant=tenant-a`, {
+        method: "POST",
+        headers: sameOriginJsonHeaders(),
+        body: JSON.stringify({ action: "source", note: "Exact source note" })
+      }),
+      routeContext
+    );
+    const extraLifecycleField = await POST(
+      new Request(routeUrl, {
+        method: "POST",
+        headers: sameOriginJsonHeaders(),
+        body: JSON.stringify({
+          action: "supersede",
+          factId: "70000000-0000-7000-8000-000000000501",
+          expectedFactVersion: 1,
+          replacementClaimId: "70000000-0000-7000-8000-000000000402",
+          expectedReplacementClaimVersion: 1,
+          expectedInitiativeVersion: 2,
+          reasonCode: "accepted_value_changed",
+          rationale: "The accepted objective changed.",
+          idempotencyKey: "browser-owned"
+        })
+      }),
+      routeContext
+    );
+    const invalidUuid = await forwardDemoRequest({ initiativeId: "not-a-uuid" });
+
+    expect([
+      headerInjection.status,
+      nonLoopbackGet.status,
+      nonLoopbackPost.status,
+      queryPost.status,
+      extraLifecycleField.status,
+      invalidUuid.status
+    ]).toEqual([404, 404, 404, 404, 404, 404]);
+    expect(headerInjection.headers.get("cache-control")).toContain("no-store");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("forwards exact same-origin lifecycle envelopes without browser-owned authority metadata", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(JSON.stringify({ state: "accepted" }), {
+        status: 201,
+        headers: { "content-type": "application/json" }
+      })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await POST(
+      new Request(routeUrl, {
+        method: "POST",
+        headers: sameOriginJsonHeaders(),
+        body: JSON.stringify({
+          action: "supersede",
+          factId: "70000000-0000-7000-8000-000000000501",
+          expectedFactVersion: 1,
+          replacementClaimId: "70000000-0000-7000-8000-000000000402",
+          expectedReplacementClaimVersion: 1,
+          expectedInitiativeVersion: 2,
+          reasonCode: "accepted_value_changed",
+          rationale: "The accepted objective changed."
+        })
+      }),
+      routeContext
+    );
+
+    expect(response.status).toBe(201);
+    expect(fetchMock.mock.calls[0]![0]).toBe(
+      `http://127.0.0.1:3001/v1/demo/initiatives/${initiativeId}/trusted-objective/supersede`
+    );
+    expect(JSON.parse(fetchMock.mock.calls[0]![1]!.body as string)).toEqual({
+      factId: "70000000-0000-7000-8000-000000000501",
+      expectedFactVersion: 1,
+      replacementClaimId: "70000000-0000-7000-8000-000000000402",
+      expectedReplacementClaimVersion: 1,
+      expectedInitiativeVersion: 2,
+      reasonCode: "accepted_value_changed",
+      rationale: "The accepted objective changed."
+    });
   });
 
   it("rejects missing, forged, stale, or cross-action support confirmation envelopes", async () => {
@@ -377,6 +757,83 @@ describe("trusted-objective UI and BFF contracts", () => {
 
     expect(response.status).toBe(201);
     expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["duplicate member", '{"action":"source","note":"safe","note":"override"}', "application/json"],
+    [
+      "escaped duplicate member",
+      '{"action":"source","note":"safe","n\\u006fte":"override"}',
+      "application/json"
+    ],
+    ["malformed JSON", '{"action":"source",', "application/json"],
+    [
+      "prototype member",
+      '{"action":"source","note":"safe","__proto__":{"polluted":true}}',
+      "application/json"
+    ],
+    ["non-UTF-8 bytes", new Uint8Array([0x7b, 0x22, 0xff, 0x22, 0x7d]), "application/json"],
+    [
+      "non-UTF-8 charset",
+      '{"action":"source","note":"safe"}',
+      "application/json; charset=iso-8859-1"
+    ],
+    [
+      "duplicate charset",
+      '{"action":"source","note":"safe"}',
+      "application/json; charset=utf-8; charset=utf-8"
+    ]
+  ])("rejects %s before forwarding", async (_label, body, contentType) => {
+    vi.stubEnv("NODE_ENV", "test");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    const response = await POST(
+      new Request(routeUrl, {
+        method: "POST",
+        headers: {
+          origin: new URL(routeUrl).origin,
+          "content-type": contentType,
+          "sec-fetch-site": "same-origin"
+        },
+        body
+      }),
+      routeContext
+    );
+
+    expect(response.status).toBe(404);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("passes the route request abort signal into the loopback helper", async () => {
+    vi.stubEnv("NODE_ENV", "test");
+    const caller = new AbortController();
+    let upstreamSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(
+      async (_url: string, init: RequestInit): Promise<Response> =>
+        new Promise((_resolve, reject) => {
+          upstreamSignal = init.signal as AbortSignal;
+          if (upstreamSignal.aborted) {
+            reject(upstreamSignal.reason);
+            return;
+          }
+          upstreamSignal.addEventListener("abort", () => reject(upstreamSignal?.reason), {
+            once: true
+          });
+        })
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const routeRequest = new Request(routeUrl, {
+      method: "POST",
+      headers: sameOriginJsonHeaders(),
+      body: JSON.stringify({ action: "source", note: "Exact source note" }),
+      signal: caller.signal
+    });
+    const responsePromise = POST(routeRequest, routeContext);
+    caller.abort();
+
+    await expect(responsePromise).resolves.toMatchObject({ status: 404 });
+    expect(upstreamSignal?.aborted).toBe(true);
   });
 
   it("uses the actual loopback Host when the framework normalizes request.url", async () => {
@@ -651,4 +1108,34 @@ function sameOriginJsonHeaders(): Record<string, string> {
     "content-type": "application/json",
     "sec-fetch-site": "same-origin"
   };
+}
+
+function stalledJsonResponse(signal: AbortSignal, onRead: () => void): Response {
+  return {
+    ok: true,
+    status: 200,
+    headers: new Headers({ "content-type": "application/json" }),
+    json: vi.fn(() => {
+      onRead();
+      return new Promise<never>((_resolve, reject) => {
+        const rejectOnAbort = () => reject(signal.reason ?? new Error("Upstream aborted"));
+        if (signal.aborted) rejectOnAbort();
+        else signal.addEventListener("abort", rejectOnAbort, { once: true });
+      });
+    })
+  } as unknown as Response;
+}
+
+async function withTestDeadline<T>(promise: Promise<T>, timeoutMs = 250): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("Test operation did not settle")), timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
 }

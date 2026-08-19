@@ -541,7 +541,7 @@ describe.sequential("durable truth command boundary", () => {
     expect(repository).not.toMatch(/FOR SHARE OF (?:span, )?source, chunk/);
   });
 
-  it("serializes first acceptance with an advisory lock before a plain prior-Fact read", async () => {
+  it("serializes first acceptance and reserves only an active Fact slot", async () => {
     const statements: Array<{ sql: string; values: readonly unknown[] | undefined }> = [];
     const tx = {
       client: {} as TenantDbTransaction["client"],
@@ -566,8 +566,42 @@ describe.sequential("durable truth command boundary", () => {
       `${id("1")}/${id("2")}/${spaceId}/activity/${id("4")}/activity.outcome`
     ]);
     expect(statements[1]?.sql).toContain("FROM truth.accepted_facts");
+    expect(statements[1]?.sql).toContain("status IN ('current', 'contested')");
     expect(statements[1]?.sql).toContain("LIMIT 1");
     expect(statements[1]?.sql).not.toMatch(/\bFOR\s+(?:NO KEY )?(?:UPDATE|SHARE)\b/i);
+
+    const occupiedTx = {
+      client: {} as TenantDbTransaction["client"],
+      async query(sql: string) {
+        if (sql.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
+        if (sql.includes("FROM truth.accepted_facts")) return { rows: [{ id: id("9") }] };
+        throw new Error(`Unexpected acceptance-slot query: ${sql}`);
+      }
+    } as unknown as TenantDbTransaction;
+    await expect(
+      new TruthLedgerRepository(occupiedTx).lockFirstAcceptanceSlot({
+        tenantId: id("1"),
+        workspaceId: id("2"),
+        spaceId,
+        subjectType: "activity",
+        subjectId: id("4"),
+        predicate: "activity.outcome"
+      })
+    ).rejects.toBeInstanceOf(TruthLedgerConflictError);
+  });
+
+  it("checks the open primary-objective proposal policy before revocation mutation", async () => {
+    const repository = await readFile(new URL("./repository.ts", import.meta.url), "utf8");
+    const revoke = repository.slice(
+      repository.indexOf("async revokePrelockedFact"),
+      repository.indexOf("async lockFirstAcceptanceSlot")
+    );
+
+    expect(revoke).toContain("status = 'proposed'");
+    expect(revoke).toContain("TruthLedgerConflictError");
+    expect(revoke.indexOf("status = 'proposed'")).toBeLessThan(
+      revoke.indexOf("terminalizePrelockedFact")
+    );
   });
 
   it("locks acceptance at the persisted Claim coordinate without Initiative-wide narrowing", async () => {
@@ -635,13 +669,17 @@ describe.sequential("durable truth command boundary", () => {
 
     expect(statements).toHaveLength(2);
     expect(statements[0]).toBe("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))");
+    expect(statements[1]).toContain("space_id = $3");
+    expect(statements[1]).toContain("id = $4");
+    expect(statements[1]).toContain("subject_type = 'initiative' AND subject_id = $5");
+    expect(statements[1]).toContain("predicate = 'initiative.primary_objective'");
     expect(statements[1]).toContain("status = 'proposed' AND version = $6");
-    expect(statements[1]).toContain("NOT EXISTS");
-    expect(statements[1]).toContain("FROM truth.accepted_facts");
+    expect(statements[1]).not.toContain("NOT EXISTS");
+    expect(statements[1]).not.toContain("FROM truth.accepted_facts");
     expect(statements[1]).toContain("FOR UPDATE");
   });
 
-  it("revalidates the exact objective generation after taking the shared coordinate lock", async () => {
+  it("reserves the objective proposal slot independently of the current accepted Fact", async () => {
     const statements: Array<{ sql: string; values?: readonly unknown[] }> = [];
     const tx = {
       client: {} as TenantDbTransaction["client"],
@@ -672,7 +710,44 @@ describe.sequential("durable truth command boundary", () => {
     expect(statements).toHaveLength(3);
     expect(statements[0]?.sql).toBe("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))");
     expect(statements[1]?.sql).toContain("FOR SHARE");
+    expect(statements[1]?.values).toEqual([
+      id("1"),
+      id("2"),
+      spaceId,
+      id("4"),
+      "initiative.primary_objective"
+    ]);
     expect(statements[2]?.sql).toContain("AS occupied");
+    expect(statements[2]?.sql).toContain("FROM truth.claims");
+    expect(statements[2]?.sql).toContain("status = 'proposed'");
+    expect(statements[2]?.sql).not.toContain("truth.accepted_facts");
+    expect(statements[2]?.sql).not.toContain("status IN ('current', 'contested')");
+
+    const occupiedTx = {
+      ...tx,
+      async query(sql: string, values?: readonly unknown[]) {
+        if (sql.startsWith("SELECT pg_advisory_xact_lock")) return { rows: [] };
+        if (sql.includes("ORDER BY created_at DESC, id DESC")) {
+          return { rows: [{ id: id("10"), version: 2, status: "rejected" }] };
+        }
+        if (sql.includes("AS occupied")) return { rows: [{ occupied: true }] };
+        return tx.query(sql, values);
+      }
+    } as unknown as TenantDbTransaction;
+    await expect(
+      new TruthLedgerRepository(occupiedTx).lockPrimaryObjectiveProposalSlot({
+        tenantId: id("1"),
+        workspaceId: id("2"),
+        spaceId,
+        subjectId: id("4"),
+        expectedLatestClaim: {
+          kind: "claim",
+          claimId: id("10"),
+          expectedVersion: 2,
+          expectedStatus: "rejected"
+        }
+      })
+    ).rejects.toBeInstanceOf(TruthLedgerConflictError);
 
     const staleTx = {
       ...tx,

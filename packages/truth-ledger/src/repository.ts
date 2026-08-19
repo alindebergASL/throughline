@@ -595,12 +595,6 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
           AND id = $4 AND subject_type = 'initiative' AND subject_id = $5
           AND predicate = 'initiative.primary_objective'
           AND status = 'proposed' AND version = $6
-          AND NOT EXISTS (
-            SELECT 1 FROM truth.accepted_facts fact
-             WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.space_id = $3
-               AND fact.subject_type = 'initiative' AND fact.subject_id = $5
-               AND fact.predicate = 'initiative.primary_objective'
-          )
         LIMIT 1 FOR UPDATE`,
       [
         input.tenantId,
@@ -1270,6 +1264,27 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     ) {
       throw new TruthLedgerConflictError();
     }
+    if (
+      input.target.subjectType === "initiative" &&
+      input.target.predicate === "initiative.primary_objective"
+    ) {
+      const openProposal = await this.guardLifecycleDatabaseOperation(() =>
+        this.tx.query<{ id: string }>(
+          `SELECT id FROM truth.claims
+           WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
+             AND subject_type = 'initiative' AND subject_id = $4
+             AND predicate = 'initiative.primary_objective' AND status = 'proposed'
+           LIMIT 1`,
+          [
+            input.target.tenantId,
+            input.target.workspaceId,
+            input.target.spaceId,
+            input.target.subjectId
+          ]
+        )
+      );
+      if (openProposal.rows.length !== 0) throw new TruthLedgerConflictError();
+    }
     await this.terminalizePrelockedFact(input.target, "revoked", input.commandId);
     await this.insertFactLifecycleEvent({
       target: input.target,
@@ -1301,6 +1316,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
        FROM truth.accepted_facts
        WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
          AND subject_type = $4 AND subject_id = $5 AND predicate = $6
+         AND status IN ('current', 'contested')
        LIMIT 1`,
       [
         input.tenantId,
@@ -1356,11 +1372,6 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     }
     const occupied = await this.tx.query<{ occupied: boolean }>(
       `SELECT EXISTS (
-         SELECT 1 FROM truth.accepted_facts
-         WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
-           AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5
-           AND status IN ('current', 'contested')
-       ) OR EXISTS (
          SELECT 1 FROM truth.claims
          WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
            AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5
