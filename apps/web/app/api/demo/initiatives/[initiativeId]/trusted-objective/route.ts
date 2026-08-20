@@ -313,6 +313,7 @@ function bodyForAction(
 }
 
 function hasRequesterAuthorityHeaders(request: Request): boolean {
+  // Next injects x-forwarded-for/host/proto; this BFF ignores and drops them as transport metadata.
   const forbidden = new Set([
     "authorization",
     "cookie",
@@ -320,9 +321,6 @@ function hasRequesterAuthorityHeaders(request: Request): boolean {
     "idempotency-key",
     "proxy-authorization",
     "role",
-    "x-forwarded-for",
-    "x-forwarded-host",
-    "x-forwarded-proto",
     "x-request-id",
     "x-trace-id"
   ]);
