@@ -19,6 +19,8 @@ const leaves: readonly GateLeaf[] = [
       "src/command-schemas.spec.ts",
       "src/confidence.spec.ts",
       "src/domain-command-bus.spec.ts",
+      "src/fact-lifecycle-command-bus.postgres.spec.ts",
+      "src/fact-lifecycle-repository.postgres.spec.ts",
       "src/predicate-registry.spec.ts",
       "src/reasons.spec.ts",
       "src/source-span.spec.ts",

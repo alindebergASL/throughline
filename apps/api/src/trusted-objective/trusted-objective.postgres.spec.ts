@@ -39,6 +39,10 @@ const excerpt =
   "The primary objective is to reduce average resident-service response time from twelve business days to five while preserving human review.";
 const objective =
   "Reduce average resident-service response time from twelve business days to five while preserving human review.";
+const replacementExcerpt =
+  "The replacement primary objective is to reduce first-response time to four business days while preserving human review.";
+const replacementObjective =
+  "Reduce first-response time to four business days while preserving human review.";
 
 suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", () => {
   let ownerPool: PgPool;
@@ -242,6 +246,738 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
       parallel_store: null
     });
   }, 30_000);
+
+  it("projects accepted, replacement-proposed, superseded, and revoked objective lifecycle from the canonical ledger", async () => {
+    const workflow = await createWorkflow("objective-lifecycle-projection");
+    const lifecycleNote = `${note}\nMaya: ${replacementExcerpt}`;
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", { note: lifecycleNote });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    const acceptedA = await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+    expect(acceptedA.statusCode, acceptedA.body).toBe(201);
+
+    const proposedB = await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective: replacementObjective,
+      exactExcerpt: replacementExcerpt,
+      supportConfirmed: true
+    });
+    expect(proposedB.statusCode, proposedB.body).toBe(201);
+    const replacementState = proposedB.json();
+    expect(replacementState).toMatchObject({
+      state: "accepted",
+      acceptedMemory: { objective, status: "Accepted", version: 1 },
+      proposal: {
+        objective: replacementObjective,
+        exactExcerpt: replacementExcerpt,
+        status: "Proposed, not accepted."
+      },
+      replacementReview: {
+        currentFactId: replacementState.acceptedMemory.factId,
+        replacementClaimId: replacementState.proposal.claimId,
+        exactExcerpt: replacementExcerpt,
+        changePreview: { from: objective, to: replacementObjective },
+        canSupersede: true
+      },
+      history: []
+    });
+
+    const superseded = await postAs("tenant-a-owner", workflow.initiativeId, "supersede", {
+      factId: replacementState.acceptedMemory.factId,
+      expectedFactVersion: replacementState.acceptedMemory.version,
+      replacementClaimId: replacementState.proposal.claimId,
+      expectedReplacementClaimVersion: replacementState.proposal.version,
+      expectedInitiativeVersion: replacementState.initiative.version,
+      reasonCode: "accepted_value_changed",
+      rationale: "The engagement established a replacement primary objective."
+    });
+    expect(superseded.statusCode, superseded.body).toBe(201);
+    const supersededState = superseded.json();
+    expect(supersededState).toMatchObject({
+      state: "accepted",
+      proposal: null,
+      replacementReview: null,
+      acceptedMemory: { objective: replacementObjective, status: "Accepted", version: 1 },
+      history: [
+        {
+          factId: replacementState.acceptedMemory.factId,
+          objective,
+          status: "Superseded",
+          transition: "Accepted → Superseded"
+        }
+      ]
+    });
+    expect(supersededState.history).toHaveLength(1);
+
+    const stale = await postAs("tenant-a-owner", workflow.initiativeId, "supersede", {
+      factId: supersededState.acceptedMemory.factId,
+      expectedFactVersion: 2,
+      replacementClaimId: replacementState.proposal.claimId,
+      expectedReplacementClaimVersion: 1,
+      expectedInitiativeVersion: supersededState.initiative.version,
+      reasonCode: "newer_evidence",
+      rationale: "This stale request must not change the current projection."
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json()).toEqual({
+      statusCode: 409,
+      message: "Command precondition failed",
+      error: "Conflict"
+    });
+    expect((await getAs("tenant-a-owner", workflow.initiativeId)).json()).toEqual(supersededState);
+
+    const revoked = await postAs("tenant-a-owner", workflow.initiativeId, "revoke", {
+      factId: supersededState.acceptedMemory.factId,
+      expectedFactVersion: supersededState.acceptedMemory.version,
+      reasonCode: "no_longer_true",
+      rationale: "The initiative no longer has an accepted primary objective."
+    });
+    expect(revoked.statusCode, revoked.body).toBe(201);
+    expect(revoked.json()).toMatchObject({
+      state: "revoked",
+      acceptedMemory: null,
+      proposal: null,
+      replacementReview: null,
+      history: [
+        {
+          factId: supersededState.acceptedMemory.factId,
+          objective: replacementObjective,
+          status: "Revoked",
+          transition: "Accepted → Revoked"
+        }
+      ]
+    });
+    expect(revoked.json().history).toHaveLength(1);
+
+    const canonical = await ownerPool.query<{
+      current_facts: string;
+      lifecycle_events: string;
+      parallel_store: string | null;
+    }>(
+      `SELECT
+         (SELECT count(*)::text FROM truth.accepted_facts
+           WHERE subject_type = 'initiative' AND subject_id = $1
+             AND predicate = 'initiative.primary_objective' AND status = 'current') AS current_facts,
+         (SELECT count(*)::text FROM truth.fact_lifecycle_events lifecycle
+           JOIN truth.accepted_facts fact ON fact.id = lifecycle.predecessor_fact_id
+           WHERE fact.subject_type = 'initiative' AND fact.subject_id = $1
+             AND fact.predicate = 'initiative.primary_objective') AS lifecycle_events,
+         to_regclass('work.trusted_objectives')::text AS parallel_store`,
+      [workflow.initiativeId]
+    );
+    expect(canonical.rows[0]).toEqual({
+      current_facts: "0",
+      lifecycle_events: "2",
+      parallel_store: null
+    });
+  }, 30_000);
+
+  it("rejects an X-route/Y-Fact revoke generically with zero lifecycle residue", async () => {
+    const x = await createWorkflow("wrong-initiative-revoke-x");
+    const y = await createWorkflow("wrong-initiative-revoke-y");
+    for (const workflow of [x, y]) {
+      await postAs("tenant-a-owner", workflow.initiativeId, "source", { note });
+      await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+        objective,
+        exactExcerpt: excerpt,
+        supportConfirmed: true
+      });
+      await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+    }
+    const xState = (await getAs("tenant-a-owner", x.initiativeId)).json();
+    const yState = (await getAs("tenant-a-owner", y.initiativeId)).json();
+    const before = await lifecycleSnapshot([x.initiativeId, y.initiativeId]);
+
+    const wrongRoute = await postAs("tenant-a-owner", x.initiativeId, "revoke", {
+      factId: yState.acceptedMemory.factId,
+      expectedFactVersion: yState.acceptedMemory.version,
+      reasonCode: "no_longer_true",
+      rationale: "A Fact from another Initiative must not be mutable through this route."
+    });
+    const missing = await postAs(
+      "tenant-a-owner",
+      "70000000-0000-7000-8000-000000000997",
+      "revoke",
+      {
+        factId: yState.acceptedMemory.factId,
+        expectedFactVersion: 1,
+        reasonCode: "no_longer_true",
+        rationale: "The target is unavailable."
+      }
+    );
+
+    expect(wrongRoute.statusCode).toBe(404);
+    expect(wrongRoute.body).toBe(missing.body);
+    expect(await lifecycleSnapshot([x.initiativeId, y.initiativeId])).toEqual(before);
+    expect((await getAs("tenant-a-owner", x.initiativeId)).json()).toEqual(xState);
+    expect((await getAs("tenant-a-owner", y.initiativeId)).json()).toEqual(yState);
+  }, 30_000);
+
+  it("keeps A current while B is open and serializes replacement proposal cardinality", async () => {
+    const workflow = await createWorkflow("active-fact-open-proposal-policy");
+    const lifecycleNote = `${note}\nMaya: ${replacementExcerpt}\nMaya: A third objective would shorten response time to three days.`;
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", { note: lifecycleNote });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+    const observed = (await getAs("tenant-a-owner", workflow.initiativeId)).json();
+    const candidateBodies = [
+      {
+        objective: replacementObjective,
+        exactExcerpt: replacementExcerpt,
+        supportConfirmed: true,
+        proposalGenerationAnchor: observed.proposalGenerationAnchor,
+        sourceRevisionAnchor: observed.sourceRevisionAnchor
+      },
+      {
+        objective: "Shorten first-response time to three business days.",
+        exactExcerpt: "A third objective would shorten response time to three days.",
+        supportConfirmed: true,
+        proposalGenerationAnchor: observed.proposalGenerationAnchor,
+        sourceRevisionAnchor: observed.sourceRevisionAnchor
+      }
+    ];
+    const concurrent = await Promise.all(
+      candidateBodies.map((payload) =>
+        postAs("tenant-a-owner", workflow.initiativeId, "proposal", payload)
+      )
+    );
+    expect(concurrent.map(({ statusCode }) => statusCode).sort()).toEqual([201, 409]);
+    await expectPrimaryObjectiveCounts(workflow.initiativeId, { proposed: 1, accepted: 1 });
+
+    const replacement = (await getAs("tenant-a-owner", workflow.initiativeId)).json();
+    const beforeAccept = await lifecycleSnapshot([workflow.initiativeId]);
+    const ordinaryAccept = await postAs("tenant-a-owner", workflow.initiativeId, "accept", {
+      claimId: replacement.proposal.claimId,
+      expectedClaimVersion: replacement.proposal.version,
+      expectedInitiativeVersion: replacement.initiative.version
+    });
+    expect(ordinaryAccept.statusCode).toBe(409);
+    expect(await lifecycleSnapshot([workflow.initiativeId])).toEqual(beforeAccept);
+
+    const third = await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      ...candidateBodies[1],
+      proposalGenerationAnchor: replacement.proposalGenerationAnchor,
+      sourceRevisionAnchor: replacement.sourceRevisionAnchor
+    });
+    expect(third.statusCode).toBe(409);
+    await expectPrimaryObjectiveCounts(workflow.initiativeId, { proposed: 1, accepted: 1 });
+
+    const beforeRevoke = await lifecycleSnapshot([workflow.initiativeId]);
+    const revoke = await postAs("tenant-a-owner", workflow.initiativeId, "revoke", {
+      factId: replacement.acceptedMemory.factId,
+      expectedFactVersion: replacement.acceptedMemory.version,
+      reasonCode: "no_longer_true",
+      rationale: "An open replacement must be resolved before revocation."
+    });
+    expect(revoke.statusCode).toBe(409);
+    expect(await lifecycleSnapshot([workflow.initiativeId])).toEqual(beforeRevoke);
+  }, 30_000);
+
+  it("withdraws proposed replacement B while accepted objective A remains current and unchanged", async () => {
+    const workflow = await createWorkflow("withdraw-open-replacement-with-current-fact");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", {
+      note: `${note}\nMaya: ${replacementExcerpt}`
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    const acceptedA = (await postAs("tenant-a-owner", workflow.initiativeId, "accept", {})).json();
+    const proposedB = await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective: replacementObjective,
+      exactExcerpt: replacementExcerpt,
+      supportConfirmed: true
+    });
+    expect(proposedB.statusCode, proposedB.body).toBe(201);
+    const openReplacement = proposedB.json();
+
+    const withdrawn = await postAs("tenant-a-owner", workflow.initiativeId, "proposal/withdraw", {
+      claimId: openReplacement.proposal.claimId,
+      expectedClaimVersion: openReplacement.proposal.version,
+      expectedInitiativeVersion: openReplacement.initiative.version,
+      disposition: "withdrawn",
+      reasonCode: "needs_rework"
+    });
+
+    expect(withdrawn.statusCode, withdrawn.body).toBe(201);
+    expect(withdrawn.json()).toMatchObject({
+      state: "accepted",
+      proposal: null,
+      replacementReview: null,
+      acceptedMemory: {
+        factId: acceptedA.acceptedMemory.factId,
+        version: acceptedA.acceptedMemory.version,
+        objective,
+        status: "Accepted"
+      }
+    });
+    const durable = await ownerPool.query<{
+      fact_status: string;
+      fact_version: number;
+      fact_value: string;
+      claim_status: string;
+      claim_version: number;
+      disposition: string;
+    }>(
+      `SELECT fact.status AS fact_status, fact.version AS fact_version,
+              fact.canonical_value_text AS fact_value,
+              claim.status AS claim_status, claim.version AS claim_version,
+              recovery.disposition
+       FROM truth.accepted_facts fact
+       JOIN truth.claims claim ON claim.tenant_id = fact.tenant_id
+         AND claim.workspace_id = fact.workspace_id AND claim.id = $2
+       JOIN truth.initiative_objective_proposal_recoveries recovery
+         ON recovery.tenant_id = claim.tenant_id
+        AND recovery.workspace_id = claim.workspace_id
+        AND recovery.predecessor_claim_id = claim.id
+       WHERE fact.id = $1`,
+      [acceptedA.acceptedMemory.factId, openReplacement.proposal.claimId]
+    );
+    expect(durable.rows).toEqual([
+      {
+        fact_status: "current",
+        fact_version: acceptedA.acceptedMemory.version,
+        fact_value: objective,
+        claim_status: "rejected",
+        claim_version: 2,
+        disposition: "withdrawn"
+      }
+    ]);
+  }, 30_000);
+
+  it("serializes proposal versus revoke and leaves only a recoverable objective state", async () => {
+    const workflow = await createWorkflow("proposal-versus-revoke");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", {
+      note: `${note}\nMaya: ${replacementExcerpt}`
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+    const observed = (await getAs("tenant-a-owner", workflow.initiativeId)).json();
+    const [proposalResponse, revokeResponse] = await Promise.all([
+      postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+        objective: replacementObjective,
+        exactExcerpt: replacementExcerpt,
+        supportConfirmed: true,
+        proposalGenerationAnchor: observed.proposalGenerationAnchor,
+        sourceRevisionAnchor: observed.sourceRevisionAnchor
+      }),
+      postAs("tenant-a-owner", workflow.initiativeId, "revoke", {
+        factId: observed.acceptedMemory.factId,
+        expectedFactVersion: observed.acceptedMemory.version,
+        reasonCode: "no_longer_true",
+        rationale: "The prior objective is no longer current."
+      })
+    ]);
+    expect([proposalResponse.statusCode, revokeResponse.statusCode]).toEqual(
+      expect.arrayContaining([201])
+    );
+    expect(
+      [proposalResponse.statusCode, revokeResponse.statusCode].every((code) =>
+        [201, 409].includes(code)
+      )
+    ).toBe(true);
+    const durable = await ownerPool.query<{ current: number; proposed: number }>(
+      `SELECT
+         (SELECT count(*)::integer FROM truth.accepted_facts WHERE subject_id = $1
+           AND predicate = 'initiative.primary_objective' AND status IN ('current','contested')) AS current,
+         (SELECT count(*)::integer FROM truth.claims WHERE subject_id = $1
+           AND predicate = 'initiative.primary_objective' AND status = 'proposed') AS proposed`,
+      [workflow.initiativeId]
+    );
+    expect(durable.rows[0]!.current).toBeLessThanOrEqual(1);
+    expect(durable.rows[0]!.proposed).toBeLessThanOrEqual(1);
+    const state = (await getAs("tenant-a-owner", workflow.initiativeId)).json();
+    if (state.proposal && !state.acceptedMemory) {
+      const recovered = await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+      expect(recovered.statusCode, recovered.body).toBe(201);
+      expect(recovered.json()).toMatchObject({
+        state: "accepted",
+        acceptedMemory: { objective: replacementObjective },
+        history: [{ status: "Revoked" }]
+      });
+    } else if (state.acceptedMemory) {
+      expect(state).toMatchObject({
+        state: "accepted",
+        acceptedMemory: { objective },
+        replacementReview: { status: "Replacement proposed, not accepted." }
+      });
+    } else {
+      expect(state).toMatchObject({ state: "revoked", proposal: null, acceptedMemory: null });
+    }
+  }, 30_000);
+
+  it("accepts C after revoking A and preserves one bounded revoked history entry", async () => {
+    const workflow = await createWorkflow("post-revocation-recovery");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", {
+      note: `${note}\nMaya: ${replacementExcerpt}`
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    const acceptedA = (await postAs("tenant-a-owner", workflow.initiativeId, "accept", {})).json();
+    const revoked = await postAs("tenant-a-owner", workflow.initiativeId, "revoke", {
+      factId: acceptedA.acceptedMemory.factId,
+      expectedFactVersion: acceptedA.acceptedMemory.version,
+      reasonCode: "no_longer_true",
+      rationale: "The prior objective is no longer current."
+    });
+    expect(revoked.json()).toMatchObject({ state: "revoked", proposal: null });
+    const proposedC = await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective: replacementObjective,
+      exactExcerpt: replacementExcerpt,
+      supportConfirmed: true
+    });
+    expect(proposedC.statusCode, proposedC.body).toBe(201);
+    const acceptedC = await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+    expect(acceptedC.statusCode, acceptedC.body).toBe(201);
+    expect(acceptedC.json()).toMatchObject({
+      state: "accepted",
+      acceptedMemory: { objective: replacementObjective },
+      history: [
+        {
+          factId: acceptedA.acceptedMemory.factId,
+          availability: "available",
+          objective,
+          status: "Revoked"
+        }
+      ]
+    });
+    expect(acceptedC.json().history).toHaveLength(1);
+    const facts = await ownerPool.query<{ current: number; revoked: number }>(
+      `SELECT count(*) FILTER (WHERE status = 'current')::integer AS current,
+              count(*) FILTER (WHERE status = 'revoked')::integer AS revoked
+       FROM truth.accepted_facts WHERE subject_id = $1
+         AND predicate = 'initiative.primary_objective'`,
+      [workflow.initiativeId]
+    );
+    expect(facts.rows[0]).toEqual({ current: 1, revoked: 1 });
+  }, 30_000);
+
+  it("rejects stale Fact, replacement Claim, and Initiative lifecycle versions with zero residue", async () => {
+    const workflow = await createWorkflow("individually-stale-lifecycle-versions");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", {
+      note: `${note}\nMaya: ${replacementExcerpt}`
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+    const proposed = await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective: replacementObjective,
+      exactExcerpt: replacementExcerpt,
+      supportConfirmed: true
+    });
+    const state = proposed.json();
+    for (const stale of [
+      { expectedFactVersion: state.acceptedMemory.version + 1 },
+      { expectedInitiativeVersion: state.initiative.version + 1 }
+    ]) {
+      const before = await lifecycleSnapshot([workflow.initiativeId]);
+      const response = await postAs("tenant-a-owner", workflow.initiativeId, "supersede", {
+        factId: state.acceptedMemory.factId,
+        expectedFactVersion: state.acceptedMemory.version,
+        replacementClaimId: state.proposal.claimId,
+        expectedReplacementClaimVersion: state.proposal.version,
+        expectedInitiativeVersion: state.initiative.version,
+        reasonCode: "accepted_value_changed",
+        rationale: "A stale version must not leave partial lifecycle writes.",
+        ...stale
+      });
+      expect(response.statusCode).toBe(409);
+      expect(await lifecycleSnapshot([workflow.initiativeId])).toEqual(before);
+    }
+
+    const withdrawn = await postAs("tenant-a-owner", workflow.initiativeId, "proposal/withdraw", {
+      claimId: state.proposal.claimId,
+      expectedClaimVersion: state.proposal.version,
+      expectedInitiativeVersion: state.initiative.version,
+      disposition: "withdrawn",
+      reasonCode: "needs_rework"
+    });
+    expect(withdrawn.statusCode, withdrawn.body).toBe(201);
+    const beforeClaim = await lifecycleSnapshot([workflow.initiativeId]);
+    const staleClaim = await postAs("tenant-a-owner", workflow.initiativeId, "supersede", {
+      factId: state.acceptedMemory.factId,
+      expectedFactVersion: state.acceptedMemory.version,
+      replacementClaimId: state.proposal.claimId,
+      expectedReplacementClaimVersion: state.proposal.version,
+      expectedInitiativeVersion: state.initiative.version,
+      reasonCode: "accepted_value_changed",
+      rationale: "A terminal replacement Claim must not be accepted."
+    });
+    expect(staleClaim.statusCode).toBe(409);
+    expect(await lifecycleSnapshot([workflow.initiativeId])).toEqual(beforeClaim);
+  }, 30_000);
+
+  it("projects A from its own source after corrected-source B supersedes it", async () => {
+    const workflow = await createWorkflow("fact-owned-distinct-source-history");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", { note });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    const acceptedA = (await postAs("tenant-a-owner", workflow.initiativeId, "accept", {})).json();
+    const originalSource = await ownerPool.query<{ id: string }>(
+      `SELECT source_artifact_id AS id FROM work.activity_sources
+       WHERE activity_id = $1 ORDER BY created_at, source_artifact_id LIMIT 1`,
+      [workflow.activityId]
+    );
+    await ownerPool.query(
+      "ALTER TABLE content.source_artifacts DISABLE TRIGGER source_artifacts_z_b2_correction_interlock"
+    );
+    try {
+      await accountBus.execute(
+        {
+          kind: "source.correct",
+          idempotencyKey: "fact-owned-distinct-source-history-correction",
+          payload: {
+            predecessorSourceArtifactId: originalSource.rows[0]!.id,
+            activityId: workflow.activityId,
+            sourceType: "note",
+            title: "Corrected engagement note",
+            text: `Corrected engagement record\nMaya: ${replacementExcerpt}`
+          }
+        },
+        createDevSecurityContext("tenant-a-owner")
+      );
+    } finally {
+      await ownerPool.query(
+        "ALTER TABLE content.source_artifacts ENABLE TRIGGER source_artifacts_z_b2_correction_interlock"
+      );
+    }
+    const proposedB = await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective: replacementObjective,
+      exactExcerpt: replacementExcerpt,
+      supportConfirmed: true
+    });
+    const replacement = proposedB.json();
+    expect(replacement.acceptedMemory).toMatchObject({
+      factId: acceptedA.acceptedMemory.factId,
+      objective,
+      exactExcerpt: excerpt,
+      sourceTitle: "Engagement note"
+    });
+    const superseded = await postAs("tenant-a-owner", workflow.initiativeId, "supersede", {
+      factId: replacement.acceptedMemory.factId,
+      expectedFactVersion: replacement.acceptedMemory.version,
+      replacementClaimId: replacement.proposal.claimId,
+      expectedReplacementClaimVersion: replacement.proposal.version,
+      expectedInitiativeVersion: replacement.initiative.version,
+      reasonCode: "corrected_source_revalidated",
+      rationale: "Corrected evidence establishes the replacement objective."
+    });
+    expect(superseded.statusCode, superseded.body).toBe(201);
+    expect(superseded.json()).toMatchObject({
+      acceptedMemory: {
+        objective: replacementObjective,
+        exactExcerpt: replacementExcerpt,
+        sourceTitle: "Corrected engagement note"
+      },
+      history: [
+        {
+          factId: acceptedA.acceptedMemory.factId,
+          availability: "available",
+          objective
+        }
+      ]
+    });
+  }, 30_000);
+
+  it("projects an exact redacted history tombstone after historical source erasure", async () => {
+    const workflow = await createWorkflow("redacted-history-source-erasure");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", { note });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    const accepted = (await postAs("tenant-a-owner", workflow.initiativeId, "accept", {})).json();
+    await postAs("tenant-a-owner", workflow.initiativeId, "revoke", {
+      factId: accepted.acceptedMemory.factId,
+      expectedFactVersion: accepted.acceptedMemory.version,
+      reasonCode: "support_invalidated",
+      rationale: "The sole supporting source must be erased."
+    });
+    const source = await ownerPool.query<{ id: string }>(
+      `SELECT source_artifact_id AS id FROM work.activity_sources
+       WHERE activity_id = $1 ORDER BY created_at, source_artifact_id LIMIT 1`,
+      [workflow.activityId]
+    );
+    await ownerPool.query(
+      "ALTER TABLE content.source_artifacts DISABLE TRIGGER source_artifacts_z_b2_tombstone_interlock"
+    );
+    await ownerPool.query(
+      "ALTER TABLE content.source_chunks DISABLE TRIGGER source_chunks_z_b2_delete_interlock"
+    );
+    try {
+      await accountBus.execute(
+        {
+          kind: "source.tombstone",
+          idempotencyKey: "redacted-history-source-erasure-tombstone",
+          payload: {
+            sourceArtifactId: source.rows[0]!.id,
+            expectedVersion: 1,
+            deletionReasonCategory: "retention",
+            deletionPolicyRef: "policy:redacted-history"
+          }
+        },
+        createDevSecurityContext("tenant-a-owner")
+      );
+    } finally {
+      await ownerPool.query(
+        "ALTER TABLE content.source_chunks ENABLE TRIGGER source_chunks_z_b2_delete_interlock"
+      );
+      await ownerPool.query(
+        "ALTER TABLE content.source_artifacts ENABLE TRIGGER source_artifacts_z_b2_tombstone_interlock"
+      );
+    }
+    const projected = await getAs("tenant-a-owner", workflow.initiativeId);
+    expect(projected.statusCode, projected.body).toBe(200);
+    expect(projected.json().state).toBe("revoked");
+    expect(projected.json().history).toEqual([
+      {
+        factId: accepted.acceptedMemory.factId,
+        availability: "redacted",
+        objective: null,
+        status: "Revoked",
+        transition: "Accepted → Revoked",
+        acceptedAt: expect.any(String),
+        changedAt: expect.any(String)
+      }
+    ]);
+    expect(projected.body).not.toContain(objective);
+    expect(projected.body).not.toContain(excerpt);
+    expect(projected.body).not.toContain("Engagement note");
+    expect(projected.body).not.toMatch(/rationale|sourceArtifactId|claimId/);
+  }, 30_000);
+
+  it("bounds A to B to C history to the immediate predecessor without rationale lineage", async () => {
+    const workflow = await createWorkflow("bounded-three-fact-history");
+    const thirdExcerpt =
+      "The final primary objective is to reduce first-response time to three business days with human review.";
+    const thirdObjective = "Reduce first-response time to three business days with human review.";
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", {
+      note: `${note}\nMaya: ${replacementExcerpt}\nMaya: ${thirdExcerpt}`
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+    const proposedB = (
+      await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+        objective: replacementObjective,
+        exactExcerpt: replacementExcerpt,
+        supportConfirmed: true
+      })
+    ).json();
+    const acceptedB = (
+      await postAs("tenant-a-owner", workflow.initiativeId, "supersede", {
+        factId: proposedB.acceptedMemory.factId,
+        expectedFactVersion: proposedB.acceptedMemory.version,
+        replacementClaimId: proposedB.proposal.claimId,
+        expectedReplacementClaimVersion: proposedB.proposal.version,
+        expectedInitiativeVersion: proposedB.initiative.version,
+        reasonCode: "accepted_value_changed",
+        rationale: "B replaces A."
+      })
+    ).json();
+    const proposedC = (
+      await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+        objective: thirdObjective,
+        exactExcerpt: thirdExcerpt,
+        supportConfirmed: true
+      })
+    ).json();
+    const acceptedC = await postAs("tenant-a-owner", workflow.initiativeId, "supersede", {
+      factId: proposedC.acceptedMemory.factId,
+      expectedFactVersion: proposedC.acceptedMemory.version,
+      replacementClaimId: proposedC.proposal.claimId,
+      expectedReplacementClaimVersion: proposedC.proposal.version,
+      expectedInitiativeVersion: proposedC.initiative.version,
+      reasonCode: "accepted_value_changed",
+      rationale: "C replaces B."
+    });
+    expect(acceptedC.statusCode, acceptedC.body).toBe(201);
+    expect(acceptedC.json().history).toEqual([
+      {
+        factId: acceptedB.acceptedMemory.factId,
+        availability: "available",
+        objective: replacementObjective,
+        status: "Superseded",
+        transition: "Accepted → Superseded",
+        acceptedAt: expect.any(String),
+        changedAt: expect.any(String)
+      }
+    ]);
+    expect(JSON.stringify(acceptedC.json().history)).not.toContain(objective);
+    expect(JSON.stringify(acceptedC.json().history)).not.toMatch(
+      /rationale|claim|source|evidence/i
+    );
+  }, 30_000);
+
+  it("keeps replacement evidence and lifecycle lineage non-disclosing across tenant boundaries", async () => {
+    const workflow = await createWorkflow("objective-lifecycle-nondisclosure");
+    await postAs("tenant-a-owner", workflow.initiativeId, "source", {
+      note: `${note}\nMaya: ${replacementExcerpt}`
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective,
+      exactExcerpt: excerpt,
+      supportConfirmed: true
+    });
+    await postAs("tenant-a-owner", workflow.initiativeId, "accept", {});
+    const replacement = await postAs("tenant-a-owner", workflow.initiativeId, "proposal", {
+      objective: replacementObjective,
+      exactExcerpt: replacementExcerpt,
+      supportConfirmed: true
+    });
+    const state = replacement.json();
+    const inaccessible = await getAs("tenant-b-viewer", workflow.initiativeId);
+    const missing = await getAs("tenant-a-owner", "70000000-0000-7000-8000-000000000995");
+    const deniedMutation = await postAs("tenant-b-viewer", workflow.initiativeId, "supersede", {
+      factId: state.acceptedMemory.factId,
+      expectedFactVersion: state.acceptedMemory.version,
+      replacementClaimId: state.proposal.claimId,
+      expectedReplacementClaimVersion: state.proposal.version,
+      expectedInitiativeVersion: state.initiative.version,
+      reasonCode: "accepted_value_changed",
+      rationale: "This must remain unavailable."
+    });
+
+    expect(inaccessible.statusCode).toBe(404);
+    expect(deniedMutation.statusCode).toBe(404);
+    expect(inaccessible.body).toBe(missing.body);
+    expect(deniedMutation.body).toBe(missing.body);
+    for (const protectedValue of [
+      objective,
+      replacementObjective,
+      replacementExcerpt,
+      state.acceptedMemory.factId,
+      state.proposal.claimId
+    ]) {
+      expect(inaccessible.body).not.toContain(protectedValue);
+      expect(deniedMutation.body).not.toContain(protectedValue);
+    }
+    expect((await getAs("tenant-a-owner", workflow.initiativeId)).json()).toEqual(state);
+  }, 20_000);
 
   it("serializes different concurrent primary-objective proposals at the canonical truth boundary", async () => {
     const workflow = await createWorkflow("concurrent-proposals");
@@ -1406,7 +2142,7 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
     const corruptAccessClass =
       acceptedFact.access_class === "confidential" ? "public" : "confidential";
     await ownerPool.query(
-      "ALTER TABLE truth.accepted_facts DISABLE TRIGGER accepted_facts_immutable"
+      "ALTER TABLE truth.accepted_facts DISABLE TRIGGER accepted_facts_lifecycle_guard"
     );
     try {
       await ownerPool.query(`UPDATE truth.accepted_facts SET access_class = $2 WHERE id = $1`, [
@@ -1415,7 +2151,7 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
       ]);
     } finally {
       await ownerPool.query(
-        "ALTER TABLE truth.accepted_facts ENABLE TRIGGER accepted_facts_immutable"
+        "ALTER TABLE truth.accepted_facts ENABLE TRIGGER accepted_facts_lifecycle_guard"
       );
     }
     const unprojectable = await getAs("tenant-a-owner", initiativeId);
@@ -1527,6 +2263,29 @@ suite("B2 Slice 2 trusted-objective browser API and PostgreSQL walking slice", (
        )::text AS count`
     );
     return result.rows[0]!.count;
+  }
+
+  async function lifecycleSnapshot(subjectIds: string[]): Promise<unknown> {
+    const result = await ownerPool.query<{ snapshot: unknown }>(
+      `SELECT jsonb_build_object(
+         'facts', (SELECT jsonb_agg(jsonb_build_array(id, subject_id, status, version)
+                    ORDER BY subject_id, created_at, id)
+                   FROM truth.accepted_facts
+                   WHERE subject_id = ANY($1::uuid[])
+                     AND predicate = 'initiative.primary_objective'),
+         'claims', (SELECT jsonb_agg(jsonb_build_array(id, subject_id, status, version)
+                     ORDER BY subject_id, created_at, id)
+                    FROM truth.claims
+                    WHERE subject_id = ANY($1::uuid[])
+                      AND predicate = 'initiative.primary_objective'),
+         'commands', (SELECT count(*) FROM ops.domain_command_records),
+         'audits', (SELECT count(*) FROM ops.audit_events),
+         'outbox', (SELECT count(*) FROM ops.product_outbox_events),
+         'lifecycle', (SELECT count(*) FROM truth.fact_lifecycle_events)
+       ) AS snapshot`,
+      [subjectIds]
+    );
+    return result.rows[0]!.snapshot;
   }
 
   async function objectiveEffectCount(): Promise<string> {

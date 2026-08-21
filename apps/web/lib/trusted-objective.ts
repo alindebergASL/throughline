@@ -1,5 +1,5 @@
 export interface TrustedObjectiveState {
-  state: "empty" | "captured" | "proposed" | "accepted";
+  state: "empty" | "captured" | "proposed" | "accepted" | "revoked";
   proposalGenerationAnchor: string;
   sourceRevisionAnchor: string | null;
   initiative: {
@@ -38,6 +38,8 @@ export interface TrustedObjectiveState {
     reworkedAt: string;
   }>;
   acceptedMemory: null | {
+    factId: string;
+    version: number;
     objective: string;
     status: "Accepted";
     exactExcerpt: string;
@@ -47,7 +49,35 @@ export interface TrustedObjectiveState {
     acceptedBy: string;
     acceptedAt: string;
     effectiveVisibility: "Public" | "Workspace" | "Restricted" | "Confidential";
+    canRevoke: boolean;
   };
+  replacementReview: null | {
+    status: "Replacement proposed, not accepted.";
+    currentFactId: string;
+    currentFactVersion: number;
+    replacementClaimId: string;
+    replacementClaimVersion: number;
+    exactExcerpt: string;
+    sourceTitle: string;
+    changePreview: { from: string; to: string };
+    reworkLineage: Array<{
+      predecessorClaimId: string;
+      successorClaimId: string;
+      disposition: "reworked";
+      reasonCode: "reworked";
+      reworkedAt: string;
+    }>;
+    canSupersede: boolean;
+  };
+  history: Array<{
+    factId: string;
+    availability: "available" | "redacted";
+    objective: string | null;
+    status: "Superseded" | "Revoked";
+    transition: "Accepted → Superseded" | "Accepted → Revoked";
+    acceptedAt: string;
+    changedAt: string;
+  }>;
 }
 
 export type ProposalRecoveryReason =
@@ -81,6 +111,8 @@ export interface ConfirmationDraft {
 export function nextActionForState(state: TrustedObjectiveState): string {
   if (state.state === "empty") return "Capture engagement note";
   if (state.state === "captured") return "Propose trusted objective";
+  if (state.replacementReview?.canSupersede) return "Supersede trusted objective";
+  if (state.state === "revoked") return "Capture updated objective";
   if (state.state === "accepted") return "Draft confirmation question";
   if (state.proposal?.supportConfirmed && state.initiative.canAccept) {
     return "Accept trusted objective";
@@ -105,6 +137,8 @@ export function demoActionEnvelope(
     | "proposal/withdraw"
     | "proposal/rework"
     | "accept"
+    | "supersede"
+    | "revoke"
     | "draft-confirmation",
   payload: Record<string, string | number | boolean>
 ): Record<string, unknown> {
@@ -128,6 +162,27 @@ export function demoActionEnvelope(
     "expectedInitiativeVersion" in payload
   ) {
     return { action, ...payload };
+  }
+  if (action === "supersede") {
+    return {
+      action,
+      factId: payload.factId,
+      expectedFactVersion: payload.expectedFactVersion,
+      replacementClaimId: payload.replacementClaimId,
+      expectedReplacementClaimVersion: payload.expectedReplacementClaimVersion,
+      expectedInitiativeVersion: payload.expectedInitiativeVersion,
+      reasonCode: payload.reasonCode,
+      rationale: payload.rationale
+    };
+  }
+  if (action === "revoke") {
+    return {
+      action,
+      factId: payload.factId,
+      expectedFactVersion: payload.expectedFactVersion,
+      reasonCode: payload.reasonCode,
+      rationale: payload.rationale
+    };
   }
   return { action };
 }

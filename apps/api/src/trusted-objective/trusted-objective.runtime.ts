@@ -27,6 +27,8 @@ import { createHash } from "node:crypto";
 import {
   TrustedObjectiveConflictError,
   TrustedObjectiveUnavailableError,
+  type TrustedObjectiveRevokeReasonCode,
+  type TrustedObjectiveSupersedeReasonCode,
   type TrustedObjectiveDraft,
   type TrustedObjectiveState
 } from "./trusted-objective.contract.js";
@@ -104,6 +106,7 @@ type ReworkLineage = TrustedObjectiveState["reworkLineage"];
 type AcceptedMemoryProjection = NonNullable<TrustedObjectiveState["acceptedMemory"]> & {
   supportingClaimId: string;
 };
+type LifecycleHistory = TrustedObjectiveState["history"];
 
 @Injectable()
 export class TrustedObjectiveRuntime implements OnModuleDestroy {
@@ -146,36 +149,19 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
         initiativeId
       );
       const source = await this.readCurrentSource(tx, scopedContext, scope);
-      if (!source)
-        return stateFor(scope, null, null, null, canAccept, proposalGenerationAnchor, null);
-
-      const accepted = await this.readAcceptedMemory(tx, scopedContext, scope, source);
-      if (accepted) {
-        const reworkLineage = await this.readReworkLineage(
-          tx,
-          scopedContext,
-          scope,
-          accepted.supportingClaimId
-        );
-        return stateFor(
-          scope,
-          source,
-          null,
-          accepted,
-          canAccept,
-          proposalGenerationAnchor,
-          null,
-          false,
-          false,
-          false,
-          reworkLineage
-        );
-      }
-      if (await this.readOnlyValidClaim(tx, scopedContext, scope, source, "accepted")) {
+      const accepted = await this.readAcceptedMemory(tx, scopedContext, scope);
+      const proposal = source
+        ? await this.readOnlyValidClaim(tx, scopedContext, scope, source, "proposed")
+        : null;
+      const history = await this.readLifecycleHistory(tx, scopedContext, scope, accepted);
+      if (
+        source &&
+        !accepted &&
+        history.length === 0 &&
+        (await this.readOnlyValidClaim(tx, scopedContext, scope, source, "accepted"))
+      ) {
         throw new TrustedObjectiveUnavailableError();
       }
-
-      const proposal = await this.readOnlyValidClaim(tx, scopedContext, scope, source, "proposed");
       let canRework = false;
       let canWithdraw = false;
       let canReject = false;
@@ -202,24 +188,41 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
           proposal.id
         );
       }
-      const lastProposalRecovery = proposal
-        ? null
-        : await this.readLatestProposalRecovery(tx, scopedContext, scope);
-      const reworkLineage = proposal
+      const canRevoke =
+        accepted && !proposal
+          ? await this.isAllowed(tx, scopedContext, "fact.revoke", "fact", accepted.factId)
+          : false;
+      const canSupersede =
+        accepted && proposal
+          ? await this.isAllowed(tx, scopedContext, "fact.supersede", "fact", accepted.factId)
+          : false;
+      const lastProposalRecovery =
+        proposal || accepted || history.length > 0
+          ? null
+          : await this.readLatestProposalRecovery(tx, scopedContext, scope);
+      const acceptedReworkLineage = accepted
+        ? await this.readReworkLineage(tx, scopedContext, scope, accepted.supportingClaimId)
+        : [];
+      const proposalReworkLineage = proposal
         ? await this.readReworkLineage(tx, scopedContext, scope, proposal.id)
         : [];
+      const reworkLineage = accepted ? acceptedReworkLineage : proposalReworkLineage;
       return stateFor(
         scope,
         source,
         proposal,
-        null,
+        accepted,
         canAccept,
         proposalGenerationAnchor,
         lastProposalRecovery,
         canRework,
         canWithdraw,
         canReject,
-        reworkLineage
+        reworkLineage,
+        proposalReworkLineage,
+        canRevoke,
+        canSupersede,
+        history
       );
     });
   }
@@ -273,51 +276,70 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
   ): Promise<TrustedObjectiveState> {
     const objective = input.objective.normalize("NFC").trim();
     const exactExcerpt = normalizeStoredSourceText(input.exactExcerpt);
-    const prepared = await this.read(context, async (tx) => {
-      const scope = await this.readScope(tx, context, initiativeId);
-      const source = await this.requireCurrentSource(tx, context, scope);
-      if (input.sourceRevisionAnchor !== primaryObjectiveSourceRevisionAnchor(source.projection)) {
-        throw new TrustedObjectiveConflictError();
-      }
-      const accepted = await this.readAcceptedMemory(tx, context, scope, source);
-      if (accepted) {
-        if (accepted.objective === objective && accepted.exactExcerpt === exactExcerpt) return null;
-        throw new TrustedObjectiveConflictError();
-      }
-      if (await this.readOnlyValidClaim(tx, context, scope, source, "accepted")) {
-        throw new TrustedObjectiveUnavailableError();
-      }
-      const latestObjectiveClaim = await this.readLatestPrimaryObjectiveClaim(tx, context, scope);
-      const existing = await this.readOnlyValidClaim(tx, context, scope, source, "proposed");
-      if (existing) {
-        const priorClaim = await this.readPrimaryObjectiveClaimBefore(
-          tx,
-          context,
-          scope,
-          existing.id
-        );
+    const { scopedContext, result: prepared } = await this.readInInitiativeSpace(
+      context,
+      initiativeId,
+      async (tx, scopedContext, scope) => {
+        const source = await this.requireCurrentSource(tx, scopedContext, scope);
         if (
-          existing.objective === objective &&
-          existing.exactExcerpt === exactExcerpt &&
-          input.proposalGenerationAnchor === primaryObjectiveGenerationAnchor(priorClaim)
+          input.sourceRevisionAnchor !== primaryObjectiveSourceRevisionAnchor(source.projection)
         ) {
-          return null;
+          throw new TrustedObjectiveConflictError();
         }
-        throw new TrustedObjectiveConflictError();
+        const accepted = await this.readAcceptedMemory(tx, scopedContext, scope);
+        if (accepted) {
+          if (accepted.objective === objective) throw new TrustedObjectiveConflictError();
+        } else {
+          const history = await this.readLifecycleHistory(tx, scopedContext, scope, null);
+          if (
+            history.length === 0 &&
+            (await this.readOnlyValidClaim(tx, scopedContext, scope, source, "accepted"))
+          ) {
+            throw new TrustedObjectiveUnavailableError();
+          }
+        }
+        const latestObjectiveClaim = await this.readLatestPrimaryObjectiveClaim(
+          tx,
+          scopedContext,
+          scope
+        );
+        const existing = await this.readOnlyValidClaim(
+          tx,
+          scopedContext,
+          scope,
+          source,
+          "proposed"
+        );
+        if (existing) {
+          const priorClaim = await this.readPrimaryObjectiveClaimBefore(
+            tx,
+            scopedContext,
+            scope,
+            existing.id
+          );
+          if (
+            existing.objective === objective &&
+            existing.exactExcerpt === exactExcerpt &&
+            input.proposalGenerationAnchor === primaryObjectiveGenerationAnchor(priorClaim)
+          ) {
+            return null;
+          }
+          throw new TrustedObjectiveConflictError();
+        }
+        if (
+          input.proposalGenerationAnchor !== primaryObjectiveGenerationAnchor(latestObjectiveClaim)
+        ) {
+          throw new TrustedObjectiveConflictError();
+        }
+        const evidence = deriveEvidenceCandidate(source.projection, exactExcerpt);
+        return {
+          scope,
+          evidence,
+          expectedPrimaryObjectiveGeneration:
+            primaryObjectiveGenerationCoordinate(latestObjectiveClaim)
+        };
       }
-      if (
-        input.proposalGenerationAnchor !== primaryObjectiveGenerationAnchor(latestObjectiveClaim)
-      ) {
-        throw new TrustedObjectiveConflictError();
-      }
-      const evidence = deriveEvidenceCandidate(source.projection, exactExcerpt);
-      return {
-        scope,
-        evidence,
-        expectedPrimaryObjectiveGeneration:
-          primaryObjectiveGenerationCoordinate(latestObjectiveClaim)
-      };
-    });
+    );
     if (prepared) {
       await this.truthCommandBus().execute(
         {
@@ -345,7 +367,7 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
             expectedPrimaryObjectiveGeneration: prepared.expectedPrimaryObjectiveGeneration
           }
         },
-        context
+        scopedContext
       );
     }
     return this.getState(context, initiativeId);
@@ -479,31 +501,35 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
       expectedInitiativeVersion: number;
     }
   ): Promise<TrustedObjectiveState> {
-    const prepared = await this.read(context, async (tx) => {
-      const scope = await this.readScope(tx, context, initiativeId);
-      if (scope.initiativeVersion !== input.expectedInitiativeVersion) {
-        throw new TrustedObjectiveConflictError();
-      }
-      const source = await this.requireCurrentSource(tx, context, scope);
-      if (await this.readAcceptedMemory(tx, context, scope, source)) {
-        const acceptedClaim = await this.readOnlyValidClaim(tx, context, scope, source, "accepted");
-        if (
-          acceptedClaim?.id === input.claimId &&
-          acceptedClaim.version === input.expectedClaimVersion + 1
-        ) {
-          return null;
+    const { scopedContext, result: prepared } = await this.readInInitiativeSpace(
+      context,
+      initiativeId,
+      async (tx, scopedContext, scope) => {
+        if (scope.initiativeVersion !== input.expectedInitiativeVersion) {
+          throw new TrustedObjectiveConflictError();
         }
-        throw new TrustedObjectiveConflictError();
+        const source = await this.requireCurrentSource(tx, scopedContext, scope);
+        const accepted = await this.readAcceptedMemory(tx, scopedContext, scope);
+        if (accepted) {
+          if (accepted.supportingClaimId === input.claimId) {
+            return null;
+          }
+          throw new TrustedObjectiveConflictError();
+        }
+        const history = await this.readLifecycleHistory(tx, scopedContext, scope, null);
+        if (
+          history.length === 0 &&
+          (await this.readOnlyValidClaim(tx, scopedContext, scope, source, "accepted"))
+        ) {
+          throw new TrustedObjectiveUnavailableError();
+        }
+        const claim = await this.readOnlyValidClaim(tx, scopedContext, scope, source, "proposed");
+        if (!claim || claim.id !== input.claimId || claim.version !== input.expectedClaimVersion) {
+          throw new TrustedObjectiveConflictError();
+        }
+        return { scope, claim };
       }
-      if (await this.readOnlyValidClaim(tx, context, scope, source, "accepted")) {
-        throw new TrustedObjectiveUnavailableError();
-      }
-      const claim = await this.readOnlyValidClaim(tx, context, scope, source, "proposed");
-      if (!claim || claim.id !== input.claimId || claim.version !== input.expectedClaimVersion) {
-        throw new TrustedObjectiveConflictError();
-      }
-      return { scope, claim };
-    });
+    );
     if (prepared) {
       await this.truthCommandBus().execute(
         {
@@ -527,9 +553,102 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
             acceptanceScope: "initiative"
           }
         },
-        context
+        scopedContext
       );
     }
+    return this.getState(context, initiativeId);
+  }
+
+  async supersede(
+    context: SecurityContext,
+    initiativeId: string,
+    input: {
+      factId: string;
+      expectedFactVersion: number;
+      replacementClaimId: string;
+      expectedReplacementClaimVersion: number;
+      expectedInitiativeVersion: number;
+      reasonCode: TrustedObjectiveSupersedeReasonCode;
+      rationale: string;
+    }
+  ): Promise<TrustedObjectiveState> {
+    await this.truthCommandBus().execute(
+      {
+        kind: "fact.supersede",
+        idempotencyKey: stableKey(
+          "supersede",
+          initiativeId,
+          input.factId,
+          String(input.expectedFactVersion),
+          input.replacementClaimId,
+          String(input.expectedReplacementClaimVersion),
+          String(input.expectedInitiativeVersion),
+          input.reasonCode,
+          input.rationale
+        ),
+        predicateCatalogVersion: B2_TRUTH_PREDICATE_CATALOG_VERSION,
+        payload: {
+          factId: input.factId,
+          expectedFactVersion: input.expectedFactVersion,
+          subject: {
+            type: "initiative",
+            id: initiativeId,
+            expectedVersion: input.expectedInitiativeVersion
+          },
+          replacementClaims: [
+            {
+              claimId: input.replacementClaimId,
+              expectedVersion: input.expectedReplacementClaimVersion
+            }
+          ],
+          reason: { code: input.reasonCode, rationale: input.rationale }
+        }
+      },
+      context
+    );
+    return this.getState(context, initiativeId);
+  }
+
+  async revoke(
+    context: SecurityContext,
+    initiativeId: string,
+    input: {
+      factId: string;
+      expectedFactVersion: number;
+      reasonCode: TrustedObjectiveRevokeReasonCode;
+      rationale: string;
+    }
+  ): Promise<TrustedObjectiveState> {
+    const { scopedContext } = await this.readInInitiativeSpace(
+      context,
+      initiativeId,
+      async (tx, scopedContext, scope) => {
+        const accepted = await this.readAcceptedMemory(tx, scopedContext, scope);
+        if (!accepted || accepted.factId !== input.factId) {
+          throw new TrustedObjectiveUnavailableError();
+        }
+      }
+    );
+    await this.truthCommandBus().execute(
+      {
+        kind: "fact.revoke",
+        idempotencyKey: stableKey(
+          "revoke",
+          initiativeId,
+          input.factId,
+          String(input.expectedFactVersion),
+          input.reasonCode,
+          input.rationale
+        ),
+        predicateCatalogVersion: B2_TRUTH_PREDICATE_CATALOG_VERSION,
+        payload: {
+          factId: input.factId,
+          expectedFactVersion: input.expectedFactVersion,
+          reason: { code: input.reasonCode, rationale: input.rationale }
+        }
+      },
+      scopedContext
+    );
     return this.getState(context, initiativeId);
   }
 
@@ -683,18 +802,34 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
     context: SecurityContext,
     scope: WorkflowScope
   ): Promise<PrimaryObjectiveClaimAnchor | null> {
-    const result = await tx.query<{
-      id: string;
-      version: number;
-      status: PrimaryObjectiveClaimAnchor["status"];
-    }>(
-      `SELECT id, version, status
+    const candidate = await tx.query<{ id: string }>(
+      `SELECT id
        FROM truth.claims
        WHERE tenant_id = $1 AND workspace_id = $2 AND subject_type = 'initiative'
          AND subject_id = $3 AND predicate = $4
        ORDER BY created_at DESC, id DESC
        LIMIT 1`,
       [context.tenantId, context.workspaceId, scope.initiativeId, PREDICATE]
+    );
+    const claimId = candidate.rows[0]?.id;
+    if (!claimId) return null;
+    const decision = await this.authorizationService().canInTransaction(
+      context,
+      "claim.read",
+      { type: "claim", id: claimId },
+      tx,
+      { lockAuthority: true }
+    );
+    if (!decision.allowed) return null;
+    const result = await tx.query<{
+      id: string;
+      version: number;
+      status: PrimaryObjectiveClaimAnchor["status"];
+    }>(
+      `SELECT id, version, status FROM truth.claims
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
+         AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5 LIMIT 1`,
+      [context.tenantId, context.workspaceId, claimId, scope.initiativeId, PREDICATE]
     );
     return result.rows[0] ?? null;
   }
@@ -705,12 +840,8 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
     scope: WorkflowScope,
     claimId: string
   ): Promise<PrimaryObjectiveClaimAnchor | null> {
-    const result = await tx.query<{
-      id: string;
-      version: number;
-      status: PrimaryObjectiveClaimAnchor["status"];
-    }>(
-      `SELECT prior.id, prior.version, prior.status
+    const candidate = await tx.query<{ id: string }>(
+      `SELECT prior.id
        FROM truth.claims current_claim
        JOIN LATERAL (
          SELECT claim.id, claim.version, claim.status
@@ -727,6 +858,26 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
          AND current_claim.id = $3 AND current_claim.subject_type = 'initiative'
          AND current_claim.subject_id = $4 AND current_claim.predicate = $5`,
       [context.tenantId, context.workspaceId, claimId, scope.initiativeId, PREDICATE]
+    );
+    const priorClaimId = candidate.rows[0]?.id;
+    if (!priorClaimId) return null;
+    const decision = await this.authorizationService().canInTransaction(
+      context,
+      "claim.read",
+      { type: "claim", id: priorClaimId },
+      tx,
+      { lockAuthority: true }
+    );
+    if (!decision.allowed) return null;
+    const result = await tx.query<{
+      id: string;
+      version: number;
+      status: PrimaryObjectiveClaimAnchor["status"];
+    }>(
+      `SELECT id, version, status FROM truth.claims
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
+         AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5 LIMIT 1`,
+      [context.tenantId, context.workspaceId, priorClaimId, scope.initiativeId, PREDICATE]
     );
     return result.rows[0] ?? null;
   }
@@ -836,7 +987,7 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
     tx: TenantDbTransaction,
     context: SecurityContext,
     scope: WorkflowScope,
-    source: CurrentSource,
+    source: CurrentSource | null,
     claimId: string,
     status: "proposed" | "accepted"
   ): Promise<ValidClaim | null> {
@@ -876,14 +1027,31 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
       [context.tenantId, context.workspaceId, claimId]
     );
     const row = result.rows[0];
-    if (!row || row.claim_status !== status || !validEvidenceRow(row, source, scope)) return null;
+    if (!row || row.claim_status !== status) return null;
+    let supportingSource = source;
+    if (!supportingSource || supportingSource.projection.id !== row.source_artifact_id) {
+      const sourceDecision = await this.authorizationService().canInTransaction(
+        context,
+        "source.read",
+        { type: "source", id: row.source_artifact_id },
+        tx,
+        { lockAuthority: true }
+      );
+      if (!sourceDecision.allowed) return null;
+      const projection = await new ContentRepository(tx)
+        .getSource(context.tenantId, context.workspaceId, row.source_artifact_id, true)
+        .catch(() => null);
+      if (!projection) return null;
+      supportingSource = { projection, createdAt: "" };
+    }
+    if (!validEvidenceRow(row, supportingSource, scope)) return null;
     return {
       id: row.claim_id,
       version: row.claim_version,
       status: row.claim_status,
       objective: row.canonical_value_text,
       exactExcerpt: row.source_excerpt,
-      sourceTitle: source.projection.title ?? SOURCE_TITLE,
+      sourceTitle: supportingSource.projection.title ?? SOURCE_TITLE,
       accessClass: row.claim_access_class,
       createdByUserId: row.created_by_user_id,
       createdByMembershipId: row.created_by_membership_id,
@@ -897,8 +1065,7 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
   private async readAcceptedMemory(
     tx: TenantDbTransaction,
     context: SecurityContext,
-    scope: WorkflowScope,
-    source: CurrentSource
+    scope: WorkflowScope
   ): Promise<AcceptedMemoryProjection | null> {
     const candidates = await tx.query<{ id: string }>(
       `SELECT id FROM truth.accepted_facts
@@ -908,7 +1075,16 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
     );
     if (candidates.rows.length === 0) return null;
     if (candidates.rows.length !== 1) throw new TrustedObjectiveUnavailableError();
-    const factId = candidates.rows[0]!.id;
+    return this.readFactMemory(tx, context, scope, candidates.rows[0]!.id, "current");
+  }
+
+  private async readFactMemory(
+    tx: TenantDbTransaction,
+    context: SecurityContext,
+    scope: WorkflowScope,
+    factId: string,
+    status: "current" | "superseded" | "revoked"
+  ): Promise<AcceptedMemoryProjection> {
     const factDecision = await this.authorizationService().canInTransaction(
       context,
       "fact.read",
@@ -918,17 +1094,18 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
     );
     if (!factDecision.allowed) throw new TrustedObjectiveUnavailableError();
     const fact = await tx.query<{
+      version: number;
       canonical_value_text: string;
       normalized_text: string;
       access_class: AccessClass;
       accepted_by_membership_id: string;
       accepted_at: Date;
     }>(
-      `SELECT canonical_value_text, normalized_text, access_class,
+      `SELECT version, canonical_value_text, normalized_text, access_class,
               accepted_by_membership_id, recorded_at AS accepted_at
        FROM truth.accepted_facts
-       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND status = 'current' LIMIT 1`,
-      [context.tenantId, context.workspaceId, factId]
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND status = $4 LIMIT 1`,
+      [context.tenantId, context.workspaceId, factId, status]
     );
     const factRow = fact.rows[0];
     if (!factRow || factRow.canonical_value_text !== factRow.normalized_text) {
@@ -944,7 +1121,7 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
       tx,
       context,
       scope,
-      source,
+      null,
       supports.rows[0]!.claim_id,
       "accepted"
     );
@@ -975,6 +1152,8 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
     );
     if (!actorDecision.allowed) throw new TrustedObjectiveUnavailableError();
     return {
+      factId,
+      version: factRow.version,
       supportingClaimId: claim.id,
       objective: factRow.canonical_value_text,
       status: "Accepted",
@@ -985,7 +1164,141 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
       transition: "Proposed → Accepted",
       acceptedBy: actorRow.display_name,
       acceptedAt: factRow.accepted_at.toISOString(),
-      effectiveVisibility: visibilityLabel(factRow.access_class)
+      effectiveVisibility: visibilityLabel(factRow.access_class),
+      canRevoke: false
+    };
+  }
+
+  private async readLifecycleHistory(
+    tx: TenantDbTransaction,
+    context: SecurityContext,
+    scope: WorkflowScope,
+    current: AcceptedMemoryProjection | null
+  ): Promise<LifecycleHistory> {
+    let historicalFactId: string | null = null;
+    let expectedTransition: "supersede" | "revoke" = "revoke";
+    let changedAt: Date | null = null;
+    if (current) {
+      const predecessor = await tx.query<{ predecessor_fact_id: string; recorded_at: Date }>(
+        `SELECT predecessor_fact_id, recorded_at FROM truth.fact_lifecycle_events
+         WHERE tenant_id = $1 AND workspace_id = $2
+           AND successor_fact_id = $3 AND transition_kind = 'supersede' LIMIT 2`,
+        [context.tenantId, context.workspaceId, current.factId]
+      );
+      if (predecessor.rows.length > 1) throw new TrustedObjectiveUnavailableError();
+      if (predecessor.rows[0]) {
+        historicalFactId = predecessor.rows[0].predecessor_fact_id;
+        expectedTransition = "supersede";
+        changedAt = predecessor.rows[0].recorded_at;
+      }
+    }
+    if (!historicalFactId) {
+      const revoked = await tx.query<{ id: string; recorded_at: Date }>(
+        `SELECT fact.id, lifecycle.recorded_at
+         FROM truth.fact_lifecycle_events lifecycle
+         JOIN truth.accepted_facts fact ON fact.tenant_id = lifecycle.tenant_id
+           AND fact.workspace_id = lifecycle.workspace_id
+           AND fact.id = lifecycle.predecessor_fact_id
+         WHERE lifecycle.tenant_id = $1 AND lifecycle.workspace_id = $2
+           AND lifecycle.transition_kind = 'revoke' AND lifecycle.successor_fact_id IS NULL
+           AND fact.subject_type = 'initiative' AND fact.subject_id = $3
+           AND fact.predicate = $4 AND fact.status = 'revoked'
+         ORDER BY lifecycle.recorded_at DESC, lifecycle.id DESC LIMIT 1`,
+        [context.tenantId, context.workspaceId, scope.initiativeId, PREDICATE]
+      );
+      if (revoked.rows.length === 0) return [];
+      historicalFactId = revoked.rows[0]!.id;
+      changedAt = revoked.rows[0]!.recorded_at;
+    }
+    const historical = await this.readHistoricalFact(
+      tx,
+      context,
+      scope,
+      historicalFactId,
+      expectedTransition === "supersede" ? "superseded" : "revoked"
+    );
+    return [
+      {
+        factId: historical.factId,
+        availability: historical.availability,
+        objective: historical.objective,
+        status: expectedTransition === "supersede" ? "Superseded" : "Revoked",
+        transition:
+          expectedTransition === "supersede" ? "Accepted → Superseded" : "Accepted → Revoked",
+        acceptedAt: historical.acceptedAt,
+        changedAt: changedAt!.toISOString()
+      }
+    ];
+  }
+
+  private async readHistoricalFact(
+    tx: TenantDbTransaction,
+    context: SecurityContext,
+    scope: WorkflowScope,
+    factId: string,
+    status: "superseded" | "revoked"
+  ): Promise<{
+    factId: string;
+    availability: "available" | "redacted";
+    objective: string | null;
+    acceptedAt: string;
+  }> {
+    const factDecision = await this.authorizationService().canInTransaction(
+      context,
+      "fact.read",
+      { type: "fact", id: factId },
+      tx,
+      { lockAuthority: true }
+    );
+    if (!factDecision.allowed) throw new TrustedObjectiveUnavailableError();
+    const facts = await tx.query<{
+      canonical_value_text: string;
+      normalized_text: string;
+      access_class: AccessClass;
+      accepted_at: Date;
+    }>(
+      `SELECT canonical_value_text, normalized_text, access_class, recorded_at AS accepted_at
+       FROM truth.accepted_facts
+       WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3
+         AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5
+         AND status = $6 LIMIT 1`,
+      [context.tenantId, context.workspaceId, factId, scope.initiativeId, PREDICATE, status]
+    );
+    const fact = facts.rows[0];
+    if (!fact) throw new TrustedObjectiveUnavailableError();
+    const redacted = () => ({
+      factId,
+      availability: "redacted" as const,
+      objective: null,
+      acceptedAt: fact.accepted_at.toISOString()
+    });
+    const supports = await tx.query<{ claim_id: string }>(
+      `SELECT claim_id FROM truth.fact_claims
+       WHERE tenant_id = $1 AND workspace_id = $2 AND fact_id = $3 ORDER BY claim_id`,
+      [context.tenantId, context.workspaceId, factId]
+    );
+    if (supports.rows.length !== 1) return redacted();
+    const claim = await this.readValidClaim(
+      tx,
+      context,
+      scope,
+      null,
+      supports.rows[0]!.claim_id,
+      "accepted"
+    );
+    if (
+      !claim ||
+      fact.canonical_value_text !== fact.normalized_text ||
+      claim.objective !== fact.canonical_value_text ||
+      fact.access_class !== maxAccessClass(claim.accessClass, scope.initiativeAccessClass)
+    ) {
+      return redacted();
+    }
+    return {
+      factId,
+      availability: "available",
+      objective: fact.canonical_value_text,
+      acceptedAt: fact.accepted_at.toISOString()
     };
   }
 
@@ -1011,10 +1324,12 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
     context: SecurityContext,
     action:
       | "fact.accept"
+      | "fact.supersede"
+      | "fact.revoke"
       | "initiative.primary_objective.proposal.withdraw"
       | "initiative.primary_objective.proposal.reject"
       | "initiative.primary_objective.proposal.rework",
-    type: "initiative" | "claim",
+    type: "initiative" | "claim" | "fact",
     id: string
   ): Promise<boolean> {
     const decision = await this.authorizationService().canInTransaction(
@@ -1025,6 +1340,51 @@ export class TrustedObjectiveRuntime implements OnModuleDestroy {
       { lockAuthority: true }
     );
     return decision.allowed;
+  }
+
+  private async readInInitiativeSpace<T>(
+    context: SecurityContext,
+    initiativeId: string,
+    callback: (
+      tx: TenantDbTransaction,
+      scopedContext: SecurityContext,
+      scope: WorkflowScope
+    ) => Promise<T>
+  ): Promise<{ scopedContext: SecurityContext; result: T }> {
+    const discovery = await this.read(context, async (tx) => ({
+      scope: await this.readScope(tx, context, initiativeId),
+      hasDatabaseClient: tx.client !== undefined
+    }));
+    const discoveredScope = discovery.scope;
+    if (!discoveredScope.initiativeSpaceId) {
+      if (discovery.hasDatabaseClient) throw new TrustedObjectiveUnavailableError();
+      const result = await this.read(context, async (tx) => {
+        const scope = await this.readScope(tx, context, initiativeId);
+        if (
+          scope.initiativeId !== discoveredScope.initiativeId ||
+          scope.initiativeSpaceId !== discoveredScope.initiativeSpaceId
+        ) {
+          throw new TrustedObjectiveUnavailableError();
+        }
+        return callback(tx, context, scope);
+      });
+      return { scopedContext: context, result };
+    }
+    const scopedContext = parseSecurityContext({
+      ...context,
+      requestedSpaceIds: [discoveredScope.initiativeSpaceId]
+    });
+    const result = await this.read(scopedContext, async (tx) => {
+      const scope = await this.readScope(tx, scopedContext, initiativeId);
+      if (
+        scope.initiativeId !== discoveredScope.initiativeId ||
+        scope.initiativeSpaceId !== discoveredScope.initiativeSpaceId
+      ) {
+        throw new TrustedObjectiveUnavailableError();
+      }
+      return callback(tx, scopedContext, scope);
+    });
+    return { scopedContext, result };
   }
 
   private read<T>(
@@ -1290,10 +1650,16 @@ function stateFor(
   canRework = false,
   canWithdraw = false,
   canReject = false,
-  reworkLineage: ReworkLineage = []
+  reworkLineage: ReworkLineage = [],
+  replacementReworkLineage: ReworkLineage = [],
+  canRevoke = false,
+  canSupersede = false,
+  history: LifecycleHistory = []
 ): TrustedObjectiveState {
   const acceptedProjection = acceptedMemory
     ? {
+        factId: acceptedMemory.factId,
+        version: acceptedMemory.version,
         objective: acceptedMemory.objective,
         status: acceptedMemory.status,
         exactExcerpt: acceptedMemory.exactExcerpt,
@@ -1302,11 +1668,20 @@ function stateFor(
         transition: acceptedMemory.transition,
         acceptedBy: acceptedMemory.acceptedBy,
         acceptedAt: acceptedMemory.acceptedAt,
-        effectiveVisibility: acceptedMemory.effectiveVisibility
+        effectiveVisibility: acceptedMemory.effectiveVisibility,
+        canRevoke
       }
     : null;
   return {
-    state: acceptedMemory ? "accepted" : proposal ? "proposed" : source ? "captured" : "empty",
+    state: acceptedMemory
+      ? "accepted"
+      : proposal
+        ? "proposed"
+        : history[0]?.status === "Revoked"
+          ? "revoked"
+          : source
+            ? "captured"
+            : "empty",
     proposalGenerationAnchor,
     sourceRevisionAnchor: source ? primaryObjectiveSourceRevisionAnchor(source.projection) : null,
     initiative: {
@@ -1341,7 +1716,26 @@ function stateFor(
       : null,
     lastProposalRecovery,
     reworkLineage,
-    acceptedMemory: acceptedProjection
+    acceptedMemory: acceptedProjection,
+    replacementReview:
+      acceptedMemory && proposal
+        ? {
+            status: "Replacement proposed, not accepted.",
+            currentFactId: acceptedMemory.factId,
+            currentFactVersion: acceptedMemory.version,
+            replacementClaimId: proposal.id,
+            replacementClaimVersion: proposal.version,
+            exactExcerpt: proposal.exactExcerpt,
+            sourceTitle: proposal.sourceTitle,
+            changePreview: {
+              from: acceptedMemory.objective,
+              to: proposal.objective
+            },
+            reworkLineage: replacementReworkLineage,
+            canSupersede
+          }
+        : null,
+    history
   };
 }
 

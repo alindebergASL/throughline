@@ -1,6 +1,8 @@
 import {
   isDomainNotificationTimestamp,
-  PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES
+  PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES,
+  REVOKE_REASON_CODES,
+  SUPERSEDE_REASON_CODES
 } from "@throughline/core-types";
 
 export const PRODUCT_AUDIT_SCHEMA_VERSION = 1 as const;
@@ -96,6 +98,26 @@ export interface ProductAuditDetailMap {
   "fact.accept": {
     resourceType: "accepted_fact";
     detail: { factId: string };
+  };
+  "fact.supersede": {
+    resourceType: "accepted_fact";
+    detail: {
+      factId: string;
+      factVersion: 2;
+      reasonCode: (typeof SUPERSEDE_REASON_CODES)[number];
+      replacementFactId: string;
+      replacementFactVersion: 1;
+      status: "superseded";
+    };
+  };
+  "fact.revoke": {
+    resourceType: "accepted_fact";
+    detail: {
+      factId: string;
+      factVersion: 2;
+      reasonCode: (typeof REVOKE_REASON_CODES)[number];
+      status: "revoked";
+    };
   };
 }
 
@@ -285,6 +307,51 @@ export function parseProductAuditSafeDetail(
       const factId = requireUuidV7(detail.factId);
       if (factId !== resourceId) fail();
       return { factId };
+    }
+    case "fact.supersede": {
+      requireResourceType(resourceType, "accepted_fact");
+      const detail = requireExactObject(safeDetail, [
+        "factId",
+        "factVersion",
+        "reasonCode",
+        "replacementFactId",
+        "replacementFactVersion",
+        "status"
+      ]);
+      const factId = requireUuidV7(detail.factId);
+      if (
+        factId !== resourceId ||
+        detail.factVersion !== 2 ||
+        detail.replacementFactVersion !== 1 ||
+        detail.status !== "superseded"
+      ) {
+        fail();
+      }
+      return {
+        factId,
+        factVersion: 2,
+        reasonCode: requireEnum(detail.reasonCode, SUPERSEDE_REASON_CODES),
+        replacementFactId: requireUuidV7(detail.replacementFactId),
+        replacementFactVersion: 1,
+        status: "superseded"
+      };
+    }
+    case "fact.revoke": {
+      requireResourceType(resourceType, "accepted_fact");
+      const detail = requireExactObject(safeDetail, [
+        "factId",
+        "factVersion",
+        "reasonCode",
+        "status"
+      ]);
+      const factId = requireUuidV7(detail.factId);
+      if (factId !== resourceId || detail.factVersion !== 2 || detail.status !== "revoked") fail();
+      return {
+        factId,
+        factVersion: 2,
+        reasonCode: requireEnum(detail.reasonCode, REVOKE_REASON_CODES),
+        status: "revoked"
+      };
     }
   }
 

@@ -42,7 +42,9 @@ export type AuthorizationAction =
   | "initiative.primary_objective.proposal.reject"
   | "initiative.primary_objective.proposal.rework"
   | "fact.read"
-  | "fact.accept";
+  | "fact.accept"
+  | "fact.supersede"
+  | "fact.revoke";
 
 export interface WorkerAuthorizationBinding {
   referenceId: string;
@@ -67,6 +69,13 @@ export interface AuthorizationDecisionOptions {
 export interface TransactionAuthorizationDecisionOptions extends AuthorizationDecisionOptions {
   workerBinding?: WorkerAuthorizationBinding;
   lockAuthority?: boolean;
+  /**
+   * Re-authorizes a durable Fact lifecycle replay against the terminal generation the original
+   * command produced. Consulted only by `fact.supersede` / `fact.revoke`; every other check stays
+   * identical, and the terminal generation it admits can never be mutated (mutation prelocks
+   * require a current version-1 Fact).
+   */
+  factLifecycleReplay?: boolean;
 }
 
 export interface AuthorizationService {

@@ -23,7 +23,8 @@ const migrationIds = [
   "0008_b2_slice1_command_integrity.sql",
   "0009_b2_source_truth_lifecycle_interlock.sql",
   "0010_b2_trusted_objective_initiative_lock.sql",
-  "0011_b2_primary_objective_proposal_recovery.sql"
+  "0011_b2_primary_objective_proposal_recovery.sql",
+  "0012_b2_fact_lifecycle.sql"
 ];
 const foundationMigrationId = migrationIds[1]!;
 const exactPrefixError =

@@ -1,7 +1,16 @@
-import type { AccessClass, ClaimSourceSpanCandidate, Confidence } from "@throughline/core-types";
+import {
+  maxAccessClass,
+  type AccessClass,
+  type B2ClaimVersionRef,
+  type ClaimSourceSpanCandidate,
+  type Confidence,
+  type RevokeReason,
+  type SupersedeReason
+} from "@throughline/core-types";
 import type { TenantDbTransaction } from "@throughline/db";
 import { createHash } from "node:crypto";
 import type { AcceptedFactConfidenceResult } from "./confidence.js";
+import { parseTruthLifecycleReason } from "./reasons.js";
 import { isAcceptedFact, type Claim, type NewlyAcceptedFact } from "./types.js";
 import type {
   AuthorizedClaimEvidenceSnapshot,
@@ -20,6 +29,25 @@ export class TruthLedgerConflictError extends Error {
   constructor() {
     super("Truth command precondition failed");
     this.name = "TruthLedgerConflictError";
+  }
+}
+
+export class TruthLedgerUnavailableError extends Error {
+  constructor() {
+    super("Truth resource is unavailable");
+    this.name = "TruthLedgerUnavailableError";
+  }
+}
+
+function hasExactErrorCode(error: unknown, expectedCode: string): boolean {
+  if (error === null || (typeof error !== "object" && typeof error !== "function")) {
+    return false;
+  }
+  try {
+    if (!Object.hasOwn(error, "code")) return false;
+    return Reflect.get(error, "code") === expectedCode;
+  } catch {
+    return false;
   }
 }
 
@@ -47,6 +75,100 @@ export interface PersistedClaimForAcceptance {
   evidenceSpanId: string;
   sourceArtifactId: string;
   claimVersion: number;
+}
+
+const prelockedCurrentFactBrand: unique symbol = Symbol("PrelockedCurrentFact");
+const postAuthorizationCurrentFactBrand: unique symbol = Symbol("PostAuthorizationCurrentFact");
+
+export type PrelockedCurrentFact = Readonly<{
+  tenantId: string;
+  workspaceId: string;
+  spaceId: string;
+  factId: string;
+  version: 1;
+  status: "current";
+  subjectType: "activity" | "initiative";
+  subjectId: string;
+  predicate: "activity.outcome" | "initiative.primary_objective";
+  subjectVersion: number;
+  factAccessClass: AccessClass;
+  subjectAccessClass: AccessClass;
+  acceptanceScope: "engagement" | "initiative";
+  authorityBasis: "activity_owner" | "initiative_owner";
+  readonly [prelockedCurrentFactBrand]: true;
+}>;
+
+export type PostAuthorizationCurrentFact = Readonly<{
+  tenantId: string;
+  workspaceId: string;
+  spaceId: string;
+  factId: string;
+  version: 1;
+  status: "current";
+  subjectType: "activity" | "initiative";
+  subjectId: string;
+  predicate: "activity.outcome" | "initiative.primary_objective";
+  subjectVersion: number;
+  factAccessClass: AccessClass;
+  subjectAccessClass: AccessClass;
+  acceptanceScope: "engagement" | "initiative";
+  authorityBasis: "activity_owner" | "initiative_owner";
+  readonly [postAuthorizationCurrentFactBrand]: true;
+}>;
+
+export interface SupersededFactResult {
+  factId: string;
+  version: 2;
+  status: "superseded";
+  replacementFactId: string;
+  replacementFactVersion: 1;
+  replacementFactStatus: "current";
+}
+
+export interface RevokedFactResult {
+  factId: string;
+  version: 2;
+  status: "revoked";
+}
+
+interface FactLifecycleHeaderRow {
+  id: string;
+  tenant_id: string;
+  workspace_id: string;
+  space_id: string;
+  subject_type: "activity" | "initiative";
+  subject_id: string;
+  predicate: "activity.outcome" | "initiative.primary_objective";
+}
+
+interface LockedCurrentFactRow extends FactLifecycleHeaderRow {
+  version: 1;
+  status: "current";
+  access_class: AccessClass;
+  space_access_class: AccessClass;
+  subject_version: number;
+  acceptance_scope: "engagement" | "initiative";
+  authority_basis: "activity_owner" | "initiative_owner";
+  context_actor_user_id: string;
+  context_actor_membership_id: string;
+  context_policy_version: string;
+}
+
+interface RefreshedCurrentFactRow extends LockedCurrentFactRow {
+  space_archived_at: string | null;
+}
+
+interface PrelockedCurrentFactState {
+  replacementClaimIds?: readonly string[];
+  postAuthorizationTarget?: PostAuthorizationCurrentFact;
+  actorUserId: string;
+  actorMembershipId: string;
+  policyVersion: string;
+}
+
+interface PostAuthorizationCurrentFactState {
+  prelockedTarget: PrelockedCurrentFact;
+  prelockedState: PrelockedCurrentFactState;
 }
 
 interface SourceRow {
@@ -114,6 +236,14 @@ interface AcceptanceRow {
 
 export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLookup {
   readonly transaction: TenantDbTransaction;
+  private readonly prelockedCurrentFacts = new WeakMap<
+    PrelockedCurrentFact,
+    PrelockedCurrentFactState
+  >();
+  private readonly postAuthorizationCurrentFacts = new WeakMap<
+    PostAuthorizationCurrentFact,
+    PostAuthorizationCurrentFactState
+  >();
 
   constructor(private readonly tx: TenantDbTransaction) {
     this.transaction = tx;
@@ -126,6 +256,34 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     const now = result.rows[0]?.now;
     if (!now) throw new TruthLedgerInvariantError();
     return now.toISOString();
+  }
+
+  async readFactLifecycleReservation(input: {
+    tenantId: string;
+    workspaceId: string;
+    factId: string;
+    expectedVersion: number;
+  }): Promise<{ spaceId: string }> {
+    if (
+      input.expectedVersion !== 1 ||
+      !isCanonicalUuidReference(input.tenantId) ||
+      !isCanonicalUuidReference(input.workspaceId) ||
+      !isUuidV7(input.factId)
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+    const result = await this.guardLifecycleDatabaseOperation(() =>
+      this.tx.query<{ id: string; space_id: string }>(
+        `SELECT fact.id, fact.space_id
+         FROM truth.accepted_facts fact
+         WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.id = $3
+         LIMIT 1`,
+        [input.tenantId, input.workspaceId, input.factId]
+      )
+    );
+    const row = result.rows[0];
+    if (!row || row.id !== input.factId) throw new TruthLedgerUnavailableError();
+    return { spaceId: row.space_id };
   }
 
   async getSubjectScope(
@@ -437,12 +595,6 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
           AND id = $4 AND subject_type = 'initiative' AND subject_id = $5
           AND predicate = 'initiative.primary_objective'
           AND status = 'proposed' AND version = $6
-          AND NOT EXISTS (
-            SELECT 1 FROM truth.accepted_facts fact
-             WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.space_id = $3
-               AND fact.subject_type = 'initiative' AND fact.subject_id = $5
-               AND fact.predicate = 'initiative.primary_objective'
-          )
         LIMIT 1 FOR UPDATE`,
       [
         input.tenantId,
@@ -599,7 +751,9 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
   async loadClaimsForAcceptance(
     tenantId: string,
     workspaceId: string,
-    claimIds: readonly string[]
+    claimIds: readonly string[],
+    excludeClaimsSupportingActiveFact = false,
+    allowIncompleteResult = false
   ): Promise<PersistedClaimForAcceptance[]> {
     const result = await this.tx.query<AcceptanceRow>(
       `SELECT claim.id, claim.space_id, claim.subject_type, claim.subject_id,
@@ -641,12 +795,32 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
              AND successor.workspace_id = source.workspace_id
              AND successor.supersedes_source_id = source.id
          )
+       ${
+         excludeClaimsSupportingActiveFact
+           ? `AND NOT EXISTS (
+           SELECT 1
+           FROM truth.fact_claims active_support
+           JOIN truth.accepted_facts active_fact
+             ON active_fact.tenant_id = active_support.tenant_id
+            AND active_fact.workspace_id = active_support.workspace_id
+            AND active_fact.space_id = active_support.space_id
+            AND active_fact.id = active_support.fact_id
+           WHERE active_support.tenant_id = claim.tenant_id
+             AND active_support.workspace_id = claim.workspace_id
+             AND active_support.space_id = claim.space_id
+             AND active_support.claim_id = claim.id
+             AND active_fact.status = 'current'
+         )`
+           : ""
+       }
        ORDER BY claim.id
        FOR UPDATE OF claim
        FOR SHARE OF source`,
       [tenantId, workspaceId, [...claimIds].sort()]
     );
-    if (result.rows.length !== claimIds.length) throw new TruthLedgerConflictError();
+    if (!allowIncompleteResult && result.rows.length !== claimIds.length) {
+      throw new TruthLedgerConflictError();
+    }
     return result.rows.map((row) => ({
       claim: {
         id: row.id,
@@ -690,6 +864,444 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     }));
   }
 
+  async prelockCurrentFact(input: {
+    tenantId: string;
+    workspaceId: string;
+    factId: string;
+    expectedVersion: number;
+  }): Promise<PrelockedCurrentFact> {
+    if (
+      input.expectedVersion !== 1 ||
+      !isCanonicalUuidReference(input.tenantId) ||
+      !isCanonicalUuidReference(input.workspaceId) ||
+      !isUuidV7(input.factId)
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+    const headerResult = await this.guardLifecycleDatabaseOperation(() =>
+      this.tx.query<FactLifecycleHeaderRow>(
+        `SELECT fact.id, fact.tenant_id, fact.workspace_id, fact.space_id,
+                fact.subject_type, fact.subject_id, fact.predicate
+         FROM truth.accepted_facts fact
+         WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.id = $3
+         LIMIT 1`,
+        [input.tenantId, input.workspaceId, input.factId]
+      )
+    );
+    const header = headerResult.rows[0];
+    if (
+      !header ||
+      header.id !== input.factId ||
+      header.tenant_id !== input.tenantId ||
+      header.workspace_id !== input.workspaceId ||
+      !isCanonicalTruthCoordinate(header)
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+
+    await this.guardLifecycleDatabaseOperation(() =>
+      this.lockTruthCoordinate({
+        tenantId: header.tenant_id,
+        workspaceId: header.workspace_id,
+        spaceId: header.space_id,
+        subjectType: header.subject_type,
+        subjectId: header.subject_id,
+        predicate: header.predicate
+      })
+    );
+
+    const subjectTable =
+      header.subject_type === "activity" ? "work.activities" : "work.initiatives";
+    const lockedResult = await this.guardLifecycleDatabaseOperation(() =>
+      this.tx.query<LockedCurrentFactRow>(
+        `SELECT fact.id, fact.tenant_id, fact.workspace_id, fact.space_id,
+                fact.subject_type, fact.subject_id, fact.predicate,
+                fact.version, fact.status, fact.access_class,
+                space.access_class AS space_access_class,
+                subject.version AS subject_version,
+                fact.acceptance_scope, fact.authority_basis,
+                ops.current_user_id() AS context_actor_user_id,
+                ops.current_membership_id() AS context_actor_membership_id,
+                ops.current_policy_version() AS context_policy_version
+         FROM truth.accepted_facts fact
+         JOIN access.spaces space
+           ON space.tenant_id = fact.tenant_id
+          AND space.workspace_id = fact.workspace_id
+          AND space.id = fact.space_id
+         JOIN ${subjectTable} subject
+           ON subject.tenant_id = fact.tenant_id
+          AND subject.workspace_id = fact.workspace_id
+          AND subject.space_id = fact.space_id
+          AND subject.id = fact.subject_id
+         WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.id = $3
+           AND fact.space_id = $4 AND fact.subject_type = $5
+           AND fact.subject_id = $6 AND fact.predicate = $7
+           AND fact.version = $8 AND fact.status = 'current'
+           AND space.archived_at IS NULL
+         LIMIT 1
+         FOR UPDATE OF fact`,
+        [
+          input.tenantId,
+          input.workspaceId,
+          input.factId,
+          header.space_id,
+          header.subject_type,
+          header.subject_id,
+          header.predicate,
+          input.expectedVersion
+        ]
+      )
+    );
+    const row = lockedResult.rows[0];
+    if (
+      !row ||
+      row.id !== header.id ||
+      row.tenant_id !== header.tenant_id ||
+      row.workspace_id !== header.workspace_id ||
+      row.space_id !== header.space_id ||
+      row.subject_type !== header.subject_type ||
+      row.subject_id !== header.subject_id ||
+      row.predicate !== header.predicate ||
+      row.version !== input.expectedVersion ||
+      row.status !== "current" ||
+      !Number.isSafeInteger(row.subject_version) ||
+      row.subject_version < 1 ||
+      !isCanonicalUuidReference(row.context_actor_user_id) ||
+      !isCanonicalUuidReference(row.context_actor_membership_id) ||
+      !isSafeReference(row.context_policy_version) ||
+      !lifecycleAuthorityMatchesCoordinate(row)
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+
+    const target = Object.freeze({
+      tenantId: row.tenant_id,
+      workspaceId: row.workspace_id,
+      spaceId: row.space_id,
+      factId: row.id,
+      version: row.version,
+      status: row.status,
+      subjectType: row.subject_type,
+      subjectId: row.subject_id,
+      predicate: row.predicate,
+      subjectVersion: row.subject_version,
+      factAccessClass: row.access_class,
+      subjectAccessClass: row.space_access_class,
+      acceptanceScope: row.acceptance_scope,
+      authorityBasis: row.authority_basis,
+      [prelockedCurrentFactBrand]: true as const
+    });
+    this.prelockedCurrentFacts.set(target, {
+      actorUserId: row.context_actor_user_id,
+      actorMembershipId: row.context_actor_membership_id,
+      policyVersion: row.context_policy_version
+    });
+    return target;
+  }
+
+  async refreshCurrentFactAfterAuthorization(input: {
+    target: PrelockedCurrentFact;
+  }): Promise<PostAuthorizationCurrentFact> {
+    const state = this.requirePrelockedCurrentFact(input.target);
+    if (state.postAuthorizationTarget !== undefined) {
+      throw new TruthLedgerConflictError();
+    }
+    const subjectTable =
+      input.target.subjectType === "activity" ? "work.activities" : "work.initiatives";
+    const refreshedResult = await this.guardLifecycleDatabaseOperation(() =>
+      this.tx.query<RefreshedCurrentFactRow>(
+        `SELECT fact.id, fact.tenant_id, fact.workspace_id, fact.space_id,
+                fact.subject_type, fact.subject_id, fact.predicate,
+                fact.version, fact.status, fact.access_class,
+                space.access_class AS space_access_class,
+                space.archived_at AS space_archived_at,
+                subject.version AS subject_version,
+                fact.acceptance_scope, fact.authority_basis,
+                ops.current_user_id() AS context_actor_user_id,
+                ops.current_membership_id() AS context_actor_membership_id,
+                ops.current_policy_version() AS context_policy_version
+           FROM truth.accepted_facts fact
+           JOIN access.spaces space
+             ON space.tenant_id = fact.tenant_id
+            AND space.workspace_id = fact.workspace_id
+            AND space.id = fact.space_id
+           JOIN ${subjectTable} subject
+             ON subject.tenant_id = fact.tenant_id
+            AND subject.workspace_id = fact.workspace_id
+            AND subject.space_id = fact.space_id
+            AND subject.id = fact.subject_id
+          WHERE fact.tenant_id = $1 AND fact.workspace_id = $2 AND fact.id = $3
+            AND fact.space_id = $4 AND fact.subject_type = $5
+            AND fact.subject_id = $6 AND fact.predicate = $7
+            AND fact.version = 1 AND fact.status = 'current'
+          LIMIT 1`,
+        [
+          input.target.tenantId,
+          input.target.workspaceId,
+          input.target.factId,
+          input.target.spaceId,
+          input.target.subjectType,
+          input.target.subjectId,
+          input.target.predicate
+        ]
+      )
+    );
+    const row = refreshedResult.rows[0];
+    if (
+      !row ||
+      row.id !== input.target.factId ||
+      row.tenant_id !== input.target.tenantId ||
+      row.workspace_id !== input.target.workspaceId ||
+      row.space_id !== input.target.spaceId ||
+      row.subject_type !== input.target.subjectType ||
+      row.subject_id !== input.target.subjectId ||
+      row.predicate !== input.target.predicate ||
+      row.version !== input.target.version ||
+      row.status !== input.target.status ||
+      row.access_class !== input.target.factAccessClass ||
+      row.subject_version !== input.target.subjectVersion ||
+      row.acceptance_scope !== input.target.acceptanceScope ||
+      row.authority_basis !== input.target.authorityBasis ||
+      row.space_archived_at !== null ||
+      !isAccessClass(row.space_access_class) ||
+      row.context_actor_user_id !== state.actorUserId ||
+      row.context_actor_membership_id !== state.actorMembershipId ||
+      row.context_policy_version !== state.policyVersion ||
+      !lifecycleAuthorityMatchesCoordinate(row)
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+
+    const target = Object.freeze({
+      tenantId: row.tenant_id,
+      workspaceId: row.workspace_id,
+      spaceId: row.space_id,
+      factId: row.id,
+      version: row.version,
+      status: row.status,
+      subjectType: row.subject_type,
+      subjectId: row.subject_id,
+      predicate: row.predicate,
+      subjectVersion: row.subject_version,
+      factAccessClass: row.access_class,
+      subjectAccessClass: row.space_access_class,
+      acceptanceScope: row.acceptance_scope,
+      authorityBasis: row.authority_basis,
+      [postAuthorizationCurrentFactBrand]: true as const
+    });
+    state.postAuthorizationTarget = target;
+    this.postAuthorizationCurrentFacts.set(target, {
+      prelockedTarget: input.target,
+      prelockedState: state
+    });
+    return target;
+  }
+
+  async lockReplacementClaimsForSupersession(input: {
+    target: PostAuthorizationCurrentFact;
+    replacementClaims: readonly B2ClaimVersionRef[];
+  }): Promise<readonly PersistedClaimForAcceptance[]> {
+    const { prelockedState: state } = this.requirePostAuthorizationCurrentFact(input.target);
+    if (
+      !Array.isArray(input.replacementClaims) ||
+      input.replacementClaims.length === 0 ||
+      input.replacementClaims.length > 100 ||
+      state.replacementClaimIds !== undefined
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+    const expectedVersions = new Map<string, number>();
+    for (const reference of input.replacementClaims) {
+      if (
+        !reference ||
+        !isUuidV7(reference.claimId) ||
+        reference.expectedVersion !== 1 ||
+        expectedVersions.has(reference.claimId)
+      ) {
+        throw new TruthLedgerConflictError();
+      }
+      expectedVersions.set(reference.claimId, reference.expectedVersion);
+    }
+    const claimIds = [...expectedVersions.keys()].sort();
+    const persistedClaims = await this.guardLifecycleDatabaseOperation(() =>
+      this.loadClaimsForAcceptance(
+        input.target.tenantId,
+        input.target.workspaceId,
+        claimIds,
+        true,
+        true
+      )
+    );
+    if (persistedClaims.length !== claimIds.length) throw new TruthLedgerUnavailableError();
+    if (
+      persistedClaims.some(
+        ({ claim, claimVersion }) =>
+          claim.status !== "proposed" ||
+          expectedVersions.get(claim.id) !== claimVersion ||
+          claim.tenantId !== input.target.tenantId ||
+          claim.workspaceId !== input.target.workspaceId ||
+          claim.spaceId !== input.target.spaceId ||
+          claim.subjectType !== input.target.subjectType ||
+          claim.subjectId !== input.target.subjectId ||
+          claim.predicate !== input.target.predicate
+      )
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+    if (
+      input.target.subjectType === "initiative" &&
+      input.target.predicate === "initiative.primary_objective"
+    ) {
+      await this.guardLifecycleDatabaseOperation(() =>
+        this.requirePrimaryObjectiveSupportConfirmations(
+          input.target.tenantId,
+          input.target.workspaceId,
+          claimIds
+        )
+      );
+    }
+    state.replacementClaimIds = Object.freeze(claimIds);
+    return Object.freeze(persistedClaims);
+  }
+
+  async supersedePrelockedFact(input: {
+    target: PostAuthorizationCurrentFact;
+    replacementFact: NewlyAcceptedFact;
+    lifecycleEventId: string;
+    commandId: string;
+    reason: SupersedeReason;
+    actorUserId: string;
+    actorMembershipId: string;
+    policyVersion: string;
+  }): Promise<SupersededFactResult> {
+    const { prelockedTarget, prelockedState: state } = this.requirePostAuthorizationCurrentFact(
+      input.target
+    );
+    const reason = parseLifecycleReason("supersede", input.reason);
+    const fact = input.replacementFact;
+    if (
+      state.replacementClaimIds === undefined ||
+      !isAcceptedFact(fact) ||
+      fact.id === input.target.factId ||
+      fact.supersedesFactId !== input.target.factId ||
+      fact.tenantId !== input.target.tenantId ||
+      fact.workspaceId !== input.target.workspaceId ||
+      fact.spaceId !== input.target.spaceId ||
+      fact.subjectType !== input.target.subjectType ||
+      fact.subjectId !== input.target.subjectId ||
+      fact.predicate !== input.target.predicate ||
+      fact.acceptanceScope !== input.target.acceptanceScope ||
+      fact.authorityBasis !== input.target.authorityBasis ||
+      fact.acceptedByUserId !== input.actorUserId ||
+      fact.acceptedByMembershipId !== input.actorMembershipId ||
+      fact.policyVersion !== input.policyVersion ||
+      input.actorUserId !== state.actorUserId ||
+      input.actorMembershipId !== state.actorMembershipId ||
+      input.policyVersion !== state.policyVersion ||
+      !isUuidV7(input.lifecycleEventId) ||
+      !isUuidV7(input.commandId) ||
+      maxAccessClass(
+        fact.accessClass,
+        maxAccessClass(input.target.subjectAccessClass, input.target.factAccessClass)
+      ) !== fact.accessClass ||
+      !sameSortedIds(fact.supportingClaimIds, state.replacementClaimIds)
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+
+    await this.terminalizePrelockedFact(input.target, "superseded", input.commandId);
+    await this.guardLifecycleDatabaseOperation(() =>
+      this.insertAcceptedFact({
+        fact,
+        commandId: input.commandId,
+        confidenceDecision: fact.confidenceDecision,
+        useTransactionTimestamp: true
+      })
+    );
+    await this.insertFactLifecycleEvent({
+      target: input.target,
+      lifecycleEventId: input.lifecycleEventId,
+      successorFactId: fact.id,
+      transitionKind: "supersede",
+      toStatus: "superseded",
+      reason,
+      actorUserId: input.actorUserId,
+      actorMembershipId: input.actorMembershipId,
+      policyVersion: input.policyVersion,
+      commandId: input.commandId
+    });
+    this.postAuthorizationCurrentFacts.delete(input.target);
+    this.prelockedCurrentFacts.delete(prelockedTarget);
+    return {
+      factId: input.target.factId,
+      version: 2,
+      status: "superseded",
+      replacementFactId: fact.id,
+      replacementFactVersion: 1,
+      replacementFactStatus: "current"
+    };
+  }
+
+  async revokePrelockedFact(input: {
+    target: PostAuthorizationCurrentFact;
+    lifecycleEventId: string;
+    commandId: string;
+    reason: RevokeReason;
+    actorUserId: string;
+    actorMembershipId: string;
+    policyVersion: string;
+  }): Promise<RevokedFactResult> {
+    const { prelockedTarget, prelockedState: state } = this.requirePostAuthorizationCurrentFact(
+      input.target
+    );
+    const reason = parseLifecycleReason("revoke", input.reason);
+    if (
+      input.actorUserId !== state.actorUserId ||
+      input.actorMembershipId !== state.actorMembershipId ||
+      input.policyVersion !== state.policyVersion ||
+      !isUuidV7(input.lifecycleEventId) ||
+      !isUuidV7(input.commandId)
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+    if (
+      input.target.subjectType === "initiative" &&
+      input.target.predicate === "initiative.primary_objective"
+    ) {
+      const openProposal = await this.guardLifecycleDatabaseOperation(() =>
+        this.tx.query<{ id: string }>(
+          `SELECT id FROM truth.claims
+           WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
+             AND subject_type = 'initiative' AND subject_id = $4
+             AND predicate = 'initiative.primary_objective' AND status = 'proposed'
+           LIMIT 1`,
+          [
+            input.target.tenantId,
+            input.target.workspaceId,
+            input.target.spaceId,
+            input.target.subjectId
+          ]
+        )
+      );
+      if (openProposal.rows.length !== 0) throw new TruthLedgerConflictError();
+    }
+    await this.terminalizePrelockedFact(input.target, "revoked", input.commandId);
+    await this.insertFactLifecycleEvent({
+      target: input.target,
+      lifecycleEventId: input.lifecycleEventId,
+      transitionKind: "revoke",
+      toStatus: "revoked",
+      reason,
+      actorUserId: input.actorUserId,
+      actorMembershipId: input.actorMembershipId,
+      policyVersion: input.policyVersion,
+      commandId: input.commandId
+    });
+    this.postAuthorizationCurrentFacts.delete(input.target);
+    this.prelockedCurrentFacts.delete(prelockedTarget);
+    return { factId: input.target.factId, version: 2, status: "revoked" };
+  }
+
   async lockFirstAcceptanceSlot(input: {
     tenantId: string;
     workspaceId: string;
@@ -704,6 +1316,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
        FROM truth.accepted_facts
        WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
          AND subject_type = $4 AND subject_id = $5 AND predicate = $6
+         AND status IN ('current', 'contested')
        LIMIT 1`,
       [
         input.tenantId,
@@ -759,11 +1372,6 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     }
     const occupied = await this.tx.query<{ occupied: boolean }>(
       `SELECT EXISTS (
-         SELECT 1 FROM truth.accepted_facts
-         WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
-           AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5
-           AND status IN ('current', 'contested')
-       ) OR EXISTS (
          SELECT 1 FROM truth.claims
          WHERE tenant_id = $1 AND workspace_id = $2 AND space_id = $3
            AND subject_type = 'initiative' AND subject_id = $4 AND predicate = $5
@@ -772,6 +1380,122 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
       [input.tenantId, input.workspaceId, input.spaceId, input.subjectId, coordinate.predicate]
     );
     if (occupied.rows[0]?.occupied !== false) throw new TruthLedgerConflictError();
+  }
+
+  private requirePrelockedCurrentFact(target: PrelockedCurrentFact): PrelockedCurrentFactState {
+    const state = this.prelockedCurrentFacts.get(target);
+    if (!state || target[prelockedCurrentFactBrand] !== true) {
+      throw new TruthLedgerConflictError();
+    }
+    return state;
+  }
+
+  private requirePostAuthorizationCurrentFact(
+    target: PostAuthorizationCurrentFact
+  ): PostAuthorizationCurrentFactState {
+    const state = this.postAuthorizationCurrentFacts.get(target);
+    if (
+      !state ||
+      target[postAuthorizationCurrentFactBrand] !== true ||
+      state.prelockedState.postAuthorizationTarget !== target ||
+      this.prelockedCurrentFacts.get(state.prelockedTarget) !== state.prelockedState
+    ) {
+      throw new TruthLedgerConflictError();
+    }
+    return state;
+  }
+
+  private async guardLifecycleDatabaseOperation<T>(operation: () => Promise<T>): Promise<T> {
+    try {
+      return await operation();
+    } catch (error) {
+      if (
+        error instanceof TruthLedgerConflictError ||
+        error instanceof TruthLedgerInvariantError ||
+        error instanceof TruthLedgerUnavailableError
+      ) {
+        throw error;
+      }
+      if (hasExactErrorCode(error, "P0001")) throw new TruthLedgerConflictError();
+      throw new TruthLedgerInvariantError();
+    }
+  }
+
+  private async terminalizePrelockedFact(
+    target: PostAuthorizationCurrentFact,
+    status: "superseded" | "revoked",
+    commandId: string
+  ): Promise<void> {
+    const result = await this.guardLifecycleDatabaseOperation(() =>
+      this.tx.query<{ id: string }>(
+        `UPDATE truth.accepted_facts
+         SET status = $5, version = version + 1,
+             last_causation_command_id = $6, updated_at = transaction_timestamp()
+         WHERE tenant_id = $1 AND workspace_id = $2 AND id = $3 AND version = $4
+           AND status = 'current' AND space_id = $7 AND subject_type = $8
+           AND subject_id = $9 AND predicate = $10
+         RETURNING id`,
+        [
+          target.tenantId,
+          target.workspaceId,
+          target.factId,
+          target.version,
+          status,
+          commandId,
+          target.spaceId,
+          target.subjectType,
+          target.subjectId,
+          target.predicate
+        ]
+      )
+    );
+    if (result.rows.length !== 1 || result.rows[0]?.id !== target.factId) {
+      throw new TruthLedgerConflictError();
+    }
+  }
+
+  private async insertFactLifecycleEvent(input: {
+    target: PostAuthorizationCurrentFact;
+    lifecycleEventId: string;
+    successorFactId?: string;
+    transitionKind: "supersede" | "revoke";
+    toStatus: "superseded" | "revoked";
+    reason: SupersedeReason | RevokeReason;
+    actorUserId: string;
+    actorMembershipId: string;
+    policyVersion: string;
+    commandId: string;
+  }): Promise<void> {
+    await this.guardLifecycleDatabaseOperation(() =>
+      this.tx.query(
+        `INSERT INTO truth.fact_lifecycle_events (
+           id, tenant_id, workspace_id, space_id,
+           predecessor_fact_id, successor_fact_id,
+           transition_kind, from_status, to_status,
+           reason_code, reason_rationale, authority_basis, policy_version,
+           acted_by_user_id, acted_by_membership_id, causation_command_id
+         ) VALUES (
+           $1,$2,$3,$4,$5,$6,$7,'current',$8,$9,$10,$11,$12,$13,$14,$15
+         )`,
+        [
+          input.lifecycleEventId,
+          input.target.tenantId,
+          input.target.workspaceId,
+          input.target.spaceId,
+          input.target.factId,
+          input.successorFactId ?? null,
+          input.transitionKind,
+          input.toStatus,
+          input.reason.code,
+          input.reason.rationale,
+          input.target.authorityBasis,
+          input.policyVersion,
+          input.actorUserId,
+          input.actorMembershipId,
+          input.commandId
+        ]
+      )
+    );
   }
 
   private async lockTruthCoordinate(input: {
@@ -791,6 +1515,7 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     fact: NewlyAcceptedFact;
     commandId: string;
     confidenceDecision: AcceptedFactConfidenceResult;
+    useTransactionTimestamp?: boolean;
   }): Promise<void> {
     if (!isAcceptedFact(input.fact)) throw new TruthLedgerInvariantError();
     const fact = input.fact;
@@ -806,7 +1531,11 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
          acceptance_policy_version, last_causation_command_id, created_at, updated_at
        ) VALUES (
          $1,$2,$3,$4,$5,$6,'truth-predicate-catalog.v1',$7,$8,$9,$10,
-         $11,$12,$13,$14,$15,$16,$17,$18,$19,'current',$20,$21,$22,$23,$24,$25,$26,$27,$27
+         $11,$12,$13,$14,$15,$16,$17,$18,
+         CASE WHEN $28::boolean THEN transaction_timestamp() ELSE $19::timestamptz END,
+         'current',$20,$21,$22,$23,$24,$25,$26,
+         CASE WHEN $28::boolean THEN transaction_timestamp() ELSE $27::timestamptz END,
+         CASE WHEN $28::boolean THEN transaction_timestamp() ELSE $27::timestamptz END
        )`,
       [
         fact.id,
@@ -835,7 +1564,8 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
         fact.authorityBasis,
         fact.policyVersion,
         input.commandId,
-        fact.createdAt
+        fact.createdAt,
+        input.useTransactionTimestamp === true
       ]
     );
     for (const claimId of fact.supportingClaimIds) {
@@ -848,11 +1578,19 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
     }
     const changed = await this.tx.query<{ id: string }>(
       `UPDATE truth.claims
-       SET status = 'accepted', version = version + 1, updated_at = $4::timestamptz
+       SET status = 'accepted', version = version + 1,
+           updated_at = CASE WHEN $5::boolean
+             THEN transaction_timestamp() ELSE $4::timestamptz END
        WHERE tenant_id = $1 AND workspace_id = $2
          AND id = ANY($3::uuid[]) AND status = 'proposed'
        RETURNING id`,
-      [fact.tenantId, fact.workspaceId, [...fact.supportingClaimIds], fact.createdAt]
+      [
+        fact.tenantId,
+        fact.workspaceId,
+        [...fact.supportingClaimIds],
+        fact.createdAt,
+        input.useTransactionTimestamp === true
+      ]
     );
     if (changed.rows.length !== fact.supportingClaimIds.length) {
       throw new TruthLedgerConflictError();
@@ -889,4 +1627,67 @@ export class TruthLedgerRepository implements AuthorizedClaimEvidenceSnapshotLoo
 
 export function sha256CanonicalText(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function isCanonicalTruthCoordinate(row: FactLifecycleHeaderRow): boolean {
+  return (
+    typeof row.space_id === "string" &&
+    typeof row.subject_id === "string" &&
+    ((row.subject_type === "activity" && row.predicate === "activity.outcome") ||
+      (row.subject_type === "initiative" && row.predicate === "initiative.primary_objective"))
+  );
+}
+
+function lifecycleAuthorityMatchesCoordinate(row: LockedCurrentFactRow): boolean {
+  return (
+    (row.subject_type === "activity" &&
+      row.predicate === "activity.outcome" &&
+      row.acceptance_scope === "engagement" &&
+      row.authority_basis === "activity_owner") ||
+    (row.subject_type === "initiative" &&
+      row.predicate === "initiative.primary_objective" &&
+      row.acceptance_scope === "initiative" &&
+      row.authority_basis === "initiative_owner")
+  );
+}
+
+function isUuidV7(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+  );
+}
+
+function isCanonicalUuidReference(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+  );
+}
+
+function isAccessClass(value: unknown): value is AccessClass {
+  return ["public", "workspace", "restricted", "confidential"].includes(value as string);
+}
+
+function isSafeReference(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}$/.test(value);
+}
+
+function sameSortedIds(left: readonly string[], right: readonly string[]): boolean {
+  return left.length === right.length && left.every((id, index) => id === right[index]);
+}
+
+function parseLifecycleReason(kind: "supersede", input: unknown): SupersedeReason;
+function parseLifecycleReason(kind: "revoke", input: unknown): RevokeReason;
+function parseLifecycleReason(
+  kind: "supersede" | "revoke",
+  input: unknown
+): SupersedeReason | RevokeReason {
+  try {
+    return kind === "supersede"
+      ? parseTruthLifecycleReason("supersede", input)
+      : parseTruthLifecycleReason("revoke", input);
+  } catch {
+    throw new TruthLedgerConflictError();
+  }
 }

@@ -5,13 +5,29 @@ interface RouteContext {
 }
 
 export async function GET(request: Request, context: RouteContext) {
-  if (new URL(request.url).search !== "") return unavailableResponse();
-  return forwardDemoRequest({ initiativeId: (await context.params).initiativeId });
+  if (
+    new URL(request.url).search !== "" ||
+    !isLoopbackRequest(request) ||
+    hasRequesterAuthorityHeaders(request)
+  ) {
+    return unavailableResponse();
+  }
+  return forwardDemoRequest({
+    initiativeId: (await context.params).initiativeId,
+    signal: request.signal
+  });
 }
 
 export async function POST(request: Request, context: RouteContext) {
-  if (!isSameOriginJsonMutation(request)) return unavailableResponse();
-  const raw = (await request.json().catch(() => null)) as Record<string, unknown> | null;
+  if (
+    new URL(request.url).search !== "" ||
+    !isLoopbackRequest(request) ||
+    !isSameOriginJsonMutation(request) ||
+    hasRequesterAuthorityHeaders(request)
+  ) {
+    return unavailableResponse();
+  }
+  const raw = await readUniqueJsonObject(request);
   const action = parseAction(raw?.action);
   if (!action || !raw || !hasExactEnvelopeKeys(action, raw)) return unavailableResponse();
   const body = bodyForAction(action, raw);
@@ -19,7 +35,8 @@ export async function POST(request: Request, context: RouteContext) {
   return forwardDemoRequest({
     initiativeId: (await context.params).initiativeId,
     action,
-    body
+    body,
+    signal: request.signal
   });
 }
 
@@ -31,10 +48,7 @@ function isSameOriginJsonMutation(request: Request): boolean {
     return false;
   }
   const contentType = request.headers.get("content-type");
-  if (
-    !contentType ||
-    !/^application\/json(?:\s*;\s*charset=[a-z0-9._-]+)?\s*$/i.test(contentType)
-  ) {
+  if (!contentType || !isUtf8JsonContentType(contentType)) {
     return false;
   }
   const origin = request.headers.get("origin");
@@ -48,6 +62,8 @@ function isSameOriginJsonMutation(request: Request): boolean {
   const requestHost = request.headers.get("host") ?? requestUrl.host;
   if (
     originUrl.protocol !== "http:" ||
+    originUrl.username !== "" ||
+    originUrl.password !== "" ||
     !["127.0.0.1", "localhost", "[::1]"].includes(originUrl.hostname) ||
     originUrl.host.toLowerCase() !== requestHost.toLowerCase()
   ) {
@@ -55,6 +71,25 @@ function isSameOriginJsonMutation(request: Request): boolean {
   }
   const fetchSite = request.headers.get("sec-fetch-site");
   return fetchSite === null || fetchSite === "same-origin";
+}
+
+function isLoopbackRequest(request: Request): boolean {
+  try {
+    const requestUrl = new URL(request.url);
+    const requestHost = request.headers.get("host") ?? requestUrl.host;
+    const hostUrl = new URL(`http://${requestHost}`);
+    return (
+      requestUrl.protocol === "http:" &&
+      requestUrl.username === "" &&
+      requestUrl.password === "" &&
+      hostUrl.username === "" &&
+      hostUrl.password === "" &&
+      ["127.0.0.1", "localhost", "[::1]"].includes(requestUrl.hostname) &&
+      ["127.0.0.1", "localhost", "[::1]"].includes(hostUrl.hostname)
+    );
+  } catch {
+    return false;
+  }
 }
 
 function parseAction(
@@ -65,6 +100,8 @@ function parseAction(
   | "proposal/withdraw"
   | "proposal/rework"
   | "accept"
+  | "supersede"
+  | "revoke"
   | "draft-confirmation"
   | null {
   return value === "source" ||
@@ -72,6 +109,8 @@ function parseAction(
     value === "proposal/withdraw" ||
     value === "proposal/rework" ||
     value === "accept" ||
+    value === "supersede" ||
+    value === "revoke" ||
     value === "draft-confirmation"
     ? value
     : null;
@@ -110,9 +149,24 @@ function hasExactEnvelopeKeys(
       "supportConfirmed"
     ],
     accept: ["action", "claimId", "expectedClaimVersion", "expectedInitiativeVersion"],
+    supersede: [
+      "action",
+      "expectedFactVersion",
+      "expectedInitiativeVersion",
+      "expectedReplacementClaimVersion",
+      "factId",
+      "rationale",
+      "reasonCode",
+      "replacementClaimId"
+    ],
+    revoke: ["action", "expectedFactVersion", "factId", "rationale", "reasonCode"],
     "draft-confirmation": ["action"]
   } as const;
-  return JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected[action]].sort());
+  const ownKeys = Reflect.ownKeys(value);
+  return (
+    ownKeys.every((key) => typeof key === "string") &&
+    JSON.stringify((ownKeys as string[]).sort()) === JSON.stringify([...expected[action]].sort())
+  );
 }
 
 function bodyForAction(
@@ -122,6 +176,8 @@ function bodyForAction(
     | "proposal/withdraw"
     | "proposal/rework"
     | "accept"
+    | "supersede"
+    | "revoke"
     | "draft-confirmation",
   value: Record<string, unknown>
 ): Record<string, unknown> | null {
@@ -155,8 +211,9 @@ function bodyForAction(
       typeof value.sourceRevisionAnchor === "string" &&
       value.supportConfirmed === true &&
       typeof value.claimId === "string" &&
+      isUuid(value.claimId) &&
       value.expectedClaimVersion === 1 &&
-      typeof value.expectedInitiativeVersion === "number" &&
+      isPositiveInteger(value.expectedInitiativeVersion) &&
       value.note === undefined
       ? {
           claimId: value.claimId,
@@ -171,8 +228,9 @@ function bodyForAction(
   }
   if (action === "proposal/withdraw") {
     return typeof value.claimId === "string" &&
+      isUuid(value.claimId) &&
       value.expectedClaimVersion === 1 &&
-      typeof value.expectedInitiativeVersion === "number" &&
+      isPositiveInteger(value.expectedInitiativeVersion) &&
       (value.disposition === "withdrawn" || value.disposition === "rejected") &&
       typeof value.reasonCode === "string" &&
       value.note === undefined &&
@@ -190,12 +248,52 @@ function bodyForAction(
   }
   if (action === "accept") {
     return typeof value.claimId === "string" &&
+      isUuid(value.claimId) &&
       value.expectedClaimVersion === 1 &&
-      typeof value.expectedInitiativeVersion === "number"
+      isPositiveInteger(value.expectedInitiativeVersion)
       ? {
           claimId: value.claimId,
           expectedClaimVersion: value.expectedClaimVersion,
           expectedInitiativeVersion: value.expectedInitiativeVersion
+        }
+      : null;
+  }
+  if (action === "supersede") {
+    return typeof value.factId === "string" &&
+      isUuid(value.factId) &&
+      isPositiveInteger(value.expectedFactVersion) &&
+      typeof value.replacementClaimId === "string" &&
+      isUuid(value.replacementClaimId) &&
+      value.expectedReplacementClaimVersion === 1 &&
+      isPositiveInteger(value.expectedInitiativeVersion) &&
+      (value.reasonCode === "newer_evidence" ||
+        value.reasonCode === "accepted_value_changed" ||
+        value.reasonCode === "corrected_source_revalidated") &&
+      validRationale(value.rationale)
+      ? {
+          factId: value.factId,
+          expectedFactVersion: value.expectedFactVersion,
+          replacementClaimId: value.replacementClaimId,
+          expectedReplacementClaimVersion: value.expectedReplacementClaimVersion,
+          expectedInitiativeVersion: value.expectedInitiativeVersion,
+          reasonCode: value.reasonCode,
+          rationale: value.rationale
+        }
+      : null;
+  }
+  if (action === "revoke") {
+    return typeof value.factId === "string" &&
+      isUuid(value.factId) &&
+      isPositiveInteger(value.expectedFactVersion) &&
+      (value.reasonCode === "no_longer_true" ||
+        value.reasonCode === "support_invalidated" ||
+        value.reasonCode === "entered_in_error") &&
+      validRationale(value.rationale)
+      ? {
+          factId: value.factId,
+          expectedFactVersion: value.expectedFactVersion,
+          reasonCode: value.reasonCode,
+          rationale: value.rationale
         }
       : null;
   }
@@ -212,4 +310,165 @@ function bodyForAction(
     value.sourceRevisionAnchor === undefined
     ? {}
     : null;
+}
+
+function hasRequesterAuthorityHeaders(request: Request): boolean {
+  // Next injects x-forwarded-for/host/proto; this BFF ignores and drops them as transport metadata.
+  const forbidden = new Set([
+    "authorization",
+    "cookie",
+    "forwarded",
+    "idempotency-key",
+    "proxy-authorization",
+    "role",
+    "x-request-id",
+    "x-trace-id"
+  ]);
+  return Array.from(request.headers.keys()).some((name) => {
+    const normalized = name.toLowerCase();
+    return forbidden.has(normalized) || normalized.startsWith("x-throughline-");
+  });
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isInteger(value) && (value as number) > 0;
+}
+
+function validRationale(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= 2_000 &&
+    value.trim() !== "" &&
+    value === value.normalize("NFC") &&
+    value === value.trim()
+  );
+}
+
+function isUtf8JsonContentType(value: string): boolean {
+  const parts = value.split(";").map((part) => part.trim());
+  if (parts[0]?.toLowerCase() !== "application/json") return false;
+  if (parts.length === 1) return true;
+  return parts.length === 2 && /^charset\s*=\s*(?:utf-8|"utf-8")$/i.test(parts[1]!);
+}
+
+async function readUniqueJsonObject(request: Request): Promise<Record<string, unknown> | null> {
+  try {
+    const bytes = await request.arrayBuffer();
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const parsed = parseUniqueJson(text);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseUniqueJson(text: string): unknown {
+  let offset = 0;
+  const skipWhitespace = () => {
+    while ([0x09, 0x0a, 0x0d, 0x20].includes(text.charCodeAt(offset))) offset += 1;
+  };
+  const parseString = (): string => {
+    if (text[offset] !== '"') throw new Error("Invalid JSON string");
+    const start = offset;
+    offset += 1;
+    while (offset < text.length) {
+      const character = text[offset]!;
+      if (character === '"') {
+        offset += 1;
+        return JSON.parse(text.slice(start, offset)) as string;
+      }
+      if (character.charCodeAt(0) < 0x20) throw new Error("Invalid JSON control character");
+      if (character === "\\") {
+        offset += 1;
+        const escape = text[offset];
+        if (!escape || !'"\\/bfnrtu'.includes(escape)) throw new Error("Invalid JSON escape");
+        if (escape === "u") {
+          const scalar = text.slice(offset + 1, offset + 5);
+          if (!/^[0-9a-f]{4}$/i.test(scalar)) throw new Error("Invalid JSON Unicode escape");
+          offset += 4;
+        }
+      }
+      offset += 1;
+    }
+    throw new Error("Unterminated JSON string");
+  };
+  const parseValue = (): unknown => {
+    skipWhitespace();
+    if (text[offset] === '"') return parseString();
+    if (text[offset] === "{") return parseObject();
+    if (text[offset] === "[") return parseArray();
+    for (const [token, value] of [
+      ["true", true],
+      ["false", false],
+      ["null", null]
+    ] as const) {
+      if (text.startsWith(token, offset)) {
+        offset += token.length;
+        return value;
+      }
+    }
+    const number = text.slice(offset).match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/);
+    if (!number) throw new Error("Invalid JSON value");
+    offset += number[0].length;
+    const value = Number(number[0]);
+    if (!Number.isFinite(value)) throw new Error("Invalid JSON number");
+    return value;
+  };
+  const parseObject = (): Record<string, unknown> => {
+    offset += 1;
+    skipWhitespace();
+    const value = Object.create(null) as Record<string, unknown>;
+    const keys = new Set<string>();
+    if (text[offset] === "}") {
+      offset += 1;
+      return value;
+    }
+    while (true) {
+      skipWhitespace();
+      const key = parseString();
+      if (keys.has(key)) throw new Error("Duplicate JSON member");
+      keys.add(key);
+      skipWhitespace();
+      if (text[offset] !== ":") throw new Error("Invalid JSON object");
+      offset += 1;
+      value[key] = parseValue();
+      skipWhitespace();
+      if (text[offset] === "}") {
+        offset += 1;
+        return value;
+      }
+      if (text[offset] !== ",") throw new Error("Invalid JSON object");
+      offset += 1;
+    }
+  };
+  const parseArray = (): unknown[] => {
+    offset += 1;
+    skipWhitespace();
+    const value: unknown[] = [];
+    if (text[offset] === "]") {
+      offset += 1;
+      return value;
+    }
+    while (true) {
+      value.push(parseValue());
+      skipWhitespace();
+      if (text[offset] === "]") {
+        offset += 1;
+        return value;
+      }
+      if (text[offset] !== ",") throw new Error("Invalid JSON array");
+      offset += 1;
+    }
+  };
+
+  const value = parseValue();
+  skipWhitespace();
+  if (offset !== text.length) throw new Error("Trailing JSON data");
+  return value;
 }

@@ -17,6 +17,47 @@ const objectiveRecoveryUrl = new URL(
   "../migrations/0011_b2_primary_objective_proposal_recovery.sql",
   import.meta.url
 );
+const factLifecycleUrl = new URL("../migrations/0012_b2_fact_lifecycle.sql", import.meta.url);
+const migrationFunctionBody = (migration: string, identity: string): string | undefined => {
+  const escapedIdentity = identity.replaceAll(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return migration.match(
+    new RegExp(
+      `CREATE (?:OR REPLACE )?FUNCTION ${escapedIdentity}\\([^)]*\\)[\\s\\S]*?AS \\$function\\$([\\s\\S]*?)\\$function\\$;`
+    )
+  )?.[1];
+};
+const exact0012FunctionBodyDigests = {
+  "ops.b2_slice1_audit_detail_valid(text,text,integer,uuid,jsonb)":
+    "144d82c83595006551ae90b66cb279e0605054470a3b82f89d7d13e53f12475a",
+  "ops.b2_slice1_event_payload_valid(text,integer,uuid,jsonb)":
+    "6d0c4b56de9120cb11375c7cceb92a7871adf2c3cd122e3eaa3c964dd1ea81f0",
+  "ops.b2_slice1_safe_request_valid(text,jsonb)":
+    "411d840a4103fad18a06842df04cf9edca89aeeba166b6b5726fbd183d586eef",
+  "ops.product_command_record_valid(text,integer,text,text,uuid,jsonb)":
+    "e5c46c5b0d47712951dce2d60e55f28bca1e7cca795658c196836b7e8fe7affa",
+  "ops.require_b2_slice1_command_atomicity()":
+    "2ed3c76136938f08846defd78c14ed84d5c50ac915a9fb946b25fbed17819f48",
+  "truth.enforce_claim_transition()":
+    "0bef1037a525126dad73b202c4dd59cd8be26fed48d6fb36657afd59b140bf48",
+  "truth.enforce_fact_lifecycle_transition()":
+    "967ec9269eb34f79e35ba6113f22ec29ba1c5d74819546b4716d982b59336a10",
+  "truth.reject_statement_mutation()":
+    "e8a66bfefb5d061c9981613e9e581872595c6f3fff384c20cd5513d7503902ae",
+  "truth.require_fact_accept_reservation()":
+    "6e3a8170aeb14d4cf474c3ed0acf9b122efa7d732e1530bad205a8c4d17190bb",
+  "truth.require_fact_lifecycle_command()":
+    "9ab571a5144343140ed4511d70c9e2127ec3b68b9c97fdd249c4cfe04e5b0e07",
+  "truth.require_fact_lifecycle_event()":
+    "16e0ece019be747f0ac189bdb092b622ae37d6183990dd2b54e9d02a126135c9",
+  "truth.require_reserved_command()":
+    "5d5ebd2c3623d64c51f6a393ddcf593149cd3ef5d0e474a157e86ca534d83c36",
+  "truth.validate_fact_insert()":
+    "0b8110b64ae04d0c3140d3a338f5d0d056695d5612080ba6b6d94abd1464f8ef",
+  "truth.validate_fact_support()":
+    "a8ad48c8b431bf21e11f6468f40e34eeb148d1fe50fa1637602e2e9f7c02f046",
+  "truth.validate_fact_lifecycle_event()":
+    "40a11b34d6a9cdb43a496523b81c3bade3b340600a6b21b4e97453e1dc55b550"
+} as const;
 const initiativeLockSql = `-- Established row-lock capability for durable Initiative truth mutations.
 CREATE POLICY initiatives_app_truth_lock ON work.initiatives
 AS PERMISSIVE FOR UPDATE TO throughline_app
@@ -79,6 +120,14 @@ describe("B2 Slice 1 additive migration contract", () => {
       [
         "0009_b2_source_truth_lifecycle_interlock.sql",
         "0463ee762f2af1b4fc61d551398424740f3927e7a31b478717de03c3c88e29f1"
+      ],
+      [
+        "0010_b2_trusted_objective_initiative_lock.sql",
+        "1fac8f65c9dd80262ea577f1109ca1e6fa4822983cb62ac52868b138e375bb93"
+      ],
+      [
+        "0011_b2_primary_objective_proposal_recovery.sql",
+        "e1160864d02eff6baa56f326bba93a6b79e98904b604fd7f5823672c7885f1f2"
       ]
     ] as const;
     for (const [file, digest] of expected) {
@@ -87,9 +136,13 @@ describe("B2 Slice 1 additive migration contract", () => {
     }
     const runner = await readFile(new URL("./migrations.ts", import.meta.url), "utf8");
     expect(runner).toMatch(
-      /case 0:[\s\S]*?validateB1CatalogContract[\s\S]*?case 1:[\s\S]*?additiveB2Phase: 1[\s\S]*?case 2:[\s\S]*?additiveB2Phase: 2[\s\S]*?case 3:[\s\S]*?additiveB2Phase: 3[\s\S]*?case 4:[\s\S]*?additiveB2Phase: 4[\s\S]*?validateB2CatalogContract/
+      /case 0:[\s\S]*?validateB1CatalogContract[\s\S]*?case 1:[\s\S]*?additiveB2Phase: 1[\s\S]*?case 2:[\s\S]*?additiveB2Phase: 2[\s\S]*?case 3:[\s\S]*?additiveB2Phase: 3[\s\S]*?case 4:[\s\S]*?additiveB2Phase: 4[\s\S]*?case 5:[\s\S]*?additiveB2Phase: 5[\s\S]*?case 6:[\s\S]*?additiveB2Phase: 6[\s\S]*?validateB2CatalogContract/
     );
     const b1Contract = await readFile(new URL("./b1-catalog-contract.ts", import.meta.url), "utf8");
+    expect.soft(b1Contract).toMatch(/type AdditiveB2Phase = 0 \| 1 \| 2 \| 3 \| 4 \| 5 \| 6;/);
+    expect
+      .soft(b1Contract)
+      .toContain('const B2_FACT_LIFECYCLE_MIGRATION_ID = "0012_b2_fact_lifecycle.sql";');
     expect(b1Contract).toContain("A staged B2 catalog requires the exact complete B1 predecessor");
     expect(b1Contract).not.toContain("source_artifacts_truth_retention");
     expect(b1Contract).toContain("Fixed staged B2 command integrity contract parser failed");
@@ -108,6 +161,18 @@ describe("B2 Slice 1 additive migration contract", () => {
     expect(commandIntegrityContract).toContain(
       '"ON ops.domain_command_records",\n        `ON ${expectedRelation}`'
     );
+    expect.soft(commandIntegrityContract).toContain("if (additiveB2Phase >= 6)");
+    expect.soft(commandIntegrityContract).toContain("B2_FACT_LIFECYCLE_MIGRATION_ID");
+    expect.soft(commandIntegrityContract).toContain("factLifecycleConstraintStatement");
+    expect.soft(commandIntegrityContract).toContain("dropPhase5B2TriggerStatement");
+    expect.soft(commandIntegrityContract).toContain("replacementPhase6B2TriggerStatement");
+    expect
+      .soft(commandIntegrityContract)
+      .toContain("Fixed Fact lifecycle command integrity contract parser failed");
+    const phase6Dispatch = runner.match(/case 6:[\s\S]*?(?=\n[ ]{4}case \d+:|\n[ ]{2}})/)?.[0];
+    expect.soft(phase6Dispatch).toBeDefined();
+    expect.soft(phase6Dispatch).toMatch(/additiveB2Phase:\s*6\s*\n/);
+    expect.soft(phase6Dispatch).not.toMatch(/\bas\b|unknown/);
     const integrityCapabilityContract = b1Contract.match(
       /const objectiveRecoveryIntegrityRelations[\s\S]*?async function validateIntegrityPredecessorAccess[\s\S]*?\n}/
     )?.[0];
@@ -127,6 +192,13 @@ describe("B2 Slice 1 additive migration contract", () => {
     expect(integrityCapabilityContract).toContain(
       'predecessorAclRows(relation, "table", [], "throughline_app", ["INSERT", "SELECT"])'
     );
+    expect
+      .soft(integrityCapabilityContract)
+      .toContain(
+        'const factLifecycleIntegrityRelations = ["truth.fact_lifecycle_events"] as const;'
+      );
+    expect.soft(integrityCapabilityContract).toContain('name: "fact_lifecycle_integrity_select"');
+    expect.soft(integrityCapabilityContract).toContain("if (additiveB2Phase >= 6)");
   });
 
   it("adds only the established Initiative row-lock capability", async () => {
@@ -463,5 +535,498 @@ describe("B2 Slice 1 additive migration contract", () => {
       "'normalizationVersion','predecessorClaimId','predicate','sourceArtifactId'"
     );
     expect(atomicity).not.toMatch(/sourceExcerpt|sourceText|objectiveText/);
+  });
+
+  it("adds only bounded ordinary Fact supersession and revocation durability", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+
+    expect([...sql.matchAll(/CREATE TABLE truth\.([a-z_]+)/g)].map((match) => match[1])).toEqual([
+      "fact_lifecycle_events"
+    ]);
+    for (const required of [
+      "predecessor_fact_id",
+      "successor_fact_id",
+      "transition_kind",
+      "from_status",
+      "to_status",
+      "reason_code",
+      "reason_rationale",
+      "authority_basis",
+      "acted_by_user_id",
+      "acted_by_membership_id",
+      "policy_version",
+      "causation_command_id",
+      "recorded_at",
+      "version"
+    ]) {
+      expect(sql).toContain(required);
+    }
+    expect(sql).toContain("status IN ('current','superseded','revoked')");
+    expect(sql).toMatch(
+      /status = 'current'[\s\S]*?version = 1[\s\S]*?status IN \('superseded','revoked'\)[\s\S]*?version = 2/
+    );
+    expect(sql).toMatch(
+      /transition_kind = 'supersede'[\s\S]*?successor_fact_id IS NOT NULL[\s\S]*?transition_kind = 'revoke'[\s\S]*?successor_fact_id IS NULL/
+    );
+    expect(sql).toMatch(
+      /FOREIGN KEY \(tenant_id, workspace_id, space_id, predecessor_fact_id\)[\s\S]*?REFERENCES truth\.accepted_facts\(tenant_id, workspace_id, space_id, id\)[\s\S]*?MATCH FULL[\s\S]*?ON UPDATE RESTRICT ON DELETE RESTRICT[\s\S]*?DEFERRABLE INITIALLY DEFERRED/
+    );
+    expect(sql).toMatch(
+      /FOREIGN KEY \(tenant_id, workspace_id, space_id, successor_fact_id\)[\s\S]*?REFERENCES truth\.accepted_facts\(tenant_id, workspace_id, space_id, id\)[\s\S]*?ON UPDATE RESTRICT ON DELETE RESTRICT[\s\S]*?DEFERRABLE INITIALLY DEFERRED/
+    );
+    expect(sql).toMatch(
+      /to_jsonb\(NEW\) - ARRAY\[\s*'status','last_causation_command_id','updated_at','version'\s*\][\s\S]*?to_jsonb\(OLD\) - ARRAY\[\s*'status','last_causation_command_id','updated_at','version'\s*\]/
+    );
+    expect(sql).not.toMatch(/DROP (?:INDEX|TRIGGER) (?:truth\.)?accepted_facts_one_current_slot/);
+    expect(sql).not.toMatch(
+      /DROP TRIGGER (?:claims_delete_guard|fact_claims_immutable|verified_evidence_immutable)/
+    );
+    expect(sql).toMatch(
+      /CREATE TRIGGER fact_lifecycle_immutable\s+BEFORE (?:DELETE OR UPDATE|UPDATE OR DELETE) ON truth\.fact_lifecycle_events/
+    );
+    expect(sql).toMatch(
+      /CREATE TRIGGER fact_lifecycle_truncate_guard\s+BEFORE TRUNCATE ON truth\.fact_lifecycle_events\s+FOR EACH STATEMENT/
+    );
+
+    expect(sql).toContain("ALTER TABLE truth.fact_lifecycle_events ENABLE ROW LEVEL SECURITY");
+    expect(sql).toContain("ALTER TABLE truth.fact_lifecycle_events FORCE ROW LEVEL SECURITY");
+    for (const policy of [
+      "accepted_facts_lifecycle_update",
+      "fact_lifecycle_select",
+      "fact_lifecycle_insert",
+      "fact_lifecycle_integrity_select"
+    ]) {
+      expect(sql).toContain(`CREATE POLICY ${policy}`);
+    }
+    expect(sql).toMatch(/GRANT SELECT, INSERT ON truth\.fact_lifecycle_events TO throughline_app;/);
+    expect(sql).toMatch(
+      /GRANT UPDATE \(status, last_causation_command_id, updated_at, version\)[\s\S]*?truth\.accepted_facts TO throughline_app;/
+    );
+    expect(sql).not.toMatch(
+      /GRANT (?:UPDATE|DELETE|TRUNCATE) ON truth\.fact_lifecycle_events|GRANT (?:UPDATE|DELETE|TRUNCATE) ON truth\.accepted_facts|GRANT[^;]*?TO (?:PUBLIC|throughline_worker|throughline_relay|throughline_product_relay);/
+    );
+
+    for (const command of ["fact.supersede.v1", "fact.revoke.v1"]) {
+      expect(sql).toContain(command);
+    }
+    expect(sql).toContain("domain_command_records_b2_slice1_atomicity_deferred");
+    expect(sql).toContain("audit_count <> 1 OR outbox_count <> 1");
+    expect(sql).toContain("fact.superseded");
+    expect(sql).toContain("fact.revoked");
+    expect(sql).toContain("caused_lifecycle_count <> 1");
+    expect(sql).toContain("predecessor_fact_count <> 1");
+    expect(sql).toContain("successor_fact_count <> 1");
+    expect(sql).toContain("successor_fact_id_value uuid;");
+    expect(sql).not.toContain("successor_fact_id uuid;");
+    expect(sql).toContain("lifecycle.successor_fact_id = successor_fact_id_value");
+    expect(sql).toContain("'replacementFactId', successor_fact_id_value");
+    expect(sql).toMatch(/fact\.revoke\.v1[\s\S]*?successor_fact_count <> 0/);
+    expect(sql).not.toMatch(
+      /fact\.(?:contest|uphold|emergency(?:[._][a-z0-9_]+)*|source(?:[._][a-z0-9_]+)*reconcil[a-z_]*)\.v\d+|(?:derived_view|derived_views)(?:\.[a-z0-9_]+)*\.v\d+|(?:contest|uphold|emergency|derived_view|source_reconcil)[a-z_]*_(?:event|command|record|store|view)s?|reconcile_source_retention|source_artifacts_truth_retention/i
+    );
+  });
+
+  it("locks and consumes the durable supersede subject version without adding owner authorization", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const transition = migrationFunctionBody(sql, "truth.enforce_fact_lifecycle_transition");
+
+    expect(transition).toBeDefined();
+    expect(transition).toMatch(
+      /IF OLD\.subject_type = 'activity' THEN[\s\S]*?SELECT subject\.version INTO subject_version[\s\S]*?FROM work\.activities subject[\s\S]*?FOR SHARE;[\s\S]*?ELSE[\s\S]*?SELECT subject\.version INTO subject_version[\s\S]*?FROM work\.initiatives subject[\s\S]*?FOR SHARE;/
+    );
+    expect(transition).toContain(
+      "(command.safe_request #>> '{subject,expectedVersion}')::integer = subject_version"
+    );
+    expect(transition).toContain("MESSAGE = 'fact supersede subject version is stale'");
+    expect(transition).not.toMatch(
+      /owner_person_id|membership\.person_id|activity_owner|initiative_owner/
+    );
+  });
+
+  it("requires every supersede replacement Claim to consume its requested pre-transition version", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const transition = migrationFunctionBody(sql, "truth.enforce_claim_transition");
+
+    expect(transition).toBeDefined();
+    expect(transition).toContain("command.command_kind IN ('fact.accept.v1','fact.supersede.v1')");
+    expect(transition).toMatch(
+      /command_kind_value = 'fact\.supersede\.v1'[\s\S]*?jsonb_array_elements\(command_request -> 'replacementClaims'\)[\s\S]*?claim_ref ->> 'claimId' = OLD\.id::text[\s\S]*?\(claim_ref ->> 'expectedVersion'\)::integer = OLD\.version/
+    );
+    expect(transition).toContain("MESSAGE = 'fact supersede replacement Claim version is stale'");
+    expect(transition).toContain(
+      "MESSAGE = 'fact supersede support set does not match replacementClaims'"
+    );
+  });
+
+  it("accepts exactly the base supersede request or its confidenceLowering alternative", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const validator = migrationFunctionBody(sql, "ops.b2_slice1_safe_request_valid");
+
+    expect(validator).toBeDefined();
+    expect(validator).toMatch(
+      /RETURN COALESCE\(\(\(\s*request_keys = ARRAY\['expectedFactVersion','factId','reason','replacementClaims','subject'\]\s+OR request_keys = ARRAY\[\s*'confidenceLowering','expectedFactVersion','factId','reason','replacementClaims','subject'\s*\]\s*\)\s+AND jsonb_typeof\(request_value -> 'factId'\) = 'string'\s+AND jsonb_typeof\(request_value -> 'expectedFactVersion'\) = 'number'\s+AND ops\.is_uuid_v7[\s\S]*?AND \(NOT \(request_value \? 'confidenceLowering'\) OR \([\s\S]*?AND length\(request_value #>> '\{confidenceLowering,reason,rationale\}'\)\s+BETWEEN 1 AND 2000\s*\)\)\), false\);/
+    );
+    expect(validator).toContain("jsonb_typeof(request_value -> 'confidenceLowering') = 'object'");
+    expect(validator).toMatch(
+      /jsonb_object_keys\(request_value -> 'confidenceLowering'\)[\s\S]*?= ARRAY\['confidence','reason'\]/
+    );
+    expect(validator).toMatch(
+      /request_value #>> '\{confidenceLowering,confidence\}' IN\s+\('confirmed','strong','weak','unknown'\)/
+    );
+    expect(validator).toMatch(
+      /jsonb_object_keys\(request_value #> '\{confidenceLowering,reason\}'\)[\s\S]*?= ARRAY\['code','rationale'\]/
+    );
+    expect(validator).toMatch(
+      /request_value #>> '\{confidenceLowering,reason,code\}' IN \(\s*'conservative_human_judgment','evidence_quality','residual_uncertainty'\s*\)/
+    );
+    expect(validator).toMatch(
+      /request_value #>> '\{confidenceLowering,reason,rationale\}' =\s*normalize\(request_value #>> '\{confidenceLowering,reason,rationale\}', NFC\)/
+    );
+    expect(validator).toMatch(
+      /length\(request_value #>> '\{confidenceLowering,reason,rationale\}'\)\s+BETWEEN 1 AND 2000/
+    );
+    expect(validator).toContain("EXCEPTION WHEN OTHERS THEN RETURN false;");
+    expect(validator).not.toMatch(/(?:request_value|request_keys)[^\n]*conflict/);
+  });
+
+  it("binds executable successor confidence and lowering provenance at INSERT time", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const reservation = migrationFunctionBody(sql, "truth.require_reserved_command");
+
+    expect(reservation).toBeDefined();
+    expect(reservation).toMatch(
+      /ELSIF TG_TABLE_NAME = 'accepted_facts' THEN\s+IF actual_kind = 'fact\.supersede\.v1' AND/
+    );
+    expect(reservation).toContain("command_request ? 'confidenceLowering'");
+    expect(reservation).toMatch(
+      /command_request #>> '\{confidenceLowering,confidence\}' IS DISTINCT FROM\s+row_data ->> 'confidence'[\s\S]*?\(row_data ->> 'human_lowered'\)::boolean IS DISTINCT FROM true[\s\S]*?command_request #>> '\{confidenceLowering,reason,code\}' IS DISTINCT FROM\s+row_data ->> 'confidence_lowering_reason_code'[\s\S]*?command_request #>> '\{confidenceLowering,reason,rationale\}' IS DISTINCT FROM\s+row_data ->> 'confidence_lowering_rationale'/
+    );
+    expect(reservation).toMatch(
+      /NOT \(command_request \? 'confidenceLowering'\)[\s\S]*?row_data ->> 'confidence' IS DISTINCT FROM\s+row_data ->> 'strongest_supporting_confidence'[\s\S]*?\(row_data ->> 'human_lowered'\)::boolean IS DISTINCT FROM false[\s\S]*?row_data ->> 'confidence_lowering_reason_code' IS NOT NULL[\s\S]*?row_data ->> 'confidence_lowering_rationale' IS NOT NULL/
+    );
+    expect(reservation).toContain(
+      "RAISE EXCEPTION 'truth mutation requires its exact reserved command'"
+    );
+  });
+
+  it("keeps the shared reservation trigger shape-safe for every attached truth row", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const reservation = migrationFunctionBody(sql, "truth.require_reserved_command");
+
+    expect(reservation).toBeDefined();
+    expect(reservation).toContain("row_data jsonb := to_jsonb(NEW)");
+    expect(
+      [...reservation!.matchAll(/\bNEW\.([a-z][a-z0-9_]*)/g)].map((match) => match[1])
+    ).toEqual([]);
+    for (const field of [
+      "tenant_id",
+      "workspace_id",
+      "space_id",
+      "subject_type",
+      "subject_id",
+      "predicate",
+      "last_causation_command_id"
+    ]) {
+      expect(reservation).toContain(`row_data ->> '${field}'`);
+    }
+  });
+
+  it("positively binds successor insertion to the exact terminalized predecessor", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const reservation = migrationFunctionBody(sql, "truth.require_reserved_command");
+    const authority = migrationFunctionBody(sql, "truth.validate_fact_insert");
+
+    expect(reservation).toBeDefined();
+    const successorReservation = reservation!.slice(
+      reservation!.indexOf("ELSIF TG_TABLE_NAME = 'accepted_facts' THEN")
+    );
+    expect(successorReservation).toMatch(
+      /NOT EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts predecessor[\s\S]*?predecessor\.tenant_id = \(row_data ->> 'tenant_id'\)::uuid[\s\S]*?predecessor\.workspace_id = \(row_data ->> 'workspace_id'\)::uuid[\s\S]*?predecessor\.space_id = \(row_data ->> 'space_id'\)::uuid[\s\S]*?predecessor\.id::text = command_request ->> 'factId'[\s\S]*?predecessor\.subject_type = row_data ->> 'subject_type'[\s\S]*?predecessor\.subject_id = \(row_data ->> 'subject_id'\)::uuid[\s\S]*?predecessor\.predicate = row_data ->> 'predicate'[\s\S]*?predecessor\.status = 'superseded'[\s\S]*?predecessor\.version = 2[\s\S]*?predecessor\.last_causation_command_id =\s*\(row_data ->> 'last_causation_command_id'\)::uuid/
+    );
+    expect(successorReservation).toContain(
+      "RAISE EXCEPTION 'truth mutation requires its exact reserved command'"
+    );
+
+    expect(authority).toBeDefined();
+    expect(authority).toMatch(
+      /command_kind_value = 'fact\.supersede\.v1'[\s\S]*?NOT EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts predecessor[\s\S]*?predecessor\.id::text = command_request ->> 'factId'[\s\S]*?predecessor\.status = 'superseded'[\s\S]*?predecessor\.version = 2[\s\S]*?predecessor\.last_causation_command_id = NEW\.last_causation_command_id/
+    );
+  });
+
+  it("collides only with a current Fact while preserving terminal coordinate history", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const authority = migrationFunctionBody(sql, "truth.validate_fact_insert");
+
+    expect(authority).toBeDefined();
+    expect(authority).toMatch(
+      /command_kind_value = 'fact\.accept\.v1'[\s\S]*?EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts current_fact[\s\S]*?current_fact\.tenant_id = NEW\.tenant_id[\s\S]*?current_fact\.workspace_id = NEW\.workspace_id[\s\S]*?current_fact\.space_id = NEW\.space_id[\s\S]*?current_fact\.subject_type = NEW\.subject_type[\s\S]*?current_fact\.subject_id = NEW\.subject_id[\s\S]*?current_fact\.predicate = NEW\.predicate[\s\S]*?current_fact\.status = 'current'/
+    );
+    expect(authority).not.toMatch(
+      /EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts prior[\s\S]*?AND NOT \(command_kind_value = 'fact\.supersede\.v1'/
+    );
+  });
+
+  it("rejects every accepted or successor Fact below its current non-archived Space class", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const authority = migrationFunctionBody(sql, "truth.validate_fact_insert");
+
+    expect(authority).toBeDefined();
+    expect(authority).toMatch(
+      /SELECT space\.access_class INTO current_space_access_class[\s\S]*?FROM access\.spaces space[\s\S]*?space\.tenant_id = NEW\.tenant_id[\s\S]*?space\.workspace_id = NEW\.workspace_id[\s\S]*?space\.id = NEW\.space_id[\s\S]*?space\.archived_at IS NULL[\s\S]*?FOR SHARE/
+    );
+    expect(authority).toContain("current_space_access_class IS NULL");
+    expect(authority).toMatch(
+      /content\.access_class_rank\(NEW\.access_class\)\s*<\s*content\.access_class_rank\(current_space_access_class\)/
+    );
+    expect(authority).toContain(
+      "RAISE EXCEPTION 'fact access class is below current Space classification'"
+    );
+    const spaceCheck = authority!.indexOf("current_space_access_class IS NULL");
+    expect(spaceCheck).toBeGreaterThan(-1);
+    expect(spaceCheck).toBeLessThan(authority!.indexOf("command_kind_value = 'fact.accept.v1'"));
+    expect(spaceCheck).toBeLessThan(authority!.indexOf("command_kind_value = 'fact.supersede.v1'"));
+  });
+
+  it("requires exact Fact classification from current Space plus persisted Claim evidence", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const support = migrationFunctionBody(sql, "truth.validate_fact_support");
+
+    expect(support).toBeDefined();
+    expect(support).toContain("row_data jsonb := to_jsonb(NEW)");
+    expect(support).toContain("WHEN 'accepted_facts' THEN row_data ->> 'id'");
+    expect(support).toContain("WHEN 'fact_claims' THEN row_data ->> 'fact_id'");
+    expect(support).toMatch(
+      /SELECT content\.access_class_rank\(space\.access_class\)[\s\S]*?FROM access\.spaces space[\s\S]*?space\.tenant_id = fact_record\.tenant_id[\s\S]*?space\.workspace_id = fact_record\.workspace_id[\s\S]*?space\.id = fact_record\.space_id[\s\S]*?space\.archived_at IS NULL/
+    );
+    expect(support).toMatch(
+      /LEFT JOIN truth\.verified_evidence_spans evidence[\s\S]*?evidence\.id = claim\.verified_evidence_span_id/
+    );
+    expect(support).toContain("evidence.access_class <> claim.access_class");
+    expect(support).toMatch(
+      /max\(GREATEST\([\s\S]*?content\.access_class_rank\(claim\.access_class\)[\s\S]*?content\.access_class_rank\(evidence\.access_class\)[\s\S]*?INTO support_count, invalid_count, strongest_rank, support_access/
+    );
+    expect(support).toContain("required_access := GREATEST(required_access, support_access)");
+    expect(support).toContain(
+      "content.access_class_rank(fact_record.access_class) <> required_access"
+    );
+    expect(support).toContain("RAISE EXCEPTION 'accepted fact support is invalid'");
+  });
+
+  it("classifies lifecycle rows by predecessor and optional successor visibility", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const policySql = (name: string) =>
+      sql.slice(
+        sql.indexOf(`CREATE POLICY ${name}`),
+        sql.indexOf(";", sql.indexOf(`CREATE POLICY ${name}`)) + 1
+      );
+
+    for (const name of ["fact_lifecycle_select", "fact_lifecycle_insert"]) {
+      const policy = policySql(name);
+      expect(policy).toMatch(
+        /EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts predecessor[\s\S]*?predecessor\.tenant_id = fact_lifecycle_events\.tenant_id[\s\S]*?predecessor\.workspace_id = fact_lifecycle_events\.workspace_id[\s\S]*?predecessor\.space_id = fact_lifecycle_events\.space_id[\s\S]*?predecessor\.id = fact_lifecycle_events\.predecessor_fact_id[\s\S]*?access\.can_read_space\(fact_lifecycle_events\.space_id, predecessor\.access_class\)/
+      );
+      expect(policy).toMatch(
+        /successor_fact_id IS NULL OR EXISTS \(\s*SELECT 1 FROM truth\.accepted_facts successor[\s\S]*?successor\.tenant_id = fact_lifecycle_events\.tenant_id[\s\S]*?successor\.workspace_id = fact_lifecycle_events\.workspace_id[\s\S]*?successor\.space_id = fact_lifecycle_events\.space_id[\s\S]*?successor\.id = fact_lifecycle_events\.successor_fact_id[\s\S]*?access\.can_read_space\(fact_lifecycle_events\.space_id, successor\.access_class\)/
+      );
+    }
+  });
+
+  it("rebinds successor confidence in deferred atomicity without recalculating support", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const atomicity = migrationFunctionBody(sql, "ops.require_b2_slice1_command_atomicity");
+
+    expect(atomicity).toBeDefined();
+    expect(atomicity).toContain("successor_confidence text;");
+    expect(atomicity).toContain("successor_strongest_confidence text;");
+    expect(atomicity).toContain("successor_human_lowered boolean;");
+    expect(atomicity).toContain("successor_lowering_reason_code text;");
+    expect(atomicity).toContain("successor_lowering_rationale text;");
+    expect(atomicity).not.toContain("actual_strongest_support_rank");
+    expect(atomicity).not.toContain("requested_confidence_rank");
+    expect(atomicity).not.toContain("max(CASE claim.confidence");
+    expect(atomicity).not.toContain(
+      "fact supersede confidenceLowering must be strictly lower than strongest support"
+    );
+    expect(atomicity).toContain("IF NEW.safe_request ? 'confidenceLowering' THEN");
+    expect(atomicity).toMatch(
+      /successor_confidence IS DISTINCT FROM\s+NEW\.safe_request #>> '\{confidenceLowering,confidence\}'[\s\S]*?successor_human_lowered IS DISTINCT FROM true[\s\S]*?successor_lowering_reason_code IS DISTINCT FROM\s+NEW\.safe_request #>> '\{confidenceLowering,reason,code\}'[\s\S]*?successor_lowering_rationale IS DISTINCT FROM\s+NEW\.safe_request #>> '\{confidenceLowering,reason,rationale\}'/
+    );
+    expect(atomicity).toContain(
+      "MESSAGE = 'fact supersede successor confidence does not match confidenceLowering'"
+    );
+    expect(atomicity).toMatch(
+      /successor_confidence IS DISTINCT FROM successor_strongest_confidence[\s\S]*?successor_human_lowered IS DISTINCT FROM false[\s\S]*?successor_lowering_reason_code IS NOT NULL[\s\S]*?successor_lowering_rationale IS NOT NULL/
+    );
+    expect(atomicity).toContain(
+      "MESSAGE = 'fact supersede successor confidence requires confidenceLowering'"
+    );
+  });
+
+  it("matches parseSortedClaimRefs and reconstructs the exact successor support request", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const validator = migrationFunctionBody(sql, "ops.b2_slice1_safe_request_valid");
+    const atomicity = migrationFunctionBody(sql, "ops.require_b2_slice1_command_atomicity");
+
+    expect(validator).toBeDefined();
+    expect(validator).toContain(
+      "jsonb_array_length(request_value -> 'replacementClaims') BETWEEN 1 AND 100"
+    );
+    expect(validator).toContain("jsonb_typeof(claim_ref -> 'claimId') <> 'string'");
+    expect(validator).toContain("jsonb_typeof(claim_ref -> 'expectedVersion') <> 'number'");
+    expect(validator).toContain(
+      "'^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$'"
+    );
+    expect(validator).toMatch(
+      /jsonb_array_elements\(request_value -> 'replacementClaims'\)[\s\S]*?WITH ORDINALITY AS replacement\(claim_ref, ordinal\)/
+    );
+    expect(validator).toContain("array_agg(claim_ref ->> 'claimId' ORDER BY ordinal) =");
+    expect(validator).toContain(
+      "array_agg(claim_ref ->> 'claimId' ORDER BY claim_ref ->> 'claimId')"
+    );
+
+    expect(atomicity).toBeDefined();
+    expect(atomicity).toContain("canonical_replacement_claims jsonb;");
+    expect(atomicity).toMatch(
+      /jsonb_agg\([\s\S]*?'claimId', support\.claim_id,[\s\S]*?'expectedVersion', claim\.version - 1[\s\S]*?ORDER BY support\.claim_id[\s\S]*?INTO canonical_replacement_claims/
+    );
+    expect(atomicity).toMatch(
+      /canonical_replacement_claims IS DISTINCT FROM\s+NEW\.safe_request -> 'replacementClaims'/
+    );
+    expect(atomicity).toContain(
+      "MESSAGE = 'fact supersede support set does not match replacementClaims'"
+    );
+  });
+
+  it("requires exact JSON scalar types across the phase-6 lifecycle envelope", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const safeRequest = migrationFunctionBody(sql, "ops.b2_slice1_safe_request_valid");
+    const productResponse = migrationFunctionBody(sql, "ops.product_command_record_valid");
+    const eventPayload = migrationFunctionBody(sql, "ops.b2_slice1_event_payload_valid");
+
+    expect(safeRequest).toBeDefined();
+    const revokeRequest = safeRequest!.slice(
+      safeRequest!.indexOf("IF command_kind_value = 'fact.revoke.v1' THEN"),
+      safeRequest!.indexOf(
+        "    END IF;\n    RETURN COALESCE",
+        safeRequest!.indexOf("IF command_kind_value = 'fact.revoke.v1' THEN")
+      )
+    );
+    const supersedeRequest = safeRequest!.slice(
+      safeRequest!.indexOf(
+        "    RETURN COALESCE",
+        safeRequest!.indexOf("IF command_kind_value = 'fact.revoke.v1' THEN")
+      ),
+      safeRequest!.indexOf(
+        "  IF command_kind_value = 'initiative.primary_objective.withdraw.v1' THEN"
+      )
+    );
+    for (const requestBranch of [revokeRequest, supersedeRequest]) {
+      expect(requestBranch).toContain("jsonb_typeof(request_value -> 'factId') = 'string'");
+      expect(requestBranch).toContain(
+        "jsonb_typeof(request_value -> 'expectedFactVersion') = 'number'"
+      );
+      expect(requestBranch).toContain("jsonb_typeof(request_value #> '{reason,code}') = 'string'");
+      expect(requestBranch).toContain(
+        "jsonb_typeof(request_value #> '{reason,rationale}') = 'string'"
+      );
+    }
+    expect(supersedeRequest).toContain(
+      "jsonb_typeof(request_value #> '{subject,type}') = 'string'"
+    );
+    expect(supersedeRequest).toContain("jsonb_typeof(request_value #> '{subject,id}') = 'string'");
+    expect(supersedeRequest).toContain(
+      "jsonb_typeof(request_value #> '{subject,expectedVersion}') = 'number'"
+    );
+
+    expect(productResponse).toBeDefined();
+    const revokeResponse = productResponse!.slice(
+      productResponse!.indexOf("IF command_kind_value = 'fact.revoke.v1' THEN"),
+      productResponse!.indexOf("ELSIF command_kind_value = 'fact.supersede.v1' THEN")
+    );
+    const supersedeResponse = productResponse!.slice(
+      productResponse!.indexOf("ELSIF command_kind_value = 'fact.supersede.v1' THEN"),
+      productResponse!.indexOf("ELSIF command_kind_value = 'claim.create.v1' THEN")
+    );
+    for (const responseBranch of [revokeResponse, supersedeResponse]) {
+      expect(responseBranch).toContain("jsonb_typeof(response -> 'factId') = 'string'");
+      expect(responseBranch).toContain("jsonb_typeof(response -> 'status') = 'string'");
+      expect(responseBranch).toContain("jsonb_typeof(response -> 'version') = 'number'");
+    }
+    expect(supersedeResponse).toContain("jsonb_typeof(response -> 'replacementFactId') = 'string'");
+    expect(supersedeResponse).toContain(
+      "jsonb_typeof(response -> 'replacementFactVersion') = 'number'"
+    );
+    expect(supersedeResponse).toContain(
+      "jsonb_typeof(response -> 'replacementFactStatus') = 'string'"
+    );
+
+    expect(eventPayload).toBeDefined();
+    const supersededEvent = eventPayload!.slice(
+      eventPayload!.indexOf("WHEN 'fact.superseded' THEN"),
+      eventPayload!.indexOf("WHEN 'fact.revoked' THEN")
+    );
+    const revokedEvent = eventPayload!.slice(
+      eventPayload!.indexOf("WHEN 'fact.revoked' THEN"),
+      eventPayload!.indexOf("WHEN 'fact.accepted' THEN")
+    );
+    for (const eventBranch of [supersededEvent, revokedEvent]) {
+      expect(eventBranch).toContain("jsonb_typeof(payload_value -> 'factId') = 'string'");
+      expect(eventBranch).toContain("jsonb_typeof(payload_value -> 'factVersion') = 'number'");
+      expect(eventBranch).toContain("jsonb_typeof(payload_value -> 'reasonCode') = 'string'");
+      expect(eventBranch).toContain("jsonb_typeof(payload_value -> 'status') = 'string'");
+    }
+    expect(supersededEvent).toContain(
+      "jsonb_typeof(payload_value -> 'replacementFactId') = 'string'"
+    );
+    expect(supersededEvent).toContain(
+      "jsonb_typeof(payload_value -> 'replacementFactVersion') = 'number'"
+    );
+  });
+
+  it("binds support insertion and supersede response identity to the exact successor", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const supportReservation = migrationFunctionBody(sql, "truth.require_fact_accept_reservation");
+    const atomicity = migrationFunctionBody(sql, "ops.require_b2_slice1_command_atomicity");
+
+    expect(supportReservation).toBeDefined();
+    expect(supportReservation).toMatch(
+      /fact\.id = NEW\.fact_id\s+AND fact\.status = 'current'\s+AND fact\.version = 1\s+AND command\.command_kind IN \('fact\.accept\.v1','fact\.supersede\.v1'\)/
+    );
+    expect(supportReservation).toContain(
+      "RAISE EXCEPTION 'fact support requires its exact reserved command'"
+    );
+
+    expect(atomicity).toBeDefined();
+    expect(atomicity).toMatch(
+      /\(NEW\.safe_response ->> 'replacementFactId'\)::uuid IS DISTINCT FROM\s+successor_fact_id_value/
+    );
+    expect(atomicity).toContain("MESSAGE = 'fact supersede response does not match successor'");
+    expect(atomicity!.indexOf("fact supersede response does not match successor")).toBeLessThan(
+      atomicity!.indexOf("SELECT count(*) INTO audit_count")
+    );
+  });
+
+  it("pins every function body created or replaced by 0012 with independent fixed digests", async () => {
+    const sql = await readFile(factLifecycleUrl, "utf8");
+    const createdFunctionNames = [...sql.matchAll(/^CREATE (?:OR REPLACE )?FUNCTION ([^(]+)\(/gm)]
+      .map((match) => match[1]!)
+      .sort();
+    const expectedFunctionNames = Object.keys(exact0012FunctionBodyDigests)
+      .map((identity) => identity.slice(0, identity.indexOf("(")))
+      .sort();
+
+    expect(createdFunctionNames).toEqual(expectedFunctionNames);
+    expect(
+      Object.fromEntries(
+        Object.entries(exact0012FunctionBodyDigests).map(([identity]) => {
+          const body = migrationFunctionBody(sql, identity.slice(0, identity.indexOf("(")));
+          expect(body, identity).toBeDefined();
+          return [
+            identity,
+            createHash("sha256").update(body!.trim().replace(/\s+/g, " ")).digest("hex")
+          ];
+        })
+      )
+    ).toEqual(exact0012FunctionBodyDigests);
   });
 });

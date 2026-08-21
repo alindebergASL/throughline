@@ -1,4 +1,8 @@
-import { PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES } from "./b2.js";
+import {
+  PRIMARY_OBJECTIVE_WITHDRAW_REASON_CODES,
+  REVOKE_REASON_CODES,
+  SUPERSEDE_REASON_CODES
+} from "./b2.js";
 
 export const DOMAIN_NOTIFICATION_EVENT_TYPES = [
   "organization.created",
@@ -16,7 +20,9 @@ export const DOMAIN_NOTIFICATION_EVENT_TYPES = [
   "initiative.primary_objective.proposal_withdrawn",
   "initiative.primary_objective.proposal_rejected",
   "initiative.primary_objective.proposal_reworked",
-  "fact.accepted"
+  "fact.accepted",
+  "fact.superseded",
+  "fact.revoked"
 ] as const;
 
 export type DomainNotificationEventType = (typeof DOMAIN_NOTIFICATION_EVENT_TYPES)[number];
@@ -50,7 +56,9 @@ export const DOMAIN_NOTIFICATION_EVENT_AGGREGATE_PAIRS = {
   "initiative.primary_objective.proposal_withdrawn": "claim",
   "initiative.primary_objective.proposal_rejected": "claim",
   "initiative.primary_objective.proposal_reworked": "claim",
-  "fact.accepted": "accepted_fact"
+  "fact.accepted": "accepted_fact",
+  "fact.superseded": "accepted_fact",
+  "fact.revoked": "accepted_fact"
 } as const satisfies Record<DomainNotificationEventType, DomainNotificationAggregateType>;
 
 export interface DomainNotificationPayloadMap {
@@ -104,6 +112,20 @@ export interface DomainNotificationPayloadMap {
     reasonCode: "reworked";
   };
   "fact.accepted": { factId: string };
+  "fact.superseded": {
+    factId: string;
+    factVersion: 2;
+    reasonCode: (typeof SUPERSEDE_REASON_CODES)[number];
+    replacementFactId: string;
+    replacementFactVersion: 1;
+    status: "superseded";
+  };
+  "fact.revoked": {
+    factId: string;
+    factVersion: 2;
+    reasonCode: (typeof REVOKE_REASON_CODES)[number];
+    status: "revoked";
+  };
 }
 
 export type DomainNotificationEnvelopeFor<T extends DomainNotificationEventType> = {
@@ -413,6 +435,61 @@ export function parseDomainNotificationEnvelope(input: unknown): DomainNotificat
         eventType,
         aggregateType: "accepted_fact",
         payload: { factId }
+      };
+    }
+    case "fact.superseded": {
+      const payload = requireExactObject(envelope.payload, [
+        "factId",
+        "factVersion",
+        "reasonCode",
+        "replacementFactId",
+        "replacementFactVersion",
+        "status"
+      ]);
+      const factId = requireUuidV7(payload.factId);
+      if (
+        factId !== aggregateId ||
+        payload.factVersion !== 2 ||
+        payload.replacementFactVersion !== 1 ||
+        payload.status !== "superseded"
+      ) {
+        fail();
+      }
+      return {
+        ...base,
+        eventType,
+        aggregateType: "accepted_fact",
+        payload: {
+          factId,
+          factVersion: 2,
+          reasonCode: requireEnum(payload.reasonCode, SUPERSEDE_REASON_CODES),
+          replacementFactId: requireUuidV7(payload.replacementFactId),
+          replacementFactVersion: 1,
+          status: "superseded"
+        }
+      };
+    }
+    case "fact.revoked": {
+      const payload = requireExactObject(envelope.payload, [
+        "factId",
+        "factVersion",
+        "reasonCode",
+        "status"
+      ]);
+      const factId = requireUuidV7(payload.factId);
+      if (factId !== aggregateId || payload.factVersion !== 2 || payload.status !== "revoked") {
+        fail();
+      }
+      return {
+        ...base,
+        eventType,
+        aggregateType: "accepted_fact",
+        payload: {
+          factId,
+          factVersion: 2,
+          reasonCode: requireEnum(payload.reasonCode, REVOKE_REASON_CODES),
+          status: "revoked"
+        }
       };
     }
   }

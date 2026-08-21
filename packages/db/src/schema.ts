@@ -995,6 +995,35 @@ export const acceptedFacts = truth.table(
   ]
 );
 
+export const factLifecycleEvents = truth.table(
+  "fact_lifecycle_events",
+  {
+    id: uuid("id").primaryKey(),
+    ...truthScope,
+    predecessorFactId: uuid("predecessor_fact_id").notNull(),
+    successorFactId: uuid("successor_fact_id"),
+    transitionKind: text("transition_kind").notNull(),
+    fromStatus: text("from_status").notNull(),
+    toStatus: text("to_status").notNull(),
+    reasonCode: text("reason_code").notNull(),
+    reasonRationale: text("reason_rationale").notNull(),
+    authorityBasis: text("authority_basis").notNull(),
+    policyVersion: text("policy_version").notNull(),
+    actedByUserId: uuid("acted_by_user_id").notNull(),
+    actedByMembershipId: uuid("acted_by_membership_id").notNull(),
+    causationCommandId: uuid("causation_command_id").notNull(),
+    recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(),
+    version: integer("version").notNull().default(1)
+  },
+  (table) => [
+    unique().on(table.tenantId, table.workspaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.spaceId, table.id),
+    unique().on(table.tenantId, table.workspaceId, table.predecessorFactId),
+    unique().on(table.tenantId, table.workspaceId, table.successorFactId),
+    unique().on(table.tenantId, table.workspaceId, table.causationCommandId)
+  ]
+);
+
 export const factClaims = truth.table(
   "fact_claims",
   {
